@@ -66,6 +66,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    float * get_embeddings_penultimate();
+    float * get_embeddings_penultimate_ith(int32_t i);
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -246,6 +249,11 @@ private:
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     size_t  embd_size = 0; // capacity (of floats) for embeddings
     float * embd      = nullptr;
+
+    // penultimate embeddings output (hidden state before final norm, for EAGLE)
+    // (2-dimensional array: [n_outputs][n_embd])
+    size_t  embd_penultimate_size = 0;
+    float * embd_penultimate      = nullptr;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

@@ -690,6 +690,51 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::get_embeddings_penultimate() {
+    output_reorder();
+
+    return embd_penultimate;
+}
+
+float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
+    int64_t j = -1;
+
+    output_reorder();
+
+    try {
+        if (embd_penultimate == nullptr) {
+            throw std::runtime_error("no penultimate embeddings");
+        }
+
+        if (i < 0) {
+            j = n_outputs + i;
+            if (j < 0) {
+                throw std::runtime_error(format("negative index out of range [0, %d)", n_outputs));
+            }
+        } else if ((size_t) i >= output_ids.size()) {
+            throw std::runtime_error(format("out of range [0, %zu)", output_ids.size()));
+        } else {
+            j = output_ids[i];
+        }
+
+        if (j < 0) {
+            throw std::runtime_error(format("batch.logits[%d] != true", i));
+        }
+        if (j >= n_outputs) {
+            throw std::runtime_error(format("corrupt output buffer (j=%" PRId64 ", n_outputs=%d)", j, n_outputs));
+        }
+
+        return embd_penultimate + j*model.hparams.n_embd;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid penultimate embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
            ggml_threadpool_t threadpool_batch) {
@@ -1178,8 +1223,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
-        auto * t_logits = res->get_logits();
-        auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+        auto * t_logits           = res->get_logits();
+        auto * t_embd             = cparams.embeddings ? res->get_embd() : nullptr;
+        auto * t_embd_penultimate = cparams.embeddings ? res->get_embd_penultimate() : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -1252,6 +1298,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         GGML_ABORT("unknown pooling type");
                     }
+            }
+        }
+
+        // extract penultimate embeddings (for EAGLE speculative decoding)
+        if (t_embd_penultimate && embd_penultimate && n_outputs > 0) {
+            ggml_backend_t backend_penult = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_penultimate);
+            GGML_ASSERT(backend_penult != nullptr);
+
+            // only extract for non-pooled case
+            if (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                float * embd_penult_out = embd_penultimate + n_outputs_prev*n_embd;
+
+                if (n_outputs) {
+                    GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                    GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_penultimate_size);
+                    ggml_backend_tensor_get_async(backend_penult, t_embd_penultimate, embd_penult_out, 0, n_outputs*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -1337,8 +1400,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         has_embd   = true;
     }
 
-    logits_size = has_logits ? n_vocab*n_outputs_max : 0;
-    embd_size   = has_embd   ?  n_embd*n_outputs_max : 0;
+    logits_size           = has_logits ? n_vocab*n_outputs_max : 0;
+    embd_size             = has_embd   ?  n_embd*n_outputs_max : 0;
+    embd_penultimate_size = has_embd   ?  n_embd*n_outputs_max : 0; // same size as embd
 
     if (output_ids.empty()) {
         // init, never resized afterwards
@@ -1346,7 +1410,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
-    const size_t new_size  = (logits_size + embd_size) * sizeof(float);
+    const size_t new_size  = (logits_size + embd_size + embd_penultimate_size) * sizeof(float);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1360,6 +1424,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             buf_output = nullptr;
             logits = nullptr;
             embd = nullptr;
+            embd_penultimate = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -1378,8 +1443,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
 
-    logits = has_logits ? output_base               : nullptr;
-    embd   = has_embd   ? output_base + logits_size : nullptr;
+    logits           = has_logits ? output_base                              : nullptr;
+    embd             = has_embd   ? output_base + logits_size                : nullptr;
+    embd_penultimate = has_embd   ? output_base + logits_size + embd_size    : nullptr;
 
     // set all ids as invalid (negative)
     std::fill(output_ids.begin(), output_ids.end(), -1);
@@ -1406,6 +1472,12 @@ void llama_context::output_reorder() {
         if (embd_size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd[i0*n_embd + k], embd[i1*n_embd + k]);
+            }
+        }
+
+        if (embd_penultimate_size > 0) {
+            for (uint64_t k = 0; k < n_embd; k++) {
+                std::swap(embd_penultimate[i0*n_embd + k], embd_penultimate[i1*n_embd + k]);
             }
         }
     }
@@ -2532,6 +2604,18 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+float * llama_get_embeddings_penultimate(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_penultimate();
+}
+
+float * llama_get_embeddings_penultimate_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_penultimate_ith(i);
 }
 
 // llama adapter API

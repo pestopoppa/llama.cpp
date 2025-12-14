@@ -968,6 +968,17 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Get penultimate layer embeddings (hidden state before final norm)
+    // Useful for EAGLE-style speculative decoding
+    // shape: [n_outputs*n_embd]
+    // Returns NULL if embeddings are not enabled
+    LLAMA_API float * llama_get_embeddings_penultimate(struct llama_context * ctx);
+
+    // Get penultimate embeddings for the ith token
+    // shape: [n_embd] (1-dimensional)
+    // returns NULL for invalid ids or if embeddings are not enabled
+    LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
+
     //
     // Vocab
     //

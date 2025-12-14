@@ -138,6 +138,10 @@ llm_build_llama::llm_build_llama(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    // capture hidden state before final norm (for EAGLE speculative decoding)
+    cb(cur, "result_penultimate", -1);
+    res->t_embd_penultimate = cur;
+
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
