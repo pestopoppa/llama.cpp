@@ -980,6 +980,37 @@ extern "C" {
     LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
 
     //
+    // EAGLE speculative decoding
+    //
+
+    struct llama_eagle_head;
+
+    // Load EAGLE draft head from GGUF file
+    // The EAGLE head must be compatible with the base model (same hidden size)
+    // Returns nullptr on failure
+    LLAMA_API struct llama_eagle_head * llama_eagle_load(
+            const char * path_gguf,
+            const struct llama_model * model_base);
+
+    // Free EAGLE head
+    LLAMA_API void llama_eagle_free(struct llama_eagle_head * eagle);
+
+    // Check if EAGLE head is compatible with base model
+    LLAMA_API bool llama_eagle_is_compatible(
+            const struct llama_eagle_head * eagle,
+            const struct llama_model * model);
+
+    // Generate draft tokens using EAGLE head
+    // Returns number of draft tokens generated (0 if not implemented yet)
+    LLAMA_API int32_t llama_eagle_generate_draft(
+            struct llama_context * ctx,
+            struct llama_eagle_head * eagle,
+            const float * hidden_states,
+            llama_token last_token,
+            int32_t n_draft,
+            llama_token * draft_tokens);
+
+    //
     // Vocab
     //
 
