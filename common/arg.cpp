@@ -537,6 +537,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.speculative.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
 
+    if (!params.speculative.kv_overrides.empty()) {
+        params.speculative.kv_overrides.emplace_back();
+        params.speculative.kv_overrides.back().key[0] = 0;
+    }
+
     if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
         throw std::runtime_error(string_format(
             "error: the supplied chat template is not supported: %s%s\n",
@@ -3082,6 +3087,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V_DRAFT"));
+    add_opt(common_arg(
+        {"--n-layer-exit-draft"}, "N",
+        string_format("exit after N layers for draft model (default: %d, 0 = compute all layers)\n"
+            "for MoE self-speculation with layer skip", params.speculative.n_layer_exit),
+        [](common_params & params, int value) {
+            params.speculative.n_layer_exit = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_LAYER_EXIT_DRAFT"));
+    add_opt(common_arg(
+        {"--override-kv-draft"}, "KEY=TYPE:VALUE",
+        "override model metadata for draft model by key. may be specified multiple times.\n"
+        "types: int, float, bool, str. example: --override-kv-draft qwen3vlmoe.expert_used_count=int:4",
+        [](common_params & params, const std::string & value) {
+            if (!string_parse_kv_override(value.c_str(), params.speculative.kv_overrides)) {
+                throw std::runtime_error(string_format("error: Invalid type for draft KV override: %s\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"-mv", "--model-vocoder"}, "FNAME",

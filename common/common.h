@@ -239,7 +239,9 @@ struct common_params_speculative {
     int32_t n_max        =    16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min        =     0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_gpu_layers =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t n_layer_exit =     0; // exit after N layers for draft model (0 = compute all layers)
     float   p_split      =  0.1f; // speculative decoding split probability
+    std::vector<llama_model_kv_override> kv_overrides; // KV overrides for draft model
     float   p_min        = 0.75f; // minimum speculative decoding probability (greedy)
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
