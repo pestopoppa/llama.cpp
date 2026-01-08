@@ -1063,6 +1063,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--n-layer-exit"}, "N",
+        string_format("exit after N layers for early exit / CAS-Spec self-drafting (default: %d, 0 = all layers)", params.n_layer_exit),
+        [](common_params & params, int value) {
+            params.n_layer_exit = value;
+        }
+    ).set_env("LLAMA_ARG_N_LAYER_EXIT"));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
@@ -3014,6 +3021,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.n_ctx = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CTX_SIZE_DRAFT"));
+    add_opt(common_arg(
+        {"--n-layer-exit-draft"}, "N",
+        string_format("exit after N layers for draft model (CAS-Spec self-speculation) (default: %d, 0 = all layers)", params.speculative.n_layer_exit),
+        [](common_params & params, int value) {
+            params.speculative.n_layer_exit = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_LAYER_EXIT_DRAFT"));
     add_opt(common_arg(
         {"-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"

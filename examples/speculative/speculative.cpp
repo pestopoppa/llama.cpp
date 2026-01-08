@@ -46,8 +46,11 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (params.speculative.model.path.empty()) {
-        LOG_ERR("%s: --model-draft is required\n", __func__);
+    // Check if we're using self-speculative mode (CAS-Spec) or external draft model
+    const bool self_speculative = params.speculative.n_layer_exit > 0;
+
+    if (params.speculative.model.path.empty() && !self_speculative) {
+        LOG_ERR("%s: --model-draft is required (or use --n-layer-exit-draft N for self-speculative mode)\n", __func__);
         return 1;
     }
 
@@ -76,21 +79,42 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
-    // load the draft model
-    params.devices = params.speculative.devices;
-    params.model = params.speculative.model;
-    params.n_gpu_layers = params.speculative.n_gpu_layers;
-    if (params.speculative.cpuparams.n_threads > 0) {
-        params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
+    std::unique_ptr<common_init_result> llama_init_dft;
+
+    if (self_speculative) {
+        // Self-speculative mode (CAS-Spec): create draft context using same model with early exit
+        LOG_INF("%s: self-speculative mode with %d layers for draft\n", __func__, params.speculative.n_layer_exit);
+
+        struct llama_context_params ctx_params_dft = llama_context_default_params();
+        ctx_params_dft.n_ctx        = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : llama_n_ctx(ctx_tgt);
+        ctx_params_dft.n_batch      = llama_n_batch(ctx_tgt);
+        ctx_params_dft.n_layer_exit = params.speculative.n_layer_exit;  // Early exit for drafting
+
+        ctx_dft = llama_init_from_model(model_tgt, ctx_params_dft);
+        if (!ctx_dft) {
+            LOG_ERR("%s: failed to create self-speculative draft context\n", __func__);
+            return 1;
+        }
+
+        // In self-speculative mode, draft model is the same as target
+        model_dft = model_tgt;
+    } else {
+        // External draft model mode
+        params.devices = params.speculative.devices;
+        params.model = params.speculative.model;
+        params.n_gpu_layers = params.speculative.n_gpu_layers;
+        if (params.speculative.cpuparams.n_threads > 0) {
+            params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
+        }
+
+        params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+        params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
+
+        llama_init_dft = common_init_from_params(params);
+
+        model_dft = llama_init_dft->model();
+        ctx_dft   = llama_init_dft->context();
     }
-
-    params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
-    params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
-
-    auto llama_init_dft = common_init_from_params(params);
-
-    model_dft = llama_init_dft->model();
-    ctx_dft   = llama_init_dft->context();
 
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);

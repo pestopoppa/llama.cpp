@@ -17,6 +17,14 @@ struct common_speculative * common_speculative_init(
         struct llama_context * ctx_dft
 );
 
+// Initialize self-speculative decoding (CAS-Spec) using same model with early layer exit for drafting
+// ctx_tgt: target context (uses all layers)
+// n_layer_draft: number of layers for draft context (early exit)
+struct common_speculative * common_speculative_init_self(
+        struct llama_context * ctx_tgt,
+        int n_layer_draft
+);
+
 void common_speculative_free(struct common_speculative * spec);
 
 bool common_speculative_are_compatible(

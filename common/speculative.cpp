@@ -74,6 +74,41 @@ struct common_speculative * common_speculative_init(
     return result;
 }
 
+struct common_speculative * common_speculative_init_self(
+        struct llama_context * ctx_tgt,
+        int n_layer_draft) {
+    if (!ctx_tgt) {
+        LOG_ERR("%s: target context is null\n", __func__);
+        return nullptr;
+    }
+
+    // Get the model from target context
+    const struct llama_model * model = llama_get_model(ctx_tgt);
+    if (!model) {
+        LOG_ERR("%s: failed to get model from target context\n", __func__);
+        return nullptr;
+    }
+
+    // Create new context params for draft with early exit
+    struct llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx        = llama_n_ctx(ctx_tgt);
+    ctx_params.n_batch      = llama_n_batch(ctx_tgt);
+    ctx_params.n_layer_exit = n_layer_draft;  // Early exit for drafting
+
+    // Create draft context with same model but fewer layers
+    struct llama_context * ctx_dft = llama_init_from_model((llama_model *)model, ctx_params);
+    if (!ctx_dft) {
+        LOG_ERR("%s: failed to create draft context for self-speculative decoding\n", __func__);
+        return nullptr;
+    }
+
+    LOG_INF("%s: created self-speculative draft context with %d layers (target has all layers)\n",
+            __func__, n_layer_draft);
+
+    // Use existing speculative init
+    return common_speculative_init(ctx_tgt, ctx_dft);
+}
+
 void common_speculative_free(struct common_speculative * spec) {
     if (spec == nullptr) {
         return;
