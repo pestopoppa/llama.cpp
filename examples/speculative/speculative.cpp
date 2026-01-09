@@ -144,6 +144,15 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // warn if ISWA models are used without --swa-full, recommend using it for reliability
+    {
+        const int n_swa_tgt = llama_model_n_swa(model_tgt);
+        const int n_swa_dft = llama_model_n_swa(model_dft);
+        if ((n_swa_tgt > 0 || n_swa_dft > 0) && !params.swa_full) {
+            LOG_WRN("%s: ISWA model detected (sliding window attention). For best reliability, consider using --swa-full\n", __func__);
+        }
+    }
+
     auto * mem_tgt = llama_get_memory(ctx_tgt);
     auto * mem_dft = llama_get_memory(ctx_dft);
 
