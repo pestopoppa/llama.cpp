@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "simd-mappings.h"
+#include "arch/x86/avx512-helpers.h"
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
@@ -1025,7 +1026,48 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX2__)
+#if defined(__AVX512VNNI__)
+    // AVX-512 VNNI path: process 2 Q8_0 blocks per iteration
+    // Uses _mm512_dpbusd_epi32 for int8 dot product (faster than AVX2 on VNNI-capable CPUs)
+    __m512 acc = _mm512_setzero_ps();
+    const __m512i zero = _mm512_setzero_si512();
+
+    for (; ib + 1 < nb; ib += 2) {
+        // Load x.qs for both blocks (32 bytes each) into zmm register
+        // Block 0 -> low 256 bits, Block 1 -> high 256 bits
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);
+        const __m512i qx = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
+
+        // Load y.qs for both blocks
+        const __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        const __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+        const __m512i qy = _mm512_inserti64x4(_mm512_castsi256_si512(qy0), qy1, 1);
+
+        // VNNI: 64 int8 pairs -> 16 int32 partial sums
+        // Low 8 int32s correspond to block 0, high 8 to block 1
+        const __m512i sums = mul_sum_i8_pairs_acc_int32x16(zero, qx, qy);
+
+        // Convert to FP32 for scaled accumulation
+        const __m512 sums_f = _mm512_cvtepi32_ps(sums);
+
+        // Create scale vector using broadcasts: [s0 x8, s1 x8]
+        const float scale0 = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const float scale1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
+        const __m256 scale0_vec = _mm256_set1_ps(scale0);
+        const __m256 scale1_vec = _mm256_set1_ps(scale1);
+        const __m512 scales = _mm512_insertf32x8(_mm512_castps256_ps512(scale0_vec), scale1_vec, 1);
+
+        // Scale partial sums and accumulate
+        acc = _mm512_fmadd_ps(scales, sums_f, acc);
+    }
+
+    // Horizontal sum of accumulator (16 floats -> 1 float)
+    sumf = _mm512_reduce_add_ps(acc);
+
+    // Handle remaining block (if nb is odd) with scalar loop below
+
+#elif defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
@@ -1043,6 +1085,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     sumf = hsum_float_8(acc);
+
 #elif defined(__AVX__)
     __m256 accum = _mm256_setzero_ps();
 
