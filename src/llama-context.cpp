@@ -3191,7 +3191,11 @@ std::unique_ptr<llama_memory_context_i> llama_context::initialize_decode_context
 
         if (batch_inp.mtp_params.op_type == MTP_OP_NONE) {
             if (mctx && mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS) {
-                kvd->last_main_model_sinfos = static_cast<llama_kv_cache_context *>(mctx.get())->get_sinfos();
+                // only access sinfos for non-ISWA models - ISWA uses a different context type
+                // (llama_kv_cache_iswa_context) that doesn't have get_sinfos()
+                if (!model.hparams.is_swa_any()) {
+                    kvd->last_main_model_sinfos = static_cast<llama_kv_cache_context *>(mctx.get())->get_sinfos();
+                }
             } else {
                 kvd->last_main_model_sinfos.clear();
             }
