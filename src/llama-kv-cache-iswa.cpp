@@ -156,9 +156,16 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             break;
         }
 
-        auto sinfos_swa = kv_swa->prepare(ubatches);
-        if (sinfos_swa.empty()) {
-            break;
+        // unified slot mode: when caches are the same size (--swa-full), SWA mirrors base slots exactly
+        // this ensures slot consistency for speculative decoding with ISWA models
+        llama_kv_cache::slot_info_vec_t sinfos_swa;
+        if (kv_base->get_size() == kv_swa->get_size()) {
+            sinfos_swa = sinfos_base;
+        } else {
+            sinfos_swa = kv_swa->prepare(ubatches);
+            if (sinfos_swa.empty()) {
+                break;
+            }
         }
 
         assert(sinfos_base.size() == sinfos_swa.size());
@@ -192,9 +199,16 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             break;
         }
 
-        auto sinfos_swa = kv_swa->prepare(ubatches);
-        if (sinfos_swa.empty()) {
-            break;
+        // unified slot mode: when caches are the same size (--swa-full), SWA mirrors base slots exactly
+        // this ensures slot consistency for speculative decoding with ISWA models
+        llama_kv_cache::slot_info_vec_t sinfos_swa;
+        if (kv_base->get_size() == kv_swa->get_size()) {
+            sinfos_swa = sinfos_base;
+        } else {
+            sinfos_swa = kv_swa->prepare(ubatches);
+            if (sinfos_swa.empty()) {
+                break;
+            }
         }
 
         assert(sinfos_base.size() == sinfos_swa.size());
