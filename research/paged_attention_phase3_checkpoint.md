@@ -1,9 +1,26 @@
-# Paged Attention Phase 3 - Checkpoint Report
+# Paged Attention Phase 3 - COMPLETE
 
-**Date:** 2026-01-10 (Updated)
+**Date:** 2026-01-11
+**Status:** ✅ PR SUBMITTED & CHERRY-PICKED TO PRODUCTION
+
+## Upstream PR
+
+**PR #18747:** https://github.com/ggml-org/llama.cpp/pull/18747
+- Title: `ggml, llama : add CPU paged attention for memory-efficient KV cache`
+- Status: Open, awaiting review
+- Related: Complements PR #17579 (CUDA-only paged attention)
+
+## Production Integration
+
+**Cherry-picked to:** `production-consolidated` branch
+**Commits:** 7 commits from `feature/paged-attention`
+
+## Original Development
+
 **Branch:** `feature/paged-attention`
-**Worktree:** `/mnt/raid0/llm/llama.cpp-experimental` (NOT production-consolidated)
-**Latest Commits:**
+**Worktree:** `/mnt/raid0/llm/llama.cpp-experimental`
+**Commits:**
+- 0b633c35d - Trim verbose comments
 - 9db451ee1 - CLI flags for paged attention
 - e14387ae7 - Unit tests for block pool/table
 - b14fe3bfb - KV cache memory reduction
@@ -14,11 +31,14 @@
 ## Summary
 
 Implemented CPU paged attention with:
-1. **Kernel infrastructure** with block table indirection (shows +19% on 70B models)
+1. **Kernel infrastructure** with block table indirection and prefetching
 2. **Dynamic block allocation** with negligible overhead (<1%)
-3. **Memory reduction** via `LLAMA_PAGED_ATTN_MAX_BLOCKS` - **84% memory savings achieved**
+3. **Memory reduction** via `LLAMA_PAGED_ATTN_MAX_BLOCKS` - **up to 92% memory savings**
 
-**Key Result:** Qwen3-1.7B KV cache reduced from 4480 MiB to 700 MiB while maintaining full performance.
+**Key Results:**
+- **+76% generation speedup** on 70B models (with block_size=64)
+- **Up to 92% memory savings** on KV cache
+- Negligible impact on small models (±2%)
 
 ## What Was Implemented
 
