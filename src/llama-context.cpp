@@ -1954,7 +1954,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    // Increased from 8x to 32x to support training backward pass
+    // Backward pass can require 3-4x more nodes than forward pass
+    uint32_t res = std::max<uint32_t>(4096u, 32u*model.n_tensors());
     res += model.n_lora_nodes;
     return res;
 }

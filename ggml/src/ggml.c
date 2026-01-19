@@ -6853,6 +6853,23 @@ void ggml_build_backward_expand(
                 ignore_src[1] = true;
                 break;
 
+            // SET_ROWS is used for KV cache updates and has no backward pass
+            // Ignore all sources to prevent assertion failure on view_src
+            case GGML_OP_SET_ROWS:
+                ignore_src[0] = true;  // source values
+                ignore_src[1] = true;  // row indices (not differentiable anyway)
+                ignore_src[2] = true;  // destination
+                break;
+
+            // FLASH_ATTN_EXT has no backward pass implementation (FLASH_ATTN_BACK is disabled)
+            // For FFN-only training (TTT), treat attention as gradient boundary
+            case GGML_OP_FLASH_ATTN_EXT:
+                ignore_src[0] = true;  // Q
+                ignore_src[1] = true;  // K
+                ignore_src[2] = true;  // V
+                ignore_src[3] = true;  // mask (optional)
+                break;
+
             default:
                 break;
         }
@@ -6869,6 +6886,21 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
+        // DEBUG: Print info about failing tensor before assert
+        if (node->view_src &&
+            node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW &&
+            node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE &&
+            node->op != GGML_OP_TRANSPOSE) {
+            fprintf(stderr, "\n=== DEBUG: view_src tensor with disallowed op ===\n");
+            fprintf(stderr, "  tensor name: %s\n", node->name);
+            fprintf(stderr, "  tensor op: %d (%s)\n", node->op, ggml_op_name(node->op));
+            fprintf(stderr, "  view_src name: %s\n", node->view_src->name);
+            fprintf(stderr, "  tensor flags: 0x%x (PARAM=%d, LOSS=%d)\n",
+                node->flags,
+                (node->flags & GGML_TENSOR_FLAG_PARAM) ? 1 : 0,
+                (node->flags & GGML_TENSOR_FLAG_LOSS) ? 1 : 0);
+            fprintf(stderr, "================================================\n\n");
+        }
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 
