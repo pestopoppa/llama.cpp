@@ -76,6 +76,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
+            {"lookup",                    lookup},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -135,6 +136,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.n_max},
         {"speculative.n_min",         speculative.n_min},
         {"speculative.p_min",         speculative.p_min},
+        {"lookup",                    lookup},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -161,6 +163,7 @@ task_params server_task::params_from_json_cmpl(
     defaults.n_predict     = params_base.n_predict;
     defaults.n_cache_reuse = params_base.n_cache_reuse;
     defaults.antiprompt    = params_base.antiprompt;
+    defaults.lookup        = params_base.lookup;
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose           = params_base.verbosity > 9;
@@ -216,6 +219,8 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
     params.speculative.n_max = std::max(params.speculative.n_max, 0);
+
+    params.lookup = json_value(data, "lookup", defaults.lookup);
 
     // Use OpenAI API logprobs only if n_probs wasn't provided
     if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
