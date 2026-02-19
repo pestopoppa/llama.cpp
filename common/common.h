@@ -173,6 +173,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR, // corpus-backed n-gram cache via SQLite sidecar
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -275,6 +276,11 @@ struct common_params_speculative {
 
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
+
+    // corpus sidecar parameters (requires -DLLAMA_CORPUS_SIDECAR=ON)
+    std::string corpus_path;              // path to sharded SQLite corpus directory                    // NOLINT
+    int32_t     corpus_refresh_tokens = 64; // re-query corpus every N generated tokens
+    int32_t     corpus_max_snippets   = 8;  // max snippets per corpus query
 
     // draft-model speculative decoding
 

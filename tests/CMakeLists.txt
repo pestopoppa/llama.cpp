@@ -206,6 +206,10 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+if (LLAMA_CORPUS_SIDECAR)
+    llama_build_and_test(test-corpus-sidecar.cpp)
+endif()
+
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")

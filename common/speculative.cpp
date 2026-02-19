@@ -9,6 +9,10 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#ifdef LLAMA_CORPUS_SIDECAR
+#include "corpus-sidecar.h"
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
@@ -25,7 +29,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -36,7 +41,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",       COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"corpus_sidecar",    COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR}
 };
 
 struct common_speculative_config {
@@ -737,6 +743,97 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
+#ifdef LLAMA_CORPUS_SIDECAR
+struct common_speculative_state_corpus_sidecar : public common_speculative_state {
+    corpus_sidecar * cs;
+    common_ngram_cache ngram_cache_corpus;
+    int tokens_since_refresh;
+    int refresh_interval;
+    int max_snippets;
+
+    common_speculative_state_corpus_sidecar(
+            enum common_speculative_type type,
+            const std::string & corpus_path,
+            const llama_vocab * vocab,
+            int refresh_interval,
+            int max_snippets)
+        : common_speculative_state(type)
+        , tokens_since_refresh(0)
+        , refresh_interval(refresh_interval)
+        , max_snippets(max_snippets)
+    {
+        cs = corpus_sidecar_init(corpus_path, vocab);
+        if (!cs) {
+            LOG_ERR("corpus_sidecar: failed to initialize from %s\n", corpus_path.c_str());
+        }
+    }
+
+    ~common_speculative_state_corpus_sidecar() override {
+        corpus_sidecar_free(cs);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+        // reset refresh counter on new generation
+        tokens_since_refresh = refresh_interval; // force refresh on first draft
+        ngram_cache_corpus.clear();
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        GGML_UNUSED(params);
+
+        if (!corpus_sidecar_ready(cs)) {
+            return;
+        }
+
+        // refresh corpus cache periodically
+        if (tokens_since_refresh >= refresh_interval || ngram_cache_corpus.empty()) {
+            // take last 32 tokens as query context
+            int tail_size = std::min((int)prompt_tgt.size(), 32);
+            std::vector<llama_token> tail(prompt_tgt.end() - tail_size, prompt_tgt.end());
+            tail.push_back(id_last);
+
+            ngram_cache_corpus.clear();
+            corpus_sidecar_query(cs, tail, ngram_cache_corpus, max_snippets);
+            tokens_since_refresh = 0;
+        }
+        tokens_since_refresh++;
+
+        if (ngram_cache_corpus.empty()) {
+            return;
+        }
+
+        // use the same 3-level drafting logic as ngram_cache, but with corpus as nc_static
+        common_ngram_cache ngram_cache_empty;
+
+        // build inp vector for common_ngram_cache_draft
+        llama_tokens inp;
+        inp.reserve(prompt_tgt.size() + 1);
+        for (size_t j = 0; j < prompt_tgt.size(); ++j) {
+            inp.push_back(prompt_tgt[j]);
+        }
+        inp.push_back(id_last);
+
+        result.push_back(id_last);
+
+        common_ngram_cache_draft(inp, result, params.n_max, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                ngram_cache_empty, ngram_cache_empty, ngram_cache_corpus);
+
+        if (result.size() > 0) {
+            result.erase(result.begin()); // remove id_last
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+};
+#endif // LLAMA_CORPUS_SIDECAR
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
@@ -785,8 +882,9 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
-        default:                                    return "unknown";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:      return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR: return "corpus_sidecar";
+        default:                                     return "unknown";
     }
 }
 
@@ -859,6 +957,10 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+#ifdef LLAMA_CORPUS_SIDECAR
+        bool has_corpus_sidecar = (params.type == COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR)
+                               || !params.corpus_path.empty();
+#endif
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -892,6 +994,11 @@ common_speculative * common_speculative_init(
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
+#ifdef LLAMA_CORPUS_SIDECAR
+        if (has_corpus_sidecar) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR, params));
+        }
+#endif
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
@@ -955,6 +1062,18 @@ common_speculative * common_speculative_init(
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
                 break;
             }
+#ifdef LLAMA_CORPUS_SIDECAR
+            case COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR: {
+                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+                impls.push_back(std::make_unique<common_speculative_state_corpus_sidecar>(
+                    config.type,
+                    config.params.corpus_path,
+                    vocab,
+                    config.params.corpus_refresh_tokens,
+                    config.params.corpus_max_snippets));
+                break;
+            }
+#endif
             default:
                 break;
         }

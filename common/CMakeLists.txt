@@ -70,6 +70,9 @@ add_library(${TARGET} STATIC
     llguidance.cpp
     log.cpp
     log.h
+    corpus-sidecar.cpp
+    corpus-sidecar.h
+    md5.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
@@ -144,6 +147,13 @@ if (LLAMA_LLGUIDANCE)
     if (WIN32)
         target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
     endif()
+endif()
+
+option(LLAMA_CORPUS_SIDECAR "Enable corpus sidecar for lookup decoding (requires SQLite3)" OFF)
+if (LLAMA_CORPUS_SIDECAR)
+    find_package(SQLite3 REQUIRED)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_CORPUS_SIDECAR)
+    target_link_libraries(${TARGET} PRIVATE SQLite::SQLite3)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
