@@ -14,9 +14,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
+#include <thread>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -748,8 +751,15 @@ struct common_speculative_state_corpus_sidecar : public common_speculative_state
     corpus_sidecar * cs;
     common_ngram_cache ngram_cache_corpus;
     int tokens_since_refresh;
-    int refresh_interval;
+    int refresh_interval; // >0 = blocking refresh every N tokens, 0 = pre-query only, -1 = async
     int max_snippets;
+
+    // async mode state
+    std::thread async_thread;
+    std::mutex  cache_mutex;
+    common_ngram_cache ngram_cache_pending; // written by background thread
+    std::atomic<bool> async_ready{false};
+    std::atomic<bool> async_running{false};
 
     common_speculative_state_corpus_sidecar(
             enum common_speculative_type type,
@@ -766,17 +776,65 @@ struct common_speculative_state_corpus_sidecar : public common_speculative_state
         if (!cs) {
             LOG_ERR("corpus_sidecar: failed to initialize from %s\n", corpus_path.c_str());
         }
+        if (refresh_interval == 0) {
+            LOG_INF("corpus_sidecar: pre-query mode (query once at begin, no refresh)\n");
+        } else if (refresh_interval < 0) {
+            LOG_INF("corpus_sidecar: async mode (non-blocking background queries)\n");
+        } else {
+            LOG_INF("corpus_sidecar: blocking refresh every %d tokens\n", refresh_interval);
+        }
     }
 
     ~common_speculative_state_corpus_sidecar() override {
+        if (async_thread.joinable()) {
+            async_thread.join();
+        }
         corpus_sidecar_free(cs);
     }
 
     void begin(const llama_tokens & prompt) override {
-        GGML_UNUSED(prompt);
-        // reset refresh counter on new generation
-        tokens_since_refresh = refresh_interval; // force refresh on first draft
-        ngram_cache_corpus.clear();
+        if (!corpus_sidecar_ready(cs)) {
+            return;
+        }
+
+        // For pre-query mode (refresh_interval == 0): query now using prompt tail
+        if (refresh_interval == 0) {
+            int tail_size = std::min((int)prompt.size(), 32);
+            std::vector<llama_token> tail(prompt.end() - tail_size, prompt.end());
+            ngram_cache_corpus.clear();
+            corpus_sidecar_query(cs, tail, ngram_cache_corpus, max_snippets);
+            LOG_INF("corpus_sidecar: pre-query populated %zu n-gram entries\n", ngram_cache_corpus.size());
+        } else {
+            // reset refresh counter on new generation
+            tokens_since_refresh = (refresh_interval > 0) ? refresh_interval : 64;
+            ngram_cache_corpus.clear();
+        }
+    }
+
+    void launch_async_query(const llama_tokens & tail_tokens) {
+        if (async_running.load()) {
+            return; // previous query still running
+        }
+        // wait for previous thread to finish
+        if (async_thread.joinable()) {
+            async_thread.join();
+        }
+        async_running.store(true);
+        async_ready.store(false);
+
+        // copy tokens for the thread
+        std::vector<llama_token> tail_copy(tail_tokens);
+        int ms = max_snippets;
+        async_thread = std::thread([this, tail_copy, ms]() {
+            common_ngram_cache local_cache;
+            corpus_sidecar_query(cs, tail_copy, local_cache, ms);
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                ngram_cache_pending = std::move(local_cache);
+            }
+            async_ready.store(true);
+            async_running.store(false);
+        });
     }
 
     void draft(
@@ -790,18 +848,36 @@ struct common_speculative_state_corpus_sidecar : public common_speculative_state
             return;
         }
 
-        // refresh corpus cache periodically
-        if (tokens_since_refresh >= refresh_interval || ngram_cache_corpus.empty()) {
-            // take last 32 tokens as query context
-            int tail_size = std::min((int)prompt_tgt.size(), 32);
-            std::vector<llama_token> tail(prompt_tgt.end() - tail_size, prompt_tgt.end());
-            tail.push_back(id_last);
+        if (refresh_interval > 0) {
+            // BLOCKING mode: refresh corpus cache periodically (original behavior)
+            if (tokens_since_refresh >= refresh_interval || ngram_cache_corpus.empty()) {
+                int tail_size = std::min((int)prompt_tgt.size(), 32);
+                std::vector<llama_token> tail(prompt_tgt.end() - tail_size, prompt_tgt.end());
+                tail.push_back(id_last);
 
-            ngram_cache_corpus.clear();
-            corpus_sidecar_query(cs, tail, ngram_cache_corpus, max_snippets);
-            tokens_since_refresh = 0;
+                ngram_cache_corpus.clear();
+                corpus_sidecar_query(cs, tail, ngram_cache_corpus, max_snippets);
+                tokens_since_refresh = 0;
+            }
+            tokens_since_refresh++;
+        } else if (refresh_interval < 0) {
+            // ASYNC mode: pick up results if ready, launch new query if idle
+            if (async_ready.load()) {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                ngram_cache_corpus = std::move(ngram_cache_pending);
+                async_ready.store(false);
+            }
+
+            tokens_since_refresh++;
+            if (tokens_since_refresh >= 64 || ngram_cache_corpus.empty()) {
+                int tail_size = std::min((int)prompt_tgt.size(), 32);
+                std::vector<llama_token> tail(prompt_tgt.end() - tail_size, prompt_tgt.end());
+                tail.push_back(id_last);
+                launch_async_query(tail);
+                tokens_since_refresh = 0;
+            }
         }
-        tokens_since_refresh++;
+        // refresh_interval == 0: pre-query mode, ngram_cache_corpus already populated in begin()
 
         if (ngram_cache_corpus.empty()) {
             return;
@@ -960,6 +1036,11 @@ common_speculative * common_speculative_init(
 #ifdef LLAMA_CORPUS_SIDECAR
         bool has_corpus_sidecar = (params.type == COMMON_SPECULATIVE_TYPE_CORPUS_SIDECAR)
                                || !params.corpus_path.empty();
+        // Corpus sidecar implies ngram_cache (prompt lookup) for fair comparison —
+        // sidecar adds corpus n-grams on top of prompt-derived n-gram lookup
+        if (has_corpus_sidecar && !has_ngram_cache) {
+            has_ngram_cache = true;
+        }
 #endif
 
         // In a more complex implementation we could use the same implementation but with different parameters.
