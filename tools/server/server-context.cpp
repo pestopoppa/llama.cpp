@@ -1879,7 +1879,16 @@ private:
                     // inference that nobody is reading anymore.
                     if (slot->is_processing()) {
                         SLT_WRN(*slot, "force-releasing processing slot for erase, id_task = %d\n", task.id);
-                        slot->release();
+                        // Notify the original request's HTTP handler so it doesn't
+                        // block forever waiting for results that will never arrive.
+                        // Must capture task id before release() nulls slot->task.
+                        if (slot->task) {
+                            const int orig_task_id = slot->task->id;
+                            slot->release();
+                            send_error(orig_task_id, "Slot erased while processing (external timeout)");
+                        } else {
+                            slot->release();
+                        }
                     }
 
                     // Erase token cache
