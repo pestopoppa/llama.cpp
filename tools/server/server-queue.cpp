@@ -314,6 +314,8 @@ void server_response::send(server_task_result_ptr && result) {
             return;
         }
     }
+    RES_DBG("result for task id = %d dropped (not in waiting list, %d tasks waiting)\n",
+            result->id, (int) waiting_task_ids.size());
 }
 
 void server_response::terminate() {
