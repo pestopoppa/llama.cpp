@@ -1943,11 +1943,12 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    // Force-release processing slots instead of deferring.
+                    // This allows external timeout managers to cancel in-flight
+                    // inference that nobody is reading anymore.
                     if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
-                        queue_tasks.defer(std::move(task));
-                        break;
+                        SLT_WRN(*slot, "force-releasing processing slot for erase, id_task = %d\n", task.id);
+                        slot->release();
                     }
 
                     // Erase token cache
@@ -3552,10 +3553,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -3569,14 +3566,22 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        // Erase doesn't need disk — allow it unconditionally.
+        // Save/restore require --slot-save-path for the filesystem path.
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slot save/restore. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
