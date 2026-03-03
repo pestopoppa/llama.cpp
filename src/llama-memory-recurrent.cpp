@@ -698,6 +698,95 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
+void llama_memory_recurrent::checkpoint(llama_memory_recurrent_checkpoint & cp) const {
+    const uint32_t n_cells = size;
+    const uint32_t n_layer = hparams.n_layer;
+
+    // save scalar state
+    cp.head = head;
+    cp.used = used;
+    cp.n    = n;
+    cp.rs_z = rs_z;
+
+    // save cell metadata
+    cp.cell_pos.resize(n_cells);
+    cp.cell_src.resize(n_cells);
+    cp.cell_src0.resize(n_cells);
+    cp.cell_tail.resize(n_cells);
+    cp.cell_seq_id.resize(n_cells);
+
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        cp.cell_pos[i]    = cells[i].pos;
+        cp.cell_src[i]    = cells[i].src;
+        cp.cell_src0[i]   = cells[i].src0;
+        cp.cell_tail[i]   = cells[i].tail;
+        cp.cell_seq_id[i] = cells[i].seq_id;
+    }
+
+    // save tensor data — only for layers that have recurrent state
+    cp.r_data.resize(n_layer);
+    cp.s_data.resize(n_layer);
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] != nullptr) {
+            const size_t nbytes = ggml_nbytes(r_l[il]);
+            cp.r_data[il].resize(nbytes);
+            ggml_backend_tensor_get(r_l[il], cp.r_data[il].data(), 0, nbytes);
+        } else {
+            cp.r_data[il].clear();
+        }
+
+        if (s_l[il] != nullptr) {
+            const size_t nbytes = ggml_nbytes(s_l[il]);
+            cp.s_data[il].resize(nbytes);
+            ggml_backend_tensor_get(s_l[il], cp.s_data[il].data(), 0, nbytes);
+        } else {
+            cp.s_data[il].clear();
+        }
+    }
+
+    cp.valid = true;
+}
+
+void llama_memory_recurrent::restore(const llama_memory_recurrent_checkpoint & cp) {
+    GGML_ASSERT(cp.valid);
+
+    const uint32_t n_cells = size;
+    const uint32_t n_layer = hparams.n_layer;
+
+    GGML_ASSERT(cp.cell_pos.size() == n_cells);
+    GGML_ASSERT(cp.r_data.size()   == n_layer);
+    GGML_ASSERT(cp.s_data.size()   == n_layer);
+
+    // restore scalar state
+    head = cp.head;
+    used = cp.used;
+    n    = cp.n;
+    rs_z = cp.rs_z;
+
+    // restore cell metadata
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        cells[i].pos    = cp.cell_pos[i];
+        cells[i].src    = cp.cell_src[i];
+        cells[i].src0   = cp.cell_src0[i];
+        cells[i].tail   = cp.cell_tail[i];
+        cells[i].seq_id = cp.cell_seq_id[i];
+    }
+
+    // restore tensor data
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il] != nullptr && !cp.r_data[il].empty()) {
+            GGML_ASSERT(cp.r_data[il].size() == ggml_nbytes(r_l[il]));
+            ggml_backend_tensor_set(r_l[il], cp.r_data[il].data(), 0, cp.r_data[il].size());
+        }
+
+        if (s_l[il] != nullptr && !cp.s_data[il].empty()) {
+            GGML_ASSERT(cp.s_data[il].size() == ggml_nbytes(s_l[il]));
+            ggml_backend_tensor_set(s_l[il], cp.s_data[il].data(), 0, cp.s_data[il].size());
+        }
+    }
+}
+
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 

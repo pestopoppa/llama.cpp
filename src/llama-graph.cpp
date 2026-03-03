@@ -2003,6 +2003,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         // Create block table tensor for paged attention if enabled
         if (mctx_cur->has_block_tracking() && cparams.flash_attn) {
             const uint32_t block_size = mctx_cur->get_block_size();
+            const uint32_t n_kv = mctx_cur->get_n_kv();
             const uint32_t max_blocks_per_seq = (n_kv + block_size - 1) / block_size;
             const uint32_t n_seqs = ubatch.n_seqs_unq;
             inp->self_block_table = mctx_cur->build_block_table_tensor(ctx0, n_seqs, max_blocks_per_seq);
