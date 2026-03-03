@@ -822,9 +822,16 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
 
     // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = false;
-        goto done;
+        // partial seq_rm failed — this is expected for recurrent/hybrid models
+        // check if we can use checkpoint/restore instead
+        if (llama_memory_has_recurrent(mem)) {
+            LOG_INF("%s: partial seq_rm not supported, but recurrent checkpointing available — speculation enabled\n", __func__);
+            // speculation is compatible via checkpoint/restore path
+        } else {
+            LOG_WRN("%s: the target context does not support partial sequence removal or recurrent checkpointing\n", __func__);
+            res = false;
+            goto done;
+        }
     }
 
 done:

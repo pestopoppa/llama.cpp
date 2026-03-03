@@ -9,6 +9,34 @@
 #include <vector>
 
 //
+// llama_memory_recurrent_checkpoint
+//
+// Lightweight in-memory snapshot of recurrent state for speculative decoding.
+// Saves cell metadata + r_l/s_l tensor data so that rejected draft tokens
+// can be rolled back without corrupting the recurrent state.
+//
+struct llama_memory_recurrent_checkpoint {
+    // cell metadata snapshot
+    std::vector<llama_pos>                    cell_pos;
+    std::vector<int32_t>                      cell_src;
+    std::vector<int32_t>                      cell_src0;
+    std::vector<int32_t>                      cell_tail;
+    std::vector<std::set<llama_seq_id>>       cell_seq_id;
+
+    // scalar state
+    uint32_t head = 0;
+    uint32_t used = 0;
+    uint32_t n    = 0;
+    int32_t  rs_z = -1;
+
+    // per-layer tensor data (CPU-side copies)
+    std::vector<std::vector<uint8_t>> r_data; // r_data[layer] = raw bytes
+    std::vector<std::vector<uint8_t>> s_data; // s_data[layer] = raw bytes
+
+    bool valid = false;
+};
+
+//
 // llama_memory_recurrent
 //
 
@@ -64,6 +92,12 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    // lightweight in-memory checkpoint/restore for speculative decoding
+    // checkpoint() saves the full recurrent state (cells + tensor data) to a CPU buffer
+    // restore()    restores a previously saved checkpoint, discarding current state
+    void checkpoint(llama_memory_recurrent_checkpoint & cp) const;
+    void restore   (const llama_memory_recurrent_checkpoint & cp);
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences

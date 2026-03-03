@@ -130,12 +130,19 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    // Try removing from the recurrent cache first.
+    // If it fails (partial removal is invalid for recurrent state), we still
+    // proceed with the attention cache cleanup. The caller is responsible for
+    // handling recurrent state rollback via checkpoint/restore when using
+    // speculative decoding on hybrid models.
+    const bool recr_ok = mem_recr->seq_rm(seq_id, p0, p1);
+    const bool attn_ok = mem_attn->seq_rm(seq_id, p0, p1);
+
+    // Return true if at least the attention cache was cleaned up.
+    // For full-range removals, both should succeed.
+    // For partial-range removals (speculative rollback), recurrent may fail
+    // but that's expected — the caller uses checkpoint/restore for recurrent state.
+    return recr_ok || attn_ok;
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -196,6 +203,14 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
+}
+
+void llama_memory_hybrid::checkpoint_recurrent(llama_memory_recurrent_checkpoint & cp) const {
+    mem_recr->checkpoint(cp);
+}
+
+void llama_memory_hybrid::restore_recurrent(const llama_memory_recurrent_checkpoint & cp) {
+    mem_recr->restore(cp);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}

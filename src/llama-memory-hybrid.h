@@ -82,6 +82,11 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // lightweight checkpoint/restore for speculative decoding on hybrid models
+    // only checkpoints the recurrent sub-memory; KV cache uses standard seq_rm rollback
+    void checkpoint_recurrent(llama_memory_recurrent_checkpoint & cp) const;
+    void restore_recurrent   (const llama_memory_recurrent_checkpoint & cp);
+
 private:
     const llama_hparams & hparams;
 
