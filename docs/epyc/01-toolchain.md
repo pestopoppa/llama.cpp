@@ -131,27 +131,13 @@ Ported the prompt lookup optimization from `llama-cli` to `llama-server` to enab
 - Code editing: 25.82 t/s (8.6x)
 - Requires source material in context
 
-**Implementation** (re-ported to `production-consolidated-v2`, 2026-03-06):
-- `--lookup` CLI flag enables per-slot ngram cache built from prompt tokens
-- Spec-first/lookup-fallback architecture: draft model tried first, prompt lookup as fallback when no draft or draft produces poor candidates
-- Per-slot `ngram_cache_context` isolation for parallel request support
-- Cache initialized from prompt tokens at `SLOT_STATE_GENERATING`, updated after each decode and speculative acceptance
-- Compatible with `-md` (draft model): `--lookup` + `-md` enables both strategies simultaneously
-
 <details>
-<summary>Code: prompt lookup via API and CLI</summary>
+<summary>Code: prompt lookup via API</summary>
 
 ```bash
-# Server: standalone lookup (no draft model needed)
-llama-server -m model.gguf --lookup --port 8080
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -d '{"model":"m","messages":[{"role":"user","content":"Summarize: [document]"}]}'
-
-# Server: spec + lookup combined (draft model + prompt lookup fallback)
-llama-server -m model.gguf -md draft.gguf --lookup --draft-max 16 --port 8080
-
-# CLI: prompt lookup (uses different flag name)
-llama-cli -m model.gguf -f prompt.txt --lookup-ngram-min 3
+# Example: Summarization task achieves 95.18 t/s (12.7x baseline)
+curl -X POST http://localhost:8081/completion \
+  -d '{"prompt": "[source document]\n\nSummarize:", "lookup_ngram_min": 3}'
 ```
 
 </details>
@@ -304,18 +290,6 @@ Rebased `production-consolidated` onto `origin/master` as `production-consolidat
 - **SSM checkpoint** cherry-picked in (conditional Go for code tasks)
 - **Build passes**: `cmake -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_CURL=ON`
 - **Smoke tests pass**: Qwen3-Coder-30B (34.0 t/s), Qwen3.5-35B-A3B (10.9 t/s)
-
-### Prompt Lookup Re-port (2026-03-06)
-
-The `--lookup` feature (commit `8e35dbc01` on `production-consolidated`) was lost during the v1→v2 rebase. Cherry-pick failed with 10 conflicts across `server-context.cpp` and `server-task.cpp`. Manually ported across 5 files (88 insertions):
-
-- `common/arg.cpp` — `--lookup` CLI flag definition
-- `common/common.h` — `bool lookup` in `common_params`
-- `tools/server/server-task.h` — `bool lookup` in `task_params`
-- `tools/server/server-task.cpp` — JSON serialization, defaults, parsing
-- `tools/server/server-context.cpp` — ngram cache fields in `server_slot`, cache lifecycle (init/reset/update), `can_speculate()` gate, spec-first/lookup-fallback draft generation
-
-Tested: standalone `--lookup`, combined `-md` + `--lookup` (spec+lookup). Both produce valid completions.
 
 ## Known Limitations
 
