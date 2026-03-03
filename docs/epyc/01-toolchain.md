@@ -4,24 +4,24 @@
 
 This project uses a **fork of llama.cpp** at `github.com/pestopoppa/llama.cpp` with local optimizations for AMD EPYC 9655 "Turin" architecture. The fork includes parallel tensor repack (2.2x model loading speedup), sliding window attention (SWA) fixes for speculative decoding, and prompt lookup ported to llama-server.
 
-The toolchain uses **git worktrees** to isolate production and experimental work, preventing branch conflicts when multiple agents share access. Production inference MUST use the `production-consolidated` branch - feature work happens in separate worktrees.
+The toolchain uses **git worktrees** to isolate production and experimental work, preventing branch conflicts when multiple agents share access. Production inference MUST use the `production-consolidated-v2-v2` branch (rebased 2026-03-03) — feature work happens in separate worktrees.
 
 ## Git Worktree Architecture
 
-The codebase is split into two physical directories sharing a single git history. Production lives at `/mnt/raid0/llm/llama.cpp` and must always stay on the `production-consolidated` branch — all benchmarks and orchestration use this build. Experimental work happens in `/mnt/raid0/llm/llama.cpp-experimental`, where you can switch branches freely without affecting production.
+The codebase is split into two physical directories sharing a single git history. Production lives at `/mnt/raid0/llm/llama.cpp` and must always stay on the `production-consolidated-v2` branch — all benchmarks and orchestration use this build. Experimental work happens in `/mnt/raid0/llm/llama.cpp-experimental`, where you can switch branches freely without affecting production.
 
 <details>
 <summary>Directory layout and worktree rules</summary>
 
 | Directory | Branch | Purpose |
 |-----------|--------|---------|
-| `/mnt/raid0/llm/llama.cpp` | `production-consolidated` | **Production** - benchmarks, stable inference |
+| `/mnt/raid0/llm/llama.cpp` | `production-consolidated-v2` | **Production** - benchmarks, stable inference |
 | `/mnt/raid0/llm/llama.cpp-experimental` | `feature/*` branches | **Experimental** - new features, research |
 
 **Production directory** (`/mnt/raid0/llm/llama.cpp`):
 - **NEVER** checkout a different branch
 - **NEVER** commit experimental work
-- Stay on `production-consolidated` at all times
+- Stay on `production-consolidated-v2` at all times
 - All benchmarks and orchestration use this build
 
 **Experimental directory** (`/mnt/raid0/llm/llama.cpp-experimental`):
@@ -44,12 +44,12 @@ cd /mnt/raid0/llm/llama.cpp
 git worktree list
 
 # Expected output:
-# /mnt/raid0/llm/llama.cpp               6b43356a1 [production-consolidated]
+# /mnt/raid0/llm/llama.cpp               6b43356a1 [production-consolidated-v2]
 # /mnt/raid0/llm/llama.cpp-experimental  xxxxxxxx [feature/paged-attention]
 
 # Start experimental work
 cd /mnt/raid0/llm/llama.cpp-experimental
-git checkout production-consolidated
+git checkout production-consolidated-v2
 git checkout -b feature/my-new-feature
 
 # Build experimental version
@@ -69,10 +69,10 @@ cmake --build build -j 96
 # Manual verification
 cd /mnt/raid0/llm/llama.cpp
 git branch --show-current
-# Output: production-consolidated
+# Output: production-consolidated-v2
 
 # If wrong branch, fix with:
-git checkout production-consolidated
+git checkout production-consolidated-v2
 ```
 
 </details>
@@ -278,6 +278,19 @@ OMP_NUM_THREADS=1 numactl --interleave=all \
 </details>
 </details>
 
+## Rebase History
+
+### production-consolidated-v2 (2026-03-03)
+
+Rebased `production-consolidated` onto `origin/master` as `production-consolidated-v2`:
+
+- **16 custom commits** applied (from 25 original)
+- **9 skipped**: upstream-merged (lookup crash, lookahead, MTMD), superseded (prompt lookup → upstream ngram spec), doc-only, merge commit
+- **4 conflicts resolved**: qwen3next.cpp (upstream API change), llama-kv-cache.cpp (SWA API x2), server-context.cpp (slot erase)
+- **SSM checkpoint** cherry-picked in (conditional Go for code tasks)
+- **Build passes**: `cmake -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_CURL=ON`
+- **Smoke tests pass**: Qwen3-Coder-30B (34.0 t/s), Qwen3.5-35B-A3B (10.9 t/s)
+
 ## Known Limitations
 
 Two model families have hard incompatibilities that will silently produce garbage or crash if you ignore them. These aren't bugs to be fixed — they're architectural constraints of the models themselves.
@@ -287,7 +300,9 @@ Two model families have hard incompatibilities that will silently produce garbag
 
 ### SSM Models (Qwen3-Next)
 
-**NEVER** use speculative decoding or prompt lookup with SSM architecture models. SSM requires consecutive context positions for state propagation — speculation breaks this invariant.
+SSM architecture models require consecutive context positions for state propagation — draft token rejection during speculation corrupts the recurrent state which encodes cumulative history.
+
+**Experimental: SSM State Checkpointing** (2026-03-03, on `production-consolidated-v2`): A checkpoint/restore mechanism saves the full recurrent state (~63 MB for Qwen3.5-35B-A3B) before speculation, restores on rejection, then re-advances through accepted tokens. Go/No-Go benchmark showed 1.56x speedup on code generation (92% accept rate) but 0.89x regression on summarization (51.9% accept rate). **Verdict**: Enable spec decode for code generation tasks only; non-code tasks should still avoid speculation with SSM models.
 
 <details>
 <summary>Code: correct vs incorrect SSM usage</summary>
@@ -339,27 +354,27 @@ When things go wrong, it's usually one of two things: wrong branch or wrong dire
 
 ```bash
 pwd  # Should be /mnt/raid0/llm/llama.cpp for production
-git branch --show-current  # Should be production-consolidated
+git branch --show-current  # Should be production-consolidated-v2
 ./build/bin/llama-cli --version  # Verify commit hash
 ```
 
 If on wrong branch:
 ```bash
 cd /mnt/raid0/llm/llama.cpp
-git checkout production-consolidated
+git checkout production-consolidated-v2
 cmake --build build -j 96  # Rebuild
 ```
 
 </details>
 
-### "I accidentally worked on production-consolidated"
+### "I accidentally worked on production-consolidated-v2"
 
 <details>
 <summary>Code: recovery steps</summary>
 
 1. Stash or commit changes: `git stash` or `git commit -am "WIP"`
 2. Create feature branch: `git checkout -b feature/my-work`
-3. Switch production back: `cd /mnt/raid0/llm/llama.cpp && git checkout production-consolidated`
+3. Switch production back: `cd /mnt/raid0/llm/llama.cpp && git checkout production-consolidated-v2`
 4. Move work to experimental: `cd /mnt/raid0/llm/llama.cpp-experimental && git cherry-pick <hash>`
 
 </details>
