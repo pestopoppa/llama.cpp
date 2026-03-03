@@ -5,6 +5,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3300,6 +3302,64 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+//
+// Recurrent state checkpointing
+//
+
+// The checkpoint struct wraps the internal checkpoint data
+struct llama_memory_checkpoint {
+    llama_memory_recurrent_checkpoint data;
+};
+
+// helper: get the recurrent memory from a possibly-hybrid memory
+static llama_memory_recurrent * get_recurrent_memory(llama_memory_t mem) {
+    if (!mem) {
+        return nullptr;
+    }
+
+    // try hybrid first (most common case for Qwen3.5, etc.)
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) {
+        return hybrid->get_mem_recr();
+    }
+
+    // try pure recurrent
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(mem);
+    return recr;
+}
+
+bool llama_memory_has_recurrent(llama_memory_t mem) {
+    return get_recurrent_memory(mem) != nullptr;
+}
+
+struct llama_memory_checkpoint * llama_memory_checkpoint_save(llama_memory_t mem) {
+    auto * recr = get_recurrent_memory(mem);
+    if (!recr) {
+        return nullptr;
+    }
+
+    auto * cp = new llama_memory_checkpoint();
+    recr->checkpoint(cp->data);
+    return cp;
+}
+
+void llama_memory_checkpoint_restore(llama_memory_t mem, const struct llama_memory_checkpoint * cp) {
+    if (!cp || !cp->data.valid) {
+        return;
+    }
+
+    auto * recr = get_recurrent_memory(mem);
+    if (!recr) {
+        return;
+    }
+
+    recr->restore(cp->data);
+}
+
+void llama_memory_checkpoint_free(struct llama_memory_checkpoint * cp) {
+    delete cp;
 }
 
 // llama state API

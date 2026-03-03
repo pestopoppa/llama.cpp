@@ -790,6 +790,30 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // Recurrent state checkpointing for speculative decoding on hybrid models
+    //
+
+    // Opaque checkpoint handle
+    struct llama_memory_checkpoint;
+
+    // Returns true if the memory contains recurrent state that can be checkpointed
+    // (i.e., the model is a hybrid SSM+attention or pure recurrent model)
+    LLAMA_API bool llama_memory_has_recurrent(llama_memory_t mem);
+
+    // Save a checkpoint of the recurrent state. Returns a new checkpoint handle.
+    // The caller owns the handle and must free it with llama_memory_checkpoint_free().
+    // Returns nullptr if the memory has no recurrent state.
+    LLAMA_API struct llama_memory_checkpoint * llama_memory_checkpoint_save(llama_memory_t mem);
+
+    // Restore a previously saved checkpoint. The recurrent state is restored to the
+    // exact state at the time of the save. The checkpoint remains valid after restore
+    // and can be reused.
+    LLAMA_API void llama_memory_checkpoint_restore(llama_memory_t mem, const struct llama_memory_checkpoint * cp);
+
+    // Free a checkpoint handle
+    LLAMA_API void llama_memory_checkpoint_free(struct llama_memory_checkpoint * cp);
+
+    //
     // State / sessions
     //
 
