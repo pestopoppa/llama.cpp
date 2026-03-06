@@ -74,6 +74,8 @@ struct task_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    bool lookup = false; // enable prompt lookup decoding (n-gram based)
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

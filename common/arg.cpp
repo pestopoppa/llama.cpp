@@ -1228,6 +1228,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lookup"},
+        "enable prompt lookup decoding using n-gram cache built from prompt tokens (no draft model needed)",
+        [](common_params & params) {
+            params.lookup = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_LOOKUP}));
+    add_opt(common_arg(
         {"-c", "--ctx-size"}, "N",
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {

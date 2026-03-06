@@ -77,6 +77,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
+            {"lookup",                    lookup},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
             {"speculative.ngram_size_n",  speculative.ngram_size_n},
             {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -140,6 +141,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.n_max},
         {"speculative.n_min",         speculative.n_min},
         {"speculative.p_min",         speculative.p_min},
+        {"lookup",                    lookup},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
         {"speculative.ngram_size_n",  speculative.ngram_size_n},
         {"speculative.ngram_size_m",  speculative.ngram_size_m},
@@ -193,6 +195,7 @@ task_params server_task::params_from_json_cmpl(
     defaults.n_cache_reuse = params_base.n_cache_reuse;
     defaults.cache_prompt  = params_base.cache_prompt;
     defaults.antiprompt    = params_base.antiprompt;
+    defaults.lookup        = params_base.lookup;
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose           = params_base.verbosity > 9;
@@ -251,6 +254,8 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
     params.speculative.n_max = std::max(params.speculative.n_max, 0);
+
+    params.lookup = json_value(data, "lookup", defaults.lookup);
 
     params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
 

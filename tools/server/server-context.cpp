@@ -9,6 +9,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ngram-cache.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -55,6 +56,10 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     common_speculative * spec = nullptr;
+
+    // prompt lookup (n-gram based draft generation)
+    common_ngram_cache ngram_cache_context;
+    bool               lookup_enabled = false;
 
     // recurrent state checkpoint for hybrid model speculation
     // saved before speculation batch decode, restored on rejection
@@ -195,6 +200,10 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
 
+        // clear prompt lookup cache
+        ngram_cache_context.clear();
+        lookup_enabled = false;
+
         task_prev = std::move(task);
         task.reset();
 
@@ -267,7 +276,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec || lookup_enabled;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1185,6 +1194,9 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // enable prompt lookup if requested via CLI or per-request param
+        slot.lookup_enabled = slot.task->params.lookup;
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -2068,7 +2080,7 @@ private:
                 continue;
             }
 
-            // generate draft tokens in speculative decoding mode
+            // generate draft tokens via prompt lookup and/or speculative decoding
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
@@ -2088,21 +2100,51 @@ private:
 
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
 
-                const auto & params_spec = slot.task->params.speculative;
+                llama_tokens draft;
+                bool draft_found = false;
 
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                // Step 1: Try draft model first (higher acceptance rate when available)
+                if (slot.spec != nullptr) {
+                    const auto & params_spec = slot.task->params.speculative;
+                    draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                    draft_found = (int) draft.size() >= slot.task->params.speculative.n_min;
+                }
+
+                // Step 2: Fall back to prompt lookup if spec decode unavailable or insufficient
+                if (!draft_found && slot.lookup_enabled) {
+                    std::vector<llama_token> inp(cached_text_tokens.begin(), cached_text_tokens.end());
+                    inp.push_back(slot.sampled); // include current token so n-grams are formed correctly
+                    std::vector<llama_token> lookup_draft;
+                    lookup_draft.push_back(slot.sampled);
+                    common_ngram_cache ngram_empty_dynamic;
+                    common_ngram_cache ngram_empty_static;
+                    common_ngram_cache_draft(inp, lookup_draft, n_draft_max,
+                        LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                        slot.ngram_cache_context, ngram_empty_dynamic, ngram_empty_static);
+                    lookup_draft.erase(lookup_draft.begin()); // remove the seed token
+
+                    if ((int) lookup_draft.size() >= std::max(1, slot.task->params.speculative.n_min)) {
+                        draft = llama_tokens(lookup_draft.begin(), lookup_draft.end());
+                        draft_found = true;
+                        SLT_DBG(slot, "prompt lookup drafted %d tokens\n", (int) draft.size());
+                    } else {
+                        SLT_DBG(slot, "prompt lookup found only %d tokens (need >= %d)\n",
+                            (int) lookup_draft.size(), std::max(1, slot.task->params.speculative.n_min));
+                    }
+                }
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
                 }
 
+                // Step 3: Feed draft into i_batch_dft pipeline (shared for both lookup and spec decode)
                 // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
+                if (!draft_found || slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     // fallback to normal decoding
                     slot.i_batch = slot.i_batch_dft[0];
@@ -2127,6 +2169,14 @@ private:
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
 
                 slot.prompt.tokens.push_back(slot.sampled);
+
+                // update prompt lookup ngram cache with the new token
+                if (slot.lookup_enabled) {
+                    const llama_tokens & text_tokens = slot.prompt.tokens.get_text_tokens();
+                    std::vector<llama_token> inp(text_tokens.begin(), text_tokens.end());
+                    common_ngram_cache_update(slot.ngram_cache_context,
+                        LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
+                }
 
                 SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                         slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
@@ -2771,6 +2821,15 @@ private:
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
+
+                    // initialize prompt lookup ngram cache from prompt tokens
+                    if (slot.lookup_enabled) {
+                        const llama_tokens & prompt_tokens = slot.prompt.tokens.get_text_tokens();
+                        std::vector<llama_token> inp(prompt_tokens.begin(), prompt_tokens.end());
+                        common_ngram_cache_update(slot.ngram_cache_context,
+                            LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
+                        SLT_INF(slot, "prompt lookup: built ngram cache from %d prompt tokens\n", (int) inp.size());
+                    }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
                 }
@@ -2851,6 +2910,14 @@ private:
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
+
+                // update prompt lookup ngram cache with newly accepted tokens
+                if (slot.lookup_enabled) {
+                    const llama_tokens & text_tokens = slot.prompt.tokens.get_text_tokens();
+                    std::vector<llama_token> inp(text_tokens.begin(), text_tokens.end());
+                    common_ngram_cache_update(slot.ngram_cache_context,
+                        LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, ids.size(), false);
+                }
 
                 // For hybrid models with recurrent state: restore checkpoint then re-advance
                 // through accepted tokens. For KV-only models: just use seq_rm as before.
