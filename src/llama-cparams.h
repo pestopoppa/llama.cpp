@@ -37,6 +37,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool freeze_recurrent; // skip SSM state writes during decode (for frozen-state speculation)
 
     // MoE self-drafting: override n_expert_used
     // 0 = use model default, 1+ = force exactly N active experts

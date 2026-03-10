@@ -98,6 +98,8 @@ struct llama_context {
     void detach_threadpool();
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
+    void set_n_layer_exit(int32_t n_layer_exit);
+    void set_freeze_recurrent(bool freeze);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 

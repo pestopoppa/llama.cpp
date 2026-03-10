@@ -1286,6 +1286,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_LAYER_EXIT"));
     add_opt(common_arg(
+        {"--n-layer-exit-draft"}, "N",
+        string_format("exit after N layers for draft context (default: %d)\n"
+            "for self-speculation: same model as target and draft, draft exits early", params.n_layer_exit_draft),
+        [](common_params & params, int value) {
+            params.n_layer_exit_draft = value;
+        }
+    ).set_env("LLAMA_ARG_N_LAYER_EXIT_DRAFT"));
+    add_opt(common_arg(
+        {"--hierarchical-spec"},
+        string_format("enable hierarchical intermediate verification for speculative decoding (default: %s)",
+            params.hierarchical_spec ? "true" : "false"),
+        [](common_params & params) {
+            params.hierarchical_spec = true;
+        }
+    ).set_env("LLAMA_ARG_HIERARCHICAL_SPEC"));
+    add_opt(common_arg(
+        {"--n-layer-exit-intermediate"}, "N",
+        string_format("intermediate layer depth for hierarchical speculation (default: %d, 0 = auto N/4)",
+            params.n_layer_exit_intermediate),
+        [](common_params & params, int value) {
+            params.n_layer_exit_intermediate = value;
+        }
+    ).set_env("LLAMA_ARG_N_LAYER_EXIT_INTERMEDIATE"));
+    add_opt(common_arg(
+        {"--no-hsd"},
+        "disable HSD capped branch resampling during speculative verification "
+            "(for A/B benchmarking HSD marginal contribution)",
+        [](common_params & params) {
+            params.sampling.enable_hsd_recovery = false;
+        }
+    ));
+    add_opt(common_arg(
+        {"--freeze-recurrent-draft"},
+        string_format("freeze SSM/recurrent state during speculation — layers compute but don't update state cache, "
+            "eliminating checkpoint/restore overhead for hybrid models (default: %s)",
+            params.freeze_recurrent_draft ? "true" : "false"),
+        [](common_params & params) {
+            params.freeze_recurrent_draft = true;
+        }
+    ).set_env("LLAMA_ARG_FREEZE_RECURRENT_DRAFT"));
+    add_opt(common_arg(
         {"--swa-full"},
         string_format("use full-size SWA cache (default: %s)\n"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),

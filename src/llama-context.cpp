@@ -929,6 +929,14 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
     cparams.n_threads_batch = n_threads_batch;
 }
 
+void llama_context::set_n_layer_exit(int32_t n_layer_exit) {
+    cparams.n_layer_exit = n_layer_exit;
+}
+
+void llama_context::set_freeze_recurrent(bool freeze) {
+    cparams.freeze_recurrent = freeze;
+}
+
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
@@ -2927,6 +2935,14 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_n_layer_exit(llama_context * ctx, int32_t n_layer_exit) {
+    ctx->set_n_layer_exit(n_layer_exit);
+}
+
+void llama_set_freeze_recurrent(llama_context * ctx, bool freeze) {
+    ctx->set_freeze_recurrent(freeze);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {
