@@ -16,7 +16,10 @@
 // can be rolled back without corrupting the recurrent state.
 //
 struct llama_memory_recurrent_checkpoint {
-    // cell metadata snapshot
+    // indices of active (non-empty) cells — only these are saved/restored
+    std::vector<uint32_t> active_cells;
+
+    // cell metadata snapshot (only for active cells)
     std::vector<llama_pos>                    cell_pos;
     std::vector<int32_t>                      cell_src;
     std::vector<int32_t>                      cell_src0;
@@ -24,14 +27,11 @@ struct llama_memory_recurrent_checkpoint {
     std::vector<std::set<llama_seq_id>>       cell_seq_id;
 
     // scalar state
+    uint32_t n_cells_total = 0; // total cell count for restore zeroing
     uint32_t head = 0;
     uint32_t used = 0;
     uint32_t n    = 0;
     int32_t  rs_z = -1;
-
-    // per-layer tensor data (CPU-side copies)
-    std::vector<std::vector<uint8_t>> r_data; // r_data[layer] = raw bytes
-    std::vector<std::vector<uint8_t>> s_data; // s_data[layer] = raw bytes
 
     bool valid = false;
 };
@@ -136,6 +136,12 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+
+    // shadow tensors for double-buffer checkpoint/restore optimization
+    // checkpoint() copies active → shadow; restore() swaps pointers (O(1))
+    std::vector<ggml_tensor *> shadow_r_l;
+    std::vector<ggml_tensor *> shadow_s_l;
+    bool shadow_valid = false; // true after first checkpoint
 
 private:
     //const llama_model & model;
