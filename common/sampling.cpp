@@ -611,6 +611,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    bool hsd_recovered = false; // at most one HSD recovery per sequence
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -620,6 +622,39 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            // HSD: capped branch resampling — attempt stochastic recovery of high-probability draft token
+            if (gsmpl->params.enable_hsd_recovery && !hsd_recovered) {
+                // look up p_target(draft[i]) from the candidate distribution
+                llama_token_data_array * cur_p = common_sampler_get_candidates(gsmpl, false);
+                float p_draft = 0.0f;
+                for (size_t k = 0; k < cur_p->size; k++) {
+                    if (cur_p->data[k].id == draft[i]) {
+                        p_draft = cur_p->data[k].p;
+                        break;
+                    }
+                }
+
+                // stochastic acceptance when draft token has high target probability
+                if (p_draft > 0.3f) {
+                    // deterministic hash from sampler seed + position for reproducibility
+                    const uint32_t seed = common_sampler_get_seed(gsmpl);
+                    const uint32_t hash = ((seed + (uint32_t)i) * 2654435761u) >> 16;
+                    const float r = (float)(hash & 0xFFFF) / 65536.0f;
+
+                    if (r < p_draft) {
+                        // stochastically accept draft[i]: undo accept of id, re-accept draft[i]
+                        common_sampler_reset(gsmpl);
+                        // re-accept all previously accepted tokens
+                        for (size_t j = 0; j < result.size() - 1; j++) {
+                            common_sampler_accept(gsmpl, result[j], true);
+                        }
+                        common_sampler_accept(gsmpl, draft[i], true);
+                        result.back() = draft[i];
+                        hsd_recovered = true;
+                        continue; // continue checking next draft tokens
+                    }
+                }
+            }
             break;
         }
     }

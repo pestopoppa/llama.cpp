@@ -67,6 +67,10 @@ struct server_slot {
     // saved before speculation batch decode, restored on rejection
     struct llama_memory_checkpoint * spec_checkpoint = nullptr;
 
+    // freeze-recurrent active for the current speculation round
+    // auto-activated for all speculation on hybrid SSM models
+    bool freeze_recurrent_active = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -686,6 +690,10 @@ private:
 
             auto params_dft = params_base;
 
+            if (params_base.n_layer_exit_draft > 0) {
+                params_dft.n_layer_exit = params_base.n_layer_exit_draft;
+            }
+
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
             params_dft.n_batch      = llama_n_ctx_seq(ctx);
@@ -791,6 +799,26 @@ private:
         const bool can_spec = common_speculative_is_compat(ctx);
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
+        }
+
+        // Architecture-specific warnings for speculation configurations
+        const bool has_recurrent = llama_memory_has_recurrent(llama_get_memory(ctx));
+
+        if (params_base.lookup && has_recurrent) {
+            SRV_INF("%s", "NOTE: --lookup on hybrid SSM model will auto-activate freeze-recurrent "
+                "during lookup-drafted speculation rounds (stateless n-gram drafts lack SSM context).\n");
+        }
+
+        if (params_base.n_layer_exit_draft > 0) {
+            if (has_recurrent) {
+                SRV_WRN("%s", "WARNING: Self-speculation (--n-layer-exit-draft) on hybrid SSM model "
+                    "will likely be slower than baseline due to SSM checkpoint/restore overhead. "
+                    "Consider: --freeze-recurrent-draft with external draft model instead.\n");
+            } else {
+                SRV_WRN("%s", "WARNING: Self-speculation (--n-layer-exit-draft) requires models trained "
+                    "for early exit (SWIFT/LayerSkip). Without early-exit training, acceptance "
+                    "rates will be near-zero. Consider: external draft model instead.\n");
+            }
         }
 
         // initialize slots
@@ -2142,18 +2170,14 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                // For hybrid SSM+attention models: save recurrent state before speculation.
-                // If draft tokens are rejected, we restore this checkpoint to avoid corrupting
-                // the recurrent state (which can't handle partial seq_rm like KV cache can).
-                if (llama_memory_has_recurrent(llama_get_memory(ctx))) {
-                    llama_memory_checkpoint_free(slot.spec_checkpoint);
-                    slot.spec_checkpoint = llama_memory_checkpoint_save(llama_get_memory(ctx));
-                }
+                const bool has_recurrent_mem = llama_memory_has_recurrent(llama_get_memory(ctx));
+                slot.freeze_recurrent_active = false; // reset for this speculation round
 
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
 
                 llama_tokens draft;
                 bool draft_found = false;
+                bool draft_from_lookup = false; // track whether draft came from n-gram lookup
 
                 // Step 1: Try draft model first (higher acceptance rate when available)
                 if (slot.spec != nullptr) {
@@ -2162,7 +2186,6 @@ private:
                     draft_found = (int) draft.size() >= slot.task->params.speculative.n_min;
                 }
 
-                // Step 2: Fall back to prompt lookup if spec decode unavailable or insufficient
                 if (!draft_found && slot.lookup_enabled) {
                     std::vector<llama_token> inp(cached_text_tokens.begin(), cached_text_tokens.end());
                     inp.push_back(slot.sampled); // include current token so n-grams are formed correctly
@@ -2178,6 +2201,7 @@ private:
                     if ((int) lookup_draft.size() >= std::max(1, slot.task->params.speculative.n_min)) {
                         draft = llama_tokens(lookup_draft.begin(), lookup_draft.end());
                         draft_found = true;
+                        draft_from_lookup = true;
                         SLT_DBG(slot, "prompt lookup drafted %d tokens\n", (int) draft.size());
                     } else {
                         SLT_DBG(slot, "prompt lookup found only %d tokens (need >= %d)\n",
@@ -2188,6 +2212,24 @@ private:
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
+                }
+
+                // For hybrid SSM+attention models: handle recurrent state before speculation batch decode.
+                // Must happen after draft source is determined — lookup drafts on hybrid models
+                // auto-activate freeze-recurrent (stateless n-gram drafts have no SSM state context,
+                // decoding them without freezing would corrupt recurrent state).
+                // For hybrid SSM+attention models: always use freeze-recurrent during speculation.
+                // Benchmarks show checkpoint/restore overhead makes all non-frozen speculation
+                // net negative on hybrid models. Freeze-recurrent trades ~13pp acceptance for
+                // zero overhead — the only config that beats baseline on hybrid SSM.
+                // For lookup drafts specifically, freeze is also required for correctness:
+                // stateless n-gram drafts lack SSM context, decoding without freeze segfaults.
+                if (has_recurrent_mem && draft_found) {
+                    llama_set_freeze_recurrent(ctx, true);
+                    slot.freeze_recurrent_active = true;
+                    if (draft_from_lookup) {
+                        SLT_DBG(slot, "%s", "freeze-recurrent: auto-activated for lookup draft on hybrid model\n");
+                    }
                 }
 
                 // Step 3: Feed draft into i_batch_dft pipeline (shared for both lookup and spec decode)
@@ -3002,10 +3044,139 @@ private:
 
                 const size_t n_draft = slot.drafted.size();
 
-                // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
-                slot.i_batch_dft.clear();
-                slot.drafted.clear();
+                std::vector<llama_token> ids;
+
+                // HiSpec: hierarchical intermediate verification (two-pass)
+                if (params_base.hierarchical_spec && n_draft > 1) {
+                    // determine intermediate depth (auto = N/4 of model layers)
+                    const int32_t n_model_layers = llama_model_n_layer(llama_get_model(ctx));
+                    int32_t intermediate_depth = params_base.n_layer_exit_intermediate;
+                    if (intermediate_depth <= 0) {
+                        intermediate_depth = std::max(1, n_model_layers / 4);
+                    }
+
+                    // --- Pass 1: Intermediate verification ---
+                    // Save draft positions for re-decode
+                    const auto saved_i_batch_dft = slot.i_batch_dft;
+                    const auto saved_drafted     = slot.drafted;
+
+                    // Clear KV cache for the speculation range
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens() - (int)n_draft, -1);
+
+                    // Build batch for intermediate decode
+                    llama_batch batch_inter = llama_batch_init((int)n_draft + 1, 0, 1);
+                    const llama_pos pos_base = slot.prompt.n_tokens() - (int)n_draft;
+                    for (size_t d = 0; d < n_draft + 1; d++) {
+                        const llama_pos pos = pos_base + (llama_pos)d;
+                        // token at each position: for the last one we use the sampled token from before speculation
+                        llama_token tok;
+                        if (d < n_draft) {
+                            tok = saved_drafted[d];
+                        } else {
+                            // the last position needs a token too — use the last drafted token
+                            tok = saved_drafted[n_draft - 1];
+                        }
+                        common_batch_add(batch_inter, tok, pos, { slot.id }, true);
+                    }
+
+                    // Decode at intermediate depth
+                    llama_set_n_layer_exit(ctx, intermediate_depth);
+                    const int ret_inter = llama_decode(ctx, batch_inter);
+                    llama_batch_free(batch_inter);
+
+                    if (ret_inter != 0) {
+                        // intermediate decode failed — fall back to standard verification
+                        SLT_WRN(slot, "HiSpec intermediate decode failed (%d), falling back to standard\n", ret_inter);
+                        llama_set_n_layer_exit(ctx, 0);
+                        // re-decode at full depth (reconstruct KV cache)
+                        goto hispec_fallback;
+                    }
+
+                    // Sample on intermediate logits using a cloned sampler
+                    struct common_sampler * smpl_inter = common_sampler_clone(slot.smpl.get());
+
+                    // Build index array for the intermediate batch positions
+                    std::vector<int> idxs_inter(n_draft + 1);
+                    for (size_t d = 0; d <= n_draft; d++) {
+                        idxs_inter[d] = (int)d;
+                    }
+
+                    const auto ids_inter = common_sampler_sample_and_accept_n(smpl_inter, ctx, idxs_inter, saved_drafted);
+                    const size_t n_inter_accepted = ids_inter.size() - 1;
+                    common_sampler_free(smpl_inter);
+
+                    SLT_DBG(slot, "HiSpec intermediate pass: %zu/%zu draft tokens survived (depth=%d/%d)\n",
+                            n_inter_accepted, n_draft, intermediate_depth, n_model_layers);
+
+                    // --- Pass 2: Full verification of survivors ---
+                    // Clear KV cache for the speculation range again
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, pos_base, -1);
+                    llama_set_n_layer_exit(ctx, 0); // restore full model
+
+                    if (n_inter_accepted == 0) {
+                        // nothing survived intermediate — re-decode just the first position at full depth
+                        llama_batch batch_full = llama_batch_init(1, 0, 1);
+                        common_batch_add(batch_full, saved_drafted[0], pos_base, { slot.id }, true);
+                        const int ret_full = llama_decode(ctx, batch_full);
+                        llama_batch_free(batch_full);
+                        if (ret_full != 0) {
+                            SLT_ERR(slot, "HiSpec full decode failed: %d\n", ret_full);
+                        }
+                        // sample from full logits — will reject the draft token
+                        const llama_token final_id = common_sampler_sample(slot.smpl.get(), ctx, 0);
+                        common_sampler_accept(slot.smpl.get(), final_id, true);
+                        ids.push_back(final_id);
+                    } else {
+                        // Build filtered batch with only intermediate-accepted tokens
+                        const size_t n_survivors = n_inter_accepted + 1; // +1 for the bonus sample position
+                        llama_batch batch_full = llama_batch_init((int)n_survivors, 0, 1);
+
+                        // Build filtered draft tokens (only the ones that passed intermediate)
+                        llama_tokens filtered_draft;
+                        for (size_t d = 0; d < n_inter_accepted; d++) {
+                            const llama_pos pos = pos_base + (llama_pos)d;
+                            common_batch_add(batch_full, saved_drafted[d], pos, { slot.id }, true);
+                            filtered_draft.push_back(saved_drafted[d]);
+                        }
+                        // Add position for the bonus sample (one past the last accepted draft)
+                        common_batch_add(batch_full, ids_inter.back(), pos_base + (llama_pos)n_inter_accepted, { slot.id }, true);
+
+                        const int ret_full = llama_decode(ctx, batch_full);
+                        llama_batch_free(batch_full);
+                        if (ret_full != 0) {
+                            SLT_ERR(slot, "HiSpec full decode failed: %d\n", ret_full);
+                        }
+
+                        // Final verification on full logits
+                        std::vector<int> idxs_full(n_survivors);
+                        for (size_t d = 0; d < n_survivors; d++) {
+                            idxs_full[d] = (int)d;
+                        }
+                        ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, idxs_full, filtered_draft);
+                    }
+
+                    slot.i_batch_dft.clear();
+                    slot.drafted.clear();
+                } else {
+                    hispec_fallback:
+                    // Standard single-pass verification (also fallback for HiSpec failure)
+                    // If coming from HiSpec fallback, need to re-decode at full depth
+                    if (params_base.hierarchical_spec && n_draft > 1) {
+                        const llama_pos pos_base_fb = slot.prompt.n_tokens() - (int)n_draft;
+                        llama_batch batch_fb = llama_batch_init((int)n_draft + 1, 0, 1);
+                        for (size_t d = 0; d <= n_draft; d++) {
+                            llama_token tok = (d < n_draft) ? slot.drafted[d] : slot.drafted[n_draft - 1];
+                            common_batch_add(batch_fb, tok, pos_base_fb + (llama_pos)d, { slot.id }, true);
+                        }
+                        llama_decode(ctx, batch_fb);
+                        llama_batch_free(batch_fb);
+                    }
+
+                    // the accepted tokens from the speculation
+                    ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                    slot.i_batch_dft.clear();
+                    slot.drafted.clear();
+                }
 
                 const int64_t t_current = ggml_time_us();
 
@@ -3035,12 +3206,39 @@ private:
                         LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, ids.size(), false);
                 }
 
-                // For hybrid models with recurrent state: restore checkpoint then re-advance
-                // through accepted tokens. For KV-only models: just use seq_rm as before.
+                // For hybrid models with recurrent state: handle post-speculation rollback.
                 const size_t n_rejected = n_draft - (ids.size() - 1);
+                if (slot.freeze_recurrent_active) {
+                    // Freeze-recurrent mode: SSM state was never modified during speculation.
+                    // Unfreeze for the next normal decode, then advance state through accepted tokens.
+                    llama_set_freeze_recurrent(ctx, false);
 
-                if (slot.spec_checkpoint && n_rejected > 0) {
-                    // partial rejection on a hybrid model — need checkpoint restore
+                    // Clean up KV cache entries for rejected positions
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+
+                    // Re-advance recurrent state through ALL accepted tokens (including sampled).
+                    // Since state was frozen, it needs to catch up from pre-speculation position.
+                    const int n_accepted = (int)ids.size() - 1; // exclude the new sampled token
+                    if (n_accepted > 0) {
+                        llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
+                        const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
+                        for (int i = 0; i < n_accepted; i++) {
+                            common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
+                        }
+                        if (batch_accepted.n_tokens > 0) {
+                            batch_accepted.logits[batch_accepted.n_tokens - 1] = true;
+                        }
+
+                        const int ret = llama_decode(ctx, batch_accepted);
+                        if (ret != 0) {
+                            SLT_ERR(slot, "failed to advance recurrent state after frozen speculation: %d\n", ret);
+                        }
+                        llama_batch_free(batch_accepted);
+                    }
+
+                    SLT_DBG(slot, "freeze-recurrent: advanced %d accepted tokens through SSM state\n", n_accepted);
+                } else if (slot.spec_checkpoint && n_rejected > 0) {
+                    // Standard checkpoint mode: partial rejection on a hybrid model
                     // restore recurrent state to pre-speculation position
                     llama_memory_checkpoint_restore(llama_get_memory(ctx), slot.spec_checkpoint);
 
@@ -3050,17 +3248,13 @@ private:
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
                     // re-advance recurrent state through accepted tokens (ids[0..n-2])
-                    // ids contains: [sampled, accepted_draft_0, ..., accepted_draft_k, new_sampled]
-                    // we need to process ids[0..n-2] to advance recurrent state
-                    const int n_accepted = (int)ids.size() - 1; // exclude the new sampled token
+                    const int n_accepted = (int)ids.size() - 1;
                     if (n_accepted > 0) {
-                        // build a small batch with the accepted tokens at their correct positions
                         llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
                         const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
                         for (int i = 0; i < n_accepted; i++) {
                             common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
                         }
-                        // mark last token for logits (not strictly needed, but keeps state consistent)
                         if (batch_accepted.n_tokens > 0) {
                             batch_accepted.logits[batch_accepted.n_tokens - 1] = true;
                         }
