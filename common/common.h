@@ -288,6 +288,8 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
 
+    bool enable_hsd_recovery = true; // HSD capped branch resampling (--no-hsd to disable)
+
     bool backend_sampling = false;
 
     bool has_logit_bias() const {
@@ -431,6 +433,10 @@ struct common_params {
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     int32_t moe_n_expert_override =     0; // MoE self-draft: override n_expert_used (0 = use model default)
     int32_t n_layer_exit          =     0; // exit after this many layers, 0 = all (for layer skip speculation)
+    int32_t n_layer_exit_draft    =     0; // layer exit for draft context (self-speculation)
+    int32_t n_layer_exit_intermediate = 0; // intermediate depth for hierarchical speculation (0 = auto N/4)
+    bool    hierarchical_spec    = false;  // enable hierarchical intermediate verification
+    bool    freeze_recurrent_draft = false; // freeze SSM state during speculation (skip writes, eliminate checkpoint)
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

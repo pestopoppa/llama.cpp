@@ -67,6 +67,35 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
 
+    // shadow tensors for double-buffer checkpoint/restore
+    shadow_r_l.resize(n_layer);
+    shadow_s_l.resize(n_layer);
+
+    // separate context map for shadow tensors
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> shadow_ctx_map;
+
+    auto shadow_ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = shadow_ctx_map.find(buft);
+        if (it == shadow_ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            shadow_ctx_map.emplace(buft, ctx);
+
+            return ctx;
+        }
+
+        return it->second.get();
+    };
+
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
@@ -97,6 +126,19 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        // allocate shadow tensors on same backend
+        ggml_context * shadow_ctx = shadow_ctx_for_buft(buft);
+        if (!shadow_ctx) {
+            throw std::runtime_error("failed to create ggml context for rs shadow cache");
+        }
+
+        ggml_tensor * sr = ggml_new_tensor_1d(shadow_ctx, type_r, hparams.n_embd_r()*mem_size);
+        ggml_tensor * ss = ggml_new_tensor_1d(shadow_ctx, type_s, hparams.n_embd_s()*mem_size);
+        ggml_format_name(sr, "shadow_r_l%d", i);
+        ggml_format_name(ss, "shadow_s_l%d", i);
+        shadow_r_l[i] = sr;
+        shadow_s_l[i] = ss;
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -110,11 +152,22 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // allocate shadow buffers
+    for (auto & [buft, ctx] : shadow_ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for rs shadow cache");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: %10s RS shadow buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs), R (%s): %7.2f MiB, S (%s): %7.2f MiB (shadow: same)\n", __func__,
                 (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
@@ -131,6 +184,7 @@ void llama_memory_recurrent::clear(bool data) {
 
     head = 0;
     used = 0;
+    shadow_valid = false;
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -703,60 +757,61 @@ void llama_memory_recurrent::checkpoint(llama_memory_recurrent_checkpoint & cp) 
     const uint32_t n_layer = hparams.n_layer;
 
     // save scalar state
+    cp.n_cells_total = n_cells;
     cp.head = head;
     cp.used = used;
     cp.n    = n;
     cp.rs_z = rs_z;
 
-    // save cell metadata
-    cp.cell_pos.resize(n_cells);
-    cp.cell_src.resize(n_cells);
-    cp.cell_src0.resize(n_cells);
-    cp.cell_tail.resize(n_cells);
-    cp.cell_seq_id.resize(n_cells);
-
+    // save only active (non-empty) cell metadata
+    cp.active_cells.clear();
     for (uint32_t i = 0; i < n_cells; ++i) {
-        cp.cell_pos[i]    = cells[i].pos;
-        cp.cell_src[i]    = cells[i].src;
-        cp.cell_src0[i]   = cells[i].src0;
-        cp.cell_tail[i]   = cells[i].tail;
-        cp.cell_seq_id[i] = cells[i].seq_id;
+        if (!cells[i].is_empty()) {
+            cp.active_cells.push_back(i);
+        }
     }
 
-    // save tensor data — only for layers that have recurrent state
-    cp.r_data.resize(n_layer);
-    cp.s_data.resize(n_layer);
+    const uint32_t n_active = (uint32_t)cp.active_cells.size();
+    cp.cell_pos.resize(n_active);
+    cp.cell_src.resize(n_active);
+    cp.cell_src0.resize(n_active);
+    cp.cell_tail.resize(n_active);
+    cp.cell_seq_id.resize(n_active);
 
+    for (uint32_t j = 0; j < n_active; ++j) {
+        const uint32_t i = cp.active_cells[j];
+        cp.cell_pos[j]    = cells[i].pos;
+        cp.cell_src[j]    = cells[i].src;
+        cp.cell_src0[j]   = cells[i].src0;
+        cp.cell_tail[j]   = cells[i].tail;
+        cp.cell_seq_id[j] = cells[i].seq_id;
+    }
+
+    // copy tensor data: active → shadow (device-to-device, avoids CPU roundtrip)
     for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il] != nullptr) {
-            const size_t nbytes = ggml_nbytes(r_l[il]);
-            cp.r_data[il].resize(nbytes);
-            ggml_backend_tensor_get(r_l[il], cp.r_data[il].data(), 0, nbytes);
-        } else {
-            cp.r_data[il].clear();
+        if (r_l[il] != nullptr && shadow_r_l[il] != nullptr) {
+            ggml_backend_tensor_copy(r_l[il], shadow_r_l[il]);
         }
-
-        if (s_l[il] != nullptr) {
-            const size_t nbytes = ggml_nbytes(s_l[il]);
-            cp.s_data[il].resize(nbytes);
-            ggml_backend_tensor_get(s_l[il], cp.s_data[il].data(), 0, nbytes);
-        } else {
-            cp.s_data[il].clear();
+        if (s_l[il] != nullptr && shadow_s_l[il] != nullptr) {
+            ggml_backend_tensor_copy(s_l[il], shadow_s_l[il]);
         }
     }
+
+    // NOTE: we use const_cast here because checkpoint is logically const
+    // (it doesn't change the observable recurrent state), but we need to
+    // update the shadow_valid flag for the restore optimization
+    const_cast<llama_memory_recurrent *>(this)->shadow_valid = true;
 
     cp.valid = true;
 }
 
 void llama_memory_recurrent::restore(const llama_memory_recurrent_checkpoint & cp) {
     GGML_ASSERT(cp.valid);
+    GGML_ASSERT(shadow_valid);
 
     const uint32_t n_cells = size;
-    const uint32_t n_layer = hparams.n_layer;
 
-    GGML_ASSERT(cp.cell_pos.size() == n_cells);
-    GGML_ASSERT(cp.r_data.size()   == n_layer);
-    GGML_ASSERT(cp.s_data.size()   == n_layer);
+    GGML_ASSERT(cp.n_cells_total == n_cells);
 
     // restore scalar state
     head = cp.head;
@@ -764,27 +819,30 @@ void llama_memory_recurrent::restore(const llama_memory_recurrent_checkpoint & c
     n    = cp.n;
     rs_z = cp.rs_z;
 
-    // restore cell metadata
+    // clear all cells to default state, then restore only the active ones
     for (uint32_t i = 0; i < n_cells; ++i) {
-        cells[i].pos    = cp.cell_pos[i];
-        cells[i].src    = cp.cell_src[i];
-        cells[i].src0   = cp.cell_src0[i];
-        cells[i].tail   = cp.cell_tail[i];
-        cells[i].seq_id = cp.cell_seq_id[i];
+        cells[i].pos  = -1;
+        cells[i].src  = -1;
+        cells[i].src0 = -1;
+        cells[i].tail = -1;
+        cells[i].seq_id.clear();
     }
 
-    // restore tensor data
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il] != nullptr && !cp.r_data[il].empty()) {
-            GGML_ASSERT(cp.r_data[il].size() == ggml_nbytes(r_l[il]));
-            ggml_backend_tensor_set(r_l[il], cp.r_data[il].data(), 0, cp.r_data[il].size());
-        }
-
-        if (s_l[il] != nullptr && !cp.s_data[il].empty()) {
-            GGML_ASSERT(cp.s_data[il].size() == ggml_nbytes(s_l[il]));
-            ggml_backend_tensor_set(s_l[il], cp.s_data[il].data(), 0, cp.s_data[il].size());
-        }
+    const uint32_t n_active = (uint32_t)cp.active_cells.size();
+    for (uint32_t j = 0; j < n_active; ++j) {
+        const uint32_t i = cp.active_cells[j];
+        GGML_ASSERT(i < n_cells);
+        cells[i].pos    = cp.cell_pos[j];
+        cells[i].src    = cp.cell_src[j];
+        cells[i].src0   = cp.cell_src0[j];
+        cells[i].tail   = cp.cell_tail[j];
+        cells[i].seq_id = cp.cell_seq_id[j];
     }
+
+    // O(1) pointer swap: shadow tensors (which hold the checkpointed state)
+    // become the active tensors. The old active tensors become the shadow.
+    std::swap(r_l, shadow_r_l);
+    std::swap(s_l, shadow_s_l);
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

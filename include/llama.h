@@ -998,6 +998,15 @@ extern "C" {
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, int32_t n_threads, int32_t n_threads_batch);
 
+    // Set the layer exit depth at runtime (for hierarchical speculation)
+    // 0 = compute all layers (full model)
+    LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n_layer_exit);
+
+    // Set freeze_recurrent flag at runtime (for frozen-state speculation on hybrid models)
+    // When true, SSM/recurrent state writes are skipped during decode — layers still compute
+    // but don't update the state cache. This eliminates checkpoint/restore overhead.
+    LLAMA_API void llama_set_freeze_recurrent(struct llama_context * ctx, bool freeze);
+
     // Get the number of threads used for generation of a single token.
     LLAMA_API int32_t llama_n_threads(struct llama_context * ctx);
 
