@@ -69,6 +69,9 @@ struct server_slot {
     // auto-activated for all speculation on hybrid SSM models
     bool freeze_recurrent_active = false;
 
+    // hybrid tree: per-path token sequences for sequential replay during verification
+    std::vector<llama_tokens> tree_replay_paths;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -198,6 +201,7 @@ struct server_slot {
         has_tree = false;
         tree_drafted.clear();
         tree_i_batch_dft.clear();
+        tree_replay_paths.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -658,18 +662,21 @@ private:
 
         params_base = params;
 
-        // Tree speculation multi-path verification requires kv_unified=true on the target.
-        // Only auto-enable n_seq_max bump when the user has set --kv-unified (safe for dense
-        // models). For hybrid/recurrent models, kv_unified breaks recurrent state management,
-        // so users must NOT set --kv-unified on hybrid models.
-        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()
-                && params_base.kv_unified) {
-            // Each slot needs up to 8 alternative tree paths + its own seq_id
+        // Tree speculation multi-path verification (dense models only) requires:
+        // 1. kv_unified=true — seq_cp() needs single-stream mode (cross-stream asserts)
+        // 2. n_seq_max sized for tree seq_ids (each slot needs up to 8 alt paths + own seq_id)
+        // Auto-enable both when tree spec is configured. Hybrid models fall through to
+        // linear freeze-recurrent speculation (tree blocked at verification time).
+        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()) {
+            if (!params_base.kv_unified) {
+                SRV_INF("%s", "tree speculation: auto-enabling kv_unified for multi-path seq_cp\n");
+                params_base.kv_unified = true;
+            }
             if (params_base.n_seq_max == 0) {
                 params_base.n_seq_max = 9 * std::max(1, params_base.n_parallel);
             }
-            SRV_INF("tree speculation: multi-path target verification enabled, n_seq_max=%d\n",
-                    params_base.n_seq_max);
+            SRV_INF("tree speculation: n_seq_max=%d, kv_unified=%d\n",
+                    params_base.n_seq_max, params_base.kv_unified);
         }
 
         llama_init = common_init_from_params(params_base);
@@ -2202,6 +2209,13 @@ private:
                 // For lookup drafts specifically, freeze is also required for correctness:
                 // stateless n-gram drafts lack SSM context, decoding without freeze segfaults.
                 if (has_recurrent_mem && draft_found) {
+                    // Save recurrent checkpoint before freezing — needed for per-path
+                    // tree replay (Approach A) and post-speculation re-advance.
+                    if (slot.spec_checkpoint) {
+                        llama_memory_checkpoint_free(slot.spec_checkpoint);
+                    }
+                    slot.spec_checkpoint = llama_memory_checkpoint_save(llama_get_memory(ctx));
+
                     llama_set_freeze_recurrent(ctx, true);
                     slot.freeze_recurrent_active = true;
                     if (draft_from_lookup) {
@@ -2241,10 +2255,14 @@ private:
                     const speculation_tree * spec_tree = (!draft_from_lookup && slot.spec)
                         ? common_speculative_get_tree(slot.spec) : nullptr;
 
-                    // Multi-path target verification: disabled for hybrid/recurrent models
-                    // because tree seq_ids on target context corrupt recurrent state.
+                    // Multi-path target verification: dense models only (requires kv_unified).
+                    // Hybrid models excluded: per-path sequential replay (Approach A) benchmarked
+                    // at -60% to -66% throughput — llama_decode runs ALL layers per path, making
+                    // replay O(N_paths × full_forward) instead of O(N_paths × recurrent_only).
+                    // Frozen multi-path (Approach 0) also net-negative (-53% to -62%).
+                    // Remaining approaches: B (linearized Delta Net) or C (recurrent co-drafting).
                     const bool has_recurrent = llama_memory_has_recurrent(llama_get_memory(ctx));
-                    if (spec_tree && spec_tree->n_nodes > 1 && !has_recurrent) {
+                    if (spec_tree && spec_tree->n_nodes > 1 && !has_recurrent && params_base.kv_unified) {
                         auto tree_paths = spec_tree->get_paths();
 
                         if (tree_paths.size() > 1) {
@@ -2282,35 +2300,53 @@ private:
                                 const llama_pos pos_sampled = slot.prompt.tokens.pos_next() - (llama_pos)slot.drafted.size() - 1;
                                 const llama_seq_id tree_seq_base = params_base.n_parallel + slot.id * 8;
 
-                                // Copy prompt KV to alternative seq_ids
-                                auto * tgt_mem = llama_get_memory(ctx);
-                                for (size_t k = 1; k < path_tokens.size(); k++) {
-                                    llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
-                                    llama_memory_seq_cp(tgt_mem, slot.id, alt_seq, 0, -1);
-                                }
-
-                                // Add alternative paths to batch
-                                for (size_t k = 1; k < path_tokens.size(); k++) {
-                                    llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
-                                    slot.tree_drafted[k] = path_tokens[k];
-                                    slot.tree_i_batch_dft[k].clear();
-
-                                    // Add sampled token for this path
-                                    slot.tree_i_batch_dft[k].push_back(batch.n_tokens);
-                                    common_batch_add(batch, slot.sampled, pos_sampled, { alt_seq }, true);
-
-                                    // Add draft tokens for this path
-                                    for (size_t d = 0; d < path_tokens[k].size(); d++) {
-                                        slot.tree_i_batch_dft[k].push_back(batch.n_tokens);
-                                        common_batch_add(batch, path_tokens[k][d], pos_sampled + 1 + (llama_pos)d, { alt_seq }, true);
+                                if (has_recurrent) {
+                                    // Hybrid tree (Approach A): store path tokens for per-path
+                                    // sequential replay during verification. Alt paths are NOT added
+                                    // to the shared batch — each will be decoded individually with
+                                    // exact recurrent state via checkpoint/restore.
+                                    // Attention KV is still forked for alt paths.
+                                    auto * tgt_mem = llama_get_memory(ctx);
+                                    for (size_t k = 1; k < path_tokens.size(); k++) {
+                                        llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
+                                        llama_memory_seq_cp(tgt_mem, slot.id, alt_seq, 0, -1);
                                     }
 
-                                    SLT_DBG(slot, "tree: added alt path %zu (%zu tokens) with seq_id=%d\n",
-                                            k, path_tokens[k].size(), alt_seq);
-                                }
+                                    slot.tree_replay_paths = path_tokens;
 
-                                SLT_DBG(slot, "tree: %zu paths in batch (%d total tree nodes)\n",
-                                        path_tokens.size(), spec_tree->n_nodes);
+                                    SLT_DBG(slot, "tree hybrid: %zu paths stored for per-path replay (%d total tree nodes)\n",
+                                            path_tokens.size(), spec_tree->n_nodes);
+                                } else {
+                                    // Dense tree: add all alt paths to shared batch for single
+                                    // batched decode + comparison (existing code path).
+                                    auto * tgt_mem = llama_get_memory(ctx);
+                                    for (size_t k = 1; k < path_tokens.size(); k++) {
+                                        llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
+                                        llama_memory_seq_cp(tgt_mem, slot.id, alt_seq, 0, -1);
+                                    }
+
+                                    for (size_t k = 1; k < path_tokens.size(); k++) {
+                                        llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
+                                        slot.tree_drafted[k] = path_tokens[k];
+                                        slot.tree_i_batch_dft[k].clear();
+
+                                        // Add sampled token for this path
+                                        slot.tree_i_batch_dft[k].push_back(batch.n_tokens);
+                                        common_batch_add(batch, slot.sampled, pos_sampled, { alt_seq }, true);
+
+                                        // Add draft tokens for this path
+                                        for (size_t d = 0; d < path_tokens[k].size(); d++) {
+                                            slot.tree_i_batch_dft[k].push_back(batch.n_tokens);
+                                            common_batch_add(batch, path_tokens[k][d], pos_sampled + 1 + (llama_pos)d, { alt_seq }, true);
+                                        }
+
+                                        SLT_DBG(slot, "tree: added alt path %zu (%zu tokens) with seq_id=%d\n",
+                                                k, path_tokens[k].size(), alt_seq);
+                                    }
+
+                                    SLT_DBG(slot, "tree: %zu paths in batch (%d total tree nodes)\n",
+                                            path_tokens.size(), spec_tree->n_nodes);
+                                }
                             }
                         }
                     }
@@ -3182,8 +3218,97 @@ private:
                     // the accepted tokens from the speculation
                     ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
 
-                    // Tree multi-path verification: try alternative paths if tree has them
-                    if (slot.has_tree && slot.tree_i_batch_dft.size() > 1) {
+                    // === HYBRID TREE: per-path sequential replay (Approach A) ===
+                    // Each path is decoded individually with exact recurrent state via
+                    // checkpoint/restore. This avoids the 12-22pp acceptance collapse from
+                    // frozen recurrent state at the cost of N sequential decodes.
+                    if (slot.has_tree && !slot.tree_replay_paths.empty() && slot.spec_checkpoint) {
+                        const auto & replay_paths = slot.tree_replay_paths;
+                        const llama_pos pos_sampled = slot.prompt.n_tokens() - (llama_pos)n_draft - 1;
+                        const llama_seq_id tree_seq_base = params_base.n_parallel + slot.id * 8;
+                        int best_path = 0;
+                        size_t best_accepted = ids.size(); // path 0 baseline from frozen decode above
+
+                        for (size_t k = 0; k < replay_paths.size(); k++) {
+                            if (replay_paths[k].empty()) continue;
+
+                            // 1. Restore recurrent checkpoint (O(1) shadow swap)
+                            llama_memory_checkpoint_restore(llama_get_memory(ctx), slot.spec_checkpoint);
+
+                            // 2. Unfreeze recurrent for this path's decode
+                            llama_set_freeze_recurrent(ctx, false);
+
+                            // 3. Choose seq_id: path 0 = slot.id, alt paths = tree_seq_base + k
+                            const llama_seq_id path_seq = (k == 0)
+                                ? (llama_seq_id)slot.id
+                                : tree_seq_base + (llama_seq_id)k;
+
+                            // 4. Build mini-batch: sampled token + path k's draft tokens
+                            const int mini_n = 1 + (int)replay_paths[k].size();
+                            llama_batch mini = llama_batch_init(mini_n, 0, 1);
+                            common_batch_add(mini, slot.sampled, pos_sampled, { path_seq }, true);
+                            for (size_t d = 0; d < replay_paths[k].size(); d++) {
+                                common_batch_add(mini, replay_paths[k][d],
+                                    pos_sampled + 1 + (llama_pos)d, { path_seq }, true);
+                            }
+
+                            // 5. Decode — attention uses forked KV, recurrent advances from checkpoint
+                            const int ret = llama_decode(ctx, mini);
+                            if (ret != 0) {
+                                SLT_ERR(slot, "tree hybrid: decode failed for path %zu: %d\n", k, ret);
+                                llama_batch_free(mini);
+                                llama_set_freeze_recurrent(ctx, true);
+                                continue;
+                            }
+
+                            // 6. Sample acceptance from exact (non-frozen) logits
+                            struct common_sampler * smpl_k = common_sampler_clone(slot.smpl.get());
+                            auto ids_k = common_sampler_sample_and_accept_n(
+                                smpl_k, ctx, replay_paths[k]);
+                            common_sampler_free(smpl_k);
+
+                            SLT_DBG(slot, "tree hybrid: path %zu accepted %zu tokens\n",
+                                    k, ids_k.size());
+
+                            if (ids_k.size() > best_accepted) {
+                                best_accepted = ids_k.size();
+                                best_path = (int)k;
+                                ids = ids_k;
+                            }
+
+                            llama_batch_free(mini);
+
+                            // 7. Re-freeze for next iteration
+                            llama_set_freeze_recurrent(ctx, true);
+                        }
+
+                        if (best_path > 0) {
+                            SLT_INF(slot, "tree hybrid: path %d won with %zu accepted tokens\n",
+                                    best_path, best_accepted);
+
+                            // Fix attention KV: slot.id has path 0's KV, need winning path's KV
+                            auto * tgt_mem = llama_get_memory(ctx);
+                            const llama_seq_id win_seq = tree_seq_base + best_path;
+
+                            // Remove path 0's draft KV from slot.id (keep prompt KV)
+                            llama_memory_seq_rm(tgt_mem, slot.id, pos_sampled, -1);
+
+                            // Copy winning path's draft KV to slot.id
+                            llama_memory_seq_cp(tgt_mem, win_seq, slot.id, pos_sampled, -1);
+                        }
+
+                        // Clean up all tree seq_ids from KV cache
+                        {
+                            auto * tgt_mem = llama_get_memory(ctx);
+                            for (size_t k = 1; k < replay_paths.size(); k++) {
+                                llama_memory_seq_rm(tgt_mem, tree_seq_base + (llama_seq_id)k, 0, -1);
+                            }
+                        }
+
+                        slot.tree_replay_paths.clear();
+                    }
+                    // === DENSE TREE: batched comparison (existing, unchanged) ===
+                    else if (slot.has_tree && slot.tree_i_batch_dft.size() > 1) {
                         const size_t n_path0_accepted = ids.size();
                         int best_path = 0;
 
@@ -3205,25 +3330,6 @@ private:
                         }
 
                         if (best_path > 0) {
-                            // An alternative path won — need to re-sample with the real sampler
-                            // Reset sampler state to pre-verification and re-do acceptance on winning path
-                            // Note: common_sampler_sample_and_accept_n on path 0 above already modified
-                            // slot.smpl. We need to undo that and redo with the winning path.
-                            // We achieve this by cloning before path 0 verification — but we already
-                            // did path 0 above. Instead, reset and re-do the winning path.
-                            // The sampler was modified by path 0 acceptance. We need to reconstruct.
-                            // Since we can't easily undo, we re-clone from the pre-verification state.
-                            // Fortunately, common_sampler_sample_and_accept_n internally does
-                            // sample+accept, so we can just run it again with a fresh clone.
-
-                            // We don't have pre-verification sampler state. The simplest correct approach:
-                            // reset the sampler and re-accept the entire prompt + winning path.
-                            // But that's expensive. Instead, accept that path 0's sampler state is
-                            // close enough (both paths share the same prompt context, only differ
-                            // in the last few tokens). For speculation, the sampler state is used
-                            // for the NEXT round's draft quality, not correctness.
-                            // The winning path's tokens ARE correct (verified against target logits).
-
                             SLT_INF(slot, "tree: path %d won with %zu accepted tokens (path 0: %zu)\n",
                                     best_path, ids.size(), n_path0_accepted);
 
@@ -3237,7 +3343,6 @@ private:
                             llama_memory_seq_rm(tgt_mem, slot.id, pos_sampled, -1);
 
                             // Copy only the winning path's draft KV to slot.id
-                            // (prompt KV at positions 0..pos_sampled-1 already present on slot.id)
                             llama_memory_seq_cp(tgt_mem, win_seq, slot.id, pos_sampled, -1);
                         }
 
@@ -3252,6 +3357,7 @@ private:
                     slot.has_tree = false;
                     slot.tree_i_batch_dft.clear();
                     slot.tree_drafted.clear();
+                    slot.tree_replay_paths.clear();
                     slot.i_batch_dft.clear();
                     slot.drafted.clear();
                 }
@@ -3286,9 +3392,16 @@ private:
                 // For hybrid models with recurrent state: handle post-speculation rollback.
                 const size_t n_rejected = n_draft - (ids.size() - 1);
                 if (slot.freeze_recurrent_active) {
-                    // Freeze-recurrent mode: SSM state was never modified during speculation.
-                    // Unfreeze for the next normal decode, then advance state through accepted tokens.
+                    // Unfreeze recurrent for normal decode going forward.
                     llama_set_freeze_recurrent(ctx, false);
+
+                    // After hybrid tree replay, recurrent state is from last replayed path.
+                    // Restore to pre-speculation state before re-advancing accepted tokens.
+                    // For non-tree (linear) speculation, recurrent was frozen so this is
+                    // also correct — restores to the exact pre-speculation position.
+                    if (slot.spec_checkpoint) {
+                        llama_memory_checkpoint_restore(llama_get_memory(ctx), slot.spec_checkpoint);
+                    }
 
                     // Clean up KV cache entries for rejected positions
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
