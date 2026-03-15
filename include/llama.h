@@ -785,6 +785,17 @@ extern "C" {
     // Free a checkpoint handle
     LLAMA_API void llama_memory_checkpoint_free(struct llama_memory_checkpoint * cp);
 
+    // Cross-context recurrent state injection for state maintainer pattern.
+    // Copies recurrent state (r_l/s_l tensors + cell metadata) for a given sequence
+    // from src memory to dst memory. Both memories must come from contexts created
+    // from the same model. Used after frozen-recurrent tree verification: the state
+    // maintainer replays the winning path, then injects its exact recurrent state
+    // into the target context.
+    LLAMA_API void llama_memory_recurrent_inject(
+        llama_memory_t dst,
+        llama_memory_t src,
+        llama_seq_id   seq_id);
+
     //
     // State / sessions
     //

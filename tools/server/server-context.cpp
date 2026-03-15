@@ -592,6 +592,11 @@ private:
 
     llama_model_ptr model_dft;
 
+    // State maintainer: second context from same model for hybrid tree speculation.
+    // Runs winning path with logits=false to maintain exact recurrent state after
+    // frozen-recurrent tree verification. Only created for hybrid + tree configs.
+    llama_context * ctx_sm = nullptr;
+
     bool add_bos_token  = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -617,6 +622,11 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        if (ctx_sm) {
+            llama_free(ctx_sm);
+            ctx_sm = nullptr;
+        }
+
         llama_init.reset();
         ctx = nullptr;
         model = nullptr;
@@ -731,6 +741,32 @@ private:
             if (params_base.speculative.p_split > 0.0f) {
                 params_base.speculative.cparams_dft.n_seq_max  = 33; // 32 tree branches + 1 primary
                 params_base.speculative.cparams_dft.kv_unified = true;
+            }
+        }
+
+        // Create state maintainer context for hybrid tree speculation.
+        // The SM is a second context from the same target model that replays the winning
+        // path with logits=false after frozen-recurrent tree verification. Model weights
+        // are shared via mmap — only recurrent state + small KV + compute buffers are duplicated.
+        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()) {
+            auto cparams_sm = common_context_params_to_llama(params_base);
+            cparams_sm.n_batch    = 64;     // small batch — only replaying winning path (K ≈ 8-16 tokens)
+            cparams_sm.n_ubatch   = 64;
+            cparams_sm.n_seq_max  = std::max(1, params_base.n_parallel); // one recurrent cell per slot
+            cparams_sm.no_perf    = true;   // no timing overhead
+            cparams_sm.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; // minimize compute buffers
+
+            ctx_sm = llama_init_from_model(model, cparams_sm);
+            if (ctx_sm) {
+                if (!llama_memory_has_recurrent(llama_get_memory(ctx_sm))) {
+                    llama_free(ctx_sm);
+                    ctx_sm = nullptr;
+                    SRV_INF("%s", "state maintainer not needed (dense model), disabled\n");
+                } else {
+                    SRV_INF("%s", "state maintainer context created for hybrid tree speculation\n");
+                }
+            } else {
+                SRV_WRN("%s", "failed to create state maintainer context — hybrid tree will use fallback re-advance\n");
             }
         }
 
@@ -2241,10 +2277,11 @@ private:
                     const speculation_tree * spec_tree = (!draft_from_lookup && slot.spec)
                         ? common_speculative_get_tree(slot.spec) : nullptr;
 
-                    // Multi-path target verification: disabled for hybrid/recurrent models
-                    // because tree seq_ids on target context corrupt recurrent state.
+                    // Multi-path target verification: enabled for dense models (no recurrent state)
+                    // or hybrid models with state maintainer (SM replays winning path to recover
+                    // exact recurrent state after frozen-recurrent tree verification).
                     const bool has_recurrent = llama_memory_has_recurrent(llama_get_memory(ctx));
-                    if (spec_tree && spec_tree->n_nodes > 1 && !has_recurrent) {
+                    if (spec_tree && spec_tree->n_nodes > 1 && (!has_recurrent || ctx_sm)) {
                         auto tree_paths = spec_tree->get_paths();
 
                         if (tree_paths.size() > 1) {
@@ -2858,6 +2895,39 @@ private:
 
             const int ret = llama_decode(ctx, batch_view);
 
+            // Mirror batch to state maintainer (keeps SM recurrent state in sync with target).
+            // SM runs with logits=false — skip output projection for minimal overhead.
+            // Skip during speculation rounds (freeze_recurrent active) — SM stays at
+            // pre-speculation state and only replays the winning path after verification.
+            if (ctx_sm && ret == 0) {
+                bool any_frozen = false;
+                for (const auto & slot : slots) {
+                    if (slot.freeze_recurrent_active) {
+                        any_frozen = true;
+                        break;
+                    }
+                }
+                if (!any_frozen) {
+                    // Build a logits-free copy of the batch view
+                    std::vector<int8_t> sm_logits(n_tokens, 0);
+                    llama_batch sm_batch_view = {
+                        n_tokens,
+                        batch_view.token,
+                        nullptr,
+                        batch_view.pos,
+                        batch_view.n_seq_id,
+                        batch_view.seq_id,
+                        sm_logits.data(),
+                    };
+                    const int ret_sm = llama_decode(ctx_sm, sm_batch_view);
+                    if (ret_sm != 0) {
+                        SRV_WRN("state maintainer decode failed: %d (disabling SM)\n", ret_sm);
+                        llama_free(ctx_sm);
+                        ctx_sm = nullptr;
+                    }
+                }
+            }
+
             metrics.on_decoded(slots);
 
             if (ret != 0) {
@@ -3293,10 +3363,46 @@ private:
                     // Clean up KV cache entries for rejected positions
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
-                    // Re-advance recurrent state through ALL accepted tokens (including sampled).
-                    // Since state was frozen, it needs to catch up from pre-speculation position.
                     const int n_accepted = (int)ids.size() - 1; // exclude the new sampled token
-                    if (n_accepted > 0) {
+
+                    if (ctx_sm && n_accepted > 0) {
+                        // State maintainer path: replay winning path through SM, then inject
+                        // exact recurrent state into target. Avoids full-model re-advance decode.
+                        llama_batch sm_batch = llama_batch_init(n_accepted, 0, 1);
+                        const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
+                        for (int i = 0; i < n_accepted; i++) {
+                            common_batch_add(sm_batch, ids[i], pos_base + i, { slot.id }, false);
+                        }
+
+                        const int ret_sm = llama_decode(ctx_sm, sm_batch);
+                        llama_batch_free(sm_batch);
+
+                        if (ret_sm == 0) {
+                            // Inject SM's exact recurrent state into target
+                            llama_memory_recurrent_inject(
+                                llama_get_memory(ctx),
+                                llama_get_memory(ctx_sm),
+                                slot.id);
+                            SLT_DBG(slot, "state maintainer: injected exact recurrent state for %d accepted tokens\n", n_accepted);
+                        } else {
+                            SLT_ERR(slot, "state maintainer replay failed: %d, falling back to target re-advance\n", ret_sm);
+                            // Fallback: re-advance through target (original path)
+                            llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
+                            for (int i = 0; i < n_accepted; i++) {
+                                common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
+                            }
+                            if (batch_accepted.n_tokens > 0) {
+                                batch_accepted.logits[batch_accepted.n_tokens - 1] = true;
+                            }
+                            const int ret = llama_decode(ctx, batch_accepted);
+                            if (ret != 0) {
+                                SLT_ERR(slot, "failed to advance recurrent state after frozen speculation: %d\n", ret);
+                            }
+                            llama_batch_free(batch_accepted);
+                        }
+                    } else if (n_accepted > 0) {
+                        // No state maintainer: re-advance recurrent state through ALL accepted tokens.
+                        // Since state was frozen, it needs to catch up from pre-speculation position.
                         llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
                         const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
                         for (int i = 0; i < n_accepted; i++) {
@@ -3313,7 +3419,8 @@ private:
                         llama_batch_free(batch_accepted);
                     }
 
-                    SLT_DBG(slot, "freeze-recurrent: advanced %d accepted tokens through SSM state\n", n_accepted);
+                    SLT_DBG(slot, "freeze-recurrent: advanced %d accepted tokens through %s\n",
+                            n_accepted, (ctx_sm && n_accepted > 0) ? "state maintainer" : "target re-advance");
                 } else if (slot.spec_checkpoint && n_rejected > 0) {
                     // Standard checkpoint mode: partial rejection on a hybrid model
                     // restore recurrent state to pre-speculation position

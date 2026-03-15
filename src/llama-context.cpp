@@ -3248,6 +3248,73 @@ void llama_memory_checkpoint_free(struct llama_memory_checkpoint * cp) {
     delete cp;
 }
 
+void llama_memory_recurrent_inject(llama_memory_t dst, llama_memory_t src, llama_seq_id seq_id) {
+    auto * dst_recr = get_recurrent_memory(dst);
+    auto * src_recr = get_recurrent_memory(src);
+    if (!dst_recr || !src_recr) {
+        return;
+    }
+
+    // Find the cell holding seq_id in src
+    int32_t src_cell = -1;
+    for (uint32_t i = 0; i < src_recr->size; i++) {
+        if (src_recr->cells[i].has_seq_id(seq_id)) {
+            src_cell = (int32_t)i;
+            break;
+        }
+    }
+    if (src_cell < 0) {
+        return;
+    }
+
+    // Find the cell holding seq_id in dst
+    int32_t dst_cell = -1;
+    for (uint32_t i = 0; i < dst_recr->size; i++) {
+        if (dst_recr->cells[i].has_seq_id(seq_id)) {
+            dst_cell = (int32_t)i;
+            break;
+        }
+    }
+    if (dst_cell < 0) {
+        return;
+    }
+
+    // Copy r_l/s_l tensor data for each layer (src_cell slice → dst_cell slice).
+    // Tensors are laid out as [n_embd_state * n_cells] — we copy only the cell's slice.
+    // No ggml_backend_tensor_copy_range exists, so we use get+set via CPU staging buffer.
+    const uint32_t n_layer = (uint32_t)src_recr->r_l.size();
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (src_recr->r_l[il] && dst_recr->r_l[il]) {
+            const size_t elem_size = ggml_element_size(src_recr->r_l[il]);
+            const size_t n_embd = ggml_nelements(src_recr->r_l[il]) / src_recr->size;
+            const size_t nbytes = n_embd * elem_size;
+            const size_t offset_src = src_cell * nbytes;
+            const size_t offset_dst = dst_cell * nbytes;
+
+            // CPU staging buffer for cross-context copy
+            std::vector<uint8_t> buf(nbytes);
+            ggml_backend_tensor_get(src_recr->r_l[il], buf.data(), offset_src, nbytes);
+            ggml_backend_tensor_set(dst_recr->r_l[il], buf.data(), offset_dst, nbytes);
+        }
+        if (src_recr->s_l[il] && dst_recr->s_l[il]) {
+            const size_t elem_size = ggml_element_size(src_recr->s_l[il]);
+            const size_t n_embd = ggml_nelements(src_recr->s_l[il]) / src_recr->size;
+            const size_t nbytes = n_embd * elem_size;
+            const size_t offset_src = src_cell * nbytes;
+            const size_t offset_dst = dst_cell * nbytes;
+
+            std::vector<uint8_t> buf(nbytes);
+            ggml_backend_tensor_get(src_recr->s_l[il], buf.data(), offset_src, nbytes);
+            ggml_backend_tensor_set(dst_recr->s_l[il], buf.data(), offset_dst, nbytes);
+        }
+    }
+
+    // Copy cell metadata (position, clear pending copy flags)
+    dst_recr->cells[dst_cell].pos  = src_recr->cells[src_cell].pos;
+    dst_recr->cells[dst_cell].src  = -1; // no pending copy
+    dst_recr->cells[dst_cell].src0 = -1;
+}
+
 // llama state API
 
 // deprecated
