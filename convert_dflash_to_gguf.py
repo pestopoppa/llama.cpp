@@ -120,6 +120,7 @@ def main():
     parser.add_argument("model_dir", type=Path, help="Path to DFlash HF model directory")
     parser.add_argument("--outfile", type=Path, required=True, help="Output GGUF file path")
     parser.add_argument("--outtype", choices=["f16", "f32"], default="f16", help="Output data type")
+    parser.add_argument("--target-gguf", type=Path, help="Target model GGUF to copy embed_tokens/lm_head from (instead of dummy zeros)")
     args = parser.parse_args()
 
     model_dir = args.model_dir
@@ -274,11 +275,34 @@ def main():
     # Convert and add tensors
     use_f16 = args.outtype == "f16"
 
-    # 1. Add dummy embedding (token_embd) - needed for model load
-    print("\nGenerating dummy token_embd (shared with target at runtime)...")
-    dummy_embd = np.zeros((vocab_size, hidden_size), dtype=np.float16 if use_f16 else np.float32)
     embd_dtype = gguf.GGMLQuantizationType.F16 if use_f16 else gguf.GGMLQuantizationType.F32
-    writer.add_tensor("token_embd.weight", dummy_embd, raw_dtype=embd_dtype)
+
+    # 1. Add embedding (token_embd)
+    target_embd = None
+    target_output = None
+    if args.target_gguf and args.target_gguf.exists():
+        print(f"\nExtracting embed/lm_head from target GGUF: {args.target_gguf}")
+        target_reader = gguf.GGUFReader(str(args.target_gguf))
+        for tensor in target_reader.tensors:
+            if tensor.name == "token_embd.weight":
+                # Dequantize from target's quantization format to f32, then convert to f16
+                target_embd = gguf.dequantize(tensor.data, tensor.tensor_type)
+                if use_f16:
+                    target_embd = target_embd.astype(np.float16)
+                print(f"  token_embd.weight: {tensor.shape} (quantized) -> {target_embd.shape} {target_embd.dtype}")
+            elif tensor.name == "output.weight":
+                target_output = gguf.dequantize(tensor.data, tensor.tensor_type)
+                if use_f16:
+                    target_output = target_output.astype(np.float16)
+                print(f"  output.weight: {tensor.shape} (quantized) -> {target_output.shape} {target_output.dtype}")
+
+    if target_embd is not None:
+        print("Using target model's token_embd (dequantized)")
+        writer.add_tensor("token_embd.weight", target_embd, raw_dtype=embd_dtype)
+    else:
+        print("\nGenerating dummy token_embd (shared with target at runtime)...")
+        dummy_embd = np.zeros((vocab_size, hidden_size), dtype=np.float16 if use_f16 else np.float32)
+        writer.add_tensor("token_embd.weight", dummy_embd, raw_dtype=embd_dtype)
 
     # 2. Convert model tensors
     print("Converting model tensors...")
@@ -310,10 +334,14 @@ def main():
         converted += 1
         print(f"  {hf_name:50s} -> {gguf_name:40s} {meta['shape']}")
 
-    # 3. Add dummy output (lm_head) - needed for model load
-    print("\nGenerating dummy output head (shared with target at runtime)...")
-    dummy_output = np.zeros((vocab_size, hidden_size), dtype=np.float16 if use_f16 else np.float32)
-    writer.add_tensor("output.weight", dummy_output, raw_dtype=embd_dtype)
+    # 3. Add output (lm_head)
+    if target_output is not None:
+        print("\nUsing target model's output head (lm_head, dequantized)")
+        writer.add_tensor("output.weight", target_output, raw_dtype=embd_dtype)
+    else:
+        print("\nGenerating dummy output head (shared with target at runtime)...")
+        dummy_output = np.zeros((vocab_size, hidden_size), dtype=np.float16 if use_f16 else np.float32)
+        writer.add_tensor("output.weight", dummy_output, raw_dtype=embd_dtype)
 
     if skipped:
         print(f"\nSkipped {len(skipped)} unrecognized tensors:")
