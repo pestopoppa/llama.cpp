@@ -1041,6 +1041,16 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // DFlash: Get hidden states from a specific layer after the last decode call.
+    // Returns a pointer to the hidden state data for the given layer index.
+    // Shape: [n_embd * n_tokens] where n_tokens is from the last decode batch.
+    // Returns NULL if the layer index is out of range or no hidden states were captured.
+    // Only available for architectures that capture hidden states (currently Qwen3 and DFlash).
+    LLAMA_API float * llama_get_hidden_state(struct llama_context * ctx, int32_t layer_idx);
+
+    // DFlash: Get the number of layers with captured hidden states.
+    LLAMA_API int32_t llama_get_hidden_state_count(struct llama_context * ctx);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

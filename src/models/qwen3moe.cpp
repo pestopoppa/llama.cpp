@@ -109,6 +109,22 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
 
         // input for next layer
         inpL = cur;
+
+        // DFlash: capture layer output for hidden state extraction
+        // Only duplicate layers that are needed (ggml_dup forces separate buffer)
+        // TODO: make target_layer_ids configurable via hparams/context
+        {
+            static const int dflash_taps[] = {1, 12, 23, 34, 45};
+            for (int t : dflash_taps) {
+                if (il == t) {
+                    if (res->t_hidden_states.size() <= static_cast<size_t>(il)) {
+                        res->t_hidden_states.resize(il + 1, nullptr);
+                    }
+                    res->t_hidden_states[il] = ggml_dup(ctx0, cur);
+                    break;
+                }
+            }
+        }
     }
     cur = inpL;
 
@@ -118,6 +134,13 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // DFlash: mark hidden state tensors as graph outputs to prevent buffer reuse
+    for (auto * t_hs : res->t_hidden_states) {
+        if (t_hs) {
+            ggml_build_forward_expand(gf, t_hs);
+        }
+    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur);

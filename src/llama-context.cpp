@@ -775,6 +775,20 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::get_hidden_state(int32_t layer_idx) {
+    if (layer_idx < 0 || layer_idx >= (int32_t) hidden_states.size()) {
+        return nullptr;
+    }
+    if (hidden_states[layer_idx].empty()) {
+        return nullptr;
+    }
+    return hidden_states[layer_idx].data();
+}
+
+int32_t llama_context::get_hidden_state_count() const {
+    return (int32_t) hidden_states.size();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1702,6 +1716,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         GGML_ABORT("unknown pooling type");
                     }
+            }
+        }
+
+        // DFlash: extract hidden states from target model layers
+        if (!res->t_hidden_states.empty() && n_outputs > 0) {
+            hidden_states.resize(res->t_hidden_states.size());
+            for (size_t il = 0; il < res->t_hidden_states.size(); il++) {
+                auto * t_hs = res->t_hidden_states[il];
+                if (!t_hs) continue;
+                const int64_t n_embd_hs = t_hs->ne[0];
+                const int64_t n_tokens_hs = t_hs->ne[1];
+                hidden_states[il].resize(n_embd_hs * n_tokens_hs);
+                ggml_backend_t backend_hs = ggml_backend_sched_get_tensor_backend(sched.get(), t_hs);
+                if (backend_hs) {
+                    ggml_backend_tensor_get_async(backend_hs, t_hs, hidden_states[il].data(), 0, n_embd_hs * n_tokens_hs * sizeof(float));
+                }
             }
         }
 
@@ -3009,6 +3039,15 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+float * llama_get_hidden_state(llama_context * ctx, int32_t layer_idx) {
+    ctx->synchronize();
+    return ctx->get_hidden_state(layer_idx);
+}
+
+int32_t llama_get_hidden_state_count(llama_context * ctx) {
+    return ctx->get_hidden_state_count();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

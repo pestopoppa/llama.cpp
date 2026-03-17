@@ -79,6 +79,10 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // DFlash hidden state access
+    float * get_hidden_state(int32_t layer_idx);
+    int32_t get_hidden_state_count() const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -273,6 +277,11 @@ private:
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+
+    // DFlash hidden state extraction: per-layer outputs from target model decode
+    // Populated during decode when model has t_hidden_states in graph result
+    // Layout: [n_layers][n_embd * n_outputs] (flattened, n_layers = t_hidden_states.size())
+    std::vector<std::vector<float>> hidden_states;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

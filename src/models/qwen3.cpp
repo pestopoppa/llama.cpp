@@ -126,4 +126,11 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // DFlash: mark hidden state tensors as graph outputs to prevent buffer reuse
+    for (auto * t_hs : res->t_hidden_states) {
+        if (t_hs) {
+            ggml_build_forward_expand(gf, t_hs);
+        }
+    }
 }
