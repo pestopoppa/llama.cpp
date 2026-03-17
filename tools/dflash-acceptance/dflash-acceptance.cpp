@@ -204,13 +204,17 @@ int main(int argc, char ** argv) {
         int n = llama_token_to_piece(vocab, token_tgt, buf, sizeof(buf), 0, true);
         printf("\n  First target token: %d (%.*s)\n", token_tgt, n, buf);
 
-        // === Phase 2: Autoregressive decode with hidden state tracking ===
-        printf("\nPhase 2: Autoregressive decode with hidden state tracking...\n");
+        // === Phase 2: Autoregressive decode with DFlash acceptance measurement ===
+        printf("\nPhase 2: Target decode + DFlash draft acceptance...\n");
 
         int n_generated = 0;
+        int n_accepted = 0;
+        int n_drafted = 0;
         llama_token prev_token = token_tgt;
+        const int n_taps = target_layer_ids.size();
 
         for (int i = 0; i < params.n_predict; i++) {
+            // Target decode: single token
             common_batch_clear(batch);
             common_batch_add(batch, prev_token, tokens.size() + i, {0}, true);
 
@@ -219,45 +223,74 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            // Verify hidden states still available after each decode step
-            if (i == 0) {
-                int32_t n_hs = llama_get_hidden_state_count(ctx_tgt);
-                float * hs0 = llama_get_hidden_state(ctx_tgt, target_layer_ids[0]);
-                printf("  Step 0: %d layers captured, layer %d %s\n",
-                       n_hs, target_layer_ids[0],
-                       hs0 ? "available" : "NOT available");
-            }
-
+            // Get target's prediction
             smpl = llama_sampler_init_greedy();
-            prev_token = llama_sampler_sample(smpl, ctx_tgt, -1);
+            llama_token target_next = llama_sampler_sample(smpl, ctx_tgt, -1);
             llama_sampler_free(smpl);
             n_generated++;
 
-            n = llama_token_to_piece(vocab, prev_token, buf, sizeof(buf), 0, true);
+            // Extract hidden states and condition DFlash drafter
+            bool drafted_ok = false;
+            llama_token draft_token = -1;
+
+            std::vector<float> ch(n_taps * n_embd_tgt);
+            bool all_hs = true;
+            for (int t = 0; t < n_taps; t++) {
+                float * hs = llama_get_hidden_state(ctx_tgt, target_layer_ids[t]);
+                if (hs) {
+                    memcpy(ch.data() + t * n_embd_tgt, hs, n_embd_tgt * sizeof(float));
+                } else {
+                    all_hs = false;
+                }
+            }
+
+            if (all_hs) {
+                // Set conditioning on drafter
+                llama_set_cross_data(ctx_dft, n_taps * n_embd_tgt, 1, ch.data());
+
+                // DFlash drafter decode with same input token
+                llama_batch dft_batch = llama_batch_init(1, 0, 1);
+                common_batch_add(dft_batch, prev_token, i, {0}, true);
+
+                if (llama_decode(ctx_dft, dft_batch) == 0) {
+                    smpl = llama_sampler_init_greedy();
+                    draft_token = llama_sampler_sample(smpl, ctx_dft, -1);
+                    llama_sampler_free(smpl);
+                    drafted_ok = true;
+                    n_drafted++;
+
+                    if (draft_token == target_next) {
+                        n_accepted++;
+                    }
+                }
+                llama_batch_free(dft_batch);
+            }
+
+            // Print target output
+            n = llama_token_to_piece(vocab, target_next, buf, sizeof(buf), 0, true);
             if (n > 0) {
                 printf("%.*s", n, buf);
                 fflush(stdout);
             }
 
-            if (llama_vocab_is_eog(vocab, prev_token)) {
+            prev_token = target_next;
+
+            if (llama_vocab_is_eog(vocab, target_next)) {
                 printf("\n[EOS]");
                 break;
             }
         }
 
-        printf("\n\n=== Results ===\n");
-        printf("Generated: %d tokens from target model\n", n_generated);
-        printf("Hidden state extraction: %s\n",
-               n_hidden > 0 ? "WORKING" : "NOT WORKING");
-        printf("Target layer count:  %d\n", n_hidden);
-        printf("Required layer taps: %zu\n", target_layer_ids.size());
-        printf("\n");
+        float accept_rate = n_drafted > 0 ? (float)n_accepted / n_drafted * 100.0f : 0.0f;
 
-        if (n_hidden >= n_layer_tgt) {
-            printf("READY for Phase 3: fc conditioning + DFlash cross-attention\n");
-        } else {
-            printf("BLOCKED: Hidden states not fully captured (%d/%d layers)\n", n_hidden, n_layer_tgt);
-        }
+        printf("\n\n=== DFlash Acceptance Results ===\n");
+        printf("Generated:    %d tokens from target model\n", n_generated);
+        printf("Drafted:      %d tokens from DFlash drafter\n", n_drafted);
+        printf("Accepted:     %d tokens (exact match with target)\n", n_accepted);
+        printf("Acceptance:   %.1f%% (%d/%d)\n", accept_rate, n_accepted, n_drafted);
+        printf("Paper target: tau=6.49 (expected ~40%% exact match per token)\n");
+        printf("\nNote: RoPE on cross-attention K is currently skipped.\n");
+        printf("      This may reduce acceptance. Adding RoPE should improve.\n");
     }
 
 cleanup:
