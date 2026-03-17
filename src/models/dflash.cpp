@@ -47,15 +47,10 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
         inp_attn_kv = build_attn_inp_kv();
     }
 
-    // For cross-attention: create non-causal mask (all zeros = fully permissive)
+    // For cross-attention: non-causal mask (all zeros = fully permissive)
+    // NULL mask = no masking applied in build_attn_mha
     ggml_tensor * cross_kq_mask = nullptr;
-    if (has_cross) {
-        const int64_t n_kv = n_ctx_tokens + n_tokens; // K/V sequence length
-        cross_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1, 1);
-        ggml_set_name(cross_kq_mask, "dflash_kq_mask");
-        ggml_set_input(cross_kq_mask);
-        // Will be set to all zeros (fully permissive) during set_inputs
-    }
+    // DFlash uses is_causal=False, so we pass nullptr for the mask
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
