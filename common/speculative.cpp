@@ -552,12 +552,13 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & result) override {
-        // Step 1: Extract hidden states from the target context
         const int n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
         const int32_t n_hidden = llama_get_hidden_state_count(ctx_tgt);
+        const int block_size = std::min(params.n_max, 16); // DFlash block size
 
+        // Step 1: Extract hidden states from target and set conditioning
+        bool conditioned = false;
         if (n_hidden > 0) {
-            // Concatenate hidden states at target layer IDs
             std::vector<float> concat_hidden(n_taps * n_embd);
             bool all_available = true;
 
@@ -572,14 +573,52 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             }
 
             if (all_available) {
-                // Set conditioning on DFlash drafter
                 llama_set_cross_data(ctx_dft, n_taps * n_embd, 1, concat_hidden.data());
+                conditioned = true;
             }
         }
 
-        // Step 2: Generate draft tokens using the conditioned drafter
-        // Fall through to base class draft which handles the AR generation loop
-        common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+        if (!conditioned) {
+            // No conditioning available — fall back to AR drafting
+            common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+            return;
+        }
+
+        // Step 2: Block-mode DFlash drafting
+        // Feed block_size tokens (id_last + mask_tokens) to the drafter in one forward pass
+        // This generates all draft tokens in parallel, matching the DFlash paper design
+        result.clear();
+
+        // Clear drafter KV cache for block-mode (each block is independent)
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        llama_memory_clear(mem_dft, false);
+
+        // Create batch with id_last followed by mask tokens
+        const llama_token mask_token = 151669; // DFlash mask token ID
+
+        common_batch_clear(batch);
+        common_batch_add(batch, id_last, 0, {0}, true);
+        for (int i = 1; i < block_size; i++) {
+            common_batch_add(batch, mask_token, i, {0}, true);
+        }
+
+        // Single forward pass through conditioned drafter
+        if (llama_decode(ctx_dft, batch) != 0) {
+            LOG_ERR("%s: DFlash block decode failed\n", __func__);
+            return;
+        }
+
+        // Sample draft tokens from each position
+        // Position 0 (id_last) predicts the first draft token
+        // Position 1..block_size-1 (mask tokens) predict subsequent draft tokens
+        for (int i = 0; i < block_size - 1; i++) {
+            // Sample from position i's logits (predicts token at position i+1)
+            common_sampler_reset(smpl);
+            llama_token draft_token = common_sampler_sample(smpl, ctx_dft, i);
+            result.push_back(draft_token);
+        }
+
+        LOG_DBG("%s: DFlash block drafted %zu tokens (conditioned)\n", __func__, result.size());
     }
 };
 
