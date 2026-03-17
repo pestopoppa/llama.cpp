@@ -2,20 +2,13 @@
 
 // DFlash block diffusion drafter graph builder.
 //
-// Architecture: Qwen3-like attention+FFN layers with cross-attention conditioning.
+// When cross-attention data is available (via llama_set_cross_data):
+//   1. Apply fc.weight projection + hidden_norm to conditioning data
+//   2. Compute K/V from both conditioning + noise tokens, concatenate
+//   3. Compute Q from noise tokens only
+//   4. Non-causal attention (all tokens attend to all K/V)
 //
-// Key differences from standard Qwen3:
-//   1. Conditioning: fc.weight projects concatenated target hidden states → drafter dim,
-//      followed by hidden_norm RMS normalization.
-//   2. Cross-attention: K/V come from concatenated [target_hidden; noise_hidden],
-//      Q comes from noise_hidden only. Same K/V projection weights for both sources.
-//   3. Non-causal attention (is_causal=False in HF reference implementation).
-//
-// Current state: Self-attention baseline with KV cache (standard Qwen3 path).
-// The model loads and runs; cross-attention conditioning will be added via the
-// speculation framework when target hidden states become available.
-//
-// Reference: /mnt/raid0/llm/cache/dflash/Qwen3-Coder-30B-A3B-DFlash/dflash.py
+// When no cross-attention data: falls back to standard self-attention.
 
 llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -35,6 +28,28 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // DFlash conditioning: project cross-attention data through fc + hidden_norm
+    ggml_tensor * target_hidden = nullptr;
+    if (cross && !cross->v_embd.empty() && model.dflash_fc) {
+        const int64_t n_cross_embd = cross->n_embd;  // should be n_taps * n_embd_target
+        const int64_t n_cross_tokens = cross->n_enc;
+
+        // Create input tensor from cross data
+        ggml_tensor * cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cross_embd, n_cross_tokens);
+        ggml_set_name(cross_inp, "dflash_cross_inp");
+        ggml_set_input(cross_inp);
+
+        // fc projection: [n_taps * n_embd, n_tokens] -> [n_embd, n_tokens]
+        target_hidden = ggml_mul_mat(ctx0, model.dflash_fc, cross_inp);
+        cb(target_hidden, "dflash_fc_out", -1);
+
+        // hidden_norm: RMS normalization
+        if (model.dflash_hidden_norm) {
+            target_hidden = build_norm(target_hidden, model.dflash_hidden_norm, NULL, LLM_NORM_RMS, -1);
+            cb(target_hidden, "dflash_hidden_norm_out", -1);
+        }
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -44,24 +59,37 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // self-attention
-        // NOTE: In full DFlash mode, K/V would come from concatenated [target_hidden; cur],
-        // with Q from cur only. For now, standard self-attention with KV cache is used
-        // since the drafter runs standalone. Cross-attention is activated when the drafter
-        // is invoked with target hidden states via the speculation framework.
+        // attention: cross-attention when conditioning available, else self-attention
         {
+            // Q always from noise hidden states
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
             cb(Qcur, "Qcur", il);
 
-            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
-            cb(Kcur, "Kcur", il);
+            ggml_tensor * Kcur;
+            ggml_tensor * Vcur;
 
-            ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
+            if (target_hidden) {
+                // Cross-attention: K/V from concatenated [target_hidden; cur]
+                ggml_tensor * Kcur_ctx   = build_lora_mm(model.layers[il].wk, target_hidden);
+                ggml_tensor * Kcur_noise = build_lora_mm(model.layers[il].wk, cur);
+                Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_noise, 1); // concat along token dim
+
+                ggml_tensor * Vcur_ctx   = build_lora_mm(model.layers[il].wv, target_hidden);
+                ggml_tensor * Vcur_noise = build_lora_mm(model.layers[il].wv, cur);
+                Vcur = ggml_concat(ctx0, Vcur_ctx, Vcur_noise, 1); // concat along token dim
+            } else {
+                // Standard self-attention (fallback)
+                Kcur = build_lora_mm(model.layers[il].wk, cur);
+                Vcur = build_lora_mm(model.layers[il].wv, cur);
+            }
+            cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+            const int64_t n_kv_tokens = Kcur->ne[1]; // n_tokens or n_ctx+n_tokens
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_kv_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_kv_tokens);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
@@ -75,11 +103,18 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
 
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            // TODO: RoPE for K needs proper position handling for cross-attention
+            // Context tokens: positions 0..n_ctx-1, noise tokens: n_ctx..n_ctx+n_noise-1
+            // For now, apply RoPE with inp_pos (only correct for self-attention fallback)
+            if (!target_hidden) {
+                Kcur = ggml_rope_ext(
+                        ctx0, Kcur, inp_pos, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow
+                        );
+            }
+            // When target_hidden is set, skip RoPE on K for now (positions need special handling)
+            // TODO: create concatenated position tensor for cross-attention K
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -145,7 +180,7 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
 
     ggml_build_forward_expand(gf, cur);
 
-    // DFlash: mark hidden state tensors as graph outputs to prevent buffer reuse
+    // Mark hidden state tensors as graph outputs to prevent buffer reuse
     for (auto * t_hs : res->t_hidden_states) {
         if (t_hs) {
             ggml_build_forward_expand(gf, t_hs);

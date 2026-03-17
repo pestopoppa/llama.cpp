@@ -83,6 +83,9 @@ struct llama_context {
     float * get_hidden_state(int32_t layer_idx);
     int32_t get_hidden_state_count() const;
 
+    // DFlash cross-attention data
+    void set_cross_data(int64_t n_embd, int64_t n_tokens, const float * data);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 

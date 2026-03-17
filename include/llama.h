@@ -1041,6 +1041,14 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // DFlash: Set cross-attention conditioning data (e.g., target model hidden states).
+    // This data will be available to the model's graph builder via the cross structure.
+    // The data is copied to host memory.
+    // n_embd: embedding dimension of the conditioning data
+    // n_tokens: number of tokens in the conditioning sequence
+    // data: pointer to float array of shape [n_embd * n_tokens] (row-major)
+    LLAMA_API void llama_set_cross_data(struct llama_context * ctx, int64_t n_embd, int64_t n_tokens, const float * data);
+
     // DFlash: Get hidden states from a specific layer after the last decode call.
     // Returns a pointer to the hidden state data for the given layer index.
     // Shape: [n_embd * n_tokens] where n_tokens is from the last decode batch.

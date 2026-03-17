@@ -3041,6 +3041,17 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+void llama_set_cross_data(llama_context * ctx, int64_t n_embd, int64_t n_tokens, const float * data) {
+    ctx->set_cross_data(n_embd, n_tokens, data);
+}
+
+void llama_context::set_cross_data(int64_t n_embd_in, int64_t n_tokens_in, const float * data) {
+    cross.n_embd = n_embd_in;
+    cross.n_enc  = n_tokens_in;
+    cross.v_embd.resize(n_embd_in * n_tokens_in);
+    memcpy(cross.v_embd.data(), data, n_embd_in * n_tokens_in * sizeof(float));
+}
+
 float * llama_get_hidden_state(llama_context * ctx, int32_t layer_idx) {
     ctx->synchronize();
     return ctx->get_hidden_state(layer_idx);

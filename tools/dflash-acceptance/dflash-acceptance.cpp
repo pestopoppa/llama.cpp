@@ -153,7 +153,13 @@ int main(int argc, char ** argv) {
                 printf("  fc.weight expects:   %d x %d\n", n_embd_dft, n_taps * n_embd_tgt);
                 printf("  Dimensions match:    %s\n",
                        (n_taps * n_embd_tgt == n_taps * n_embd_dft) ? "YES" : "NO");
-                printf("\n  Hidden state extraction pipeline: VALIDATED\n");
+
+                // Pass conditioning to DFlash drafter
+                printf("\n  Setting cross-attention data on DFlash drafter...\n");
+                llama_set_cross_data(ctx_dft, n_taps * n_embd_tgt, 1, concat_hidden.data());
+                printf("  Cross data set: %d dims x 1 token\n", n_taps * n_embd_tgt);
+
+                printf("  Hidden state extraction pipeline: VALIDATED\n");
             }
         } else {
             printf("  WARNING: No hidden states captured. Target model may not support hidden state extraction.\n");
