@@ -132,6 +132,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_DFLASH,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -536,6 +537,9 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // DFlash conditioning
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
 };
 
 enum llm_tensor_layer {

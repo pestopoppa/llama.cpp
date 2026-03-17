@@ -1139,6 +1139,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                // DFlash drafters may have hidden_size != n_heads*head_dim
+                // key_length and value_length in GGUF override the default n_embd/n_head
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_MAINCODER:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -3900,6 +3907,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 } break;
             case LLM_ARCH_QWEN3:
             case LLM_ARCH_QWEN3VL:
+            case LLM_ARCH_DFLASH:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -3913,6 +3921,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                     // output rerank head
                     cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
+
+                    // DFlash conditioning tensors (only present for DFlash arch)
+                    if (arch == LLM_ARCH_DFLASH) {
+                        // fc: projects concatenated target hidden states to drafter hidden dim
+                        // input dim = n_target_taps * n_embd (stored in GGUF as dflash.n_target_layers)
+                        const int64_t n_target_taps = 5; // TODO: read from GGUF metadata
+                        dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {n_target_taps * n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+                        dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd},                         TENSOR_NOT_REQUIRED);
+                    }
 
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
@@ -8474,6 +8491,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_qwen3>(*this, params);
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                llm = std::make_unique<llm_build_dflash>(*this, params);
+            } break;
         case LLM_ARCH_QWEN3MOE:
             {
                 llm = std::make_unique<llm_build_qwen3moe>(*this, params);
@@ -9101,6 +9122,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

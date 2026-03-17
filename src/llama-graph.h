@@ -666,6 +666,10 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
+    // DFlash hidden state extraction: per-layer outputs at target_layer_ids
+    // Each entry is [n_embd, n_tokens] for the layer output BEFORE the final norm
+    std::vector<ggml_tensor *> t_hidden_states;
+
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;

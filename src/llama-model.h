@@ -492,6 +492,10 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // DFlash conditioning tensors (global, not per-layer)
+    struct ggml_tensor * dflash_fc          = nullptr; // [n_embd, n_target_taps * n_embd]
+    struct ggml_tensor * dflash_hidden_norm = nullptr; // [n_embd]
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

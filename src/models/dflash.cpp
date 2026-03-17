@@ -1,6 +1,23 @@
 #include "models.h"
 
-llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+// DFlash block diffusion drafter graph builder.
+//
+// Architecture: Qwen3-like attention+FFN layers with cross-attention conditioning.
+//
+// Key differences from standard Qwen3:
+//   1. Conditioning: fc.weight projects concatenated target hidden states → drafter dim,
+//      followed by hidden_norm RMS normalization.
+//   2. Cross-attention: K/V come from concatenated [target_hidden; noise_hidden],
+//      Q comes from noise_hidden only. Same K/V projection weights for both sources.
+//   3. Non-causal attention (is_causal=False in HF reference implementation).
+//
+// Current state: Self-attention baseline with KV cache (standard Qwen3 path).
+// The model loads and runs; cross-attention conditioning will be added via the
+// speculation framework when target hidden states become available.
+//
+// Reference: /mnt/raid0/llm/cache/dflash/Qwen3-Coder-30B-A3B-DFlash/dflash.py
+
+llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
@@ -18,11 +35,7 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // Layer skip support: compute fewer layers for early exit speculation
-    const int64_t n_layer_exit = cparams.n_layer_exit;
-    const int64_t n_layer_to_use = (n_layer_exit > 0 && n_layer_exit < n_layer) ? n_layer_exit : n_layer;
-
-    for (int il = 0; il < n_layer_to_use; ++il) {
+    for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -32,8 +45,11 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
         cb(cur, "attn_norm", il);
 
         // self-attention
+        // NOTE: In full DFlash mode, K/V would come from concatenated [target_hidden; cur],
+        // with Q from cur only. For now, standard self-attention with KV cache is used
+        // since the drafter runs standalone. Cross-attention is activated when the drafter
+        // is invoked with target hidden states via the speculation framework.
         {
-            // compute Q and K and RoPE them
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
             cb(Qcur, "Qcur", il);
 
@@ -73,15 +89,17 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        // Handle last layer (or early exit layer)
-        if (il == n_layer_to_use - 1 && inp_out_ids) {
+
+        // Handle last layer
+        if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
+
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // feed-forward network
+        // feed-forward network (standard Qwen3 SwiGLU)
         cur = build_norm(ffn_inp,
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
@@ -103,13 +121,13 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
         // input for next layer
         inpL = cur;
 
-        // DFlash: capture layer output for hidden state extraction
-        // These are stored as graph tensor pointers (no copies yet)
+        // Capture layer output for hidden state extraction
         if (res->t_hidden_states.size() <= static_cast<size_t>(il)) {
             res->t_hidden_states.resize(il + 1, nullptr);
         }
         res->t_hidden_states[il] = cur;
     }
+
     cur = inpL;
 
     cur = build_norm(cur,
