@@ -185,7 +185,38 @@ int main(int argc, char ** argv) {
                     char buf_dft[128];
                     int n_dft = llama_token_to_piece(vocab_dft, token_dft, buf_dft, sizeof(buf_dft), 0, true);
                     printf("  Drafter predicted: %d (%.*s)\n", token_dft, n_dft, buf_dft);
-                    printf("  (with dummy embed/lm_head, output is expected to be garbage)\n");
+
+                    // === Phase 1c: Block-mode test (16 tokens in one batch) ===
+                    printf("\nPhase 1c: DFlash block-mode test (16 tokens)...\n");
+
+                    // Clear drafter KV cache for clean block decode
+                    llama_memory_clear(llama_get_memory(ctx_dft), false);
+
+                    // Re-set conditioning (cleared by memory clear)
+                    llama_set_cross_data(ctx_dft, n_taps * n_embd_tgt, 1, concat_hidden.data());
+
+                    llama_batch block_batch = llama_batch_init(16, 0, 1);
+                    common_batch_add(block_batch, token_dft, 0, {0}, true); // use drafter's prediction as first token
+                    for (int bi = 1; bi < 16; bi++) {
+                        common_batch_add(block_batch, (llama_token)151669, bi, {0}, true); // mask tokens
+                    }
+
+                    int block_ret = llama_decode(ctx_dft, block_batch);
+                    if (block_ret == 0) {
+                        printf("  Block decode: SUCCESS (16 tokens in one forward pass)\n");
+                        // Sample from each position
+                        for (int bi = 0; bi < std::min(5, 15); bi++) {
+                            llama_sampler * s = llama_sampler_init_greedy();
+                            llama_token t = llama_sampler_sample(s, ctx_dft, bi);
+                            llama_sampler_free(s);
+                            char tb[32];
+                            int tn = llama_token_to_piece(vocab, t, tb, sizeof(tb), 0, true);
+                            printf("    pos %d: token %d (%.*s)\n", bi, t, tn, tb);
+                        }
+                    } else {
+                        printf("  Block decode: FAILED (ret=%d)\n", block_ret);
+                    }
+                    llama_batch_free(block_batch);
                 } else {
                     printf("  DFlash drafter decode: FAILED (ret=%d)\n", dft_ret);
                 }

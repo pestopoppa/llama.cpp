@@ -578,12 +578,51 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             }
         }
 
-        // Step 2: Generate draft tokens using the conditioned drafter
-        // Currently uses AR drafting (sequential). Block-mode (16 parallel tokens) is WIP.
-        // AR drafting with conditioning gives ~27% per-token acceptance but 2-7% per-block
-        // because conditioning becomes stale after the first token.
-        // TODO: Implement block-mode (single forward pass over 16 mask tokens)
-        common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+        // Step 2: Block-mode DFlash drafting
+        // Generate all draft tokens in one forward pass (matching the paper's design)
+        result.clear();
+
+        // Clear drafter KV cache — each block is a fresh decode
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        llama_memory_clear(mem_dft, false);
+        prompt_dft.clear();
+
+        const llama_token mask_token = 151669;
+        const int blk_size = std::min(params.n_max, 16);
+
+        // Build batch: id_last at pos 0, mask tokens at pos 1..blk_size-1
+        llama_batch blk_batch = llama_batch_init(blk_size, 0, 1);
+        common_batch_add(blk_batch, id_last, 0, {0}, true);
+        for (int i = 1; i < blk_size; i++) {
+            common_batch_add(blk_batch, mask_token, i, {0}, true);
+        }
+
+        // Single forward pass
+        if (llama_decode(ctx_dft, blk_batch) != 0) {
+            LOG_ERR("%s: DFlash block decode failed\n", __func__);
+            llama_batch_free(blk_batch);
+            // Fall back to AR drafting without conditioning
+            common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+            return;
+        }
+
+        // Sample from each position (pos i predicts token i+1)
+        for (int i = 0; i < blk_size - 1; i++) {
+            common_sampler_reset(smpl);
+            llama_token draft_token = common_sampler_sample(smpl, ctx_dft, i);
+            result.push_back(draft_token);
+        }
+
+        llama_batch_free(blk_batch);
+
+        // Update prompt_dft for KV cache tracking
+        prompt_dft.clear();
+        prompt_dft.push_back(id_last);
+        for (const auto & t : result) {
+            prompt_dft.push_back(t);
+        }
+
+        LOG_DBG("%s: DFlash block drafted %zu tokens\n", __func__, result.size());
     }
 };
 
