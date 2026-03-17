@@ -4,7 +4,8 @@
 //
 // Two modes:
 //   1. Self-attention (no cross data): standard Qwen3 with KV cache
-//   2. Cross-attention (cross data set): fc conditioning + K/V concatenation, no KV cache
+//   2. Cross-attention (cross data set): fc conditioning + K/V concatenation,
+//      direct MHA without KV cache, non-causal (fully permissive) mask
 
 llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -19,16 +20,15 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // Check if cross-attention data is available
     const bool has_cross = cross && !cross->v_embd.empty() && model.dflash_fc;
 
-    // Conditioning: project cross-attention data through fc + hidden_norm
+    // Conditioning projection: cross data → fc → hidden_norm
     ggml_tensor * target_hidden = nullptr;
+    int64_t n_ctx_tokens = 0;
     if (has_cross) {
-        const int64_t n_cross_embd = cross->n_embd;
-        const int64_t n_cross_tokens = cross->n_enc;
+        n_ctx_tokens = cross->n_enc;
 
-        ggml_tensor * cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cross_embd, n_cross_tokens);
+        ggml_tensor * cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd, n_ctx_tokens);
         ggml_set_name(cross_inp, "dflash_cross_inp");
         ggml_set_input(cross_inp);
 
@@ -41,27 +41,28 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
         }
     }
 
-    // Build attention input based on mode
-    // Self-attention mode: use KV cache
-    // Cross-attention mode: use no-cache attention
-    llm_graph_input_attn_kv      * inp_attn_kv = nullptr;
-    llm_graph_input_attn_no_cache * inp_attn_nc = nullptr;
-
-    if (has_cross) {
-        inp_attn_nc = build_attn_inp_no_cache();
-    } else {
+    // Attention input: KV cache for self-attention, none for cross-attention
+    llm_graph_input_attn_kv * inp_attn_kv = nullptr;
+    if (!has_cross) {
         inp_attn_kv = build_attn_inp_kv();
+    }
+
+    // For cross-attention: create non-causal mask (all zeros = fully permissive)
+    ggml_tensor * cross_kq_mask = nullptr;
+    if (has_cross) {
+        const int64_t n_kv = n_ctx_tokens + n_tokens; // K/V sequence length
+        cross_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1, 1);
+        ggml_set_name(cross_kq_mask, "dflash_kq_mask");
+        ggml_set_input(cross_kq_mask);
+        // Will be set to all zeros (fully permissive) during set_inputs
     }
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL,
-                model.layers[il].attn_norm, NULL,
-                LLM_NORM_RMS, il);
+        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // Attention
         {
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
             cb(Qcur, "Qcur", il);
@@ -70,7 +71,7 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
             ggml_tensor * Vcur;
 
             if (has_cross && target_hidden) {
-                // Cross-attention: K/V from concat [target_hidden; cur]
+                // Cross-attention: K/V from [target_hidden; cur]
                 ggml_tensor * Kcur_ctx   = build_lora_mm(model.layers[il].wk, target_hidden);
                 ggml_tensor * Kcur_noise = build_lora_mm(model.layers[il].wk, cur);
                 Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_noise, 1);
@@ -90,11 +91,10 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_kv_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_kv_tokens);
 
-            // QK norms
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
 
-            // RoPE
+            // RoPE on Q (noise positions)
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -105,21 +105,24 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
             }
-            // Cross-attention: skip RoPE on K for now
-            // TODO: concatenated position tensor [ctx_positions; noise_positions]
+            // Cross-attention: skip RoPE on K (positions need special handling)
+            // In the HF code, RoPE is applied after K concatenation with position_ids
+            // covering the full context+noise range. For now, skip RoPE on K for cross-attn.
+            // This may reduce acceptance rate but validates the pipeline.
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
             if (has_cross) {
-                // No-cache attention path
-                cur = build_attn(inp_attn_nc,
-                        model.layers[il].wo, model.layers[il].bo,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                // Direct MHA with non-causal mask — no KV cache
+                cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, cross_kq_mask, nullptr, nullptr,
                         1.0f/sqrtf(float(n_embd_head)), il);
+                cb(cur, "kqv_out", il);
+
+                // O projection
+                cur = build_lora_mm(model.layers[il].wo, cur);
             } else {
-                // KV cache attention path
                 cur = build_attn(inp_attn_kv,
                         model.layers[il].wo, model.layers[il].bo,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
@@ -135,23 +138,19 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        cur = build_norm(ffn_inp,
-                model.layers[il].ffn_norm, NULL,
-                LLM_NORM_RMS, il);
+        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
                 model.layers[il].ffn_up,   NULL, NULL,
                 model.layers[il].ffn_gate, NULL, NULL,
                 model.layers[il].ffn_down, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-
         inpL = cur;
 
         if (res->t_hidden_states.size() <= static_cast<size_t>(il)) {
