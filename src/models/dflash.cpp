@@ -28,10 +28,16 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     if (has_cross) {
         n_ctx_tokens = cross->n_enc;
 
-        ggml_tensor * cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd, n_ctx_tokens);
-        ggml_set_name(cross_inp, "dflash_cross_inp");
-        ggml_set_input(cross_inp);
+        // Register cross data input handler
+        auto inp_cross = std::make_unique<llm_graph_input_dflash_cross>(cross);
+        inp_cross->cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd, n_ctx_tokens);
+        ggml_set_name(inp_cross->cross_inp, "dflash_cross_inp");
+        ggml_set_input(inp_cross->cross_inp);
 
+        ggml_tensor * cross_inp = inp_cross->cross_inp;
+        res->add_input(std::move(inp_cross));
+
+        // fc projection: [n_taps * n_embd, n_tokens] → [n_embd, n_tokens]
         target_hidden = ggml_mul_mat(ctx0, model.dflash_fc, cross_inp);
         cb(target_hidden, "dflash_fc_out", -1);
 

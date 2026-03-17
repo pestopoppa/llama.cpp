@@ -394,6 +394,18 @@ public:
     const llama_kv_cache_iswa_context * mctx;
 };
 
+// DFlash conditioning data input
+class llm_graph_input_dflash_cross : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_cross(const llama_cross * cross) : cross(cross) {}
+    ~llm_graph_input_dflash_cross() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * cross_inp = nullptr; // F32 [n_cross_embd, n_cross_tokens]
+    const llama_cross * cross;
+};
+
 class llm_graph_input_attn_cross : public llm_graph_input_i {
 public:
     llm_graph_input_attn_cross(const llama_cross * cross) : cross(cross) {}

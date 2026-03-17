@@ -501,6 +501,14 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_dflash_cross::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (cross_inp && cross && !cross->v_embd.empty()) {
+        ggml_backend_tensor_set(cross_inp, cross->v_embd.data(), 0,
+            cross->n_embd * cross->n_enc * sizeof(float));
+    }
+}
+
 void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(cross_kq_mask);
 
