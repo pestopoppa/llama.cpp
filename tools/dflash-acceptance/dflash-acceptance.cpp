@@ -160,6 +160,36 @@ int main(int argc, char ** argv) {
                 printf("  Cross data set: %d dims x 1 token\n", n_taps * n_embd_tgt);
 
                 printf("  Hidden state extraction pipeline: VALIDATED\n");
+
+                // === Phase 1b: DFlash drafter decode with conditioning ===
+                printf("\nPhase 1b: DFlash drafter decode with conditioning...\n");
+
+                // The DFlash drafter needs the first accepted token as input
+                // (matching HF: noise_embedding = target.model.embed_tokens(block_output_ids))
+                // Use mask_token_id (151669) as the initial noise token
+
+                llama_batch dft_batch = llama_batch_init(1, 0, 1);
+                const llama_token mask_token = 151669; // DFlash mask token
+                common_batch_add(dft_batch, mask_token, 0, {0}, true);
+
+                int dft_ret = llama_decode(ctx_dft, dft_batch);
+                if (dft_ret == 0) {
+                    printf("  DFlash drafter decode: SUCCESS\n");
+
+                    // Get drafter's prediction
+                    const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
+                    llama_sampler * smpl_dft = llama_sampler_init_greedy();
+                    llama_token token_dft = llama_sampler_sample(smpl_dft, ctx_dft, -1);
+                    llama_sampler_free(smpl_dft);
+
+                    char buf_dft[128];
+                    int n_dft = llama_token_to_piece(vocab_dft, token_dft, buf_dft, sizeof(buf_dft), 0, true);
+                    printf("  Drafter predicted: %d (%.*s)\n", token_dft, n_dft, buf_dft);
+                    printf("  (with dummy embed/lm_head, output is expected to be garbage)\n");
+                } else {
+                    printf("  DFlash drafter decode: FAILED (ret=%d)\n", dft_ret);
+                }
+                llama_batch_free(dft_batch);
             }
         } else {
             printf("  WARNING: No hidden states captured. Target model may not support hidden state extraction.\n");
