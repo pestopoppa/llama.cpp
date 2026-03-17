@@ -174,6 +174,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_TREE,          // tree speculation with draft model (p_split branching)
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block diffusion drafting with target conditioning
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 

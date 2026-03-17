@@ -29,7 +29,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
-    COMMON_SPECULATIVE_TYPE_TREE
+    COMMON_SPECULATIVE_TYPE_TREE,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -41,7 +42,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
-    {"tree",          COMMON_SPECULATIVE_TYPE_TREE}
+    {"tree",          COMMON_SPECULATIVE_TYPE_TREE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -526,6 +528,60 @@ llama_tokens speculation_tree::get_greedy_path() const {
 
     return result;
 }
+
+// --- DFlash speculation state ---
+// DFlash block diffusion drafting with target model conditioning.
+// Reads hidden states from the target context, conditions the DFlash drafter,
+// and generates draft tokens autoregressively.
+
+struct common_speculative_state_dflash : public common_speculative_state_draft {
+    // DFlash target layer IDs (from drafter model config)
+    // TODO: read from GGUF metadata
+    static constexpr int dflash_taps[] = {1, 12, 23, 34, 45};
+    static constexpr int n_taps = 5;
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            const std::vector<std::pair<std::string, std::string>> & replacements)
+        : common_speculative_state_draft(type, ctx_tgt, ctx_dft, replacements) {}
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        // Step 1: Extract hidden states from the target context
+        const int n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
+        const int32_t n_hidden = llama_get_hidden_state_count(ctx_tgt);
+
+        if (n_hidden > 0) {
+            // Concatenate hidden states at target layer IDs
+            std::vector<float> concat_hidden(n_taps * n_embd);
+            bool all_available = true;
+
+            for (int t = 0; t < n_taps; t++) {
+                float * hs = llama_get_hidden_state(ctx_tgt, dflash_taps[t]);
+                if (hs) {
+                    memcpy(concat_hidden.data() + t * n_embd, hs, n_embd * sizeof(float));
+                } else {
+                    all_available = false;
+                    break;
+                }
+            }
+
+            if (all_available) {
+                // Set conditioning on DFlash drafter
+                llama_set_cross_data(ctx_dft, n_taps * n_embd, 1, concat_hidden.data());
+            }
+        }
+
+        // Step 2: Generate draft tokens using the conditioned drafter
+        // Fall through to base class draft which handles the AR generation loop
+        common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+    }
+};
 
 // --- Tree speculation state ---
 // Wraps common_speculative_state_draft and adds p_split tree branching.
@@ -1287,6 +1343,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
         case COMMON_SPECULATIVE_TYPE_TREE:          return "tree";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -1401,7 +1458,18 @@ common_speculative * common_speculative_init(
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
         if (has_draft) {
-            if (params.p_split > 0.0f) {
+            // Check if the draft model is a DFlash drafter (by architecture name)
+            bool is_dflash = false;
+            if (ctx_dft) {
+                char arch_buf[64] = {};
+                llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch_buf, sizeof(arch_buf));
+                is_dflash = (std::string(arch_buf) == "dflash");
+            }
+
+            if (is_dflash) {
+                // DFlash block diffusion drafting
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
+            } else if (params.p_split > 0.0f) {
                 // tree speculation: draft model with p_split branching
                 configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_TREE, params));
             } else {
@@ -1474,6 +1542,15 @@ common_speculative * common_speculative_init(
                     /* .ctx_dft      = */ ctx_dft,
                     /* .replacements = */ params.replacements
                 ));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(config.type,
+                    /* .ctx_tgt      = */ ctx_tgt,
+                    /* .ctx_dft      = */ ctx_dft,
+                    /* .replacements = */ params.replacements
+                ));
+                LOG_INF("%s: DFlash speculation enabled — conditioning from target hidden states\n", __func__);
                 break;
             }
             default:
