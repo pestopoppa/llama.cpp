@@ -578,47 +578,12 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             }
         }
 
-        if (!conditioned) {
-            // No conditioning available — fall back to AR drafting
-            common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
-            return;
-        }
-
-        // Step 2: Block-mode DFlash drafting
-        // Feed block_size tokens (id_last + mask_tokens) to the drafter in one forward pass
-        // This generates all draft tokens in parallel, matching the DFlash paper design
-        result.clear();
-
-        // Clear drafter KV cache for block-mode (each block is independent)
-        auto * mem_dft = llama_get_memory(ctx_dft);
-        llama_memory_clear(mem_dft, false);
-
-        // Create batch with id_last followed by mask tokens
-        const llama_token mask_token = 151669; // DFlash mask token ID
-
-        common_batch_clear(batch);
-        common_batch_add(batch, id_last, 0, {0}, true);
-        for (int i = 1; i < block_size; i++) {
-            common_batch_add(batch, mask_token, i, {0}, true);
-        }
-
-        // Single forward pass through conditioned drafter
-        if (llama_decode(ctx_dft, batch) != 0) {
-            LOG_ERR("%s: DFlash block decode failed\n", __func__);
-            return;
-        }
-
-        // Sample draft tokens from each position
-        // Position 0 (id_last) predicts the first draft token
-        // Position 1..block_size-1 (mask tokens) predict subsequent draft tokens
-        for (int i = 0; i < block_size - 1; i++) {
-            // Sample from position i's logits (predicts token at position i+1)
-            common_sampler_reset(smpl);
-            llama_token draft_token = common_sampler_sample(smpl, ctx_dft, i);
-            result.push_back(draft_token);
-        }
-
-        LOG_DBG("%s: DFlash block drafted %zu tokens (conditioned)\n", __func__, result.size());
+        // Step 2: Generate draft tokens using the conditioned drafter
+        // Currently uses AR drafting (sequential). Block-mode (16 parallel tokens) is WIP.
+        // AR drafting with conditioning gives ~27% per-token acceptance but 2-7% per-block
+        // because conditioning becomes stale after the first token.
+        // TODO: Implement block-mode (single forward pass over 16 mask tokens)
+        common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
     }
 };
 
