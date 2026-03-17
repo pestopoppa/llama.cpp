@@ -503,9 +503,20 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
 void llm_graph_input_dflash_cross::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
+    // Fill cross conditioning data
     if (cross_inp && cross && !cross->v_embd.empty()) {
         ggml_backend_tensor_set(cross_inp, cross->v_embd.data(), 0,
             cross->n_embd * cross->n_enc * sizeof(float));
+    }
+    // Fill K position tensor: [0, 1, ..., n_ctx-1, n_ctx, ..., n_ctx+n_noise-1]
+    if (pos_k && cross) {
+        const int64_t n_ctx = cross->n_enc;
+        const int64_t n_total = n_ctx + n_noise;
+        std::vector<int32_t> positions(n_total);
+        for (int64_t i = 0; i < n_total; i++) {
+            positions[i] = (int32_t)i;
+        }
+        ggml_backend_tensor_set(pos_k, positions.data(), 0, n_total * sizeof(int32_t));
     }
 }
 

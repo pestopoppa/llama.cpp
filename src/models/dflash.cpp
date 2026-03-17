@@ -24,17 +24,24 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
 
     // Conditioning projection: cross data → fc → hidden_norm
     ggml_tensor * target_hidden = nullptr;
+    ggml_tensor * pos_k = nullptr; // K position tensor for cross-attention RoPE
     int64_t n_ctx_tokens = 0;
     if (has_cross) {
         n_ctx_tokens = cross->n_enc;
 
         // Register cross data input handler
-        auto inp_cross = std::make_unique<llm_graph_input_dflash_cross>(cross);
+        auto inp_cross = std::make_unique<llm_graph_input_dflash_cross>(cross, n_tokens);
         inp_cross->cross_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd, n_ctx_tokens);
         ggml_set_name(inp_cross->cross_inp, "dflash_cross_inp");
         ggml_set_input(inp_cross->cross_inp);
 
+        // K position tensor for RoPE: [0..n_ctx+n_noise-1]
+        inp_cross->pos_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ctx_tokens + n_tokens);
+        ggml_set_name(inp_cross->pos_k, "dflash_pos_k");
+        ggml_set_input(inp_cross->pos_k);
+
         ggml_tensor * cross_inp = inp_cross->cross_inp;
+        pos_k = inp_cross->pos_k;
         res->add_input(std::move(inp_cross));
 
         // fc projection: [n_taps * n_embd, n_tokens] → [n_embd, n_tokens]
@@ -100,16 +107,17 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            if (!has_cross) {
-                // Self-attention: RoPE on K with same positions
+            if (has_cross && pos_k) {
+                // Cross-attention: RoPE on K with full [0..n_ctx+n_noise-1] positions
+                Kcur = ggml_rope_ext(ctx0, Kcur, pos_k, nullptr,
+                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, attn_factor, beta_fast, beta_slow);
+            } else {
+                // Self-attention: RoPE on K with same positions as Q
                 Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
             }
-            // Cross-attention: skip RoPE on K (positions need special handling)
-            // In the HF code, RoPE is applied after K concatenation with position_ids
-            // covering the full context+noise range. For now, skip RoPE on K for cross-attn.
-            // This may reduce acceptance rate but validates the pipeline.
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
