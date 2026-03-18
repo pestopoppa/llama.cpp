@@ -1071,6 +1071,12 @@ extern "C" {
             int32_t                   n_tokens,
             float                   * out_embd);
 
+    // Share the output (lm_head) weight tensor from src model to dst model.
+    // Used by DFlash: drafter has dummy output weight, needs target's real lm_head.
+    LLAMA_API void llama_model_share_output_weight(
+            struct llama_model       * model_dst,
+            const struct llama_model * model_src);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

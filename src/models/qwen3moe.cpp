@@ -114,6 +114,8 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         // Only duplicate layers that are needed (ggml_dup forces separate buffer)
         // TODO: make target_layer_ids configurable via hparams/context
         {
+            // HF extract_context_feature adds offset=1 to target_layer_ids [1,12,23,34,45],
+            // so it accesses hidden_states[2,13,24,35,46] = C++ layer outputs {1,12,23,34,45}
             static const int dflash_taps[] = {1, 12, 23, 34, 45};
             for (int t : dflash_taps) {
                 if (il == t) {

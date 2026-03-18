@@ -535,7 +535,8 @@ llama_tokens speculation_tree::get_greedy_path() const {
 // and generates draft tokens autoregressively.
 
 struct common_speculative_state_dflash : public common_speculative_state_draft {
-    // DFlash target layer IDs (from drafter model config)
+    // HF extract_context_feature adds offset=1 to target_layer_ids [1,12,23,34,45],
+    // so it accesses hidden_states[2,13,24,35,46] = C++ layer outputs {1,12,23,34,45}
     // TODO: read from GGUF metadata
     static constexpr int dflash_taps[] = {1, 12, 23, 34, 45};
     static constexpr int n_taps = 5;
@@ -684,6 +685,7 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             llama_token draft_token = common_sampler_sample(smpl, ctx_dft, i);
             result.push_back(draft_token);
         }
+
 
         llama_batch_free(blk_batch);
 
@@ -1591,6 +1593,11 @@ common_speculative * common_speculative_init(
             }
 
             if (is_dflash) {
+                // DFlash drafter uses target's lm_head for final logits
+                // (drafter GGUF has dummy output weight)
+                const llama_model * model_tgt = llama_get_model(ctx_tgt);
+                llama_model_share_output_weight(params.model_dft, model_tgt);
+
                 // DFlash block diffusion drafting
                 configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
             } else if (params.p_split > 0.0f) {

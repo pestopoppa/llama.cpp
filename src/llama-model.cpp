@@ -8935,6 +8935,19 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
+void llama_model_share_output_weight(
+        llama_model       * model_dst,
+        const llama_model * model_src) {
+    GGML_ASSERT(model_src->output != nullptr);
+    model_dst->output   = model_src->output;
+    model_dst->output_b = model_src->output_b;
+    LLAMA_LOG_INFO("%s: shared output weight [%ldx%ld, %s] from target model\n",
+            __func__,
+            (long)model_src->output->ne[0],
+            (long)model_src->output->ne[1],
+            ggml_type_name(model_src->output->type));
+}
+
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }
