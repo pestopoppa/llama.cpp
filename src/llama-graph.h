@@ -553,6 +553,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    int64_t                        cross_n_enc = 0; // snapshot of cross->n_enc at graph build time
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -639,7 +640,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross       == other.cross &&
+            cross_n_enc == other.cross_n_enc;
     }
 };
 

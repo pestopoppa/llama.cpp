@@ -2096,6 +2096,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.cross_n_enc =*/ cross.n_enc,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3079,6 +3080,35 @@ int32_t llama_get_hidden_state_count(llama_context * ctx) {
 
 int32_t llama_get_hidden_state_n_tokens(llama_context * ctx, int32_t layer_idx) {
     return ctx->get_hidden_state_n_tokens(layer_idx);
+}
+
+void llama_model_get_token_embeddings(
+        const llama_model * model,
+        const llama_token * tokens,
+        int32_t             n_tokens,
+        float             * out_embd) {
+    const auto * tok_embd = model->tok_embd;
+    GGML_ASSERT(tok_embd != nullptr);
+
+    const int64_t n_embd = tok_embd->ne[0];
+    const size_t row_size = n_embd * ggml_type_size(tok_embd->type) / ggml_blck_size(tok_embd->type);
+
+    // For quantized embeddings, we need to dequantize row by row
+    if (tok_embd->type == GGML_TYPE_F32) {
+        for (int32_t i = 0; i < n_tokens; i++) {
+            ggml_backend_tensor_get(tok_embd, out_embd + i * n_embd,
+                                    tokens[i] * row_size, row_size);
+        }
+    } else {
+        // Dequantize quantized embeddings to f32
+        std::vector<uint8_t> row_buf(row_size);
+        const auto * type_traits = ggml_get_type_traits(tok_embd->type);
+        for (int32_t i = 0; i < n_tokens; i++) {
+            ggml_backend_tensor_get(tok_embd, row_buf.data(),
+                                    tokens[i] * row_size, row_size);
+            type_traits->to_float(row_buf.data(), out_embd + i * n_embd, n_embd);
+        }
+    }
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

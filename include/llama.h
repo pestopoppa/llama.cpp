@@ -1062,6 +1062,15 @@ extern "C" {
     // DFlash: Get the number of tokens in the hidden state for a given layer.
     LLAMA_API int32_t llama_get_hidden_state_n_tokens(struct llama_context * ctx, int32_t layer_idx);
 
+    // Get token embeddings from the model's embedding table.
+    // Writes n_tokens * n_embd floats to out_embd (row-major: [n_tokens][n_embd]).
+    // Uses ggml_backend_tensor_get to read directly from the tok_embd tensor.
+    LLAMA_API void llama_model_get_token_embeddings(
+            const struct llama_model * model,
+            const llama_token       * tokens,
+            int32_t                   n_tokens,
+            float                   * out_embd);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

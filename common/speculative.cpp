@@ -555,7 +555,10 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
         const int n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
         const int32_t n_hidden = llama_get_hidden_state_count(ctx_tgt);
         const int block_size = std::min(params.n_max, 16); // DFlash block size
-        LOG_INF("%s: n_hidden=%d, n_embd=%d\n", __func__, n_hidden, n_embd);
+        static int dflash_call_count = 0;
+        if (dflash_call_count++ < 5) {
+            fprintf(stderr, "DFLASH: draft() call #%d, n_hidden=%d, n_embd=%d\n", dflash_call_count, n_hidden, n_embd);
+        }
 
         // Step 1: Extract hidden states from target and set conditioning
         // Use ALL tokens from the target's hidden states (not just the last one)
@@ -591,16 +594,23 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
                 if (all_available) {
                     llama_set_cross_data(ctx_dft, n_taps * n_embd, n_ctx_tokens, concat_hidden.data());
                     conditioned = true;
-                    LOG_INF("%s: DFlash conditioned with %d context tokens, cross_dim=%d\n",
-                            __func__, n_ctx_tokens, n_taps * n_embd);
+                    if (dflash_call_count <= 5) {
+                        fprintf(stderr, "DFLASH: conditioned with %d ctx tokens, cross_dim=%d\n",
+                                n_ctx_tokens, n_taps * n_embd);
+                    }
                 } else {
-                    LOG_INF("%s: DFlash hidden states not all available\n", __func__);
+                    if (dflash_call_count <= 5) {
+                        fprintf(stderr, "DFLASH: hidden states not all available\n");
+                    }
                 }
             }
         }
 
         // Fall back to AR drafting when no conditioning
         if (!conditioned) {
+            if (dflash_call_count <= 5) {
+                fprintf(stderr, "DFLASH: FALLBACK to AR drafting (no conditioning)\n");
+            }
             llama_set_cross_data(ctx_dft, 0, 0, nullptr);
             common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
             return;
@@ -619,13 +629,42 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
         // (DFlash blocks are independent — each uses fresh conditioning from target)
         llama_memory_clear(mem_dft, false);
         prompt_dft.clear();
-        const int pos_start = 0;
 
-        // Build batch: id_last + mask tokens, positions continuing from KV cache
-        llama_batch blk_batch = llama_batch_init(blk_size, 0, 1);
-        common_batch_add(blk_batch, id_last, pos_start, {0}, true);
+        // CRITICAL: batch positions must align with pos_k noise positions in dflash.cpp.
+        // pos_k = [0..n_ctx-1, n_ctx..n_ctx+n_noise-1], so noise positions start at n_ctx.
+        // Q uses inp_pos (batch positions), K uses pos_k. For correct RoPE distances
+        // (noise-to-noise distance=0, noise-to-context distance=n_ctx-pos),
+        // batch positions must start at n_ctx_tokens to match K's noise region.
+        const int n_ctx_tokens_from_tgt = llama_get_hidden_state_n_tokens(ctx_tgt, dflash_taps[0]);
+        const int pos_start = n_ctx_tokens_from_tgt;
+        LOG_INF("%s: block positions start at %d (n_ctx=%d)\n", __func__, pos_start, n_ctx_tokens_from_tgt);
+
+        // Build batch with TARGET model embeddings (not token IDs through drafter's dummy table).
+        // The HF code does: noise_embedding = target.model.embed_tokens(block_output_ids)
+        // then passes the float embeddings directly to the drafter's forward().
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        const int n_embd_tgt = llama_model_n_embd(model_tgt);
+
+        // Get token embeddings from the TARGET model's embedding table
+        std::vector<llama_token> block_tokens(blk_size);
+        block_tokens[0] = id_last;
         for (int i = 1; i < blk_size; i++) {
-            common_batch_add(blk_batch, mask_token, pos_start + i, {0}, true);
+            block_tokens[i] = mask_token;
+        }
+
+        std::vector<float> block_embd(blk_size * n_embd_tgt);
+        llama_model_get_token_embeddings(model_tgt, block_tokens.data(), blk_size, block_embd.data());
+
+        // Create batch with float embeddings (embd != 0 → uses embd path, bypasses drafter tok_embd)
+        llama_batch blk_batch = llama_batch_init(blk_size, n_embd_tgt, 1);
+        blk_batch.n_tokens = blk_size;
+        for (int i = 0; i < blk_size; i++) {
+            memcpy(blk_batch.embd + i * n_embd_tgt, block_embd.data() + i * n_embd_tgt,
+                   n_embd_tgt * sizeof(float));
+            blk_batch.pos[i]      = pos_start + i;
+            blk_batch.n_seq_id[i] = 1;
+            blk_batch.seq_id[i][0]= 0;
+            blk_batch.logits[i]   = 1; // output logits for all positions
         }
 
         // Single forward pass
@@ -637,8 +676,10 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             return;
         }
 
-        // Sample from each position (pos i predicts token i+1)
-        for (int i = 0; i < blk_size - 1; i++) {
+        // Sample from positions 1..15 (matching HF: [:, -block_size+1:, :]).
+        // Position 0 is id_last — its logits aren't used. Positions 1..15 predict
+        // the tokens for each block position (what should replace the mask token).
+        for (int i = 1; i < blk_size; i++) {
             common_sampler_reset(smpl);
             llama_token draft_token = common_sampler_sample(smpl, ctx_dft, i);
             result.push_back(draft_token);
