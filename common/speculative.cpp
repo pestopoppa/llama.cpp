@@ -555,6 +555,7 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
         const int n_embd = llama_model_n_embd(llama_get_model(ctx_tgt));
         const int32_t n_hidden = llama_get_hidden_state_count(ctx_tgt);
         const int block_size = std::min(params.n_max, 16); // DFlash block size
+        LOG_INF("%s: n_hidden=%d, n_embd=%d\n", __func__, n_hidden, n_embd);
 
         // Step 1: Extract hidden states from target and set conditioning
         // Use ALL tokens from the target's hidden states (not just the last one)
@@ -590,13 +591,17 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
                 if (all_available) {
                     llama_set_cross_data(ctx_dft, n_taps * n_embd, n_ctx_tokens, concat_hidden.data());
                     conditioned = true;
-                    LOG_DBG("%s: DFlash conditioning with %d context tokens\n", __func__, n_ctx_tokens);
+                    LOG_INF("%s: DFlash conditioned with %d context tokens, cross_dim=%d\n",
+                            __func__, n_ctx_tokens, n_taps * n_embd);
+                } else {
+                    LOG_INF("%s: DFlash hidden states not all available\n", __func__);
                 }
             }
         }
 
-        // Fall back to AR drafting when no conditioning or no KV context
-        if (!conditioned || prompt_dft.empty()) {
+        // Fall back to AR drafting when no conditioning
+        if (!conditioned) {
+            llama_set_cross_data(ctx_dft, 0, 0, nullptr);
             common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
             return;
         }
@@ -610,9 +615,11 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
         const llama_token mask_token = 151669;
         const int blk_size = std::min(params.n_max, 16);
 
-        // Position tracking: continue from where the drafter's KV cache left off
-        // prompt_dft tracks what's in the drafter's KV cache
-        const int pos_start = (int) prompt_dft.size();
+        // Clear KV cache for fresh block decode with conditioning
+        // (DFlash blocks are independent — each uses fresh conditioning from target)
+        llama_memory_clear(mem_dft, false);
+        prompt_dft.clear();
+        const int pos_start = 0;
 
         // Build batch: id_last + mask tokens, positions continuing from KV cache
         llama_batch blk_batch = llama_batch_init(blk_size, 0, 1);

@@ -3055,6 +3055,13 @@ void llama_set_cross_data(llama_context * ctx, int64_t n_embd, int64_t n_tokens,
 }
 
 void llama_context::set_cross_data(int64_t n_embd_in, int64_t n_tokens_in, const float * data) {
+    if (n_embd_in <= 0 || n_tokens_in <= 0 || data == nullptr) {
+        // Clear cross data
+        cross.n_embd = 0;
+        cross.n_enc  = 0;
+        cross.v_embd.clear();
+        return;
+    }
     cross.n_embd = n_embd_in;
     cross.n_enc  = n_tokens_in;
     cross.v_embd.resize(n_embd_in * n_tokens_in);
