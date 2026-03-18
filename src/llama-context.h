@@ -82,6 +82,7 @@ struct llama_context {
     // DFlash hidden state access
     float * get_hidden_state(int32_t layer_idx);
     int32_t get_hidden_state_count() const;
+    int32_t get_hidden_state_n_tokens(int32_t layer_idx) const;
 
     // DFlash cross-attention data
     void set_cross_data(int64_t n_embd, int64_t n_tokens, const float * data);
@@ -283,8 +284,9 @@ private:
 
     // DFlash hidden state extraction: per-layer outputs from target model decode
     // Populated during decode when model has t_hidden_states in graph result
-    // Layout: [n_layers][n_embd * n_outputs] (flattened, n_layers = t_hidden_states.size())
+    // Layout: [n_layers][n_embd * n_tokens] (flattened, n_layers = t_hidden_states.size())
     std::vector<std::vector<float>> hidden_states;
+    std::vector<int32_t> hidden_states_n_tokens; // n_tokens per layer
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

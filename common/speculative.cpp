@@ -557,24 +557,41 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
         const int block_size = std::min(params.n_max, 16); // DFlash block size
 
         // Step 1: Extract hidden states from target and set conditioning
+        // Use ALL tokens from the target's hidden states (not just the last one)
         bool conditioned = false;
         if (n_hidden > 0) {
-            std::vector<float> concat_hidden(n_taps * n_embd);
-            bool all_available = true;
-
+            // Get number of tokens in hidden states (from first available layer)
+            int32_t n_ctx_tokens = 0;
             for (int t = 0; t < n_taps; t++) {
-                float * hs = llama_get_hidden_state(ctx_tgt, dflash_taps[t]);
-                if (hs) {
-                    memcpy(concat_hidden.data() + t * n_embd, hs, n_embd * sizeof(float));
-                } else {
-                    all_available = false;
-                    break;
-                }
+                n_ctx_tokens = llama_get_hidden_state_n_tokens(ctx_tgt, dflash_taps[t]);
+                if (n_ctx_tokens > 0) break;
             }
 
-            if (all_available) {
-                llama_set_cross_data(ctx_dft, n_taps * n_embd, 1, concat_hidden.data());
-                conditioned = true;
+            if (n_ctx_tokens > 0) {
+                // Concatenate hidden states: [n_taps * n_embd, n_ctx_tokens]
+                // Layout: for each token position, concatenate all tap layers
+                std::vector<float> concat_hidden(n_taps * n_embd * n_ctx_tokens);
+                bool all_available = true;
+
+                for (int t = 0; t < n_taps; t++) {
+                    float * hs = llama_get_hidden_state(ctx_tgt, dflash_taps[t]);
+                    if (!hs) { all_available = false; break; }
+
+                    // Copy per-token: for each token, copy this tap's n_embd values
+                    // Input layout: [n_embd, n_tokens] (column-major from ggml)
+                    // Output layout: [n_taps * n_embd, n_tokens] (concatenated per-token)
+                    for (int tok = 0; tok < n_ctx_tokens; tok++) {
+                        memcpy(concat_hidden.data() + tok * n_taps * n_embd + t * n_embd,
+                               hs + tok * n_embd,
+                               n_embd * sizeof(float));
+                    }
+                }
+
+                if (all_available) {
+                    llama_set_cross_data(ctx_dft, n_taps * n_embd, n_ctx_tokens, concat_hidden.data());
+                    conditioned = true;
+                    LOG_DBG("%s: DFlash conditioning with %d context tokens\n", __func__, n_ctx_tokens);
+                }
             }
         }
 

@@ -1059,6 +1059,9 @@ extern "C" {
     // DFlash: Get the number of layers with captured hidden states.
     LLAMA_API int32_t llama_get_hidden_state_count(struct llama_context * ctx);
 
+    // DFlash: Get the number of tokens in the hidden state for a given layer.
+    LLAMA_API int32_t llama_get_hidden_state_n_tokens(struct llama_context * ctx, int32_t layer_idx);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
