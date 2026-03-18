@@ -578,23 +578,30 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
             }
         }
 
+        // Fall back to AR drafting when no conditioning or no KV context
+        if (!conditioned || prompt_dft.empty()) {
+            common_speculative_state_draft::draft(params, prompt_tgt, id_last, result);
+            return;
+        }
+
         // Step 2: Block-mode DFlash drafting
         // Generate all draft tokens in one forward pass (matching the paper's design)
+        // Key differences from AR: don't clear KV cache, use positions continuing from context
         result.clear();
 
-        // Clear drafter KV cache — each block is a fresh decode
         auto * mem_dft = llama_get_memory(ctx_dft);
-        llama_memory_clear(mem_dft, false);
-        prompt_dft.clear();
-
         const llama_token mask_token = 151669;
         const int blk_size = std::min(params.n_max, 16);
 
-        // Build batch: id_last at pos 0, mask tokens at pos 1..blk_size-1
+        // Position tracking: continue from where the drafter's KV cache left off
+        // prompt_dft tracks what's in the drafter's KV cache
+        const int pos_start = (int) prompt_dft.size();
+
+        // Build batch: id_last + mask tokens, positions continuing from KV cache
         llama_batch blk_batch = llama_batch_init(blk_size, 0, 1);
-        common_batch_add(blk_batch, id_last, 0, {0}, true);
+        common_batch_add(blk_batch, id_last, pos_start, {0}, true);
         for (int i = 1; i < blk_size; i++) {
-            common_batch_add(blk_batch, mask_token, i, {0}, true);
+            common_batch_add(blk_batch, mask_token, pos_start + i, {0}, true);
         }
 
         // Single forward pass
@@ -615,14 +622,23 @@ struct common_speculative_state_dflash : public common_speculative_state_draft {
 
         llama_batch_free(blk_batch);
 
-        // Update prompt_dft for KV cache tracking
-        prompt_dft.clear();
+        // Update prompt_dft: add id_last + block tokens to KV cache tracking
+        // After verification, the server will call accept(n_accepted) which should
+        // crop the KV cache. For now, track the full block.
         prompt_dft.push_back(id_last);
         for (const auto & t : result) {
             prompt_dft.push_back(t);
         }
 
-        LOG_DBG("%s: DFlash block drafted %zu tokens\n", __func__, result.size());
+        // Crop KV cache to keep only id_last (matching HF: past_key_values_draft.crop(start))
+        // The accepted tokens become part of the context; rejected block tokens are discarded
+        if (prompt_dft.size() > 1) {
+            llama_memory_seq_rm(mem_dft, 0, pos_start + 1, -1);
+            prompt_dft.resize(pos_start + 1); // keep up to id_last
+        }
+
+        LOG_DBG("%s: DFlash block drafted %zu tokens (pos %d-%d)\n",
+                __func__, result.size(), pos_start, pos_start + blk_size - 1);
     }
 };
 

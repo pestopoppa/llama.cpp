@@ -189,29 +189,39 @@ int main(int argc, char ** argv) {
                     // === Phase 1c: Block-mode test (16 tokens in one batch) ===
                     printf("\nPhase 1c: DFlash block-mode test (16 tokens)...\n");
 
-                    // Clear drafter KV cache for clean block decode
-                    llama_memory_clear(llama_get_memory(ctx_dft), false);
-
-                    // Re-set conditioning (cleared by memory clear)
+                    // DON'T clear KV cache — accumulate context like the HF code
+                    // The single-token decode in Phase 1b already populated the KV cache
+                    // Re-set conditioning for this block
                     llama_set_cross_data(ctx_dft, n_taps * n_embd_tgt, 1, concat_hidden.data());
 
+                    // Positions continue from where the drafter left off
+                    // Phase 1b decoded 1 token at pos 0, so block starts at pos 1
+                    const int block_pos_start = 1;
+
                     llama_batch block_batch = llama_batch_init(16, 0, 1);
-                    common_batch_add(block_batch, token_dft, 0, {0}, true); // use drafter's prediction as first token
+                    // Position 0 of block: the last accepted token (already in KV from Phase 1b)
+                    // Actually, we need to feed the NEXT token to predict. In the HF code:
+                    //   block_output_ids[0] = last_accepted, block_output_ids[1:] = mask
+                    // The drafter sees the accepted token + masks and predicts for positions 1..15
+                    common_batch_add(block_batch, token_dft, block_pos_start, {0}, true);
                     for (int bi = 1; bi < 16; bi++) {
-                        common_batch_add(block_batch, (llama_token)151669, bi, {0}, true); // mask tokens
+                        common_batch_add(block_batch, (llama_token)151669, block_pos_start + bi, {0}, true);
                     }
 
                     int block_ret = llama_decode(ctx_dft, block_batch);
                     if (block_ret == 0) {
-                        printf("  Block decode: SUCCESS (16 tokens in one forward pass)\n");
-                        // Sample from each position
-                        for (int bi = 0; bi < std::min(5, 15); bi++) {
+                        printf("  Block decode: SUCCESS (16 tokens, pos %d-%d)\n",
+                               block_pos_start, block_pos_start + 15);
+                        // Sample from each position — compare with target
+                        // Get target's next tokens for comparison
+                        printf("  Draft vs Target (first 8 positions):\n");
+                        for (int bi = 0; bi < std::min(8, 15); bi++) {
                             llama_sampler * s = llama_sampler_init_greedy();
                             llama_token t = llama_sampler_sample(s, ctx_dft, bi);
                             llama_sampler_free(s);
                             char tb[32];
                             int tn = llama_token_to_piece(vocab, t, tb, sizeof(tb), 0, true);
-                            printf("    pos %d: token %d (%.*s)\n", bi, t, tn, tb);
+                            printf("    pos %d: draft=%d (%.*s)\n", bi, t, tn, tb);
                         }
                     } else {
                         printf("  Block decode: FAILED (ret=%d)\n", block_ret);
