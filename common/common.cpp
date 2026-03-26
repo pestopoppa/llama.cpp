@@ -1427,6 +1427,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kv_hadamard = params.kv_hadamard;
+    cparams.n_kv_recent = params.n_kv_recent;
 
     // Set paged attention environment variables if CLI flags are used
     // This allows CLI flags to override any existing env vars

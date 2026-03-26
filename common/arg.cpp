@@ -386,6 +386,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_POLAR_Q4,
+    GGML_TYPE_TURBO_Q3,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2001,6 +2003,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-hadamard"},
+        "apply Walsh-Hadamard Transform to KV cache before quantization (improves q4 quality)",
+        [](common_params & params) {
+            params.kv_hadamard = true;
+        }
+    ).set_env("LLAMA_ARG_KV_HADAMARD"));
+    add_opt(common_arg(
+        {"--kv-recent"}, "N",
+        "hybrid buffer: keep N most recent K tokens at f16, compress rest (default: 128 when using turbo_q3)",
+        [](common_params & params, int value) {
+            params.n_kv_recent = (uint32_t)value;
+        }
+    ).set_env("LLAMA_ARG_KV_RECENT"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

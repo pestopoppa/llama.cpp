@@ -9,6 +9,8 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-polar-quant.h"
+#include "ggml-turbo-quant.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -895,6 +897,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 0,
         .type_size                = 0,
         .is_quantized             = false,
+    },
+    [GGML_TYPE_POLAR_Q4] = {
+        .type_name                = "polar_q4",
+        .blck_size                = QK_POLAR,
+        .type_size                = sizeof(block_polar_q4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_polar_q4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_polar_q4_ref,
+    },
+    [GGML_TYPE_TURBO_Q3] = {
+        .type_name                = "turbo_q3",
+        .blck_size                = QK_TURBO,
+        .type_size                = sizeof(block_turbo_q3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_q3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_q3_ref,
     },
 };
 

@@ -20,6 +20,7 @@ struct llama_cparams;
 
 struct llama_memory_context_i;
 
+class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -316,6 +317,10 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // Hybrid precision: if non-null, old K/V data lives here (compressed)
+    const llama_kv_cache * kv_old = nullptr;
+    uint32_t n_kv_old = 0;
 };
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
@@ -444,6 +449,8 @@ struct llm_graph_params {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    const llama_kv_cache         * kv_old = nullptr; // hybrid precision: old compressed K/V
+    uint32_t                       n_kv_old = 0;     // number of evicted cells in kv_old
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -651,6 +658,8 @@ struct llm_graph_context {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    const llama_kv_cache         * kv_old;   // hybrid precision old cache (nullable)
+    uint32_t                       n_kv_old; // number of evicted cells
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -841,6 +850,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+
+    // Hadamard smoothing for KV cache quantization
+    ggml_tensor * build_hadamard(ggml_tensor * a) const;
 
     //
     // recurrent

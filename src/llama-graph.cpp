@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-hadamard.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -390,7 +391,43 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (n_kv_old > 0) {
+        // Hybrid precision: expanded mask [n_kv_old + n_kv_recent, n_tokens, ...]
+        // Concat layout: [old K (indices 0..n_kv_old-1), recent K (indices n_kv_old..n_kv_total-1)]
+        // Fill: old portion = -inf (masked), recent portion = normal causal mask
+
+        const uint32_t n_kv_total  = self_kq_mask->ne[0];
+
+        // 1. Fill entire mask with -inf
+        float * data = (float *)self_kq_mask->data;
+        const uint32_t total_elements = ggml_nelements(self_kq_mask);
+        for (uint32_t i = 0; i < total_elements; i++) {
+            data[i] = -INFINITY;
+        }
+
+        // 2. Fill recent portion: let set_input_kq_mask fill a temporary,
+        //    then copy to the right offset in the expanded mask
+        //    For simplicity: just call it on self_kq_mask and accept that
+        //    it fills indices [0, n_kv_recent) — then shift right.
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        // 3. Shift: move [0, n_kv_recent) data to [n_kv_old, n_kv_total)
+        //    and fill [0, n_kv_old) with -inf
+        const uint32_t n_kv_recent = mctx->get_n_kv();
+        const uint32_t n_rows      = total_elements / n_kv_total;
+
+        for (uint32_t row = n_rows; row-- > 0; ) { // reverse to avoid overwrite
+            float * row_data = data + row * n_kv_total;
+            // Move recent data from [0, n_kv_recent) to [n_kv_old, n_kv_old+n_kv_recent)
+            memmove(row_data + n_kv_old, row_data, n_kv_recent * sizeof(float));
+            // Fill old portion with -inf
+            for (uint32_t j = 0; j < n_kv_old; j++) {
+                row_data[j] = -INFINITY;
+            }
+        }
+    } else {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (self_block_table != nullptr) {
         mctx->set_input_block_table(self_block_table);
@@ -407,7 +444,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= self_kq_mask->ne[0] == mctx->get_n_kv();
+    // For hybrid precision, mask spans n_kv_old + n_kv_recent
+    const int64_t expected_n_kv = mctx->get_n_kv() + (int64_t)n_kv_old;
+    res &= self_kq_mask->ne[0] == expected_n_kv;
     res &= self_kq_mask->ne[1] == params.ubatch.n_tokens;
 
     return res;
@@ -723,6 +762,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
+    kv_old           (params.kv_old),
+    n_kv_old         (params.n_kv_old),
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1507,6 +1548,10 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+ggml_tensor * llm_graph_context::build_hadamard(ggml_tensor * a) const {
+    return ggml_map_custom1(ctx0, a, ggml_hadamard_custom_op, GGML_N_TASKS_MAX, nullptr);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -1581,6 +1626,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #endif
         }
 
+        // Hadamard inverse on flash attention output (dim0 = n_embd_head_v)
+        if (cparams.kv_hadamard && !v_mla) {
+            cur = build_hadamard(cur);
+        }
+
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
@@ -1637,6 +1687,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+
+        // Hadamard inverse on non-flash attention output (dim0 = n_embd_head_v)
+        if (cparams.kv_hadamard && !v_mla) {
+            cur = ggml_cont(ctx0, cur);
+            cur = build_hadamard(cur);
+        }
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
@@ -1766,6 +1822,30 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
+    // Hybrid precision: expand mask and set kv_old
+    if (kv_old) {
+        inp->kv_old = kv_old;
+        inp->n_kv_old = n_kv_old; // from graph_params, set by get_hybrid_n_evicted()
+
+        if (inp->n_kv_old > 0) {
+            // Expand the kq_mask to span [n_kv_old + n_kv_recent, n_tokens/n_stream, 1, n_stream]
+            // The original mask covers [n_kv_recent, ...]. We prepend n_kv_old columns.
+            const auto n_kv_recent = mctx_cur->get_n_kv();
+            const auto n_kv_total  = inp->n_kv_old + n_kv_recent;
+            const auto n_tokens    = ubatch.n_tokens;
+            const auto n_stream    = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+            // Replace the mask with an expanded one
+            inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_total, n_tokens/n_stream, 1, n_stream);
+            ggml_set_input(inp->self_kq_mask);
+            inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+            // Note: set_input callback needs to fill the old portion with -inf (masked)
+            // since kv_old cells have no valid position data yet (no eviction).
+            // When eviction is implemented, the mask will use kv_old's cell positions.
+        }
+    }
+
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
@@ -1790,6 +1870,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // Hadamard smoothing: transform K and V before quantized storage
+    if (cparams.kv_hadamard) {
+        k_cur = build_hadamard(k_cur);
+        cb(k_cur, "k_hadamard", il);
+        v_cur = build_hadamard(v_cur);
+        cb(v_cur, "v_hadamard", il);
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
@@ -1801,9 +1889,108 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask();
 
+    // Hadamard smoothing: transform Q to match K domain (H·Q · (H·K)^T = Q·K^T)
     ggml_tensor * q = q_cur;
+    if (cparams.kv_hadamard) {
+        q = build_hadamard(q);
+        cb(q, "q_hadamard", il);
+    }
+
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // Hybrid precision: split attention (exact on recent, dequant on old)
+    if (inp->kv_old && inp->n_kv_old > 0) {
+        ggml_tensor * k_old_raw = inp->kv_old->get_k_tensor(il);
+        ggml_tensor * v_old_raw = inp->kv_old->get_v_tensor(il);
+
+        if (k_old_raw && v_old_raw) {
+            const uint64_t kv_size_old    = inp->kv_old->get_size();
+            const uint64_t n_embd_k_gqa_l = k_old_raw->ne[0];
+            const uint64_t n_embd_v_gqa_l = v_old_raw->ne[0];
+            const uint32_t n_kv_old_l     = inp->n_kv_old;
+
+            // 4D views of old K and V
+            ggml_tensor * k_old = ggml_view_4d(ctx0, k_old_raw,
+                    hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv_old_l, 1,
+                    ggml_row_size(k_old_raw->type, hparams.n_embd_head_k),
+                    ggml_row_size(k_old_raw->type, n_embd_k_gqa_l),
+                    ggml_row_size(k_old_raw->type, n_embd_k_gqa_l * kv_size_old),
+                    0);
+
+            ggml_tensor * v_old = ggml_view_4d(ctx0, v_old_raw,
+                    hparams.n_embd_head_v, hparams.n_head_kv(il), n_kv_old_l, 1,
+                    ggml_row_size(v_old_raw->type, hparams.n_embd_head_v),
+                    ggml_row_size(v_old_raw->type, n_embd_v_gqa_l),
+                    ggml_row_size(v_old_raw->type, n_embd_v_gqa_l * kv_size_old),
+                    0);
+
+            // Split attention: non-flash path (matmul based)
+            // 1. QK scores for recent K (exact, f16)
+            ggml_tensor * kq_recent = ggml_mul_mat(ctx0, k, q);
+            ggml_mul_mat_set_prec(kq_recent, GGML_PREC_F32);
+            cb(kq_recent, "kq_recent", il);
+
+            // 2. QK scores for old K (dequant to f32, then matmul)
+            ggml_tensor * k_old_f32 = ggml_cast(ctx0, k_old, GGML_TYPE_F32);
+            ggml_tensor * kq_old = ggml_mul_mat(ctx0, k_old_f32, q);
+            ggml_mul_mat_set_prec(kq_old, GGML_PREC_F32);
+            cb(kq_old, "kq_old", il);
+
+            // 3. Concat scores: [kq_old, kq_recent] along KV dimension (dim 0)
+            // kq shape: [n_kv, n_tokens, n_head, 1]
+            // concat along dim 0 gives [n_kv_old + n_kv_recent, n_tokens, n_head, 1]
+            ggml_tensor * kq = ggml_concat(ctx0, kq_old, kq_recent, 0);
+            cb(kq, "kq_hybrid", il);
+
+            // 4. Scale + softmax with combined mask
+            kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+            cb(kq, "kq_soft_max", il);
+
+            // 5. V weighted sum: need combined V [v_old, v_recent]
+            // Transpose V for matmul: V needs to be [n_kv, n_embd_head_v, ...]
+            ggml_tensor * v_old_f32 = ggml_cast(ctx0, v_old, GGML_TYPE_F32);
+            ggml_tensor * v_recent_f32 = ggml_cast(ctx0, v, GGML_TYPE_F32);
+
+            // V is [n_embd_head_v, n_head_kv, n_kv, 1] — transpose to [n_kv, n_embd_head_v, n_head_kv, 1]
+            ggml_tensor * v_old_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_old_f32));
+            ggml_tensor * v_recent_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_recent_f32));
+
+            // Concat transposed V along dim 0 (n_kv): [n_kv_old+n_kv_recent, n_embd_head_v, ...]
+            ggml_tensor * v_combined_t = ggml_concat(ctx0, v_old_t, v_recent_t, 0);
+
+            // KQV = softmax(QK) × V
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_combined_t, kq);
+            cb(kqv, "kqv_hybrid", il);
+
+            // Permute + reshape to 2D (same as non-flash path)
+            ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+
+            if (cparams.kv_hadamard && !v_mla) {
+                cur = ggml_cont(ctx0, cur);
+                cur = build_hadamard(cur);
+            }
+
+            cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            cb(cur, "kqv_out", il);
+
+            if (!cparams.offload_kqv) {
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+            }
+
+            ggml_build_forward_expand(gf, cur);
+
+            // Skip the normal build_attn_mha path — go directly to wo projection
+            if (wo) {
+                cur = build_lora_mm(wo, cur);
+                if (wo_b) {
+                    cur = ggml_add(ctx0, cur, wo_b);
+                }
+            }
+
+            return cur;
+        }
+    }
 
     ggml_tensor * block_table = inp->get_block_table();
     int32_t block_size = block_table ? mctx_cur->get_block_size() : 0;
@@ -1856,6 +2043,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
+    // Hadamard smoothing: transform K and V before quantized storage
+    if (cparams.kv_hadamard && k_cur) {
+        k_cur = build_hadamard(k_cur);
+        cb(k_cur, "k_hadamard", il);
+    }
+    if (cparams.kv_hadamard && v_cur) {
+        v_cur = build_hadamard(v_cur);
+        cb(v_cur, "v_hadamard", il);
+    }
+
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
@@ -1871,7 +2068,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
+    // Hadamard smoothing: transform Q to match K domain
     ggml_tensor * q = q_cur;
+    if (cparams.kv_hadamard) {
+        q = build_hadamard(q);
+        cb(q, "q_hadamard", il);
+    }
+
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 

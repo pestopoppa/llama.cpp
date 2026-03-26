@@ -150,8 +150,15 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_used()     const; // number of occupied cells (stream 0)
 
     bool get_has_shift() const;
+
+    // Hybrid precision buffer support: expose internals for CPU-side eviction
+    llama_kv_cells       & get_cells(uint32_t stream = 0)       { return v_cells[stream]; }
+    const llama_kv_cells & get_cells(uint32_t stream = 0) const { return v_cells[stream]; }
+    ggml_tensor * get_k_tensor(int32_t il) const;
+    ggml_tensor * get_v_tensor(int32_t il) const;
 
     //
     // graph_build API

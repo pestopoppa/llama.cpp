@@ -8,6 +8,8 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-polar-quant.h"
+#include "ggml-turbo-quant.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -383,6 +385,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    [GGML_TYPE_POLAR_Q4] = {
+        .from_float               = (ggml_from_float_t) quantize_row_polar_q4_ref,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO_Q3] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_q3_ref,
+        .nrows                    = 1,
     },
 };
 

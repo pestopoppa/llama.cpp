@@ -20,6 +20,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+class llama_kv_cache;
 
 // "memory" as in physical memory for a buffer type, in bytes
 struct llama_memory_breakdown_data {
@@ -57,6 +58,10 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    // returns kv_old from hybrid precision cache, or nullptr if not hybrid
+    const llama_kv_cache * get_hybrid_kv_old() const;
+    uint32_t get_hybrid_n_evicted() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);

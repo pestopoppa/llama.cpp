@@ -372,6 +372,9 @@ extern "C" {
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
+        bool kv_hadamard; // apply Walsh-Hadamard Transform to KV cache before quantization [EXPERIMENTAL]
+                          // smooths outlier magnitudes, improving q4_0 quality to match f16
+        uint32_t n_kv_recent; // hybrid buffer: N most recent K tokens at f16, rest compressed [EXPERIMENTAL]
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363

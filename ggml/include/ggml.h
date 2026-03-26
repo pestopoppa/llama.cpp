@@ -427,7 +427,9 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        GGML_TYPE_POLAR_Q4 = 40, // PolarQuant ~3.1 bits (KV cache)
+        GGML_TYPE_TURBO_Q3 = 41, // TurboQuant ~3.5 bits (PolarQuant + QJL, KV cache)
+        GGML_TYPE_COUNT   = 42,
     };
 
     // precision

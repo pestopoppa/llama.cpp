@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "llama-arch.h"
+#include "llama-kv-cache-hybrid-prec.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -145,7 +146,9 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
-    cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.flash_attn    = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.kv_hadamard   = params.kv_hadamard;
+    cparams.n_kv_recent   = params.n_kv_recent;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -584,6 +587,19 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+const llama_kv_cache * llama_context::get_hybrid_kv_old() const {
+    auto * hybrid = dynamic_cast<llama_kv_cache_hybrid_prec *>(memory.get());
+    if (hybrid && hybrid->get_n_evicted() > 0) {
+        return hybrid->get_old();
+    }
+    return nullptr;
+}
+
+uint32_t llama_context::get_hybrid_n_evicted() const {
+    auto * hybrid = dynamic_cast<llama_kv_cache_hybrid_prec *>(memory.get());
+    return hybrid ? hybrid->get_n_evicted() : 0;
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -2042,6 +2058,8 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ &cvec,
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
+        /*.kv_old      =*/ get_hybrid_kv_old(),
+        /*.n_kv_old    =*/ get_hybrid_n_evicted(),
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2927,6 +2945,8 @@ llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
+        /*.kv_hadamard                 =*/ false,
+        /*.n_kv_recent                 =*/ 0, // 0 = disabled (auto: 128 when turbo_q3)
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
@@ -2981,6 +3001,8 @@ llama_context * llama_init_from_model(
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
         return nullptr;
     }
+
+    // PolarQuant initialization is lazy — happens on first quantize/dequantize call
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
         params.pooling_type != model->hparams.pooling_type) {

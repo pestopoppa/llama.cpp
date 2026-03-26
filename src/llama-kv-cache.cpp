@@ -1088,6 +1088,28 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_used() const {
+    uint32_t total = 0;
+    for (uint32_t s = 0; s < n_stream; s++) {
+        total += v_cells[s].get_used();
+    }
+    return total;
+}
+
+ggml_tensor * llama_kv_cache::get_k_tensor(int32_t il) const {
+    for (const auto & layer : layers) {
+        if ((int32_t)layer.il == il) return layer.k;
+    }
+    return nullptr;
+}
+
+ggml_tensor * llama_kv_cache::get_v_tensor(int32_t il) const {
+    for (const auto & layer : layers) {
+        if ((int32_t)layer.il == il) return layer.v;
+    }
+    return nullptr;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

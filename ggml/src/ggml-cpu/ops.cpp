@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-turbo-quant.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "ggml.h"
@@ -8088,13 +8089,20 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
-    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
-    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    const bool k_is_qjl = (k->type == GGML_TYPE_TURBO_Q3);
 
-    GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
-    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+    ggml_type         k_vec_dot_type = GGML_TYPE_F32;
+    ggml_from_float_t q_to_vec_dot   = NULL;
+    ggml_vec_dot_t    kq_vec_dot     = NULL;
+    ggml_to_float_t   v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    if (!k_is_qjl) {
+        k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+        q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+        kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+        GGML_ASSERT((q_to_vec_dot) && "fattn: unsupported K-type");
+    }
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float) && "fattn: unsupported V-type");
 
     int ith = params->ith;
 
@@ -8133,7 +8141,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+
+        // QJL: project query once via JL matrix
+        uint8_t qjl_q_signs[TURBO_SKETCH_DIM / 8];
+        float   qjl_q_sketch[TURBO_SKETCH_DIM];
+        if (k_is_qjl) {
+            turbo_qjl_project_query(pq, qjl_q_signs, qjl_q_sketch);
+        } else {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8147,7 +8163,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (k_is_qjl) {
+                s = turbo_qjl_score_projected(qjl_q_signs, qjl_q_sketch, pq, (const block_turbo_q3 *)k_data);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8428,13 +8448,20 @@ static void ggml_compute_forward_flash_attn_ext_paged_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
-    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
-    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    const bool k_is_qjl = (k->type == GGML_TYPE_TURBO_Q3);
 
-    GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
-    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+    ggml_type         k_vec_dot_type = GGML_TYPE_F32;
+    ggml_from_float_t q_to_vec_dot   = NULL;
+    ggml_vec_dot_t    kq_vec_dot     = NULL;
+    ggml_to_float_t   v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    if (!k_is_qjl) {
+        k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+        q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+        kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+        GGML_ASSERT((q_to_vec_dot) && "fattn: unsupported K-type");
+    }
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float) && "fattn: unsupported V-type");
 
     int ith = params->ith;
 

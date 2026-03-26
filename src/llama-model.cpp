@@ -7,6 +7,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-hybrid-prec.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
@@ -7457,6 +7458,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 nullptr,
                                 reuse);
+                    } else if (params.type_k == GGML_TYPE_TURBO_Q3 && cparams.n_kv_recent > 0) {
+                        // Hybrid precision buffer: recent tokens at f16, old at turbo_q3
+                        GGML_ASSERT(!hparams.is_swa_any());
+
+                        res = new llama_kv_cache_hybrid_prec(
+                                *this,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_kv_recent,
+                                cparams.n_seq_max,
+                                cparams.n_ubatch,
+                                1);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
