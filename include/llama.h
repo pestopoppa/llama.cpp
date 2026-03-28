@@ -382,6 +382,8 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
+        bool skip_recurrent; // skip recurrent layers entirely — attention-only forward pass (for draft context)
+
         // Layer skipping for speculative decoding (Track 7/9)
         int32_t n_layer_exit;  // exit after this many layers, 0 = compute all layers (default)
                                // use for early exit / layer skip speculation
@@ -785,6 +787,15 @@ extern "C" {
     // Free a checkpoint handle
     LLAMA_API void llama_memory_checkpoint_free(struct llama_memory_checkpoint * cp);
 
+    // Clone a recurrent cell: give dst_seq_id its own cell with tensor data
+    // copied from src_seq_id's cell. Used to split shared cells created by
+    // seq_cp() so that tree paths have independent recurrent state.
+    // Returns false if src has no cell or no free cells available.
+    LLAMA_API bool llama_memory_recurrent_clone_cell(
+        llama_memory_t mem,
+        llama_seq_id   src_seq_id,
+        llama_seq_id   dst_seq_id);
+
     //
     // State / sessions
     //
@@ -965,6 +976,15 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // MTP-only evaluation: runs just the MTP head on a single token
+    // using the cached hidden state from the previous llama_decode() call.
+    // Produces MTP logits available via llama_get_logits_mtp().
+    // Does NOT update KV cache or recurrent state.
+    // Returns 0 on success, negative on error.
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+                     llama_token   token);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1018,6 +1038,11 @@ extern "C" {
     // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // MTP (Multi-Token Prediction) logits for models with nextn_predict_layers > 0
+    // Returns NULL if the model has no MTP head
+    LLAMA_API float * llama_get_logits_mtp    (struct llama_context * ctx);
+    LLAMA_API float * llama_get_logits_mtp_ith(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

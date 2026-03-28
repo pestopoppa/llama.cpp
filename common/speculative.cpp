@@ -1359,7 +1359,7 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.mparams_dft.path.empty();
+        bool has_draft = params.model_dft != nullptr;
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);

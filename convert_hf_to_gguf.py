@@ -4851,6 +4851,48 @@ class Qwen3_5TextModel(_LinearAttentionVReorderBase):
 class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+        if n_mtp > 0:
+            self.block_count = self.hparams["num_hidden_layers"] + n_mtp
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+        if n_mtp > 0:
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+        if n_mtp > 0 and name.startswith("mtp."):
+            n_main = self.hparams["num_hidden_layers"]
+            if "layers." in name:
+                # mtp.layers.{bid}.* → model.layers.{bid + n_main}.*
+                new_bid = (bid or 0) + n_main
+                name = name.replace(f"mtp.layers.{bid}", f"model.layers.{new_bid}")
+                yield from super().modify_tensors(data_torch, name, new_bid)
+                return
+            else:
+                # Shared MTP tensors → replicate to all MTP layer positions
+                remapper = {
+                    "mtp.fc": "model.layers.{bid}.eh_proj",
+                    "mtp.pre_fc_norm_embedding": "model.layers.{bid}.enorm",
+                    "mtp.pre_fc_norm_hidden": "model.layers.{bid}.hnorm",
+                    "mtp.norm": "model.layers.{bid}.shared_head.norm",
+                }
+                _n = Path(name)
+                key = _n.stem
+                if key not in remapper:
+                    return  # unknown MTP tensor
+                new_name = remapper[key] + _n.suffix
+                for b in range(n_main, self.block_count):
+                    yield from super().modify_tensors(data_torch, new_name.format(bid=b), b)
+                return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
 
 @ModelBase.register("GPT2LMHeadModel")
 class GPT2Model(TextModel):

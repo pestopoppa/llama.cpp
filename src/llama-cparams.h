@@ -38,6 +38,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool freeze_recurrent; // skip SSM state writes during decode (for frozen-state speculation)
+    bool skip_recurrent;   // skip recurrent layers entirely during forward pass (attention-only draft)
 
     // MoE self-drafting: override n_expert_used
     // 0 = use model default, 1+ = force exactly N active experts

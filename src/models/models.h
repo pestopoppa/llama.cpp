@@ -584,6 +584,10 @@ private:
 struct llm_build_qwen35moe : public llm_build_delta_net_base {
     llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params);
 private:
+    // Build MTP head: enorm(embd) + hnorm(cached_hidden) → concat → eh_proj → transformer → LM head
+    // In MTP_EVAL mode: sets res->t_logits. In normal mode: sets res->t_logits_mtp.
+    void build_mtp_head(ggml_tensor * mtp_embd, int n_main_layers);
+
     ggml_tensor * build_layer_attn(
     llm_graph_input_attn_kv * inp_attn,
                 ggml_tensor * cur,

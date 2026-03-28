@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
@@ -7,6 +8,22 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     const int64_t n_embd_head = hparams.n_embd_head_v;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+    const int n_main_layers = n_layer - (int)hparams.nextn_predict_layers;
+
+    // === MTP-only evaluation mode ===
+    // Skip main transformer, only run MTP head on a single token.
+    // Used for draft generation in speculation loop.
+    if (gtype == LLM_GRAPH_TYPE_MTP_EVAL) {
+        GGML_ASSERT(hparams.nextn_predict_layers > 0);
+        GGML_ASSERT(mtp_hidden_valid);
+
+        ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+
+        build_mtp_head(inpL, n_main_layers);
+        return;
+    }
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -18,12 +35,22 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
 
     cb(inpL, "model.input_embed", -1);
 
+    // Save initial embedding for MTP
+    ggml_tensor * mtp_embd = (hparams.nextn_predict_layers > 0) ? inpL : nullptr;
+
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // Main transformer layers (exclude MTP layers)
+
+    for (int il = 0; il < n_main_layers; ++il) {
+        // Attention-only draft: skip recurrent layers entirely (pass input through)
+        if (cparams.skip_recurrent && hparams.is_recurrent(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -40,7 +67,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_main_layers - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -69,6 +96,14 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     }
     cur = inpL;
 
+    // Save the last hidden state (pre-norm) for MTP
+    ggml_tensor * main_hidden = cur;
+
+    // Filter MTP embedding by output ids
+    if (mtp_embd && inp_out_ids) {
+        mtp_embd = ggml_get_rows(ctx0, mtp_embd, inp_out_ids);
+    }
+
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
@@ -82,6 +117,163 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // Export pre-norm hidden state for MTP caching (used by NEXT decode step)
+    if (hparams.nextn_predict_layers > 0) {
+        res->t_mtp_hidden_out = main_hidden;
+        ggml_build_forward_expand(gf, main_hidden);
+    }
+
+    // === In-graph MTP-1 Forward Pass ===
+    // Predicts the next token from CACHED hidden state (previous step) + current token embedding
+    // Used for acceptance rate measurement; for speculation, use LLM_GRAPH_TYPE_MTP_EVAL instead
+    // Skip when batch has multiple tokens (cached hidden is [n_embd, 1], can't broadcast)
+    if (hparams.nextn_predict_layers > 0 && mtp_hidden_valid && n_outputs <= 1) {
+        build_mtp_head(mtp_embd, n_main_layers);
+    }
+}
+
+void llm_build_qwen35moe::build_mtp_head(ggml_tensor * mtp_embd, int n_main_layers) {
+    const int64_t n_embd_head = hparams.n_embd_head_v;
+    const int mtp_il = n_main_layers; // MTP layer index
+    const auto & mtp_layer = model.layers[mtp_il];
+
+    // Get cached hidden state from previous decode step
+    auto * inp_mtp = build_inp_mtp_hidden();
+    ggml_tensor * cached_hidden = inp_mtp->hidden_prev;
+
+    // Step 1: Normalize embedding and hidden state, concatenate, project
+    ggml_tensor * embd_normed = build_norm(mtp_embd,     mtp_layer.nextn.enorm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(embd_normed, "mtp_enorm", mtp_il);
+
+    ggml_tensor * h_normed    = build_norm(cached_hidden, mtp_layer.nextn.hnorm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(h_normed, "mtp_hnorm", mtp_il);
+
+    // Concatenate along embedding dimension: [2*n_embd, n_mtp_tokens]
+    ggml_tensor * combined = ggml_concat(ctx0, embd_normed, h_normed, 0);
+    cb(combined, "mtp_combined", mtp_il);
+
+    // Project down: [2*n_embd, n_mtp_tokens] -> [n_embd, n_mtp_tokens]
+    ggml_tensor * mtp_cur = build_lora_mm(mtp_layer.nextn.eh_proj, combined);
+    cb(mtp_cur, "mtp_projected", mtp_il);
+
+    const int64_t n_mtp_tokens = mtp_cur->ne[1];
+
+    // Step 2: MTP transformer layer — full attention (gated Q) + MoE
+    ggml_tensor * mtp_attn_in = build_norm(mtp_cur, mtp_layer.attn_norm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(mtp_attn_in, "mtp_attn_norm", mtp_il);
+
+    // Gated Q + K + V projections
+    ggml_tensor * Qcur_full = build_lora_mm(mtp_layer.wq, mtp_attn_in);
+    cb(Qcur_full, "mtp_Qcur_full", mtp_il);
+
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_mtp_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    cb(Qcur, "mtp_Qcur", mtp_il);
+
+    Qcur = build_norm(Qcur, mtp_layer.attn_q_norm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(Qcur, "mtp_Qcur_normed", mtp_il);
+
+    ggml_tensor * Kcur = build_lora_mm(mtp_layer.wk, mtp_attn_in);
+    cb(Kcur, "mtp_Kcur", mtp_il);
+
+    ggml_tensor * Vcur = build_lora_mm(mtp_layer.wv, mtp_attn_in);
+    cb(Vcur, "mtp_Vcur", mtp_il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_mtp_tokens);
+    Kcur = build_norm(Kcur, mtp_layer.attn_k_norm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(Kcur, "mtp_Kcur_normed", mtp_il);
+
+    // Gate (second half of Q projection)
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_mtp_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_mtp_tokens);
+    cb(gate, "mtp_gate", mtp_il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_mtp_tokens);
+
+    // RoPE: skip for single-token MTP (Q·K^T is scalar, RoPE is identity)
+    // Only apply during prefill when all positions are available
+    if (n_mtp_tokens == n_tokens && gtype != LLM_GRAPH_TYPE_MTP_EVAL) {
+        int sections[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+        ggml_tensor * inp_pos = build_inp_pos();
+
+        Qcur = ggml_rope_multi(
+                ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+
+    cb(Qcur, "mtp_Qcur_rope", mtp_il);
+    cb(Kcur, "mtp_Kcur_rope", mtp_il);
+
+    // No-cache attention (MTP layer has no KV cache)
+    auto * mtp_attn_inp = build_attn_inp_no_cache();
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f
+        ? 1.0f / sqrtf(float(n_embd_head))
+        : hparams.f_attention_scale;
+
+    ggml_tensor * mtp_attn_out = build_attn(mtp_attn_inp,
+                nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, mtp_il);
+    cb(mtp_attn_out, "mtp_attn_pregate", mtp_il);
+
+    // Apply output gate
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    mtp_attn_out = ggml_mul(ctx0, mtp_attn_out, gate_sigmoid);
+    cb(mtp_attn_out, "mtp_attn_gated", mtp_il);
+
+    // Output projection
+    mtp_attn_out = build_lora_mm(mtp_layer.wo, mtp_attn_out);
+    cb(mtp_attn_out, "mtp_attn_output", mtp_il);
+
+    // Residual
+    mtp_cur = ggml_add(ctx0, mtp_attn_out, mtp_cur);
+    cb(mtp_cur, "mtp_attn_residual", mtp_il);
+
+    // Post-attention norm + MoE FFN
+    ggml_tensor * mtp_ffn_residual = mtp_cur;
+
+    ggml_tensor * mtp_post_norm = build_norm(mtp_cur, mtp_layer.attn_post_norm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(mtp_post_norm, "mtp_attn_post_norm", mtp_il);
+
+    mtp_cur = build_layer_ffn(mtp_post_norm, mtp_il);
+    cb(mtp_cur, "mtp_ffn_out", mtp_il);
+
+    // FFN residual
+    mtp_cur = ggml_add(ctx0, mtp_cur, mtp_ffn_residual);
+    cb(mtp_cur, "mtp_post_moe", mtp_il);
+
+    // Step 3: Final norm + shared LM head
+    ggml_tensor * mtp_out_norm;
+    if (mtp_layer.nextn.shared_head_norm) {
+        mtp_out_norm = build_norm(mtp_cur, mtp_layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+    } else {
+        mtp_out_norm = build_norm(mtp_cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    }
+    cb(mtp_out_norm, "mtp_result_norm", -1);
+
+    // Shared LM head (same as main model)
+    ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_out_norm);
+    cb(mtp_logits, "mtp_result_output", -1);
+
+    // In MTP_EVAL mode, this IS the main output. In normal mode, it's auxiliary.
+    if (gtype == LLM_GRAPH_TYPE_MTP_EVAL) {
+        res->t_logits = mtp_logits;
+    } else {
+        res->t_logits_mtp = mtp_logits;
+    }
+    ggml_build_forward_expand(gf, mtp_logits);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35moe::build_qkvz(

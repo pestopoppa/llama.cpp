@@ -31,6 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP_EVAL,  // MTP-only: skip main transformer, only run MTP head
 };
 
 enum llm_ffn_op_type {
@@ -256,6 +257,22 @@ public:
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
     const llama_cross * cross;
+};
+
+// MTP hidden state cache: provides the previous step's hidden state for MTP forward
+class llm_graph_input_mtp_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_hidden(int64_t n_embd, const float * cache_data, bool cache_valid)
+        : n_embd(n_embd), cache_data(cache_data), cache_valid(cache_valid) {}
+    virtual ~llm_graph_input_mtp_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * hidden_prev = nullptr; // F32 [n_embd, 1]
+
+    const int64_t n_embd;
+    const float * cache_data;
+    const bool    cache_valid;
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -557,6 +574,10 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // MTP hidden state cache from previous decode step
+    const float * mtp_hidden_cache = nullptr;
+    bool          mtp_hidden_valid = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -634,8 +655,10 @@ public:
     virtual ~llm_graph_result() = default;
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
-    ggml_tensor * get_logits()      const { return t_logits; }
-    ggml_tensor * get_embd()        const { return t_embd; }
+    ggml_tensor * get_logits()          const { return t_logits; }
+    ggml_tensor * get_logits_mtp()      const { return t_logits_mtp; }
+    ggml_tensor * get_mtp_hidden_out()  const { return t_mtp_hidden_out; }
+    ggml_tensor * get_embd()            const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
@@ -663,7 +686,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
+    ggml_tensor * t_logits_mtp      = nullptr; // MTP-1 predicted next-token logits
+    ggml_tensor * t_mtp_hidden_out  = nullptr; // pre-norm hidden state for MTP caching
+    ggml_tensor * t_embd            = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
@@ -703,6 +728,7 @@ using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_
 
 struct llm_graph_context {
     const llm_arch arch;
+    const llm_graph_type gtype;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
@@ -745,6 +771,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // MTP hidden state cache from previous decode step
+    const float * mtp_hidden_cache;
+    bool          mtp_hidden_valid;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -856,6 +886,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_cls() const;
 
     ggml_tensor * build_inp_cross_embd() const;
+    llm_graph_input_mtp_hidden * build_inp_mtp_hidden() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;

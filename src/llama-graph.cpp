@@ -313,6 +313,18 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_hidden::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (hidden_prev && cache_valid && cache_data) {
+        ggml_backend_tensor_set(hidden_prev, cache_data, 0, n_embd * sizeof(float));
+    } else if (hidden_prev) {
+        // Zero-fill when no cached hidden state available
+        std::vector<float> zeros(n_embd, 0.0f);
+        ggml_backend_tensor_set(hidden_prev, zeros.data(), 0, n_embd * sizeof(float));
+    }
+}
+
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -535,6 +547,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    // skip recurrent state setup when skip_recurrent is active (attention-only draft)
+    if (cparams.skip_recurrent || !inp_rs) {
+        return;
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -560,13 +577,16 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    // skip recurrent state checks when skip_recurrent is active (attention-only draft)
+    if (inp_rs) {
+        res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+        res &= inp_rs->head == mctx->get_recr()->get_head();
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
 
     return res;
 }
@@ -735,11 +755,13 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_inp_tokens    = nullptr;
+    t_inp_embd      = nullptr;
+    t_logits        = nullptr;
+    t_logits_mtp    = nullptr;
+    t_mtp_hidden_out = nullptr;
+    t_embd          = nullptr;
+    t_embd_pooled   = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -847,6 +869,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
+    gtype            (params.gtype),
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
@@ -881,6 +904,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_hidden_cache (params.mtp_hidden_cache),
+    mtp_hidden_valid (params.mtp_hidden_valid),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1715,6 +1740,21 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     return cur;
 }
 
+llm_graph_input_mtp_hidden * llm_graph_context::build_inp_mtp_hidden() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_hidden>(n_embd, mtp_hidden_cache, mtp_hidden_valid);
+
+    auto & cur = inp->hidden_prev;
+
+    // [n_embd, 1] — single cached hidden state from previous decode step
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_input(cur);
+
+    auto * result = inp.get();
+    res->add_input(std::move(inp));
+
+    return result;
+}
+
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
     auto inp = std::make_unique<llm_graph_input_pos_bucket>(hparams);
 
@@ -2444,7 +2484,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    // skip recurrent state inputs when skip_recurrent is active (attention-only draft)
+    std::unique_ptr<llm_graph_input_rs> inp_rs;
+    if (!cparams.skip_recurrent) {
+        inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    }
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);

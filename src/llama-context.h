@@ -75,6 +75,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    float * get_logits_mtp();
+    float * get_logits_mtp_ith(int32_t i);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -130,6 +133,11 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // MTP-only evaluation: runs just the MTP head on a single token using the cached hidden state.
+    // Produces MTP logits (next-token prediction) without running the main transformer.
+    // Returns 0 on success. MTP logits available via llama_get_logits_mtp().
+    int decode_mtp(llama_token token);
 
     //
     // state save/load
@@ -269,6 +277,14 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // MTP predicted next-token logits (2-dimensional array: [n_outputs][n_vocab])
+    buffer_view<float> logits_mtp = {nullptr, 0};
+
+    // MTP hidden state cache: stores last output position's pre-norm hidden state
+    // from the previous decode step, for use in the next step's MTP forward pass
+    std::vector<float> mtp_hidden_cache;
+    bool               mtp_hidden_valid = false;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

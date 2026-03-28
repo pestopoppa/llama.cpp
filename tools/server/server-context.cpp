@@ -592,6 +592,8 @@ private:
 
     llama_model_ptr model_dft;
 
+    bool moe_self_draft_active = false; // true = draft uses target model, don't free model_dft
+
     bool add_bos_token  = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -658,15 +660,17 @@ private:
 
         params_base = params;
 
-        // Tree speculation multi-path verification requires kv_unified=true on the target.
-        // Only auto-enable n_seq_max bump when the user has set --kv-unified (safe for dense
-        // models). For hybrid/recurrent models, kv_unified breaks recurrent state management,
-        // so users must NOT set --kv-unified on hybrid models.
-        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()
-                && params_base.kv_unified) {
+        // Tree speculation multi-path verification needs n_seq_max for per-path seq_ids
+        // and kv_unified for seq_cp() KV forking. For hybrid models, the batch allocator
+        // in llama-context.cpp is constrained to n_seq_max (not LLAMA_MAX_SEQ) to respect
+        // the recurrent memory cell count.
+        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()) {
             // Each slot needs up to 8 alternative tree paths + its own seq_id
             if (params_base.n_seq_max == 0) {
                 params_base.n_seq_max = 9 * std::max(1, params_base.n_parallel);
+            }
+            if (!params_base.kv_unified) {
+                params_base.kv_unified = true;
             }
             SRV_INF("tree speculation: multi-path target verification enabled, n_seq_max=%d\n",
                     params_base.n_seq_max);
@@ -731,6 +735,68 @@ private:
             if (params_base.speculative.p_split > 0.0f) {
                 params_base.speculative.cparams_dft.n_seq_max  = 33; // 32 tree branches + 1 primary
                 params_base.speculative.cparams_dft.kv_unified = true;
+            }
+        }
+
+        // MoE self-draft: create draft context from target model with reduced experts
+        if (params_base.speculative.moe_n_expert_draft > 0 && !params_base.speculative.has_dft()) {
+            SRV_INF("MoE self-draft: creating draft context with %d expert(s) from target model\n",
+                    params_base.speculative.moe_n_expert_draft);
+
+            // Use target model as draft model (weights shared via mmap, no duplication)
+            params_base.speculative.model_dft = model;
+            moe_self_draft_active = true;
+
+            // Configure draft context params from target, with reduced experts
+            auto params_dft = params_base;
+            params_dft.n_parallel            = 1;
+            params_dft.n_ctx                 = params_base.speculative.n_ctx == 0
+                                                 ? llama_n_ctx_seq(ctx) : params_base.speculative.n_ctx;
+            params_dft.n_batch               = llama_n_ctx_seq(ctx);
+            params_dft.moe_n_expert_override = params_base.speculative.moe_n_expert_draft;
+
+            params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+
+            // Force linear speculation for self-draft — tree mode requires target n_seq_max > 1
+            // which must be set before target context creation (too late here).
+            // Linear is sufficient: 1.79x draft speedup with draft_max=8-16 is strong.
+            if (params_base.speculative.p_split > 0.0f) {
+                SRV_WRN("%s", "WARNING: --draft-p-split ignored for --moe-n-expert-draft "
+                    "(tree speculation requires target n_seq_max setup before context creation)\n");
+                params_base.speculative.p_split = 0.0f;
+            }
+            params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;
+        }
+
+        // Attention-only draft: create draft context that skips all recurrent layers
+        if (params_base.skip_recurrent_draft && !params_base.speculative.has_dft()
+                && params_base.speculative.model_dft == nullptr) {
+            const bool has_recurrent = llama_memory_has_recurrent(llama_get_memory(ctx));
+            if (!has_recurrent) {
+                SRV_WRN("%s", "WARNING: --skip-recurrent-draft has no effect on non-hybrid models "
+                    "(no recurrent layers to skip). Use --moe-n-expert-draft instead.\n");
+            } else {
+                SRV_INF("%s", "Attention-only draft: creating draft context that skips recurrent layers\n");
+
+                params_base.speculative.model_dft = model;
+                moe_self_draft_active = true; // reuse flag to prevent double-free
+
+                auto params_dft = params_base;
+                params_dft.n_parallel = 1;
+                params_dft.n_ctx      = params_base.speculative.n_ctx == 0
+                                          ? llama_n_ctx_seq(ctx) : params_base.speculative.n_ctx;
+                params_dft.n_batch    = llama_n_ctx_seq(ctx);
+
+                params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                params_base.speculative.cparams_dft.skip_recurrent = true;
+
+                // Force linear speculation — tree mode incompatible with hybrid memory + skip_recurrent
+                if (params_base.speculative.p_split > 0.0f) {
+                    SRV_WRN("%s", "WARNING: --draft-p-split ignored for --skip-recurrent-draft "
+                        "(tree speculation incompatible with hybrid recurrent memory)\n");
+                    params_base.speculative.p_split = 0.0f;
+                }
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;
             }
         }
 
@@ -824,6 +890,12 @@ private:
                     "for early exit (SWIFT/LayerSkip). Without early-exit training, acceptance "
                     "rates will be near-zero. Consider: external draft model instead.\n");
             }
+        }
+
+        if (moe_self_draft_active) {
+            SRV_INF("MoE self-draft active: draft context uses %d expert(s), target uses full expert count. "
+                "Weights shared via mmap — only KV cache + recurrent state duplicated.\n",
+                params_base.speculative.moe_n_expert_draft);
         }
 
         // initialize slots
@@ -2192,20 +2264,32 @@ private:
                 }
 
                 // For hybrid SSM+attention models: handle recurrent state before speculation batch decode.
-                // Must happen after draft source is determined — lookup drafts on hybrid models
-                // auto-activate freeze-recurrent (stateless n-gram drafts have no SSM state context,
-                // decoding them without freezing would corrupt recurrent state).
-                // For hybrid SSM+attention models: always use freeze-recurrent during speculation.
-                // Benchmarks show checkpoint/restore overhead makes all non-frozen speculation
-                // net negative on hybrid models. Freeze-recurrent trades ~13pp acceptance for
-                // zero overhead — the only config that beats baseline on hybrid SSM.
-                // For lookup drafts specifically, freeze is also required for correctness:
-                // stateless n-gram drafts lack SSM context, decoding without freeze segfaults.
+                // Two strategies depending on whether tree multi-path verification is available:
+                //
+                // (a) Tree speculation: save checkpoint + clone cells per path (done in Step 3b).
+                //     Each tree path gets independent recurrent state; batched decode produces
+                //     exact logits. After verification, checkpoint restore + re-advance accepted.
+                //
+                // (b) Linear-only / lookup: freeze-recurrent (zero overhead, ~13pp acceptance loss).
+                //     Lookup drafts REQUIRE freeze for correctness (stateless n-gram drafts lack
+                //     SSM context, decoding without freeze corrupts recurrent state).
+                const bool tree_available = !draft_from_lookup && slot.spec &&
+                    common_speculative_get_tree(slot.spec) &&
+                    common_speculative_get_tree(slot.spec)->n_nodes > 1;
+
                 if (has_recurrent_mem && draft_found) {
-                    llama_set_freeze_recurrent(ctx, true);
-                    slot.freeze_recurrent_active = true;
-                    if (draft_from_lookup) {
-                        SLT_DBG(slot, "%s", "freeze-recurrent: auto-activated for lookup draft on hybrid model\n");
+                    if (tree_available) {
+                        // Tree multi-path: save recurrent checkpoint before tree paths are set up.
+                        // Cell cloning + non-frozen decode gives exact logits per path.
+                        slot.spec_checkpoint = llama_memory_checkpoint_save(llama_get_memory(ctx));
+                        SLT_DBG(slot, "%s", "hybrid tree: recurrent checkpoint saved, exact-logit mode\n");
+                    } else {
+                        // Linear-only or lookup: freeze recurrent (cheaper than checkpoint)
+                        llama_set_freeze_recurrent(ctx, true);
+                        slot.freeze_recurrent_active = true;
+                        if (draft_from_lookup) {
+                            SLT_DBG(slot, "%s", "freeze-recurrent: auto-activated for lookup draft on hybrid model\n");
+                        }
                     }
                 }
 
@@ -2241,8 +2325,9 @@ private:
                     const speculation_tree * spec_tree = (!draft_from_lookup && slot.spec)
                         ? common_speculative_get_tree(slot.spec) : nullptr;
 
-                    // Multi-path target verification: disabled for hybrid/recurrent models
-                    // because tree seq_ids on target context corrupt recurrent state.
+                    // Multi-path target verification: enabled for all models.
+                    // For hybrid/recurrent models, seq_cp creates shared recurrent cells —
+                    // clone_cell splits them so each path has independent recurrent state.
                     const bool has_recurrent = llama_memory_has_recurrent(llama_get_memory(ctx));
                     if (spec_tree && spec_tree->n_nodes > 1 && !has_recurrent) {
                         auto tree_paths = spec_tree->get_paths();
@@ -2287,6 +2372,18 @@ private:
                                 for (size_t k = 1; k < path_tokens.size(); k++) {
                                     llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
                                     llama_memory_seq_cp(tgt_mem, slot.id, alt_seq, 0, -1);
+                                }
+
+                                // For hybrid models: seq_cp creates shared recurrent cells.
+                                // Clone each alt path's cell so it has independent state that
+                                // advances correctly during the batched non-frozen decode.
+                                if (has_recurrent) {
+                                    for (size_t k = 1; k < path_tokens.size(); k++) {
+                                        llama_seq_id alt_seq = tree_seq_base + (llama_seq_id)k;
+                                        if (!llama_memory_recurrent_clone_cell(tgt_mem, slot.id, alt_seq)) {
+                                            SLT_WRN(slot, "tree: failed to clone recurrent cell for alt path %zu (seq=%d)\n", k, alt_seq);
+                                        }
+                                    }
                                 }
 
                                 // Add alternative paths to batch
@@ -3284,23 +3381,25 @@ private:
                 }
 
                 // For hybrid models with recurrent state: handle post-speculation rollback.
-                const size_t n_rejected = n_draft - (ids.size() - 1);
                 if (slot.freeze_recurrent_active) {
                     // Freeze-recurrent mode: SSM state was never modified during speculation.
                     // Unfreeze for the next normal decode, then advance state through accepted tokens.
                     llama_set_freeze_recurrent(ctx, false);
 
-                    // Clean up KV cache entries for rejected positions
-                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
-
                     // Re-advance recurrent state through ALL accepted tokens (including sampled).
                     // Since state was frozen, it needs to catch up from pre-speculation position.
                     const int n_accepted = (int)ids.size() - 1; // exclude the new sampled token
+
+                    // Remove ALL speculation positions (accepted + rejected) from KV.
+                    // The re-advance decode will re-insert accepted positions.
+                    // This is required for M-RoPE models which validate X < Y on positions.
+                    const llama_pos pos_spec_start = slot.prompt.n_tokens() - n_accepted;
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, pos_spec_start, -1);
+
                     if (n_accepted > 0) {
                         llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
-                        const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
                         for (int i = 0; i < n_accepted; i++) {
-                            common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
+                            common_batch_add(batch_accepted, ids[i], pos_spec_start + i, { slot.id }, false);
                         }
                         if (batch_accepted.n_tokens > 0) {
                             batch_accepted.logits[batch_accepted.n_tokens - 1] = true;
@@ -3314,23 +3413,26 @@ private:
                     }
 
                     SLT_DBG(slot, "freeze-recurrent: advanced %d accepted tokens through SSM state\n", n_accepted);
-                } else if (slot.spec_checkpoint && n_rejected > 0) {
-                    // Standard checkpoint mode: partial rejection on a hybrid model
-                    // restore recurrent state to pre-speculation position
+                } else if (slot.spec_checkpoint) {
+                    // Checkpoint mode (tree+hybrid): restore recurrent state to pre-speculation
+                    // and re-advance through accepted tokens. Always needed because:
+                    // (a) on rejection: recurrent advanced past accepted point
+                    // (b) on alt-path win: slot.id's recurrent cell has wrong path's state
                     llama_memory_checkpoint_restore(llama_get_memory(ctx), slot.spec_checkpoint);
-
-                    // seq_rm on the hybrid memory will:
-                    // - skip recurrent (partial removal fails, but we've restored it)
-                    // - clean up KV cache entries for rejected positions
-                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
                     // re-advance recurrent state through accepted tokens (ids[0..n-2])
                     const int n_accepted = (int)ids.size() - 1;
+
+                    // Remove ALL speculation positions from KV (accepted + rejected).
+                    // checkpoint_restore only affects recurrent state; KV still has stale entries.
+                    // Re-advance will re-insert accepted positions into KV + update recurrent.
+                    const llama_pos pos_spec_start = slot.prompt.n_tokens() - n_accepted;
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, pos_spec_start, -1);
+
                     if (n_accepted > 0) {
                         llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
-                        const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
                         for (int i = 0; i < n_accepted; i++) {
-                            common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
+                            common_batch_add(batch_accepted, ids[i], pos_spec_start + i, { slot.id }, false);
                         }
                         if (batch_accepted.n_tokens > 0) {
                             batch_accepted.logits[batch_accepted.n_tokens - 1] = true;

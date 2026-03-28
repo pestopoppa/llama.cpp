@@ -1327,6 +1327,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FREEZE_RECURRENT_DRAFT"));
     add_opt(common_arg(
+        {"--skip-recurrent-draft"},
+        string_format("attention-only draft: skip all recurrent/Delta Net layers during draft forward pass, "
+            "keeping only attention layers. Creates a self-draft context from the target model. (default: %s)",
+            params.skip_recurrent_draft ? "true" : "false"),
+        [](common_params & params) {
+            params.skip_recurrent_draft = true;
+        }
+    ).set_env("LLAMA_ARG_SKIP_RECURRENT_DRAFT"));
+    add_opt(common_arg(
         {"--swa-full"},
         string_format("use full-size SWA cache (default: %s)\n"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),
@@ -2026,6 +2035,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_n_expert_override = value;
         }
     ).set_env("LLAMA_ARG_MOE_N_EXPERT"));
+    add_opt(common_arg(
+        {"--moe-n-expert-draft"}, "N",
+        string_format("MoE self-draft: number of experts for draft context (default: %d = disabled)\n"
+                      "creates a self-draft context from the target model with reduced experts", params.speculative.moe_n_expert_draft),
+        [](common_params & params, int value) {
+            params.speculative.moe_n_expert_draft = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_N_EXPERT_DRAFT"));
     add_opt(common_arg(
         {"-gan", "--grp-attn-n"}, "N",
         string_format("group-attention factor (default: %d)", params.grp_attn_n),

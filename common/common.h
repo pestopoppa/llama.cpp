@@ -301,6 +301,8 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    int32_t moe_n_expert_draft = 0; // MoE self-draft: expert count for draft context (0 = disabled)
+
     bool has_dft() const {
         return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
     }
@@ -384,6 +386,7 @@ struct common_params {
     int32_t n_layer_exit_intermediate = 0; // intermediate depth for hierarchical speculation (0 = auto N/4)
     bool    hierarchical_spec    = false;  // enable hierarchical intermediate verification
     bool    freeze_recurrent_draft = false; // freeze SSM state during speculation (skip writes, eliminate checkpoint)
+    bool    skip_recurrent_draft   = false; // attention-only draft: skip recurrent layers, keep only attention
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

@@ -2547,19 +2547,32 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
                 ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
+                // NextN/MTP parameters
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+
                 // Mark recurrent layers (linear attention layers)
+                // MTP layers (at the end) use full attention, not Delta Net
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    const uint32_t n_main_layers = hparams.n_layer - hparams.nextn_predict_layers;
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                        if (i >= n_main_layers) {
+                            // MTP layers use full attention
+                            hparams.recurrent_layer_arr[i] = false;
+                        } else {
+                            hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                        }
                     }
                 }
 
-                switch (hparams.n_layer) {
-                    case 28: type = LLM_TYPE_35B_A3B; break;
-                    case 48: type = LLM_TYPE_80B_A3B; break;
-                    default: type = LLM_TYPE_UNKNOWN;
+                {
+                    const uint32_t n_main_layers = hparams.n_layer - hparams.nextn_predict_layers;
+                    switch (n_main_layers) {
+                        case 28: type = LLM_TYPE_35B_A3B; break;
+                        case 48: type = LLM_TYPE_80B_A3B; break;
+                        default: type = LLM_TYPE_UNKNOWN;
+                    }
                 }
             } break;
         case LLM_ARCH_MISTRAL3:
@@ -7467,14 +7480,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const int64_t value_dim  = head_v_dim * n_v_heads;
                     const int64_t conv_dim   = key_dim * 2 + value_dim;
 
+                    const uint32_t n_main_layers = n_layer - hparams.nextn_predict_layers;
+
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
+                        const bool is_mtp_layer = hparams.nextn_predict_layers > 0 &&
+                                                  static_cast<uint32_t>(i) >= n_main_layers;
 
                         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
                         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
 
                         if (!hparams.is_recurrent(i)) {
-                            // Attention layers
+                            // Full attention layers (includes MTP layers)
                             layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head * 2 }, 0);
                             layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
                             layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
@@ -7508,6 +7525,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), { n_embd, n_ff_shexp }, 0);
                         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), { n_embd, n_ff_shexp }, 0);
                         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { n_ff_shexp, n_embd }, 0);
+
+                        // NextN/MTP tensors for MTP layers
+                        if (is_mtp_layer) {
+                            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, 0);
+                            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd }, 0);
+                            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd }, 0);
+                            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
+                        }
                     }
                 } break;
             case LLM_ARCH_QWEN35:
