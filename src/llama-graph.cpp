@@ -9,6 +9,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-hadamard.h"
 
 #include <cassert>
 #include <cmath>
@@ -1800,6 +1801,10 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+ggml_tensor * llm_graph_context::build_hadamard(ggml_tensor * a) const {
+    return ggml_map_custom1(ctx0, a, ggml_hadamard_custom_op, GGML_N_TASKS_MAX, nullptr);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -1876,6 +1881,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+        // Hadamard inverse on flash attention output
+        if (cparams.kv_hadamard && !v_mla) {
+            cur = build_hadamard(cur);
+        }
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
@@ -1931,6 +1941,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+
+        // Hadamard inverse on non-flash attention output
+        if (cparams.kv_hadamard && !v_mla) {
+            cur = ggml_cont(ctx0, cur);
+            cur = build_hadamard(cur);
+        }
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
@@ -2084,6 +2100,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // Hadamard smoothing: transform K and V before quantized storage
+    if (cparams.kv_hadamard) {
+        k_cur = build_hadamard(k_cur);
+        cb(k_cur, "k_hadamard", il);
+        v_cur = build_hadamard(v_cur);
+        cb(v_cur, "v_hadamard", il);
+    }
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
@@ -2095,7 +2119,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask();
 
+    // Hadamard smoothing: transform Q to match K domain (H·Q · (H·K)^T = Q·K^T)
     ggml_tensor * q = q_cur;
+    if (cparams.kv_hadamard) {
+        q = build_hadamard(q);
+        cb(q, "q_hadamard", il);
+    }
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
@@ -2233,6 +2262,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
+    // Hadamard smoothing: transform K and V before quantized storage
+    if (cparams.kv_hadamard && k_cur) {
+        k_cur = build_hadamard(k_cur);
+        cb(k_cur, "k_hadamard", il);
+    }
+    if (cparams.kv_hadamard && v_cur) {
+        v_cur = build_hadamard(v_cur);
+        cb(v_cur, "v_hadamard", il);
+    }
+
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
@@ -2248,7 +2287,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
+    // Hadamard smoothing: transform Q to match K domain
     ggml_tensor * q = q_cur;
+    if (cparams.kv_hadamard) {
+        q = build_hadamard(q);
+        cb(q, "q_hadamard", il);
+    }
+
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
