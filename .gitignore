@@ -145,3 +145,11 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+.gitnexus
+
+# Local standalone tools (not part of main build)
+/tools/math-tools/
+/tools/bench-kv-block/
+
+# Local headers (not upstream)
+/ggml/src/ggml-cpu/arch/x86/avx512-helpers.h

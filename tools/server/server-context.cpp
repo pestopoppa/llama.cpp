@@ -65,7 +65,8 @@ struct server_slot {
 
     // recurrent state checkpoint for hybrid model speculation
     // saved before speculation batch decode, restored on rejection
-    struct llama_memory_checkpoint * spec_checkpoint = nullptr;
+    // NOTE: requires SSM checkpointing patch (6e49ca1ae) — stubbed until Phase 5
+    // struct llama_memory_checkpoint * spec_checkpoint = nullptr;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -3008,54 +3009,10 @@ private:
                         LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, ids.size(), false);
                 }
 
-                // For hybrid models with recurrent state: restore checkpoint then re-advance
-                // through accepted tokens. For KV-only models: just use seq_rm as before.
-                const size_t n_rejected = n_draft - (ids.size() - 1);
-
-                if (slot.spec_checkpoint && n_rejected > 0) {
-                    // partial rejection on a hybrid model — need checkpoint restore
-                    // restore recurrent state to pre-speculation position
-                    llama_memory_checkpoint_restore(llama_get_memory(ctx), slot.spec_checkpoint);
-
-                    // seq_rm on the hybrid memory will:
-                    // - skip recurrent (partial removal fails, but we've restored it)
-                    // - clean up KV cache entries for rejected positions
-                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
-
-                    // re-advance recurrent state through accepted tokens (ids[0..n-2])
-                    // ids contains: [sampled, accepted_draft_0, ..., accepted_draft_k, new_sampled]
-                    // we need to process ids[0..n-2] to advance recurrent state
-                    const int n_accepted = (int)ids.size() - 1; // exclude the new sampled token
-                    if (n_accepted > 0) {
-                        // build a small batch with the accepted tokens at their correct positions
-                        llama_batch batch_accepted = llama_batch_init(n_accepted, 0, 1);
-                        const llama_pos pos_base = slot.prompt.n_tokens() - n_accepted;
-                        for (int i = 0; i < n_accepted; i++) {
-                            common_batch_add(batch_accepted, ids[i], pos_base + i, { slot.id }, false);
-                        }
-                        // mark last token for logits (not strictly needed, but keeps state consistent)
-                        if (batch_accepted.n_tokens > 0) {
-                            batch_accepted.logits[batch_accepted.n_tokens - 1] = true;
-                        }
-
-                        const int ret = llama_decode(ctx, batch_accepted);
-                        if (ret != 0) {
-                            SLT_ERR(slot, "failed to re-advance recurrent state after speculation rollback: %d\n", ret);
-                        }
-                        llama_batch_free(batch_accepted);
-                    }
-
-                    SLT_DBG(slot, "recurrent checkpoint restored, re-advanced %d accepted tokens\n", (int)ids.size() - 1);
-                } else {
-                    // either KV-only model, or all draft tokens accepted (no rollback needed)
-                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
-                }
-
-                // free checkpoint — will be re-created next speculation round
-                if (slot.spec_checkpoint) {
-                    llama_memory_checkpoint_free(slot.spec_checkpoint);
-                    slot.spec_checkpoint = nullptr;
-                }
+                // NOTE: hybrid model checkpoint restore/re-advance logic requires SSM checkpointing
+                // patch (6e49ca1ae). For now, use simple seq_rm (correct for KV-only models).
+                // TODO(Phase 5): restore checkpoint-based rollback for hybrid models
+                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
