@@ -1524,7 +1524,11 @@ static common_chat_params common_chat_params_init_nemotron_v2(const common_chat_
 static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template & tmpl, const struct templates_params & inputs) {
     common_chat_params data;
 
-    data.prompt = apply(tmpl, inputs);
+    // Pass enable_thinking to Jinja template so Qwen3.5's conditional works
+    json extra_context = json {
+        {"enable_thinking", inputs.enable_thinking},
+    };
+    data.prompt = apply(tmpl, inputs, /* messages_override =*/ std::nullopt, /* tools_override= */ std::nullopt, extra_context);
     data.format = COMMON_CHAT_FORMAT_PEG_CONSTRUCTED;
 
     // Nemotron Nano 3 and Step-3.5-Flash use the Qwen3 Coder tool calling with thinking
