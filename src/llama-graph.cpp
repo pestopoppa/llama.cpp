@@ -412,7 +412,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
         // 3. Shift: move [0, n_kv_recent) data to [n_kv_old, n_kv_total)
-        //    and fill [0, n_kv_old) with -inf
+        //    and unmask old portion (evicted cells are oldest — all tokens attend to all of them)
         const uint32_t n_kv_recent = mctx->get_n_kv();
         const uint32_t n_rows      = total_elements / n_kv_total;
 
@@ -420,9 +420,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
             float * row_data = data + row * n_kv_total;
             // Move recent data from [0, n_kv_recent) to [n_kv_old, n_kv_old+n_kv_recent)
             memmove(row_data + n_kv_old, row_data, n_kv_recent * sizeof(float));
-            // Fill old portion with -inf
+            // Unmask old portion: evicted cells have valid data, allow causal attention
+            // Only unmask positions that have been evicted (0..n_kv_old-1)
             for (uint32_t j = 0; j < n_kv_old; j++) {
-                row_data[j] = -INFINITY;
+                row_data[j] = 0.0f;  // 0.0 = unmasked (no bias)
             }
         }
     } else {
@@ -1925,53 +1926,19 @@ ggml_tensor * llm_graph_context::build_attn(
                     ggml_row_size(v_old_raw->type, n_embd_v_gqa_l * kv_size_old),
                     0);
 
-            // Split attention: non-flash path (matmul based)
-            // 1. QK scores for recent K (exact, f16)
-            ggml_tensor * kq_recent = ggml_mul_mat(ctx0, k, q);
-            ggml_mul_mat_set_prec(kq_recent, GGML_PREC_F32);
-            cb(kq_recent, "kq_recent", il);
+            // Hybrid attention: concat old+recent K/V, use flash attention on combined
+            // Cast old K/V to f16 (fast, well-optimized) then concat with recent (already f16)
+            ggml_tensor * k_old_f16 = (k_old->type == GGML_TYPE_F16) ? k_old : ggml_cast(ctx0, k_old, GGML_TYPE_F16);
+            ggml_tensor * k_combined = ggml_concat(ctx0, k_old_f16, k, 2); // concat along n_kv dim (dim 2 after view)
+            cb(k_combined, "k_combined", il);
 
-            // 2. QK scores for old K (dequant to f32, then matmul)
-            ggml_tensor * k_old_f32 = ggml_cast(ctx0, k_old, GGML_TYPE_F32);
-            ggml_tensor * kq_old = ggml_mul_mat(ctx0, k_old_f32, q);
-            ggml_mul_mat_set_prec(kq_old, GGML_PREC_F32);
-            cb(kq_old, "kq_old", il);
+            ggml_tensor * v_old_f16 = (v_old->type == GGML_TYPE_F16) ? v_old : ggml_cast(ctx0, v_old, GGML_TYPE_F16);
+            ggml_tensor * v_combined = ggml_concat(ctx0, v_old_f16, v, 2); // concat along n_kv dim
+            cb(v_combined, "v_combined", il);
 
-            // 3. Concat scores: [kq_old, kq_recent] along KV dimension (dim 0)
-            // kq shape: [n_kv, n_tokens, n_head, 1]
-            // concat along dim 0 gives [n_kv_old + n_kv_recent, n_tokens, n_head, 1]
-            ggml_tensor * kq = ggml_concat(ctx0, kq_old, kq_recent, 0);
-            cb(kq, "kq_hybrid", il);
-
-            // 4. Scale + softmax with combined mask
-            kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
-            cb(kq, "kq_soft_max", il);
-
-            // 5. V weighted sum: need combined V [v_old, v_recent]
-            // Transpose V for matmul: V needs to be [n_kv, n_embd_head_v, ...]
-            ggml_tensor * v_old_f32 = ggml_cast(ctx0, v_old, GGML_TYPE_F32);
-            ggml_tensor * v_recent_f32 = ggml_cast(ctx0, v, GGML_TYPE_F32);
-
-            // V is [n_embd_head_v, n_head_kv, n_kv, 1] — transpose to [n_kv, n_embd_head_v, n_head_kv, 1]
-            ggml_tensor * v_old_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_old_f32));
-            ggml_tensor * v_recent_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_recent_f32));
-
-            // Concat transposed V along dim 0 (n_kv): [n_kv_old+n_kv_recent, n_embd_head_v, ...]
-            ggml_tensor * v_combined_t = ggml_concat(ctx0, v_old_t, v_recent_t, 0);
-
-            // KQV = softmax(QK) × V
-            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_combined_t, kq);
-            cb(kqv, "kqv_hybrid", il);
-
-            // Permute + reshape to 2D (same as non-flash path)
-            ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
-
-            if (cparams.kv_hadamard && !v_mla) {
-                cur = ggml_cont(ctx0, cur);
-                cur = build_hadamard(cur);
-            }
-
-            cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            // Use the combined K/V with flash attention via build_attn_mha
+            // The kq_mask is already expanded to [n_kv_old+n_kv_recent, ...] in build_attn_inp_kv
+            ggml_tensor * cur = build_attn_mha(q, k_combined, v_combined, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
             cb(cur, "kqv_out", il);
 
             if (!cparams.offload_kqv) {

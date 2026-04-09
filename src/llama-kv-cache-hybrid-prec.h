@@ -74,6 +74,7 @@ private:
     std::unique_ptr<llama_kv_cache> kv_old;    // compressed, receives evicted tokens
     bool kv_old_has_data = false;
     uint32_t n_evicted = 0;                     // number of cells written to kv_old
+    bool in_prefill = false;                    // suppress eviction during multi-token prefill
 
     // Evict oldest cells from kv_recent to kv_old (CPU-side tensor copy + quantize)
     void evict_oldest(uint32_t n_to_evict);

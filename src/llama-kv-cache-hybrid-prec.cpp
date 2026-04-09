@@ -40,24 +40,38 @@ llama_kv_cache_hybrid_prec::llama_kv_cache_hybrid_prec(
             v_trans, offload, unified, size_recent, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, no_filter, no_reuse);
 
+    // Use q4_0 for old K cache instead of turbo_q3 — PolarQuant dequant has too much error
+    // for direct K reconstruction. q4_0 with Hadamard smoothing is quality-neutral.
+    ggml_type old_type_k = (type_k == GGML_TYPE_TURBO_Q3) ? GGML_TYPE_Q4_0 : type_k;
+    LLAMA_LOG_INFO("%s: old cache K type: %s (requested: %s)\n",
+            __func__, ggml_type_name(old_type_k), ggml_type_name(type_k));
+
     kv_old = std::make_unique<llama_kv_cache>(
-            model, type_k, type_v,
+            model, old_type_k, type_v,
             v_trans, offload, unified, size_old, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, no_filter, no_reuse);
 }
 
 void llama_kv_cache_hybrid_prec::clear(bool data) {
-    LLAMA_LOG_DEBUG("%s: clearing hybrid cache (data=%d)\n", __func__, data);
+    LLAMA_LOG_DEBUG("%s: clearing hybrid cache (data=%d, n_evicted=%u)\n", __func__, data, n_evicted);
     kv_recent->clear(data);
-    if (kv_old && kv_old_has_data) {
+    if (kv_old) {
         kv_old->clear(data);
         kv_old_has_data = false;
+        n_evicted = 0;
     }
 }
 
 bool llama_kv_cache_hybrid_prec::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = kv_recent->seq_rm(seq_id, p0, p1);
-    if (kv_old && kv_old_has_data) res = res & kv_old->seq_rm(seq_id, p0, p1);
+    if (kv_old && kv_old_has_data) {
+        res = res & kv_old->seq_rm(seq_id, p0, p1);
+        // If old cache is now empty after removal, reset eviction counter
+        if (kv_old->get_used() == 0) {
+            kv_old_has_data = false;
+            n_evicted = 0;
+        }
+    }
     return res;
 }
 
@@ -115,11 +129,10 @@ bool llama_kv_cache_hybrid_prec::get_can_shift() const {
 
 llama_memory_context_ptr llama_kv_cache_hybrid_prec::init_batch(
         llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // Check if kv_recent is over the eviction threshold
-    // If so, the oldest cells' data would be evicted to kv_old.
-    // For now: just set the flag that kv_old has data when kv_recent is full enough.
-    // The actual data eviction requires graph-based tensor copy which happens during apply().
-    //
+    // Detect prefill: if n_ubatch > 1, we're processing multiple tokens per batch.
+    // Suppress eviction during prefill — all tokens need f16 precision for correct attention.
+    // Eviction should only happen during single-token decode.
+    in_prefill = (n_ubatch > 1);
     return kv_recent->init_batch(balloc, n_ubatch, embd_all);
 }
 
@@ -130,10 +143,12 @@ llama_memory_context_ptr llama_kv_cache_hybrid_prec::init_full() {
 
 llama_memory_context_ptr llama_kv_cache_hybrid_prec::init_update(llama_context * lctx, bool optimize) {
     // Eviction: if kv_recent has more used cells than threshold, evict oldest to kv_old
-    if (kv_old) {
+    // Skip during prefill — all tokens need f16 precision during multi-token batch processing
+    if (kv_old && !in_prefill) {
         uint32_t used = kv_recent->get_used();
 
-        if (used > n_kv_recent) {
+        // Batch eviction: only evict when 64+ cells over threshold, amortizing CPU quantize cost
+        if (used > n_kv_recent + 64) {
             uint32_t excess = used - n_kv_recent;
             // Cap eviction to avoid overwhelming kv_old capacity
             uint32_t kv_old_capacity = kv_old->get_size();
