@@ -672,12 +672,17 @@ private:
 
         params_base = params;
 
-        // Tree speculation multi-path verification requires kv_unified=true on the target.
-        // Only auto-enable n_seq_max bump when the user has set --kv-unified (safe for dense
-        // models). For hybrid/recurrent models, kv_unified breaks recurrent state management,
-        // so users must NOT set --kv-unified on hybrid models.
-        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()
-                && params_base.kv_unified) {
+        // Tree speculation multi-path verification requires kv_unified (shared context across
+        // all seq_ids) and sufficient n_seq_max for alternative tree paths.
+        // Auto-enable both when a draft model with p_split > 0 is configured.
+        // For hybrid/recurrent models, tree multi-path is disabled at verification time
+        // (line ~2299) since tree seq_ids corrupt recurrent state — kv_unified is still
+        // safe to set, the recurrent guard prevents the problematic code path.
+        if (params_base.speculative.p_split > 0.0f && params_base.speculative.has_dft()) {
+            if (!params_base.kv_unified) {
+                SRV_INF("%s", "tree speculation: auto-enabling --kv-unified for multi-path verification\n");
+                params_base.kv_unified = true;
+            }
             // Each slot needs up to 8 alternative tree paths + its own seq_id
             if (params_base.n_seq_max == 0) {
                 params_base.n_seq_max = 9 * std::max(1, params_base.n_parallel);
