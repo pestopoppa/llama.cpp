@@ -166,6 +166,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.moe_n_expert_override = params.moe_n_expert_override;
     cparams.n_layer_exit = params.n_layer_exit;  // layer skip for speculative decoding
+    cparams.freeze_recurrent = false;
 
     // initialized later
     cparams.pipeline_parallel = false;
