@@ -647,6 +647,13 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
+    // get memory handle for KV cache operations (e.g., set_beta for AM compaction)
+    // note: only safe to call when no inference is running on the target slot
+    llama_memory_t get_memory() const { return ctx ? llama_get_memory(ctx) : nullptr; }
+
+    // get llama_context for state get/set operations (AM compaction)
+    llama_context * get_ctx() const { return ctx; }
+
     ~server_context_impl() {
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
@@ -3584,10 +3591,22 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
-        // Erase doesn't need disk — allow it unconditionally.
+        // Erase and set-beta don't need disk — allow unconditionally.
         // Save/restore require --slot-save-path for the filesystem path.
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
+        }
+
+        if (action == "set-beta") {
+            return handle_slots_set_beta(req, id_slot);
+        }
+
+        if (action == "seq-rm") {
+            return handle_slots_seq_rm(req, id_slot);
+        }
+
+        if (action == "compact") {
+            return handle_slots_compact(req, id_slot);
         }
 
         if (params.slot_save_path.empty()) {
@@ -4238,6 +4257,343 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
     res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_set_beta(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    // Parse JSON body: {"betas": [{"pos": N, "beta": F}, ...]}
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.contains("betas") || !body["betas"].is_array()) {
+        res->error(format_error_response("Expected JSON body with 'betas' array of {pos, beta} objects", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    llama_memory_t mem = ctx_server.get_memory();
+    if (!mem) {
+        res->error(format_error_response("No memory context available", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    int n_set = 0;
+    int n_failed = 0;
+    for (const auto & entry : body["betas"]) {
+        if (!entry.contains("pos") || !entry.contains("beta")) {
+            n_failed++;
+            continue;
+        }
+        const llama_pos pos = entry["pos"].get<llama_pos>();
+        const float beta    = entry["beta"].get<float>();
+        // use seq_id from the slot (slot ID maps to seq ID in single-seq mode)
+        if (llama_memory_set_beta(mem, id_slot, pos, beta)) {
+            n_set++;
+        } else {
+            n_failed++;
+        }
+    }
+
+    json result = {
+        {"id_slot", id_slot},
+        {"n_set",   n_set},
+        {"n_failed", n_failed},
+    };
+    res->ok(result);
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    // Parse parameters: keep_ratio (0.0-1.0), beta, keep_first, keep_last
+    auto body = json::parse(req.body, nullptr, false);
+    float keep_ratio  = body.is_object() && body.contains("keep_ratio")  ? body["keep_ratio"].get<float>()   : 0.5f;
+    float beta        = body.is_object() && body.contains("beta")        ? body["beta"].get<float>()          : 0.1f;
+    int   keep_first  = body.is_object() && body.contains("keep_first")  ? body["keep_first"].get<int>()      : 8;
+    int   keep_last   = body.is_object() && body.contains("keep_last")   ? body["keep_last"].get<int>()       : 15;
+
+    {
+        // Step 1: Get state size
+        size_t state_size = llama_state_seq_get_size(ctx_server.get_ctx(), id_slot);
+        if (state_size == 0) {
+            res->error(format_error_response("Slot has no state to compact", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // Step 2: Save state to buffer
+        std::vector<uint8_t> state_buf(state_size);
+        size_t written = llama_state_seq_get_data(ctx_server.get_ctx(), state_buf.data(), state_buf.size(), id_slot);
+        if (written == 0) {
+            res->error(format_error_response("Failed to save state", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        // Step 3: Parse the state buffer to find cell positions
+        // Format: n_stream(u32), per-stream: cell_count(u32) + meta + data
+        // Meta/cell: pos(i32) + n_seq_id(u32) + ext{x:i32, y:i32, beta:f32} + seq_ids(i32[])
+        const uint8_t * p = state_buf.data();
+        const uint8_t * end = p + written;
+
+        uint32_t n_stream;
+        memcpy(&n_stream, p, 4); p += 4;
+
+        // Collect cell positions and their offsets for the first stream
+        struct cell_info {
+            int32_t pos;
+            uint32_t n_seq_id;
+            int32_t ext_x, ext_y;
+            float ext_beta;
+            size_t meta_offset; // offset in original buffer
+        };
+        std::vector<cell_info> cells;
+        uint32_t cell_count = 0;
+
+        if (n_stream > 0) {
+            memcpy(&cell_count, p, 4); p += 4;
+
+            for (uint32_t i = 0; i < cell_count; i++) {
+                cell_info ci;
+                ci.meta_offset = p - state_buf.data();
+                memcpy(&ci.pos, p, 4); p += 4;
+                memcpy(&ci.n_seq_id, p, 4); p += 4;
+                memcpy(&ci.ext_x, p, 4); p += 4;
+                memcpy(&ci.ext_y, p, 4); p += 4;
+                memcpy(&ci.ext_beta, p, 4); p += 4;
+                p += ci.n_seq_id * 4; // skip seq_ids
+                cells.push_back(ci);
+            }
+        }
+
+        if (cells.empty()) {
+            res->error(format_error_response("No cells to compact", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // Step 4: Select positions to keep (heuristic: first N + last M + sampled middle)
+        std::vector<bool> keep(cell_count, false);
+        int n_keep = 0;
+
+        // Keep first
+        for (int i = 0; i < std::min(keep_first, (int)cell_count); i++) {
+            keep[i] = true;
+        }
+        // Keep last
+        for (int i = std::max(0, (int)cell_count - keep_last); i < (int)cell_count; i++) {
+            keep[i] = true;
+        }
+        // Count kept so far
+        n_keep = 0;
+        for (bool k : keep) n_keep += k;
+
+        // Fill to target ratio with evenly sampled middle
+        int target = std::max(n_keep, (int)(cell_count * keep_ratio));
+        int middle_start = std::min(keep_first, (int)cell_count);
+        int middle_end = std::max(0, (int)cell_count - keep_last);
+        if (middle_end > middle_start && target > n_keep) {
+            int step = std::max(1, (middle_end - middle_start) / (target - n_keep));
+            for (int i = middle_start; i < middle_end && n_keep < target; i += step) {
+                if (!keep[i]) {
+                    keep[i] = true;
+                    n_keep++;
+                }
+            }
+        }
+
+        // Build keep indices
+        std::vector<uint32_t> keep_indices;
+        for (uint32_t i = 0; i < cell_count; i++) {
+            if (keep[i]) keep_indices.push_back(i);
+        }
+        n_keep = keep_indices.size();
+        float actual_ratio = (float)cell_count / n_keep;
+
+        // Step 5: Build compacted state buffer
+        // Re-parse original and copy only kept cells + their K/V rows
+        // This mirrors the Python state_compactor logic
+
+        // First pass: calculate compacted size
+        // Meta size: n_stream(4) + cell_count(4) + per-cell(pos:4 + n_seq_id:4 + ext:12 + seq_ids:4*n) = ...
+        // Data: v_trans(4) + n_layer(4) + per-layer-K(type:4 + row_size:8 + rows*n_keep) + per-layer-V(...)
+        // Tail: remaining bytes after KV section
+
+        // Re-read data section to get layer info
+        // p is now at the start of the data section
+        uint32_t v_trans, n_layer;
+        memcpy(&v_trans, p, 4); p += 4;
+        memcpy(&n_layer, p, 4); p += 4;
+
+        struct layer_info {
+            int32_t type_id;
+            uint64_t row_size;
+            const uint8_t * data_start;
+        };
+        std::vector<layer_info> k_layers, v_layers;
+
+        // K layers
+        for (uint32_t il = 0; il < n_layer; il++) {
+            layer_info li;
+            memcpy(&li.type_id, p, 4); p += 4;
+            memcpy(&li.row_size, p, 8); p += 8;
+            li.data_start = p;
+            p += cell_count * li.row_size;
+            k_layers.push_back(li);
+        }
+
+        // V layers
+        if (!v_trans) {
+            for (uint32_t il = 0; il < n_layer; il++) {
+                layer_info li;
+                memcpy(&li.type_id, p, 4); p += 4;
+                memcpy(&li.row_size, p, 8); p += 8;
+                li.data_start = p;
+                p += cell_count * li.row_size;
+                v_layers.push_back(li);
+            }
+        }
+
+        // Tail bytes (recurrent state for SSM-hybrid)
+        size_t tail_size = end - p;
+
+        // Calculate compact buffer size
+        size_t compact_meta_size = 4 + 4; // n_stream + cell_count
+        for (uint32_t idx : keep_indices) {
+            compact_meta_size += 4 + 4 + 12 + cells[idx].n_seq_id * 4; // pos + n_seq_id + ext + seq_ids
+        }
+        size_t compact_data_size = 4 + 4; // v_trans + n_layer
+        for (const auto & kl : k_layers) {
+            compact_data_size += 4 + 8 + n_keep * kl.row_size;
+        }
+        for (const auto & vl : v_layers) {
+            compact_data_size += 4 + 8 + n_keep * vl.row_size;
+        }
+        size_t compact_size = compact_meta_size + compact_data_size + tail_size;
+
+        std::vector<uint8_t> compact_buf(compact_size);
+        uint8_t * w = compact_buf.data();
+
+        // Write n_stream
+        memcpy(w, &n_stream, 4); w += 4;
+
+        // Write cell_count (compacted)
+        uint32_t n_keep_u32 = n_keep;
+        memcpy(w, &n_keep_u32, 4); w += 4;
+
+        // Write meta for kept cells
+        for (uint32_t idx : keep_indices) {
+            // Seek to this cell's meta in the original buffer
+            const uint8_t * cp = state_buf.data() + 4 + 4; // start of first cell meta
+            for (uint32_t j = 0; j < idx; j++) {
+                cp += 4 + 4 + 12; // pos + n_seq_id + ext
+                uint32_t ns;
+                memcpy(&ns, cp - 12 + 4, 4); // re-read n_seq_id
+                // Actually, this is getting complicated. Let me use stored info.
+            }
+            // Simpler: write from stored cell_info + re-read seq_ids from original
+            // pos
+            memcpy(w, &cells[idx].pos, 4); w += 4;
+            // n_seq_id
+            memcpy(w, &cells[idx].n_seq_id, 4); w += 4;
+            // ext with beta
+            memcpy(w, &cells[idx].ext_x, 4); w += 4;
+            memcpy(w, &cells[idx].ext_y, 4); w += 4;
+            float new_beta = beta; // set beta on all kept cells
+            memcpy(w, &new_beta, 4); w += 4;
+            // seq_ids — read from original buffer at stored offset
+            const uint8_t * seq_src = state_buf.data() + cells[idx].meta_offset + 4 + 4 + 12; // after pos+n_seq_id+ext
+            memcpy(w, seq_src, cells[idx].n_seq_id * 4);
+            w += cells[idx].n_seq_id * 4;
+        }
+
+        // Write data section
+        memcpy(w, &v_trans, 4); w += 4;
+        memcpy(w, &n_layer, 4); w += 4;
+
+        // K layers — copy only kept rows
+        for (const auto & kl : k_layers) {
+            memcpy(w, &kl.type_id, 4); w += 4;
+            memcpy(w, &kl.row_size, 8); w += 8;
+            for (uint32_t idx : keep_indices) {
+                memcpy(w, kl.data_start + idx * kl.row_size, kl.row_size);
+                w += kl.row_size;
+            }
+        }
+
+        // V layers
+        for (const auto & vl : v_layers) {
+            memcpy(w, &vl.type_id, 4); w += 4;
+            memcpy(w, &vl.row_size, 8); w += 8;
+            for (uint32_t idx : keep_indices) {
+                memcpy(w, vl.data_start + idx * vl.row_size, vl.row_size);
+                w += vl.row_size;
+            }
+        }
+
+        // Tail bytes (recurrent state)
+        if (tail_size > 0) {
+            memcpy(w, end - tail_size, tail_size);
+            w += tail_size;
+        }
+
+        size_t compact_written = w - compact_buf.data();
+
+        // Step 6: Restore compacted state
+        size_t restored = llama_state_seq_set_data(ctx_server.get_ctx(), compact_buf.data(), compact_written, id_slot);
+
+        json result = {
+            {"id_slot",         id_slot},
+            {"original_cells",  (int)cell_count},
+            {"kept_cells",      n_keep},
+            {"compression",     actual_ratio},
+            {"beta",            beta},
+            {"tail_bytes",      (int)tail_size},
+            {"state_bytes",     (int)compact_written},
+            {"restored",        restored > 0},
+        };
+        res->ok(result);
+    }
+
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_seq_rm(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    // Parse JSON body: {"ranges": [{"p0": N, "p1": M}, ...]}
+    // Removes KV entries at positions [p0, p1) for the slot's sequence
+    auto body = json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.contains("ranges") || !body["ranges"].is_array()) {
+        res->error(format_error_response("Expected JSON body with 'ranges' array of {p0, p1} objects", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    llama_memory_t mem = ctx_server.get_memory();
+    if (!mem) {
+        res->error(format_error_response("No memory context available", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    int n_removed = 0;
+    int n_failed = 0;
+    for (const auto & entry : body["ranges"]) {
+        if (!entry.contains("p0") || !entry.contains("p1")) {
+            n_failed++;
+            continue;
+        }
+        const llama_pos p0 = entry["p0"].get<llama_pos>();
+        const llama_pos p1 = entry["p1"].get<llama_pos>();
+        if (llama_memory_seq_rm(mem, id_slot, p0, p1)) {
+            n_removed++;
+        } else {
+            n_failed++;
+        }
+    }
+
+    json result = {
+        {"id_slot", id_slot},
+        {"n_ranges_removed", n_removed},
+        {"n_failed", n_failed},
+    };
+    res->ok(result);
     return res;
 }
 
