@@ -2023,7 +2023,23 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             continue;
         }
 
-        state_write_meta(io, cr, seq_id);
+        // stream flags: bit 0 = ext (beta + 2D positions) present per cell
+        // determines whether state_write_meta includes llama_kv_cell_ext data
+        bool has_ext = hparams.n_pos_per_embd() > 1; // M-RoPE needs ext
+        if (!has_ext) {
+            // check if any cell has non-zero beta (AM compaction)
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second && !has_ext; ++i) {
+                    if (cells.ext_get(i).beta != 0.0f) {
+                        has_ext = true;
+                    }
+                }
+            }
+        }
+        uint32_t stream_flags = has_ext ? 1u : 0u;
+        io.write(&stream_flags, sizeof(stream_flags));
+
+        state_write_meta(io, cr, seq_id, has_ext);
         state_write_data(io, cr);
     }
 }
@@ -2047,12 +2063,17 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             continue;
         }
 
+        // read stream flags (added for AM compaction ext support)
+        uint32_t stream_flags;
+        io.read_to(&stream_flags, sizeof(stream_flags));
+        const bool read_ext = (stream_flags & 1u) != 0;
+
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, read_ext);
         res = res && state_read_data(io, strm, cell_count, sinfo);
 
         if (!res) {
@@ -2066,7 +2087,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     }
 }
 
-void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
+void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id, bool write_ext) const {
     const auto & cells = v_cells[cr.strm];
 
     for (const auto & range : cr.data) {
@@ -2087,8 +2108,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            // always write ext (contains beta for AM compaction + 2D positions for M-RoPE)
-            {
+            // write ext if model uses M-RoPE or if any cell has non-zero beta (AM compaction)
+            if (write_ext) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -2199,7 +2220,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, bool read_ext) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2228,12 +2249,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            // always read ext (contains beta for AM compaction + 2D positions for M-RoPE)
+            // read ext if present (beta for AM compaction + 2D positions for M-RoPE)
             llama_kv_cell_ext ext_i;
-            io.read_to(&ext_i, sizeof(ext_i));
+            if (read_ext) {
+                io.read_to(&ext_i, sizeof(ext_i));
+            }
             ext_values.push_back(ext_i);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (read_ext && hparams.n_pos_per_embd() > 1) {
                 ubatch.pos[i + ubatch.n_tokens]   = ext_i.y;
                 ubatch.pos[i + ubatch.n_tokens*2] = ext_i.x;
             }
@@ -2294,8 +2317,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            // always read ext (contains beta for AM compaction + 2D positions for M-RoPE)
-            {
+            // read ext if present (beta for AM compaction + 2D positions for M-RoPE)
+            if (read_ext) {
                 llama_kv_cell_ext ext;
                 io.read_to(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
