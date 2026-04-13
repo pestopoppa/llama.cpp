@@ -15,6 +15,11 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // per-token additive attention bias for Attention Matching KV compaction
+    // when non-zero, this value is added to the attention score for this KV position
+    // see: arxiv:2602.16284 (Attention Matching, Zweiger et al.)
+    float beta = 0.0f;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
