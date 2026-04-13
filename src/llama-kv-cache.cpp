@@ -704,6 +704,29 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+bool llama_kv_cache::set_beta(llama_seq_id seq_id, llama_pos pos, float beta) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        if (!cells.seq_has(i, seq_id)) {
+            continue;
+        }
+        if (cells.pos_get(i) == pos) {
+            auto ext = cells.ext_get(i);
+            ext.beta = beta;
+            cells.ext_set(i, ext);
+            return true;
+        }
+    }
+
+    return false; // position not found
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -1673,7 +1696,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 if (alibi) {
                     data[idst + j] = -std::abs(p0 - p1);
                 } else {
-                    data[idst + j] = 0.0f;
+                    // inject per-token attention bias from Attention Matching compaction
+                    // beta == 0.0f for normal (non-compacted) KV entries (no-op)
+                    data[idst + j] = cells.ext_get(j).beta;
                 }
 
                 continue;
@@ -2062,7 +2087,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            // always write ext (contains beta for AM compaction + 2D positions for M-RoPE)
+            {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -2187,6 +2213,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        std::vector<llama_kv_cell_ext> ext_values;
+        ext_values.reserve(cell_count);
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
@@ -2199,12 +2228,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
-                llama_kv_cell_ext ext;
-                io.read_to(&ext, sizeof(ext));
+            // always read ext (contains beta for AM compaction + 2D positions for M-RoPE)
+            llama_kv_cell_ext ext_i;
+            io.read_to(&ext_i, sizeof(ext_i));
+            ext_values.push_back(ext_i);
 
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+            if (hparams.n_pos_per_embd() > 1) {
+                ubatch.pos[i + ubatch.n_tokens]   = ext_i.y;
+                ubatch.pos[i + ubatch.n_tokens*2] = ext_i.x;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2224,9 +2255,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
-        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        // apply ext (beta + 2D positions) to the allocated cells
+        // apply_ubatch doesn't propagate ext, so set manually after allocation
+        GGML_ASSERT(sinfo.idxs[0].size() == ext_values.size());
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            const uint32_t idx = sinfo.idxs[0][i];
+            cells.ext_set(idx, ext_values[i]);
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -2257,7 +2294,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            // always read ext (contains beta for AM compaction + 2D positions for M-RoPE)
+            {
                 llama_kv_cell_ext ext;
                 io.read_to(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
