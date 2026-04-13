@@ -751,6 +751,17 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Set per-token attention bias (beta) for Attention Matching KV compaction.
+    // The bias is added to attention scores during softmax computation.
+    // pos: the position of the token in the sequence
+    // beta: additive attention bias (0.0 = no bias, default for non-compacted entries)
+    // Returns false if the position is not found in the cache for this sequence.
+    LLAMA_API bool llama_memory_set_beta(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos pos,
+                     float beta);
+
     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

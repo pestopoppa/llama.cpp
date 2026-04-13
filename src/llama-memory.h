@@ -109,6 +109,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // set per-token attention bias for Attention Matching KV compaction
+    // default implementation returns false (not supported for non-KV-cache memory types)
+    virtual bool set_beta(llama_seq_id /*seq_id*/, llama_pos /*pos*/, float /*beta*/) { return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

@@ -3293,6 +3293,18 @@ void llama_memory_seq_div(
     mem->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_memory_set_beta(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos pos,
+                 float beta) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->set_beta(seq_id, pos, beta);
+}
+
 llama_pos llama_memory_seq_pos_min(
         llama_memory_t mem,
           llama_seq_id seq_id) {
