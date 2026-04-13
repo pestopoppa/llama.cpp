@@ -4379,33 +4379,97 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
             return res;
         }
 
-        // Step 4: Select positions to keep (heuristic: first N + last M + sampled middle)
+        // Step 4: Select positions to keep
+        // Strategy: always keep first N + last M (anchor tokens).
+        // For middle positions: score by K-vector norm summed across layers (proxy for attention importance).
+        // Positions with larger key norms attract more attention weight — this is the key insight from
+        // KnormPress (NVIDIA KVPress) and is a fast approximation of full attention-weight scoring.
+
+        // First, peek ahead to read K data for norm scoring (we'll re-read it properly in step 5)
+        const uint8_t * data_peek = p;
+        uint32_t peek_v_trans, peek_n_layer;
+        memcpy(&peek_v_trans, data_peek, 4); data_peek += 4;
+        memcpy(&peek_n_layer, data_peek, 4); data_peek += 4;
+
+        // Compute per-position importance score = sum of K-row L2 norms across layers
+        std::vector<float> importance(cell_count, 0.0f);
+        {
+            const uint8_t * kp = data_peek;
+            for (uint32_t il = 0; il < peek_n_layer; il++) {
+                int32_t k_type;
+                uint64_t k_row_size;
+                memcpy(&k_type, kp, 4); kp += 4;
+                memcpy(&k_row_size, kp, 8); kp += 8;
+
+                // Compute L2 norm of each K row (treat as f16 or f32 depending on type)
+                for (uint32_t c = 0; c < cell_count; c++) {
+                    const uint8_t * row = kp + c * k_row_size;
+                    float norm_sq = 0.0f;
+
+                    if (k_type == 1) { // GGML_TYPE_F16
+                        const uint16_t * fp16 = (const uint16_t *)row;
+                        uint32_t n_elem = k_row_size / 2;
+                        for (uint32_t e = 0; e < n_elem; e++) {
+                            // fast f16→f32: use ggml helper or bit manipulation
+                            // simplified: just use the raw bits as a magnitude proxy
+                            uint16_t h = fp16[e];
+                            int exp = (h >> 10) & 0x1F;
+                            float approx = (float)(exp > 0 ? exp - 15 : 0); // log2 magnitude
+                            norm_sq += approx * approx;
+                        }
+                    } else if (k_type == 0) { // GGML_TYPE_F32
+                        const float * fp32 = (const float *)row;
+                        uint32_t n_elem = k_row_size / 4;
+                        for (uint32_t e = 0; e < n_elem; e++) {
+                            norm_sq += fp32[e] * fp32[e];
+                        }
+                    } else {
+                        // Quantized type — use row byte sum as rough proxy
+                        for (uint64_t b = 0; b < k_row_size; b++) {
+                            norm_sq += (float)(row[b]) * (float)(row[b]);
+                        }
+                    }
+
+                    importance[c] += sqrtf(norm_sq);
+                }
+
+                kp += cell_count * k_row_size;
+            }
+        }
+
+        // Select positions: anchor first/last, then top-k by importance for middle
         std::vector<bool> keep(cell_count, false);
         int n_keep = 0;
 
-        // Keep first
+        // Always keep first N and last M
         for (int i = 0; i < std::min(keep_first, (int)cell_count); i++) {
             keep[i] = true;
         }
-        // Keep last
         for (int i = std::max(0, (int)cell_count - keep_last); i < (int)cell_count; i++) {
             keep[i] = true;
         }
-        // Count kept so far
         n_keep = 0;
         for (bool k : keep) n_keep += k;
 
-        // Fill to target ratio with evenly sampled middle
+        // Fill remaining slots with highest-importance middle positions
         int target = std::max(n_keep, (int)(cell_count * keep_ratio));
-        int middle_start = std::min(keep_first, (int)cell_count);
-        int middle_end = std::max(0, (int)cell_count - keep_last);
-        if (middle_end > middle_start && target > n_keep) {
-            int step = std::max(1, (middle_end - middle_start) / (target - n_keep));
-            for (int i = middle_start; i < middle_end && n_keep < target; i += step) {
+        if (target > n_keep) {
+            // Build (importance, index) pairs for non-anchored positions
+            std::vector<std::pair<float, uint32_t>> scored;
+            for (uint32_t i = 0; i < cell_count; i++) {
                 if (!keep[i]) {
-                    keep[i] = true;
-                    n_keep++;
+                    scored.push_back({importance[i], i});
                 }
+            }
+            // Sort by importance descending
+            std::sort(scored.begin(), scored.end(), [](const auto & a, const auto & b) {
+                return a.first > b.first;
+            });
+            // Keep top (target - n_keep) by importance
+            int to_add = target - n_keep;
+            for (int i = 0; i < std::min(to_add, (int)scored.size()); i++) {
+                keep[scored[i].second] = true;
+                n_keep++;
             }
         }
 
