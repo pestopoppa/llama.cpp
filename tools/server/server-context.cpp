@@ -4762,17 +4762,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
         std::vector<cell_info> cells;
         uint32_t cell_count = 0;
 
+        bool has_ext = false;
         if (n_stream > 0) {
             memcpy(&cell_count, p, 4); p += 4;
+
+            // read stream flags
+            uint32_t stream_flags;
+            memcpy(&stream_flags, p, 4); p += 4;
+            has_ext = (stream_flags & 1u) != 0;
 
             for (uint32_t i = 0; i < cell_count; i++) {
                 cell_info ci;
                 ci.meta_offset = p - state_buf.data();
                 memcpy(&ci.pos, p, 4); p += 4;
                 memcpy(&ci.n_seq_id, p, 4); p += 4;
-                memcpy(&ci.ext_x, p, 4); p += 4;
-                memcpy(&ci.ext_y, p, 4); p += 4;
-                memcpy(&ci.ext_beta, p, 4); p += 4;
+                if (has_ext) {
+                    memcpy(&ci.ext_x, p, 4); p += 4;
+                    memcpy(&ci.ext_y, p, 4); p += 4;
+                    memcpy(&ci.ext_beta, p, 4); p += 4;
+                } else {
+                    ci.ext_x = 0; ci.ext_y = 0; ci.ext_beta = 0.0f;
+                }
                 p += ci.n_seq_id * 4; // skip seq_ids
                 cells.push_back(ci);
             }
@@ -4869,7 +4879,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
         size_t tail_size = end - p;
 
         // Calculate compact buffer size
-        size_t compact_meta_size = 4 + 4; // n_stream + cell_count
+        size_t compact_meta_size = 4 + 4 + 4; // n_stream + cell_count + stream_flags
         for (uint32_t idx : keep_indices) {
             compact_meta_size += 4 + 4 + 12 + cells[idx].n_seq_id * 4; // pos + n_seq_id + ext + seq_ids
         }
@@ -4891,6 +4901,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
         // Write cell_count (compacted)
         uint32_t n_keep_u32 = n_keep;
         memcpy(w, &n_keep_u32, 4); w += 4;
+
+        // Write stream flags (ext present since we're writing beta)
+        uint32_t out_flags = 1u; // always write ext in compacted output (has beta)
+        memcpy(w, &out_flags, 4); w += 4;
 
         // Write meta for kept cells
         for (uint32_t idx : keep_indices) {
