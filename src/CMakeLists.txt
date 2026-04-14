@@ -58,6 +58,7 @@ add_library(llama
             models/deepseek.cpp
             models/deepseek2.cpp
             models/delta-net-base.cpp
+            models/diff-transformer.cpp
             models/dots1.cpp
             models/dream.cpp
             models/ernie4-5-moe.cpp
