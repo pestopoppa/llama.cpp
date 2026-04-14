@@ -239,6 +239,7 @@ struct llama_layer {
     struct ggml_tensor * wk        = nullptr;
     struct ggml_tensor * wv        = nullptr;
     struct ggml_tensor * wo        = nullptr;
+    struct ggml_tensor * w_lambda  = nullptr; // diff-transformer: lambda projection
     struct ggml_tensor * wqkv      = nullptr;
     struct ggml_tensor * wq_a      = nullptr;
     struct ggml_tensor * wq_b      = nullptr;
