@@ -8,6 +8,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "../../src/llama-kv-compress.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -4305,13 +4306,56 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_set_beta(const
 std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const server_http_req & req, int id_slot) {
     auto res = create_response();
 
-    // Parse parameters: keep_ratio (0.0-1.0), beta, keep_first, keep_last
+    // Parse parameters: keep_ratio (0.0-1.0), beta, keep_first, keep_last, scorer
     auto body = json::parse(req.body, nullptr, false);
     float keep_ratio  = body.is_object() && body.contains("keep_ratio")  ? body["keep_ratio"].get<float>()   : 0.5f;
     float beta        = body.is_object() && body.contains("beta")        ? body["beta"].get<float>()          : 0.1f;
     int   keep_first  = body.is_object() && body.contains("keep_first")  ? body["keep_first"].get<int>()      : 8;
     int   keep_last   = body.is_object() && body.contains("keep_last")   ? body["keep_last"].get<int>()       : 15;
+    std::string scorer = body.is_object() && body.contains("scorer")     ? body["scorer"].get<std::string>()  : "expected_attention";
 
+    // Expected Attention scorer: operates directly on KV cache via llama_kv_compress_evict().
+    // Faster and more accurate than K-norm. Does not use serialize/restore — evicts in-place.
+    // THREAD SAFETY: EA reads raw KV tensor data without locks. The slot MUST be idle
+    // (not processing inference) to avoid concurrent read/write on KV buffers.
+    // The server's slot state machine guarantees this when called between requests.
+    if (scorer == "expected_attention") {
+        llama_kv_compress_params ea_params;
+        ea_params.compression_ratio = 1.0f - keep_ratio;  // keep_ratio=0.5 means remove 50%
+        ea_params.n_sink            = keep_first;
+        ea_params.n_future          = body.is_object() && body.contains("n_future") ? body["n_future"].get<int>() : 128;
+        ea_params.use_covariance    = body.is_object() && body.contains("use_covariance") ? body["use_covariance"].get<bool>() : true;
+
+        // Layer-adaptive weights for autopilot tuning.
+        // Pass "layer_weights": [1.0, 1.0, ..., 2.0, 2.0] to emphasize deep layers.
+        // If omitted, uniform weighting across all attention layers.
+        if (body.is_object() && body.contains("layer_weights") && body["layer_weights"].is_array()) {
+            for (const auto & w : body["layer_weights"]) {
+                ea_params.layer_weights.push_back(w.get<float>());
+            }
+        }
+
+        int n_evicted = llama_kv_compress_evict(ctx_server.get_ctx(), id_slot, ea_params);
+        if (n_evicted < 0) {
+            res->error(format_error_response("Expected Attention compression failed", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx_server.get_ctx());
+        llama_pos new_pos_max = llama_memory_seq_pos_max(mem, id_slot);
+
+        json result = {
+            {"id_slot",       id_slot},
+            {"scorer",        "expected_attention"},
+            {"n_evicted",     n_evicted},
+            {"keep_ratio",    keep_ratio},
+            {"pos_max_after", new_pos_max},
+        };
+        res->ok(result);
+        return res;
+    }
+
+    // K-norm scorer (legacy): serializes state, scores by K-row L2 norms, rebuilds buffer.
     {
         // Step 1: Get state size
         size_t state_size = llama_state_seq_get_size(ctx_server.get_ctx(), id_slot);
