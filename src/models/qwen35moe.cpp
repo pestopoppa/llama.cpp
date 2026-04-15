@@ -67,6 +67,15 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // Capture hidden states at attention layer outputs for routing probes.
+        // Only when explicitly requested (adds memory overhead).
+        // Only capture full-attention layers (not recurrent/SSM) since attention
+        // layers have bidirectional context while SSM layers are recency-biased.
+        if (capture_hidden_states && !hparams.is_recurrent(il)) {
+            ggml_set_output(cur);
+            res->t_layer_hs[il] = cur;
+        }
+
         // Input for next layer
         inpL = cur;
     }

@@ -79,6 +79,12 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // hidden state probing
+    void set_capture_hidden_states(bool enable) { capture_hidden_states = enable; }
+    const float * get_hidden_state_layer(int layer) const;
+    int           get_hidden_state_count() const { return (int)layer_hidden_states.size(); }
+    int           get_hidden_state_layer_id(int i) const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -274,6 +280,11 @@ private:
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
 
+    // per-layer hidden states for routing probes
+    // populated when capture_hidden_states is true after graph computation
+    // key: layer index, value: mean-pooled hidden state [n_embd]
+    std::map<int, std::vector<float>> layer_hidden_states;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -301,6 +312,10 @@ private:
     std::unique_ptr<llama_batch_allocr> balloc;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
+    // when true, the next graph build captures per-layer hidden states
+    // into res->t_layer_hs (attention layers only). reset after extraction.
+    bool capture_hidden_states = false;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 

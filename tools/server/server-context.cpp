@@ -1684,6 +1684,26 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void send_hidden_states(const server_slot & slot) {
+        auto res = std::make_unique<server_task_result_hidden_states>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const int n_layers = llama_get_hidden_state_count(ctx);
+        for (int i = 0; i < n_layers; ++i) {
+            const int layer_id = llama_get_hidden_state_layer_id(ctx, i);
+            const float * hs = llama_get_hidden_state_layer(ctx, layer_id);
+            if (hs) {
+                const int n_embd = llama_model_n_embd(model);
+                res->layer_states.emplace_back(layer_id, std::vector<float>(hs, hs + n_embd));
+            }
+        }
+
+        SLT_DBG(slot, "sending %d layer hidden states\n", n_layers);
+        queue_results.send(std::move(res));
+    }
+
     void send_rerank(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
@@ -1801,6 +1821,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_HIDDEN_STATES:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2956,6 +2977,7 @@ private:
             }
 
             llama_set_embeddings(ctx, slot_batched->task->need_embd());
+            llama_set_capture_hidden_states(ctx, slot_batched->task->need_hidden_states());
         }
 
         if (batch.n_tokens == 0) {
@@ -3085,6 +3107,13 @@ private:
                         slot.release();
                         slot.i_batch = -1;
                         continue; // continue loop of slots
+                    }
+
+                    if (slot.task->type == SERVER_TASK_TYPE_HIDDEN_STATES) {
+                        send_hidden_states(slot);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
                     }
 
                     if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
@@ -4457,6 +4486,64 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    this->post_hidden_states = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.embedding) {
+            res->error(format_error_response("This server does not support hidden states. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+
+        json prompt;
+        if (body.contains("content")) {
+            prompt = body.at("content");
+        } else if (body.contains("input")) {
+            prompt = body.at("input");
+        } else {
+            res->error(format_error_response("\"content\" or \"input\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+        for (const auto & tokens : tokenized_prompts) {
+            if (tokens.empty()) {
+                res->error(format_error_response("Input content cannot be empty", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+
+        // create and queue the tasks
+        json responses = json::array();
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            for (size_t i = 0; i < tokenized_prompts.size(); i++) {
+                server_task task = server_task(SERVER_TASK_TYPE_HIDDEN_STATES);
+                task.id     = rd.get_new_id();
+                task.tokens = std::move(tokenized_prompts[i]);
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        } else {
+            for (auto & result : all_results.results) {
+                responses.push_back(result->to_json());
+            }
+        }
+
+        res->ok(json(responses));
+        return res;
     };
 
     this->post_rerank = [this](const server_http_req & req) {

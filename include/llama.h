@@ -1080,6 +1080,26 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Hidden state extraction for routing probes [EXPERIMENTAL]
+    // Call llama_set_capture_hidden_states(ctx, true) BEFORE llama_decode to capture
+    // per-layer hidden states. After decode, retrieve mean-pooled hidden states.
+    // The flag auto-resets after extraction.
+
+    // Enable/disable hidden state capture for the next decode call
+    LLAMA_API void llama_set_capture_hidden_states(struct llama_context * ctx, bool enable);
+
+    // Get mean-pooled hidden state for a specific layer after decode
+    // Returns pointer to float[n_embd] or NULL if layer was not captured
+    // Only attention layers are captured (SSM layers are skipped)
+    LLAMA_API const float * llama_get_hidden_state_layer(struct llama_context * ctx, int layer);
+
+    // Get number of captured hidden state layers after decode
+    LLAMA_API int llama_get_hidden_state_count(struct llama_context * ctx);
+
+    // Get layer index of the i-th captured hidden state (0-indexed)
+    // Use with llama_get_hidden_state_count to iterate all captured layers
+    LLAMA_API int llama_get_hidden_state_layer_id(struct llama_context * ctx, int i);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

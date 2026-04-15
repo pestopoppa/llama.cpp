@@ -18,6 +18,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_INFILL,
+    SERVER_TASK_TYPE_HIDDEN_STATES,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
@@ -181,10 +182,15 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_HIDDEN_STATES:
                 return true;
             default:
                 return false;
         }
+    }
+
+    bool need_hidden_states() const {
+        return type == SERVER_TASK_TYPE_HIDDEN_STATES;
     }
 
     bool need_logits() const {
@@ -475,6 +481,15 @@ struct server_task_result_embd : server_task_result {
     json to_json_non_oaicompat();
 
     json to_json_oaicompat();
+};
+
+struct server_task_result_hidden_states : server_task_result {
+    // layer_index → mean-pooled hidden state [n_embd]
+    std::vector<std::pair<int, std::vector<float>>> layer_states;
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
 };
 
 struct server_task_result_rerank : server_task_result {

@@ -949,9 +949,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
-    samplers         (params.samplers),
-    cb_func          (params.cb),
-    res              (params.res),
+    samplers              (params.samplers),
+    capture_hidden_states (params.capture_hidden_states),
+    cb_func               (params.cb),
+    res                   (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

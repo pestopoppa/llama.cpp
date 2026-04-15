@@ -1819,6 +1819,24 @@ json server_task_result_embd::to_json_oaicompat() {
 }
 
 //
+// server_task_result_hidden_states
+//
+json server_task_result_hidden_states::to_json() {
+    json layers = json::array();
+    for (const auto & [layer_id, state] : layer_states) {
+        layers.push_back({
+            {"layer", layer_id},
+            {"hidden_state", state},
+        });
+    }
+    return json {
+        {"index",            index},
+        {"layers",           layers},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
 // server_task_result_rerank
 //
 json server_task_result_rerank::to_json() {

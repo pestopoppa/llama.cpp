@@ -1388,6 +1388,43 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+    // extract per-layer hidden states (for routing probes)
+    if (capture_hidden_states) {
+        const auto & layer_hs = res->get_layer_hidden_states();
+        const int64_t n_embd_hs = hparams.n_embd;
+
+        layer_hidden_states.clear();
+
+        for (const auto & [il, t_hs] : layer_hs) {
+            ggml_backend_t backend_hs = ggml_backend_sched_get_tensor_backend(sched.get(), t_hs);
+            if (!backend_hs) {
+                continue;
+            }
+
+            // Read raw hidden states: [n_embd, n_tokens]
+            const int64_t hs_n_tokens = t_hs->ne[1];
+            std::vector<float> raw(n_embd_hs * hs_n_tokens);
+            ggml_backend_tensor_get_async(backend_hs, t_hs, raw.data(), 0, raw.size() * sizeof(float));
+
+            // Mean-pool across token positions → [n_embd]
+            std::vector<float> pooled(n_embd_hs, 0.0f);
+            for (int64_t t = 0; t < hs_n_tokens; ++t) {
+                for (int64_t e = 0; e < n_embd_hs; ++e) {
+                    pooled[e] += raw[t * n_embd_hs + e];
+                }
+            }
+            const float inv_n = 1.0f / (float)hs_n_tokens;
+            for (int64_t e = 0; e < n_embd_hs; ++e) {
+                pooled[e] *= inv_n;
+            }
+
+            layer_hidden_states[il] = std::move(pooled);
+        }
+
+        // Reset flag after extraction
+        capture_hidden_states = false;
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -2170,11 +2207,12 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.cross                 =*/ &cross,
+        /*.capture_hidden_states =*/ capture_hidden_states,
+        /*.samplers              =*/ sampling.samplers,
+        /*.n_outputs             =*/ n_outputs,
+        /*.cb                    =*/ graph_get_cb(),
+        /*.res                   =*/ res,
     };
 }
 
@@ -3127,6 +3165,44 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+// hidden state member functions
+const float * llama_context::get_hidden_state_layer(int layer) const {
+    auto it = layer_hidden_states.find(layer);
+    if (it == layer_hidden_states.end()) {
+        return nullptr;
+    }
+    return it->second.data();
+}
+
+int llama_context::get_hidden_state_layer_id(int i) const {
+    if (i < 0 || i >= (int)layer_hidden_states.size()) {
+        return -1;
+    }
+    auto it = layer_hidden_states.begin();
+    std::advance(it, i);
+    return it->first;
+}
+
+// C API wrappers
+void llama_set_capture_hidden_states(llama_context * ctx, bool enable) {
+    ctx->set_capture_hidden_states(enable);
+}
+
+const float * llama_get_hidden_state_layer(llama_context * ctx, int layer) {
+    ctx->synchronize();
+    return ctx->get_hidden_state_layer(layer);
+}
+
+int llama_get_hidden_state_count(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_hidden_state_count();
+}
+
+int llama_get_hidden_state_layer_id(llama_context * ctx, int i) {
+    ctx->synchronize();
+    return ctx->get_hidden_state_layer_id(i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

@@ -548,6 +548,11 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // when true, models that support hidden-state extraction will capture
+    // per-layer outputs (attention layers only) into res->t_layer_hs.
+    // adds memory overhead — only enable for /hidden-states requests.
+    bool capture_hidden_states = false;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -648,6 +653,11 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
 
+    // per-layer hidden states for probing / routing
+    // populated by models that support hidden-state extraction (e.g., qwen35moe)
+    // key: layer index, value: hidden state tensor [n_embd, n_tokens]
+    const std::map<int, ggml_tensor *> & get_layer_hidden_states() const { return t_layer_hs; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -675,6 +685,10 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    // per-layer hidden states (layer_index → tensor)
+    // captured at attention layer outputs for routing probes
+    std::map<int, ggml_tensor *> t_layer_hs;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -757,6 +771,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const bool capture_hidden_states;
 
     const llm_graph_cb & cb_func;
 
