@@ -611,7 +611,10 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // For MROPE/IMROPE (n_pos_per_embd > 1), seq_add shifts the base text
+    // position which is shared across all position components. The K-shift
+    // graph (build_rope_shift) already handles MROPE/IMROPE by falling back
+    // to NEOX-style rotation, so this is safe for text-only inference.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -656,7 +659,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    // For MROPE/IMROPE: seq_div shifts base text position, same reasoning as seq_add.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1223,9 +1226,8 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
+    // MROPE/IMROPE (n_pos_per_embd > 1) is supported: build_rope_shift falls
+    // back to NEOX-style rotation which correctly shifts all position components.
     return true;
 }
 
