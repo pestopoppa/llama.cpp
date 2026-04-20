@@ -44,6 +44,11 @@ struct llama_cparams {
     // 0 = use model default, 1+ = force exactly N active experts
     int32_t moe_n_expert_override;
 
+    // TIDE early exit: number of layers to compute (0 = all layers)
+    // When > 0 and < n_layer, the model exits early after this many layers.
+    // Used by TIDE router for per-token adaptive layer exit.
+    int32_t n_layer_exit;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

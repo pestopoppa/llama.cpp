@@ -1992,6 +1992,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_N_EXPERT"));
     add_opt(common_arg(
+        {"--n-layer-exit"}, "N",
+        string_format("TIDE: exit after N layers (default: %d = all layers)\n"
+                      "Used for early-exit speculation. Set dynamically by TIDE router.", params.n_layer_exit),
+        [](common_params & params, int value) {
+            params.n_layer_exit = value;
+        }
+    ).set_env("LLAMA_ARG_N_LAYER_EXIT"));
+    add_opt(common_arg(
         {"-gan", "--grp-attn-n"}, "N",
         string_format("group-attention factor (default: %d)", params.grp_attn_n),
         [](common_params & params, int value) {

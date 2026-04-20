@@ -23,7 +23,11 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // TIDE early exit: compute fewer layers when n_layer_exit is set
+    const int64_t n_layer_exit = cparams.n_layer_exit;
+    const int64_t n_layer_eff = (n_layer_exit > 0 && n_layer_exit < n_layer) ? n_layer_exit : n_layer;
+
+    for (int il = 0; il < n_layer_eff; ++il) {
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -40,7 +44,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer_eff - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
