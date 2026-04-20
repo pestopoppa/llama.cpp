@@ -81,32 +81,39 @@ static std::vector<std::string> generate_calibration_text(int n_samples) {
 int main(int argc, char ** argv) {
     common_params params;
 
-    // Custom args
+    // Custom args — extract before common_params_parse (which rejects unknowns)
     std::string output_dir = "./tide_calibration";
     int n_samples = 2000;
     int seq_len = 512;
     int checkpoint_interval = 4;
 
-    // Parse standard llama args first
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
-        return 1;
-    }
-
-    // Parse our custom args (after standard parsing)
+    // Pre-parse custom args and remove them from argv
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--output-dir" && i + 1 < argc) {
+        std::string arg = argv[i];
+        if (arg == "--output-dir" && i + 1 < argc) {
             output_dir = argv[++i];
-        } else if (std::string(argv[i]) == "--n-samples" && i + 1 < argc) {
+        } else if (arg == "--n-samples" && i + 1 < argc) {
             n_samples = std::atoi(argv[++i]);
-        } else if (std::string(argv[i]) == "--seq-len" && i + 1 < argc) {
+        } else if (arg == "--seq-len" && i + 1 < argc) {
             seq_len = std::atoi(argv[++i]);
-        } else if (std::string(argv[i]) == "--checkpoint-interval" && i + 1 < argc) {
+        } else if (arg == "--checkpoint-interval" && i + 1 < argc) {
             checkpoint_interval = std::atoi(argv[++i]);
+        } else {
+            filtered_argv.push_back(argv[i]);
         }
     }
 
+    int filtered_argc = (int)filtered_argv.size();
+
     // Force embeddings mode
     params.embedding = true;
+
+    // Parse standard llama args
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+        return 1;
+    }
 
     fprintf(stderr, "TIDE Calibration\n");
     fprintf(stderr, "  Model: %s\n", params.model.path.c_str());
