@@ -1003,6 +1003,10 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // TIDE: dynamically set the number of layers to compute (0 = all layers)
+    // Call between llama_decode() calls to enable adaptive early exit
+    LLAMA_API void llama_set_n_layer_exit(struct llama_context * ctx, int32_t n_layer_exit);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
