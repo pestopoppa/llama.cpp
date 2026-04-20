@@ -5,6 +5,21 @@
 
 struct common_speculative;
 
+// tree topology built during tree-based speculative drafting (DySpec)
+struct speculation_tree {
+    std::vector<int32_t>     parent;     // parent[i] = -1 for root
+    std::vector<llama_token> tokens;     // token at each node
+    std::vector<float>       log_probs;  // cumulative log probability to reach node i
+    int32_t n_nodes = 0;
+
+    std::vector<std::vector<int32_t>> get_paths() const;
+    llama_tokens get_best_path() const;
+    llama_tokens get_greedy_path() const;
+};
+
+// get tree from last draft call (nullptr if no tree or p_split == 0)
+const speculation_tree * common_speculative_get_tree(const common_speculative * spec);
+
 // comma separated list of all types
 std::string common_speculative_type_name_str();
 
