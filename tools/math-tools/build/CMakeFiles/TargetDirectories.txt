@@ -1,0 +1,7 @@
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/llama-math-tools.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/edit_cache.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/rebuild_cache.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/list_install_components.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/install.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/install/local.dir
+/mnt/raid0/llm/llama.cpp/tools/math-tools/build/CMakeFiles/install/strip.dir
