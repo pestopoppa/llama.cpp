@@ -1,0 +1,62 @@
+[
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/main.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/main.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/main.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/main.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/numerical/matrix_op.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/matrix_op.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/matrix_op.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/numerical/matrix_op.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/numerical/solve_ode.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/solve_ode.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/solve_ode.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/numerical/solve_ode.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/numerical/optimize.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/optimize.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/numerical/optimize.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/numerical/optimize.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/statistical/monte_carlo.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/monte_carlo.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/monte_carlo.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/statistical/monte_carlo.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/statistical/mcmc.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/mcmc.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/mcmc.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/statistical/mcmc.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/statistical/bayesopt.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/bayesopt.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/statistical/bayesopt.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/statistical/bayesopt.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/visualization/plot_braille.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/plot_braille.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/plot_braille.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/visualization/plot_braille.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/visualization/render_math.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/render_math.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/render_math.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/visualization/render_math.cpp.o"
+},
+{
+  "directory": "/mnt/raid0/llm/llama.cpp/tools/math-tools/build",
+  "command": "/usr/bin/c++ -DHAVE_OPENMP -I/mnt/raid0/llm/llama.cpp/tools/math-tools/include -I/mnt/raid0/llm/llama.cpp/tools/math-tools/external/eigen -I/mnt/raid0/llm/llama.cpp/tools/math-tools/../../vendor/nlohmann -std=gnu++17 -O3 -march=native -ffast-math -funroll-loops -fopenmp -o CMakeFiles/llama-math-tools.dir/commands/visualization/plot_sixel.cpp.o -c /mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/plot_sixel.cpp",
+  "file": "/mnt/raid0/llm/llama.cpp/tools/math-tools/commands/visualization/plot_sixel.cpp",
+  "output": "CMakeFiles/llama-math-tools.dir/commands/visualization/plot_sixel.cpp.o"
+}
+]

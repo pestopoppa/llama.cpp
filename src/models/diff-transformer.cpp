@@ -75,7 +75,7 @@ llm_build_diff_transformer::llm_build_diff_transformer(
             // Use build_attn with wo=nullptr to get attention output without output projection.
             // build_attn handles KV cache store/retrieve and mask application internally.
             ggml_tensor * attn_full = build_attn(inp_attn,
-                    nullptr, nullptr,  // wo=NULL, wo_b=NULL — we apply wo after differential
+                    nullptr, nullptr, nullptr,  // wo=NULL, wo_b=NULL, wo_s=NULL — we apply wo after differential
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(attn_full, "attn_full", il);
 
