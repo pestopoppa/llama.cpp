@@ -1067,6 +1067,10 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_n_layer_exit(int32_t value) {
+    cparams.n_layer_exit = value;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -3085,6 +3089,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_n_layer_exit(llama_context * ctx, int32_t n_layer_exit) {
+    ctx->set_n_layer_exit(n_layer_exit);
 }
 
 void llama_synchronize(llama_context * ctx) {
