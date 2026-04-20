@@ -418,6 +418,7 @@ struct common_params {
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     int32_t moe_n_expert_override =     0; // MoE self-draft: override n_expert_used (0 = use model default)
+    int32_t n_layer_exit          =     0; // TIDE early exit: 0 = all layers, N = exit after N layers
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

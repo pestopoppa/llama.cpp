@@ -356,6 +356,9 @@ extern "C" {
         // Used for MoE self-draft speculation: draft context uses n=1, verify uses full
         int32_t  moe_n_expert_override;
 
+        // TIDE early exit: 0 = all layers, N = exit after N layers
+        int32_t  n_layer_exit;
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
