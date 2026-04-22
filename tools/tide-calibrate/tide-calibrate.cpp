@@ -53,51 +53,33 @@ static bool tide_eval_callback(struct ggml_tensor * t, bool ask, void * user_dat
 
     const std::string name(t->name);
 
-    // Debug: print first few unique tensor names to find the right pattern
-    static std::set<std::string> seen_names;
-    static int debug_count = 0;
-    if (ask && debug_count < 100 && seen_names.insert(name).second) {
-        if (name.find("l_out") != std::string::npos ||
-            name.find("post_moe") != std::string::npos ||
-            name.find("ffn_out") != std::string::npos ||
-            name.find("attn_res") != std::string::npos) {
-            fprintf(stderr, "  [cb_eval] tensor: '%s' ne=(%lld,%lld,%lld,%lld)\n",
-                    name.c_str(), (long long)t->ne[0], (long long)t->ne[1],
-                    (long long)t->ne[2], (long long)t->ne[3]);
-            debug_count++;
-        }
-    }
-
-    // Try multiple name patterns — model builders use different conventions
+    // Match l_out-N tensors (all model builders use this via cb())
     int layer = -1;
     if (name.rfind("l_out-", 0) == 0) {
-        layer = std::atoi(name.c_str() + 6) + 1;
-    } else if (name.rfind("post_moe-", 0) == 0) {
-        layer = std::atoi(name.c_str() + 9) + 1;
+        layer = std::atoi(name.c_str() + 6) + 1; // l_out-0 = after layer 1
     }
 
     if (layer < 0 || g_capture.checkpoint_layers.count(layer) == 0) return false;
 
     if (ask) {
-        return true; // yes, copy this tensor's data
+        return true;
     }
 
-    // Not asking — data is available, capture it
+    // Data available — capture it
     int n_elements = (int)ggml_nelements(t);
     const float * data = (const float *)t->data;
 
-    // Find checkpoint index
     int ckpt_idx = 0;
     for (int cl : g_capture.checkpoint_layers) {
         if (cl == layer) break;
         ckpt_idx++;
     }
 
-    if (ckpt_idx < (int)g_capture.captured.size()) {
+    if (ckpt_idx < (int)g_capture.captured.size() && data && n_elements > 0) {
         g_capture.captured[ckpt_idx].assign(data, data + n_elements);
     }
 
-    return false;
+    return true; // MUST return true to continue graph execution (false = abort)
 }
 
 // Compute cosine similarity between two float vectors
@@ -163,6 +145,7 @@ int main(int argc, char ** argv) {
     int checkpoint_interval = 4;
     bool full_states = false;
     float cos_threshold = 0.98f;
+    int start_sample = 0;  // --start-sample N for resume
 
     // Pre-parse custom args
     std::vector<char *> filtered_argv;
@@ -181,6 +164,8 @@ int main(int argc, char ** argv) {
             full_states = true;
         } else if (arg == "--cos-threshold" && i + 1 < argc) {
             cos_threshold = std::atof(argv[++i]);
+        } else if (arg == "--start-sample" && i + 1 < argc) {
+            start_sample = std::atoi(argv[++i]);
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -253,12 +238,18 @@ int main(int argc, char ** argv) {
 
     if (!full_states) {
         // =====================================================
-        // ON-THE-FLY MODE: Pairwise forward passes with embeddings API
-        // For each checkpoint pair (L, L+interval), run two forward passes
-        // at n_layer_exit=L and n_layer_exit=L+interval, compute cosine
-        // similarity between the embeddings, write compact labels.
-        // Total: 2*(N-1) forward passes per sample.
+        // SINGLE-PASS MODE: One forward pass per sample via cb_eval callback.
+        // The callback captures l_out-N tensors at checkpoint layers during
+        // a full forward pass. Cosine similarity computed from captured states.
+        // 1 forward pass per sample (vs 2*(N-1) in pairwise mode).
         // =====================================================
+
+        // Set up callback capture state
+        g_capture.checkpoint_layers.insert(checkpoint_layers.begin(), checkpoint_layers.end());
+        g_capture.n_embd = n_embd;
+        g_capture.n_checkpoints = n_checkpoints;
+        g_capture.captured.resize(n_checkpoints);
+
         struct pair_file {
             int layer_a, layer_b;
             FILE * fp_cos;
@@ -273,27 +264,31 @@ int main(int argc, char ** argv) {
                      output_dir.c_str(), checkpoint_layers[i], checkpoint_layers[i+1]);
             snprintf(fname_label, sizeof(fname_label), "%s/labels_%03d_%03d.bin",
                      output_dir.c_str(), checkpoint_layers[i], checkpoint_layers[i+1]);
+
+            // Open in append mode if resuming
+            const char * mode = (start_sample > 0) ? "ab" : "wb";
             pairs.push_back({
                 checkpoint_layers[i], checkpoint_layers[i+1],
-                fopen(fname_cos, "wb"), fopen(fname_label, "wb"),
+                fopen(fname_cos, mode), fopen(fname_label, mode),
                 0, 0
             });
         }
 
-        fprintf(stderr, "  Forward passes per sample: %d (2 per checkpoint pair)\n", 2 * (n_checkpoints - 1));
+        if (start_sample > 0) {
+            fprintf(stderr, "  Resuming from sample %d\n", start_sample);
+        }
+        fprintf(stderr, "  Forward passes per sample: 1 (single-pass callback)\n");
 
         auto t_start = std::chrono::high_resolution_clock::now();
+        int samples_done = 0;
 
-        // Temp buffers for embeddings at two consecutive checkpoints
-        std::vector<float> emb_a(seq_len * n_embd, 0.0f);
-        std::vector<float> emb_b(seq_len * n_embd, 0.0f);
-
-        for (int s = 0; s < n_samples; s++) {
-            if (s % 10 == 0) {
+        for (int s = start_sample; s < n_samples; s++) {
+            if (samples_done % 10 == 0) {
                 auto t_now = std::chrono::high_resolution_clock::now();
                 double elapsed = std::chrono::duration<double>(t_now - t_start).count();
-                double rate = s > 0 ? s / elapsed : 0;
-                double eta = rate > 0 ? (n_samples - s) / rate : 0;
+                double rate = samples_done > 0 ? samples_done / elapsed : 0;
+                int remaining = n_samples - s;
+                double eta = rate > 0 ? remaining / rate : 0;
                 fprintf(stderr, "  [%d/%d] %.3f samples/s, ETA %.0fs\n", s, n_samples, rate, eta);
             }
 
@@ -301,48 +296,98 @@ int main(int argc, char ** argv) {
             if ((int)tokens.size() > seq_len) tokens.resize(seq_len);
             int n_tokens = (int)tokens.size();
 
+            // Clear captures and enable callback
+            for (auto & v : g_capture.captured) v.clear();
+            g_capture.active = true;
+
+            // Single full forward pass — callback captures l_out at checkpoints
+            llama_set_n_layer_exit(ctx, 0);
+            llama_memory_clear(llama_get_memory(ctx), false);
+            llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+            for (int i = 0; i < n_tokens; i++) common_batch_add(batch, tokens[i], i, {0}, true);
+            llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            g_capture.active = false;
+
+            // Check if callback captured data (first sample only — sanity check)
+            if (samples_done == 0) {
+                int captured_count = 0;
+                for (auto & v : g_capture.captured) if (!v.empty()) captured_count++;
+                if (captured_count < 2) {
+                    fprintf(stderr, "\n  CALLBACK FALLBACK: only captured %d/%d checkpoints via callback.\n",
+                            captured_count, n_checkpoints);
+                    fprintf(stderr, "  Falling back to pairwise mode (slower but reliable).\n\n");
+
+                    // Fallback: pairwise forward passes for this and all remaining samples
+                    g_capture.active = false;
+                    std::vector<float> emb_a(seq_len * n_embd, 0.0f);
+                    std::vector<float> emb_b(seq_len * n_embd, 0.0f);
+
+                    for (int s2 = s; s2 < n_samples; s2++) {
+                        if ((s2 - s) % 10 == 0) {
+                            auto t_now = std::chrono::high_resolution_clock::now();
+                            double elapsed = std::chrono::duration<double>(t_now - t_start).count();
+                            double rate = (s2 - s) > 0 ? (s2 - s) / elapsed : 0;
+                            double eta = rate > 0 ? (n_samples - s2) / rate : 0;
+                            fprintf(stderr, "  [%d/%d] %.3f samples/s, ETA %.0fs (pairwise fallback)\n",
+                                    s2, n_samples, rate, eta);
+                        }
+
+                        std::vector<llama_token> tok2 = common_tokenize(ctx, texts[s2], true);
+                        if ((int)tok2.size() > seq_len) tok2.resize(seq_len);
+                        int nt2 = (int)tok2.size();
+
+                        for (int p = 0; p < (int)pairs.size(); p++) {
+                            auto & pf = pairs[p];
+                            for (int layer_idx = 0; layer_idx < 2; layer_idx++) {
+                                int exit_l = (layer_idx == 0) ? pf.layer_a : pf.layer_b;
+                                auto & emb = (layer_idx == 0) ? emb_a : emb_b;
+                                llama_set_n_layer_exit(ctx, exit_l == n_layer ? 0 : exit_l);
+                                llama_memory_clear(llama_get_memory(ctx), false);
+                                llama_batch b2 = llama_batch_init(nt2, 0, 1);
+                                for (int i = 0; i < nt2; i++) common_batch_add(b2, tok2[i], i, {0}, true);
+                                llama_decode(ctx, b2);
+                                llama_batch_free(b2);
+                                for (int i = 0; i < nt2 && i < seq_len; i++) {
+                                    float * e = llama_get_embeddings_ith(ctx, i);
+                                    if (e) memcpy(emb.data() + i * n_embd, e, n_embd * sizeof(float));
+                                    else   memset(emb.data() + i * n_embd, 0, n_embd * sizeof(float));
+                                }
+                            }
+                            for (int t = 0; t < seq_len; t++) {
+                                float cos = 0.0f; uint8_t label = 0;
+                                if (t < nt2) {
+                                    cos = cosine_similarity(emb_a.data()+t*n_embd, emb_b.data()+t*n_embd, n_embd);
+                                    label = (cos > cos_threshold) ? 1 : 0;
+                                }
+                                fwrite(&cos, sizeof(float), 1, pf.fp_cos);
+                                fwrite(&label, sizeof(uint8_t), 1, pf.fp_label);
+                                pf.n_total++; if (label) pf.n_converged++;
+                            }
+                        }
+                        samples_done++;
+                    }
+                    goto finish;  // skip to stats
+                }
+                fprintf(stderr, "  Callback captured %d/%d checkpoints — single-pass mode active\n",
+                        captured_count, n_checkpoints);
+            }
+
+            // Compute cosine similarities from captured data
             for (int p = 0; p < (int)pairs.size(); p++) {
                 auto & pf = pairs[p];
+                auto & h_a = g_capture.captured[p];
+                auto & h_b = g_capture.captured[p + 1];
 
-                // Forward pass at layer A
-                llama_set_n_layer_exit(ctx, pf.layer_a == n_layer ? 0 : pf.layer_a);
-                llama_memory_clear(llama_get_memory(ctx), false);
-                {
-                    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-                    for (int i = 0; i < n_tokens; i++) common_batch_add(batch, tokens[i], i, {0}, true);
-                    llama_decode(ctx, batch);
-                    llama_batch_free(batch);
-                }
-                for (int i = 0; i < n_tokens && i < seq_len; i++) {
-                    float * e = llama_get_embeddings_ith(ctx, i);
-                    if (e) memcpy(emb_a.data() + i * n_embd, e, n_embd * sizeof(float));
-                    else   memset(emb_a.data() + i * n_embd, 0, n_embd * sizeof(float));
-                }
+                int n_tok_a = h_a.empty() ? 0 : (int)h_a.size() / n_embd;
+                int n_tok_b = h_b.empty() ? 0 : (int)h_b.size() / n_embd;
+                int n_tok = std::min({n_tok_a, n_tok_b, seq_len});
 
-                // Forward pass at layer B
-                llama_set_n_layer_exit(ctx, pf.layer_b == n_layer ? 0 : pf.layer_b);
-                llama_memory_clear(llama_get_memory(ctx), false);
-                {
-                    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-                    for (int i = 0; i < n_tokens; i++) common_batch_add(batch, tokens[i], i, {0}, true);
-                    llama_decode(ctx, batch);
-                    llama_batch_free(batch);
-                }
-                for (int i = 0; i < n_tokens && i < seq_len; i++) {
-                    float * e = llama_get_embeddings_ith(ctx, i);
-                    if (e) memcpy(emb_b.data() + i * n_embd, e, n_embd * sizeof(float));
-                    else   memset(emb_b.data() + i * n_embd, 0, n_embd * sizeof(float));
-                }
-
-                // Compute cosine similarity per token
                 for (int t = 0; t < seq_len; t++) {
                     float cos = 0.0f;
                     uint8_t label = 0;
-                    if (t < n_tokens) {
-                        cos = cosine_similarity(
-                            emb_a.data() + t * n_embd,
-                            emb_b.data() + t * n_embd,
-                            n_embd);
+                    if (t < n_tok && !h_a.empty() && !h_b.empty()) {
+                        cos = cosine_similarity(h_a.data() + t*n_embd, h_b.data() + t*n_embd, n_embd);
                         label = (cos > cos_threshold) ? 1 : 0;
                     }
                     fwrite(&cos, sizeof(float), 1, pf.fp_cos);
@@ -351,13 +396,15 @@ int main(int argc, char ** argv) {
                     if (label) pf.n_converged++;
                 }
             }
+            samples_done++;
         }
 
+    finish:
         auto t_end = std::chrono::high_resolution_clock::now();
         double total_time = std::chrono::duration<double>(t_end - t_start).count();
 
-        fprintf(stderr, "\nCalibration complete: %d samples in %.0fs (%.3f samples/s)\n",
-                n_samples, total_time, n_samples / total_time);
+        fprintf(stderr, "\nCalibration complete: %d new samples in %.0fs (%.3f samples/s)\n",
+                samples_done, total_time, samples_done > 0 ? samples_done / total_time : 0);
 
         fprintf(stderr, "\nConvergence rates (threshold=%.2f):\n", cos_threshold);
         for (auto & pf : pairs) {
