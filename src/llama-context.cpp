@@ -1068,7 +1068,10 @@ void llama_context::set_warmup(bool value) {
 }
 
 void llama_context::set_n_layer_exit(int32_t value) {
-    cparams.n_layer_exit = value;
+    if (cparams.n_layer_exit != value) {
+        cparams.n_layer_exit = value;
+        sched_need_reserve = true; // Force graph rebuild — different layer count = different graph
+    }
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
