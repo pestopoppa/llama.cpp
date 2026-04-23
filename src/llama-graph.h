@@ -897,6 +897,8 @@ struct llm_graph_context {
     // attention
     //
 
+    ggml_tensor * build_hadamard(ggml_tensor * a) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

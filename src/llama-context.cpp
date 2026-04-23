@@ -164,6 +164,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_hadamard = params.kv_hadamard;
     cparams.moe_n_expert_override = params.moe_n_expert_override;
     cparams.n_layer_exit = params.n_layer_exit;
 
@@ -2927,6 +2928,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_hadamard                 =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

@@ -5,12 +5,6 @@
 #include <cstring>
 #include <vector>
 
-// TIDE projection (shared with qwen3.cpp — TODO: move to common header)
-extern bool              tide_proj_loaded;
-extern std::vector<float> tide_proj_data;
-extern int               tide_proj_exit_layer;
-extern int               tide_proj_n_embd;
-
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -85,18 +79,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     }
     cur = inpL;
 
-    // TIDE: use projection instead of output_norm when exiting early
-    if (n_layer_exit > 0 && tide_proj_loaded && tide_proj_exit_layer == n_layer_exit) {
-        ggml_tensor * proj = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                tide_proj_n_embd, tide_proj_n_embd);
-        ggml_set_name(proj, "tide_projection");
-        memcpy(proj->data, tide_proj_data.data(), tide_proj_data.size() * sizeof(float));
-        cur = ggml_mul_mat(ctx0, proj, cur);
-        cb(cur, "tide_projected", -1);
-    } else {
-        // Normal: final norm
-        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-    }
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

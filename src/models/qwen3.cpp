@@ -1,68 +1,4 @@
 #include "models.h"
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
-// TIDE: projection matrix for early exit (loaded once, used in graph)
-// Non-static so qwen35moe.cpp and other models can extern-reference them
-bool              tide_proj_loaded = false;
-std::vector<float> tide_proj_data;
-int               tide_proj_exit_layer = 0;
-int               tide_proj_n_embd = 0;
-
-// Load projection from .npy file (raw float32, n_embd×n_embd matrix)
-__attribute__((constructor))
-static void tide_try_load_projection() {
-    const char * path = getenv("TIDE_PROJECTION_PATH");
-    const char * layer_str = getenv("TIDE_EXIT_LAYER");
-    const char * embd_str = getenv("TIDE_N_EMBD");
-    if (!path || !layer_str || !embd_str) return;
-
-    int n_embd = atoi(embd_str);
-    int exit_layer = atoi(layer_str);
-    if (n_embd <= 0 || exit_layer <= 0) return;
-
-    FILE * f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "TIDE: cannot open %s\n", path); return; }
-
-    // Skip .npy header (find first \n after MAGIC)
-    // Simple: seek to data start. .npy v1 header is 128 bytes typically.
-    // For raw binary files, no header to skip.
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    long expected = (long)n_embd * n_embd * sizeof(float);
-
-    // Check if it's a .npy file (starts with \x93NUMPY)
-    fseek(f, 0, SEEK_SET);
-    char magic[6];
-    if (fread(magic, 1, 6, f) == 6 && magic[0] == (char)0x93 && memcmp(magic+1, "NUMPY", 5) == 0) {
-        // .npy format: skip header
-        fseek(f, 0, SEEK_SET);
-        unsigned char header[10];
-        fread(header, 1, 10, f);
-        uint16_t header_len = *(uint16_t*)(header + 8);
-        fseek(f, 10 + header_len, SEEK_SET);
-    } else {
-        // Raw binary
-        fseek(f, 0, SEEK_SET);
-    }
-
-    tide_proj_data.resize(n_embd * n_embd);
-    size_t read = fread(tide_proj_data.data(), sizeof(float), n_embd * n_embd, f);
-    fclose(f);
-
-    if ((int)read != n_embd * n_embd) {
-        fprintf(stderr, "TIDE: read %zu floats, expected %d\n", read, n_embd * n_embd);
-        tide_proj_data.clear();
-        return;
-    }
-
-    tide_proj_exit_layer = exit_layer;
-    tide_proj_n_embd = n_embd;
-    tide_proj_loaded = true;
-    fprintf(stderr, "TIDE: loaded projection for layer %d (%dx%d, %.1f MB)\n",
-            exit_layer, n_embd, n_embd, (float)(n_embd * n_embd * 4) / 1e6);
-}
 
 llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -161,23 +97,9 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    // TIDE: if early exit is active and projection matrix is loaded,
-    // use projection instead of output_norm (projection maps h_L → result_norm space)
-    if (n_layer_exit > 0 && tide_proj_loaded && tide_proj_exit_layer == n_layer_exit) {
-        // Load projection as ggml tensor and apply: cur = cur @ projection
-        ggml_tensor * proj = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                tide_proj_n_embd, tide_proj_n_embd);
-        ggml_set_name(proj, "tide_projection");
-        memcpy(proj->data, tide_proj_data.data(), tide_proj_data.size() * sizeof(float));
-
-        cur = ggml_mul_mat(ctx0, proj, cur);
-        cb(cur, "tide_projected", -1);
-    } else {
-        // Normal path: output norm
-        cur = build_norm(cur,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, -1);
-    }
+    cur = build_norm(cur,
+            model.output_norm, NULL,
+            LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

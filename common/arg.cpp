@@ -2063,6 +2063,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kv-hadamard"},
+        "apply Walsh-Hadamard Transform to KV cache before quantization (improves q4 quality)",
+        [](common_params & params) {
+            params.kv_hadamard = true;
+        }
+    ).set_env("LLAMA_ARG_KV_HADAMARD"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
