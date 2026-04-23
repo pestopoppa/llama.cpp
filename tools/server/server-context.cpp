@@ -122,6 +122,13 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    // TIDE dynamic early exit state
+    int32_t tide_exit_layer   = 0;  // current exit layer (0 = full model)
+    int32_t tide_warmup       = 5;  // decode this many tokens at full layers first
+    int32_t tide_step         = 0;  // checkpoint interval (set from model layers)
+    int32_t tide_consec_high  = 0;  // consecutive high-confidence tokens
+    int32_t tide_consec_low   = 0;  // consecutive low-confidence tokens
+
     stop_type stop;
 
     std::string stopping_word;
@@ -212,6 +219,14 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+
+        // TIDE: reset dynamic exit state and restore full layers
+        if (tide_exit_layer > 0) {
+            llama_set_n_layer_exit(ctx, 0);
+        }
+        tide_exit_layer  = 0;
+        tide_consec_high = 0;
+        tide_consec_low  = 0;
         json_schema = json();
 
         // clear speculative decoding stats
@@ -2941,6 +2956,53 @@ private:
                     slot.t_start_generation = t_current;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                     metrics.on_prompt_eval(slot);
+
+                    // TIDE: initialize step size from model layer count
+                    const int n_layer = llama_model_n_layer(llama_get_model(slot.ctx));
+                    slot.tide_step = std::max(4, n_layer / 8); // exit in steps of ~12.5% of layers
+                }
+
+                // TIDE: dynamic early exit adjustment based on sampling confidence
+                if (slot.tide_step > 0 && slot.n_decoded > slot.tide_warmup) {
+                    const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+                    const float top_prob = (cur_p && cur_p->size > 0) ? cur_p->data[0].p : 0.0f;
+                    const int n_layer = llama_model_n_layer(llama_get_model(slot.ctx));
+                    const float conf_threshold = 0.8f; // high confidence: top token > 80%
+
+                    if (top_prob > conf_threshold) {
+                        slot.tide_consec_high++;
+                        slot.tide_consec_low = 0;
+
+                        // After 3 consecutive high-confidence tokens, try reducing layers
+                        if (slot.tide_consec_high >= 3 && slot.tide_exit_layer == 0) {
+                            // Start conservative: skip last 1 step
+                            slot.tide_exit_layer = n_layer - slot.tide_step;
+                            llama_set_n_layer_exit(slot.ctx, slot.tide_exit_layer);
+                            SLT_DBG(slot, "TIDE: reducing to %d/%d layers (confidence=%.2f)\n",
+                                    slot.tide_exit_layer, n_layer, top_prob);
+                        } else if (slot.tide_consec_high >= 6 && slot.tide_exit_layer > 0) {
+                            // After sustained confidence, try reducing further (minimum 50% of layers)
+                            int new_exit = std::max(n_layer / 2, slot.tide_exit_layer - slot.tide_step);
+                            if (new_exit < slot.tide_exit_layer) {
+                                slot.tide_exit_layer = new_exit;
+                                llama_set_n_layer_exit(slot.ctx, slot.tide_exit_layer);
+                                SLT_DBG(slot, "TIDE: further reducing to %d/%d layers (confidence=%.2f)\n",
+                                        slot.tide_exit_layer, n_layer, top_prob);
+                            }
+                        }
+                    } else {
+                        slot.tide_consec_low++;
+                        slot.tide_consec_high = 0;
+
+                        // Immediately restore full layers on low confidence
+                        if (slot.tide_exit_layer > 0 && slot.tide_consec_low >= 1) {
+                            SLT_DBG(slot, "TIDE: restoring full %d layers (confidence=%.2f)\n",
+                                    n_layer, top_prob);
+                            slot.tide_exit_layer = 0;
+                            llama_set_n_layer_exit(slot.ctx, 0);
+                            slot.tide_consec_high = 0;
+                        }
+                    }
                 }
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
