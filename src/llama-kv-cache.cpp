@@ -1370,6 +1370,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
     }
 
+    // ggml_set_rows requires f32 source (from_float quantizes to cache type)
+    if (k_cur->type != GGML_TYPE_F32) {
+        k_cur = ggml_cast(ctx, k_cur, GGML_TYPE_F32);
+    }
+
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
@@ -1404,6 +1409,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
             // merge the buffer across all streams because the idxs are global
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+        }
+
+        // ggml_set_rows requires f32 source (from_float quantizes to cache type)
+        if (v_cur->type != GGML_TYPE_F32) {
+            v_cur = ggml_cast(ctx, v_cur, GGML_TYPE_F32);
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
