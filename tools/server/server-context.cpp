@@ -2967,7 +2967,7 @@ private:
                     const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
                     const float top_prob = (cur_p && cur_p->size > 0) ? cur_p->data[0].p : 0.0f;
                     const int n_layer = llama_model_n_layer(llama_get_model(slot.ctx));
-                    const float conf_threshold = 0.8f; // high confidence: top token > 80%
+                    const float conf_threshold = 0.95f; // high confidence: top token > 95%
 
                     if (top_prob > conf_threshold) {
                         slot.tide_consec_high++;
@@ -2981,8 +2981,8 @@ private:
                             SLT_DBG(slot, "TIDE: reducing to %d/%d layers (confidence=%.2f)\n",
                                     slot.tide_exit_layer, n_layer, top_prob);
                         } else if (slot.tide_consec_high >= 6 && slot.tide_exit_layer > 0) {
-                            // After sustained confidence, try reducing further (minimum 50% of layers)
-                            int new_exit = std::max(n_layer / 2, slot.tide_exit_layer - slot.tide_step);
+                            // After sustained confidence, try reducing further (minimum 75% of layers)
+                            int new_exit = std::max(n_layer * 3 / 4, slot.tide_exit_layer - slot.tide_step);
                             if (new_exit < slot.tide_exit_layer) {
                                 slot.tide_exit_layer = new_exit;
                                 llama_set_n_layer_exit(slot.ctx, slot.tide_exit_layer);
