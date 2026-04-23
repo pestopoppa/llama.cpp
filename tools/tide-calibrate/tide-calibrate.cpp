@@ -39,6 +39,8 @@ struct capture_state {
     int n_embd;
     // Captured hidden states: checkpoint_idx -> flat float vector (n_tokens * n_embd)
     std::vector<std::vector<float>> captured;
+    // Captured result_norm (full model output after output norm, before LM head)
+    std::vector<float> result_norm;
     int n_checkpoints;
     bool active = false;
 };
@@ -52,6 +54,22 @@ static bool tide_eval_callback(struct ggml_tensor * t, bool ask, void * user_dat
     if (!g_capture.active) return false;
 
     const std::string name(t->name);
+
+    // Capture result_norm (full model output after output norm)
+    // Note: tensor name is exactly "result_norm" (set with il=-1, so no suffix)
+    if (name == "result_norm") {
+        static bool debug_rn = true;
+        if (ask) {
+            if (debug_rn) { fprintf(stderr, "  [cb] result_norm ASK (ne=%lld)\n", (long long)ggml_nelements(t)); debug_rn = false; }
+            return true;
+        }
+        int n_elements = (int)ggml_nelements(t);
+        const float * data = (const float *)t->data;
+        if (data && n_elements > 0) {
+            g_capture.result_norm.assign(data, data + n_elements);
+        }
+        return true;
+    }
 
     // Match l_out-N tensors (all model builders use this via cb())
     int layer = -1;
@@ -274,10 +292,30 @@ int main(int argc, char ** argv) {
             });
         }
 
+        // Norm training data: per-checkpoint l_out + result_norm (first token per sample)
+        struct norm_file {
+            int layer;
+            FILE * fp;
+        };
+        std::vector<norm_file> norm_files;
+        for (int i = 0; i < n_checkpoints; i++) {
+            char fname[256];
+            snprintf(fname, sizeof(fname), "%s/l_out_%03d.bin", output_dir.c_str(), checkpoint_layers[i]);
+            const char * mode = (start_sample > 0) ? "ab" : "wb";
+            norm_files.push_back({checkpoint_layers[i], fopen(fname, mode)});
+        }
+        {
+            char fname[256];
+            snprintf(fname, sizeof(fname), "%s/result_norm.bin", output_dir.c_str());
+            const char * mode = (start_sample > 0) ? "ab" : "wb";
+            norm_files.push_back({-1, fopen(fname, mode)}); // -1 = result_norm (target)
+        }
+
         if (start_sample > 0) {
             fprintf(stderr, "  Resuming from sample %d\n", start_sample);
         }
         fprintf(stderr, "  Forward passes per sample: 1 (single-pass callback)\n");
+        fprintf(stderr, "  Also dumping norm training data (l_out + result_norm, first token per sample)\n");
 
         auto t_start = std::chrono::high_resolution_clock::now();
         int samples_done = 0;
@@ -298,6 +336,7 @@ int main(int argc, char ** argv) {
 
             // Clear captures and enable callback
             for (auto & v : g_capture.captured) v.clear();
+            g_capture.result_norm.clear();
             g_capture.active = true;
 
             // Single full forward pass — callback captures l_out at checkpoints
@@ -396,8 +435,30 @@ int main(int argc, char ** argv) {
                     if (label) pf.n_converged++;
                 }
             }
+
+            // Write norm training data: first token's hidden state at each checkpoint + result_norm
+            for (int ci = 0; ci < n_checkpoints; ci++) {
+                auto & h = g_capture.captured[ci];
+                if (!h.empty() && (int)h.size() >= n_embd) {
+                    fwrite(h.data(), sizeof(float), n_embd, norm_files[ci].fp);
+                } else {
+                    std::vector<float> zeros(n_embd, 0.0f);
+                    fwrite(zeros.data(), sizeof(float), n_embd, norm_files[ci].fp);
+                }
+            }
+            // result_norm (target)
+            if (!g_capture.result_norm.empty() && (int)g_capture.result_norm.size() >= n_embd) {
+                fwrite(g_capture.result_norm.data(), sizeof(float), n_embd, norm_files.back().fp);
+            } else {
+                std::vector<float> zeros(n_embd, 0.0f);
+                fwrite(zeros.data(), sizeof(float), n_embd, norm_files.back().fp);
+            }
+
             samples_done++;
         }
+
+        // Close norm files
+        for (auto & nf : norm_files) fclose(nf.fp);
 
     finish:
         auto t_end = std::chrono::high_resolution_clock::now();
