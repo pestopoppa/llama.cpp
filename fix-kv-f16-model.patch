@@ -1,0 +1,41 @@
+From: Claude Code Agent <noreply@anthropic.com>
+Subject: fix: cast K/V to f32 before set_rows when model weights are f16
+
+ggml_set_rows only supports f32 source data (it calls from_float to
+quantize into the cache type). When model weights are f16, the K/V
+tensors after matmul+RoPE are f16, causing set_rows to interpret f16
+bytes as f32 — producing garbage KV cache data.
+
+This only affects models with f16 weights AND quantized KV cache types
+(q4_0, q8_0, etc). Q4_K_M weight models work because their matmul
+outputs are already f32.
+
+Fix: cast k_cur/v_cur to f32 in cpy_k/cpy_v before set_rows if not
+already f32.
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1213,6 +1213,11 @@
+         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+     }
+
++    // ggml_set_rows requires f32 source (from_float quantizes to cache type)
++    if (k_cur->type != GGML_TYPE_F32) {
++        k_cur = ggml_cast(ctx, k_cur, GGML_TYPE_F32);
++    }
++
+     // store the current K values into the cache
+     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+ }
+@@ -1248,6 +1253,11 @@
+             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+         }
+
++        // ggml_set_rows requires f32 source (from_float quantizes to cache type)
++        if (v_cur->type != GGML_TYPE_F32) {
++            v_cur = ggml_cast(ctx, v_cur, GGML_TYPE_F32);
++        }
++
+         return ggml_set_rows(ctx, v, v_cur, v_idxs);
+     }
