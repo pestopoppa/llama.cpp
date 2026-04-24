@@ -149,3 +149,10 @@ a.out.*
 
 # Core dumps
 core
+
+# Core dumps + perf captures (local dev only — should never be committed)
+core
+core.*
+perf.data
+perf.data.*
+perf-*.data
