@@ -1937,14 +1937,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
-    // extra_buffer op? Skip the extra path when the op is a fused
-    // MUL_MAT+residual (src[2] + op_params[1]==1). The repack/extra paths
-    // don't know about our fused src[2]; the fallback ggml_compute_forward_mul_mat
-    // handles it correctly.
-    const bool mm_fused = (tensor->op == GGML_OP_MUL_MAT
-                           && ggml_get_op_params_i32(tensor, 1) == 1
-                           && tensor->src[2] != NULL);
-    if (!mm_fused && ggml_cpu_extra_compute_forward(params, tensor)) {
+    // extra_buffer op? The repack path is now fusion-aware (adds src[2] per-chunk),
+    // so we can let it handle fused MUL_MAT as well.
+    if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
 

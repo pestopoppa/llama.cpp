@@ -20,6 +20,7 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
+        ggml_tensor * attn_residual = nullptr;
 
         // norm
         cur = build_norm(inpL,
@@ -55,18 +56,39 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
+            // Pass inpSA as the attention residual so the output projection
+            // can fuse the residual ADD into its MUL_MAT chunk-write. Skip on
+            // the last layer (inp_out_ids slicing) and when wo_s is set (the
+            // outer ggml_mul(wo_s) would rescale the residual and break math).
+            // Gated by GGML_FUSE_ATTN_RES=1 (default off).
+            static int s_fuse_attn_res = -1;
+            if (s_fuse_attn_res < 0) {
+                const char * env = getenv("GGML_FUSE_ATTN_RES");
+                s_fuse_attn_res = (env && *env && env[0] != '0') ? 1 : 0;
+            }
+            const bool last_slice = (il == n_layer - 1 && inp_out_ids);
+            attn_residual = (s_fuse_attn_res && !last_slice && !model.layers[il].wo_s) ? inpSA : nullptr;
+
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il,
+                    attn_residual);
             if (model.layers[il].wo_s) {
                 cur = ggml_mul(ctx0, cur, model.layers[il].wo_s);
             }
         }
+        ggml_tensor * ffn_inp;
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            ffn_inp = ggml_add(ctx0, cur, inpSA);
+        } else if (attn_residual) {
+            // build_attn already added the residual (fused into o-proj matmul,
+            // or via internal fallback add).
+            ffn_inp = cur;
+        } else {
+            ffn_inp = ggml_add(ctx0, cur, inpSA);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
         // MoE branch
