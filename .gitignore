@@ -146,3 +146,6 @@ poetry.toml
 # emscripten
 a.out.*
 .gitnexus/
+
+# Core dumps
+core
