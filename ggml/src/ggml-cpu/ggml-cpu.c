@@ -3235,39 +3235,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-#ifndef GGML_USE_OPENMP
-            // Lever B: optionally downgrade the between-op barrier to CCD-local
-            // when both the current op wrote CCD-block-partitioned output AND the
-            // next op consumes it with the same partitioning. Gated by env var
-            // GGML_BARRIER_LOCAL_BETWEEN_OPS=1. Unsafe in the general case —
-            // experimental, should be validated via perplexity before enabling.
-            static int s_local_between = -1;
-            if (s_local_between < 0) {
-                const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
-                s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
-            }
-            if (s_local_between) {
-                enum ggml_op cur_op  = node->op;
-                enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
-                bool cur_preserves = (cur_op == GGML_OP_MUL_MAT ||
-                                      cur_op == GGML_OP_MUL_MAT_ID ||
-                                      cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
-                                      cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
-                bool next_local = (next_op == GGML_OP_MUL_MAT ||
-                                   next_op == GGML_OP_MUL_MAT_ID ||
-                                   next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
-                                   next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
-                if (cur_preserves && next_local) {
-                    ggml_barrier_local(state->threadpool);
-                } else {
-                    ggml_barrier(state->threadpool);
-                }
-            } else {
-                ggml_barrier(state->threadpool);
-            }
-#else
+            // Lever B v1 (between-op barrier downgrade by op-pair heuristic) was
+            // attempted 2026-04-24 and REVERTED — perplexity verified that even
+            // the tightest heuristic (current partitioned-write + next element-wise)
+            // corrupts output. Root cause: ADD/MUL/SCALE op implementations use
+            // their own internal chunking that doesn't necessarily align with
+            // the previous MUL_MAT's per-thread write partition, even under
+            // GGML_CCD_WORK_DIST=1. A safe Lever B requires per-op refactor to
+            // guarantee matching partitioning, not a graph-level shortcut. The
+            // ggml_barrier_local() primitive remains available for future
+            // per-op-site use when that refactor happens.
             ggml_barrier(state->threadpool);
-#endif
         }
     }
 
@@ -3644,27 +3622,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         GGML_ASSERT(rc == 0);
     }
 
-    if (threadpool->ccd_pool_enabled && threadpool->ccd_core_base >= 0) {
-        // Main thread (worker[0]): pin similarly to its assigned CCD/local-id.
-        memset(workers[0].cpumask, 0, GGML_MAX_N_THREADS);
-        int ccd_id = workers[0].ccd_id;
-        int local_id = workers[0].ccd_local_id;
-        int base = threadpool->ccd_core_base;
-        int core;
-        if (threadpool->ccd_threads == 8) {
-            core = base + ccd_id * 8 + local_id;
-        } else if (threadpool->ccd_threads == 16) {
-            int phys_start = base + ccd_id * 8;
-            core = (local_id < 8) ? (phys_start + local_id)
-                                  : (96 + phys_start + (local_id - 8));
-        } else {
-            core = base + ccd_id * threadpool->ccd_threads + local_id;
-        }
-        if (core >= 0 && core < GGML_MAX_N_THREADS) {
-            workers[0].cpumask[core] = 1;
-        }
-    } else if (threadpool->ccd_pool_enabled) {
-        // CCD pool active but core pinning disabled; main thread uses inherited affinity.
+    if (threadpool->ccd_pool_enabled) {
+        // Main thread (worker[0]): intentionally do NOT pin to a single core.
+        // Pinning main to one core would restrict its cpuset, and any thread
+        // pool it later creates (e.g., a second pool for batch/eval) would
+        // inherit the restricted cpuset — all workers of that second pool
+        // would then pile onto the single inherited core. Leave main on the
+        // inherited (task-wide) cpuset. Secondary workers are already pinned
+        // above and will do the actual compute work.
         memset(workers[0].cpumask, 0, GGML_MAX_N_THREADS);
     } else {
         ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
