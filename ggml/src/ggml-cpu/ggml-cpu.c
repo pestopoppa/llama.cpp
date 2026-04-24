@@ -601,7 +601,14 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #ifdef GGML_USE_OPENMP
     #pragma omp barrier
 #else
-    // ---- Per-CCD 2-level barrier (Phase 1.0 CPU1 prototype) ----
+    // ---- Per-CCD 2-level barrier (Phase 1.0 CPU1 prototype + Lever A tightening) ----
+    // Perf (2026-04-24) showed ggml_barrier = 43% of decode cycles at 96 threads.
+    // Lever A tightens memory-order: the sense-flip store uses release, and the
+    // matching acquire on the sense-load handshake (line 633/642) provides the
+    // ordering for post-barrier reads. The trailing seq_cst thread fence is
+    // redundant on x86 when all downstream reads are through atomic loads with
+    // acquire ordering. GGML_BARRIER_STRICT=1 restores the old seq_cst fence
+    // for paranoid testing.
     if (tp->ccd_pool_enabled && n_threads == tp->ccd_count * tp->ccd_threads && ggml_tls_state != NULL) {
         struct ggml_compute_state * st = ggml_tls_state;
         int ccd_id = st->ccd_id;
@@ -615,19 +622,20 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         st->local_sense  = my_local;
         st->global_sense = my_global;
 
-        // Arrive at local CCD barrier
-        int local_n = atomic_fetch_add_explicit(&csync->n_arrived, 1, memory_order_seq_cst);
+        // Arrive at local CCD barrier. acq_rel on x86 compiles to the same lock xadd
+        // as seq_cst without paying for mfence semantics we don't actually need here.
+        int local_n = atomic_fetch_add_explicit(&csync->n_arrived, 1, memory_order_acq_rel);
 
         if (local_n == (tp->ccd_threads - 1)) {
             // Last thread on this CCD — reset local counter (for next use), promote to global.
             atomic_store_explicit(&csync->n_arrived, 0, memory_order_relaxed);
 
-            int global_n = atomic_fetch_add_explicit(&tp->ccd_global_arrived, 1, memory_order_seq_cst);
+            int global_n = atomic_fetch_add_explicit(&tp->ccd_global_arrived, 1, memory_order_acq_rel);
 
             if (global_n == (tp->ccd_count - 1)) {
                 // Last CCD-leader globally — reset global counter, flip global sense.
                 atomic_store_explicit(&tp->ccd_global_arrived, 0, memory_order_relaxed);
-                atomic_store_explicit(&tp->ccd_global_sense, my_global, memory_order_seq_cst);
+                atomic_store_explicit(&tp->ccd_global_sense, my_global, memory_order_release);
             } else {
                 // Wait for global sense to flip
                 while (atomic_load_explicit(&tp->ccd_global_sense, memory_order_acquire) != my_global) {
@@ -647,7 +655,18 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         #ifdef GGML_TSAN_ENABLED
         atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
         #else
-        atomic_thread_fence(memory_order_seq_cst);
+        {
+            // Optional strict mode for paranoia — skip the mfence by default because
+            // the release/acquire pair above already establishes happens-before.
+            static int s_strict = -1;
+            if (s_strict < 0) {
+                const char * env = getenv("GGML_BARRIER_STRICT");
+                s_strict = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            if (s_strict) {
+                atomic_thread_fence(memory_order_seq_cst);
+            }
+        }
         #endif
         return;
     }
