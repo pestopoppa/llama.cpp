@@ -495,6 +495,7 @@ struct ggml_threadpool {
     bool ccd_pool_enabled;
     int  ccd_count;                 // number of CCDs in use (0 if disabled)
     int  ccd_threads;               // threads per CCD
+    int  ccd_core_base;             // first physical core of this process's cpuset (0 if unrestricted)
     struct ggml_ccd_sync GGML_CACHE_ALIGN ccd[GGML_TP_MAX_CCD];
     atomic_int GGML_CACHE_ALIGN ccd_global_arrived;
     atomic_int GGML_CACHE_ALIGN ccd_global_sense;
@@ -3380,6 +3381,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->ccd_pool_enabled = false;
         threadpool->ccd_count        = 0;
         threadpool->ccd_threads      = 0;
+        threadpool->ccd_core_base    = 0;
         for (int c = 0; c < GGML_TP_MAX_CCD; ++c) {
             atomic_init(&threadpool->ccd[c].n_arrived, 0);
             atomic_init(&threadpool->ccd[c].sense, 0);
@@ -3417,11 +3419,69 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
                 }
             }
             if (ccds > 0 && ccds <= GGML_TP_MAX_CCD) {
-                threadpool->ccd_pool_enabled = true;
-                threadpool->ccd_count        = ccds;
-                threadpool->ccd_threads      = tpcc;
-                GGML_LOG_INFO("[GGML_CCD_POOLS] enabled: %d CCDs x %d threads/CCD (total %d)\n",
-                              ccds, tpcc, nt);
+                // Respect any external cpuset (taskset / cgroup). Without this, CCD pinning
+                // assumes cores 0..95 are all available and silently mis-pins under
+                // taskset quarters — leading to concurrent instances all piling onto
+                // core 0 (deadlock-like stalls observed 2026-04-24).
+                //
+                // Read the process's current allowed CPU set, verify it forms a
+                // contiguous aligned range of exactly ccds*tpcc cores matching our
+                // CCD geometry, and compute ccd_core_base as the first allowed core.
+                // If the cpuset doesn't fit cleanly, disable CCD pinning (barrier
+                // can still work, but we won't force specific cores).
+                int base_core   = 0;
+                int fit_cpuset  = 1;
+                int need_cores  = ccds * tpcc;
+                cpu_set_t allowed;
+                CPU_ZERO(&allowed);
+                if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+                    int count = 0, first = -1, last = -1;
+                    for (int c = 0; c < (int)(sizeof(allowed)*8) && c < GGML_MAX_N_THREADS; ++c) {
+                        if (CPU_ISSET(c, &allowed)) {
+                            if (first < 0) first = c;
+                            last = c;
+                            count++;
+                        }
+                    }
+                    // Heuristic: for ccd_threads==8 (physical-only) we expect exactly
+                    // need_cores contiguous cores at [first..first+need_cores-1].
+                    // For ccd_threads==16 (phys+HT) the set includes SMT siblings; skip
+                    // strict fit check and just use first allowed core as base.
+                    if (first < 0) {
+                        fit_cpuset = 0;
+                    } else {
+                        base_core = first;
+                        if (tpcc == 8) {
+                            // Physical-only: require contiguous first..first+need_cores-1
+                            if (last - first + 1 != need_cores || count != need_cores) {
+                                fit_cpuset = 0;
+                            }
+                        }
+                        // For other ccd_threads values and tpcc=16 (phys+HT), we don't
+                        // strictly validate — just warn if size doesn't match.
+                    }
+                } else {
+                    fit_cpuset = 0;
+                }
+
+                if (!fit_cpuset) {
+                    GGML_LOG_INFO("[GGML_CCD_POOLS] requested but cpuset doesn't fit "
+                                  "%d CCDs x %d threads (base=%d, need=%d cores); "
+                                  "disabling CCD pinning — barrier still uses 2-level form\n",
+                                  ccds, tpcc, base_core, need_cores);
+                    // Keep the 2-level barrier but don't force core pinning.
+                    threadpool->ccd_pool_enabled = true;
+                    threadpool->ccd_count        = ccds;
+                    threadpool->ccd_threads      = tpcc;
+                    threadpool->ccd_core_base    = -1;   // sentinel: do not pin cores
+                } else {
+                    threadpool->ccd_pool_enabled = true;
+                    threadpool->ccd_count        = ccds;
+                    threadpool->ccd_threads      = tpcc;
+                    threadpool->ccd_core_base    = base_core;
+                    GGML_LOG_INFO("[GGML_CCD_POOLS] enabled: %d CCDs x %d threads/CCD "
+                                  "(total %d, core_base=%d)\n", ccds, tpcc, nt, base_core);
+                }
             } else {
                 GGML_LOG_INFO("[GGML_CCD_POOLS] requested but n_threads=%d doesn't fit; disabling\n", nt);
             }
@@ -3469,31 +3529,36 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        if (threadpool->ccd_pool_enabled) {
+        if (threadpool->ccd_pool_enabled && threadpool->ccd_core_base >= 0) {
             // CCD-aware per-worker cpumask: worker j pinned to a specific core on its CCD.
-            // EPYC 9655 layout: 12 CCDs × 8 physical cores (0-95) + HT siblings (96-191).
-            // When ccd_threads==8, worker j → physical core j.
-            // When ccd_threads==16, worker j<96 → physical core j; j>=96 → HT sibling (j+0 mapping).
+            // EPYC 9655 layout: 12 CCDs × 8 physical cores + HT siblings at core+96.
+            // ccd_core_base is the first core of this process's cpuset (respects taskset).
             memset(workers[j].cpumask, 0, GGML_MAX_N_THREADS);
             int ccd_id = workers[j].ccd_id;
             int local_id = workers[j].ccd_local_id;
+            int base = threadpool->ccd_core_base;
             int core;
             if (threadpool->ccd_threads == 8) {
-                core = ccd_id * 8 + local_id;        // 96 workers, physical only
+                core = base + ccd_id * 8 + local_id;        // physical cores only
             } else if (threadpool->ccd_threads == 16) {
-                int phys_start = ccd_id * 8;
+                int phys_start = base + ccd_id * 8;
                 if (local_id < 8) {
                     core = phys_start + local_id;            // physical core
                 } else {
                     core = 96 + phys_start + (local_id - 8); // HT sibling of the same CCD
                 }
             } else {
-                // Fallback for other ccd_threads values: contiguous range
-                core = ccd_id * threadpool->ccd_threads + local_id;
+                // Fallback for other ccd_threads values: contiguous range from base
+                core = base + ccd_id * threadpool->ccd_threads + local_id;
             }
             if (core >= 0 && core < GGML_MAX_N_THREADS) {
                 workers[j].cpumask[core] = 1;
             }
+        } else if (threadpool->ccd_pool_enabled) {
+            // CCD pool active but core pinning disabled due to cpuset mismatch.
+            // Do not set a cpumask — let the kernel schedule threads within the
+            // inherited process cpuset.
+            memset(workers[j].cpumask, 0, GGML_MAX_N_THREADS);
         } else {
             ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
         }
@@ -3502,24 +3567,28 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         GGML_ASSERT(rc == 0);
     }
 
-    if (threadpool->ccd_pool_enabled) {
+    if (threadpool->ccd_pool_enabled && threadpool->ccd_core_base >= 0) {
         // Main thread (worker[0]): pin similarly to its assigned CCD/local-id.
         memset(workers[0].cpumask, 0, GGML_MAX_N_THREADS);
         int ccd_id = workers[0].ccd_id;
         int local_id = workers[0].ccd_local_id;
+        int base = threadpool->ccd_core_base;
         int core;
         if (threadpool->ccd_threads == 8) {
-            core = ccd_id * 8 + local_id;
+            core = base + ccd_id * 8 + local_id;
         } else if (threadpool->ccd_threads == 16) {
-            int phys_start = ccd_id * 8;
+            int phys_start = base + ccd_id * 8;
             core = (local_id < 8) ? (phys_start + local_id)
                                   : (96 + phys_start + (local_id - 8));
         } else {
-            core = ccd_id * threadpool->ccd_threads + local_id;
+            core = base + ccd_id * threadpool->ccd_threads + local_id;
         }
         if (core >= 0 && core < GGML_MAX_N_THREADS) {
             workers[0].cpumask[core] = 1;
         }
+    } else if (threadpool->ccd_pool_enabled) {
+        // CCD pool active but core pinning disabled; main thread uses inherited affinity.
+        memset(workers[0].cpumask, 0, GGML_MAX_N_THREADS);
     } else {
         ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
