@@ -1299,10 +1299,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
-    // Fused residual (op fusion Phase 1): if op_params[1]==1 and src[2] is
-    // a shape-matching f32 tensor, add src[2] to the chunk output during
-    // write. Saves the downstream ADD op and its barrier.
-    const struct ggml_tensor * src2 = (ggml_get_op_params_i32(dst, 1) == 1) ? dst->src[2] : NULL;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1374,20 +1370,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    const int64_t nwrite = MIN(iir0 + blck_0, ir0_end) - iir0;
-                    float * dst_row = &dst_col[iir0 + cn * nb1 / nb0];
-                    const float * tmp_row = tmp + (cn * 16);
-                    if (src2) {
-                        const float * src2_row = (const float *)((const char *)src2->data
-                                                                 + (i1 + cn) * src2->nb[1]
-                                                                 +  i2       * src2->nb[2]
-                                                                 +  i3       * src2->nb[3]) + iir0;
-                        for (int64_t k = 0; k < nwrite; ++k) {
-                            dst_row[k] = tmp_row[k] + src2_row[k];
-                        }
-                    } else {
-                        memcpy(dst_row, tmp_row, nwrite * sizeof(float));
-                    }
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
             }
         }
@@ -1436,11 +1419,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    // Fused residual ADD is only handled by the ggml epilogue path. Skip the
-    // llamafile_sgemm fast path when fusion is active.
-    const bool mm_fused_residual = (ggml_get_op_params_i32(dst, 1) == 1 && dst->src[2] != NULL);
-
-    if (src1_cont && !mm_fused_residual) {
+    if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1505,7 +1484,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type && !mm_fused_residual) {
+    if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1937,14 +1916,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
-    // extra_buffer op? Skip the extra path when the op is a fused
-    // MUL_MAT+residual (src[2] + op_params[1]==1). The repack/extra paths
-    // don't know about our fused src[2]; the fallback ggml_compute_forward_mul_mat
-    // handles it correctly.
-    const bool mm_fused = (tensor->op == GGML_OP_MUL_MAT
-                           && ggml_get_op_params_i32(tensor, 1) == 1
-                           && tensor->src[2] != NULL);
-    if (!mm_fused && ggml_cpu_extra_compute_forward(params, tensor)) {
+    // extra_buffer op?
+    if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
 
