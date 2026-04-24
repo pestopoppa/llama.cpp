@@ -16,6 +16,13 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#if defined(__linux__)
+#include <cctype>    // isdigit
+#include <cerrno>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 #include "repack.h"
 
@@ -4513,9 +4520,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
+            // Remainder rows: the 4-row-interleaved `ggml_quantize_mat_t` can only
+            // consume full 4-row blocks, so any leftover rows (e.g. ne11=1 during
+            // single-token decode) fall through to a plain `from_float` per row.
+            //
+            // The upstream pattern was `i11 = i11_processed + ith; i11 < ne11; i11 += nth`,
+            // which at ne11=1 has ONLY thread 0 do real work while the other nth-1
+            // threads skip straight to the `ggml_barrier` below — a serial stall
+            // that caps tensor_traits decode throughput regardless of thread count.
+            // The standard `ggml_compute_forward_mul_mat` path (ggml-cpu.c:1466-1475)
+            // solves this by partitioning the K dimension across threads for each
+            // leftover row. Mirror that here.
             const int64_t i11_processed = ne11 - ne11 % 4;
-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+            for (int64_t i11 = i11_processed; i11 < ne11; ++i11) {
+                const size_t bs = ggml_blck_size(PARAM_TYPE);
+                const size_t nbw0 = ggml_type_size(PARAM_TYPE);
+                const int64_t nb_k = ne10 / bs;
+                const int64_t k_block_start = (ith * nb_k) / nth;
+                const int64_t k_block_end   = ((ith + 1) * nb_k) / nth;
+                if (k_block_end > k_block_start) {
+                    from_float(
+                        (float *) (data_ptr + i11 * nb11 + k_block_start * bs * nb10),
+                        (void *) (wdata_ptr + i11 * nbw1 + k_block_start * nbw0),
+                        (k_block_end - k_block_start) * bs);
+                }
             }
         }
 
@@ -4977,6 +5005,63 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     if (buffer == nullptr) {
         return nullptr;
     }
+
+#if defined(__linux__)
+    // NUMA placement: the underlying `ggml_aligned_malloc` returns unfaulted
+    // anonymous pages that, on first-touch, get pinned to whichever NUMA node
+    // the touching thread runs on. For a ~26 GB Q8_0 weight buffer on NPS4
+    // EPYC, first-touch from whatever thread runs `set_tensor` lands every
+    // page on that one node; decode traffic from 96 threads × 4 nodes then
+    // saturates that single node's memory controllers (measured 2026-04-24:
+    // 2.8× regression vs the mmap+interleave baseline).
+    //
+    // Fix: mbind the whole region to MPOL_INTERLEAVE across all nodes so
+    // first-touch round-robins the pages. This is the allocation-time
+    // analog of the CPU1 Phase 1.3 `set_mempolicy(MPOL_INTERLEAVE)` that the
+    // mmap path applies before mapping GGUF weights, scoped to this buffer
+    // rather than process-wide. Gated `only_numa` (via ggml_is_numa()) so
+    // single-node hosts pay nothing.
+    if (ggml_is_numa() && buffer->context && buffer->size >= (1ull << 20)) {
+        int n_nodes = 0;
+        if (DIR * d = opendir("/sys/devices/system/node")) {
+            struct dirent * ent;
+            while ((ent = readdir(d))) {
+                if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) {
+                    n_nodes++;
+                }
+            }
+            closedir(d);
+        }
+        if (n_nodes > 1) {
+            const unsigned long maxnode = 64UL;
+            unsigned long nodemask = 0;
+            for (int n = 0; n < n_nodes && n < 64; ++n) nodemask |= (1UL << n);
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+#ifndef SYS_mbind
+// x86_64 mbind syscall number; avoid pulling in <sys/syscall.h> if it
+// doesn't surface SYS_mbind on this libc.
+#define SYS_mbind 237
+#endif
+            uintptr_t addr = (uintptr_t) buffer->context;
+            size_t    len  = buffer->size;
+            // Page-align the start down and length up for mbind.
+            const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+            uintptr_t aligned_addr = addr & ~(page - 1);
+            size_t    aligned_len  = ((addr - aligned_addr) + len + page - 1) & ~(page - 1);
+            long rc = syscall(SYS_mbind, (void *) aligned_addr, aligned_len,
+                              MPOL_INTERLEAVE, &nodemask, maxnode, 0ul);
+            if (rc != 0) {
+                GGML_LOG_WARN("cpu-repack: mbind(MPOL_INTERLEAVE) failed on %zu-byte buffer: %s\n",
+                              aligned_len, strerror(errno));
+            } else {
+                GGML_LOG_INFO("cpu-repack: mbind(MPOL_INTERLEAVE) on %.1f GiB across %d NUMA nodes\n",
+                              aligned_len / (1024.0 * 1024.0 * 1024.0), n_nodes);
+            }
+        }
+    }
+#endif
 
     buffer->buft              = buft;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
