@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <cstdlib>
+#include <cctype>
+#include <vector>
+#include <dirent.h>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -22,6 +26,14 @@
             #include <sys/resource.h>
         #endif
     #endif
+#endif
+
+#if defined(__linux__)
+    #if __has_include(<numaif.h>)
+        #include <numaif.h>
+        #define LLAMA_HAS_NUMAIF 1
+    #endif
+    #include <sys/syscall.h>
 #endif
 
 #if defined(_WIN32)
@@ -439,6 +451,48 @@ struct llama_mmap::impl {
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+        // Phase 1.3 (CPU1): if GGML_NUMA_WEIGHTS is active, suppress MAP_POPULATE and set
+        // a process-wide MPOL_INTERLEAVE policy *before* mmap so that file readahead and
+        // demand faults both place pages round-robin across NUMA nodes. Per-region mbind()
+        // does NOT govern file-backed readahead placement; only set_mempolicy does.
+        //
+        // =1 / =interleave: equivalent to running under `numactl --interleave=all`, but
+        //                   inline so individual llama.cpp instances can opt in without
+        //                   a wrapper.
+        // =stripe         : reserved for a future tensor-aware layout (requires Phase 1.2
+        //                   CCD-aware work distribution to be useful).
+#if defined(__linux__) && defined(LLAMA_HAS_NUMAIF)
+        {
+            const char * env = std::getenv("GGML_NUMA_WEIGHTS");
+            if (env && *env && strcmp(env, "0") != 0) {
+                prefetch = 0;
+
+                int n_nodes = 0;
+                if (DIR * d = opendir("/sys/devices/system/node")) {
+                    struct dirent * ent;
+                    while ((ent = readdir(d))) {
+                        if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) {
+                            n_nodes++;
+                        }
+                    }
+                    closedir(d);
+                }
+                if (n_nodes > 1) {
+                    const unsigned long maxnode = 64UL;
+                    std::vector<unsigned long> mask(1, 0);
+                    for (int n = 0; n < n_nodes; ++n) mask[0] |= (1UL << n);
+                    long rc = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode);
+                    if (rc != 0) {
+                        LLAMA_LOG_WARN("numa-weights: set_mempolicy(MPOL_INTERLEAVE) failed: %s\n", strerror(errno));
+                    } else {
+                        LLAMA_LOG_INFO("numa-weights: set_mempolicy(MPOL_INTERLEAVE) across %d nodes\n", n_nodes);
+                    }
+                } else {
+                    LLAMA_LOG_INFO("numa-weights: only %d NUMA node(s); nothing to do\n", n_nodes);
+                }
+            }
+        }
+#endif
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
