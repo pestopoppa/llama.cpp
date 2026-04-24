@@ -1461,6 +1461,111 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// M=1 GEMV on a weight matrix repacked as block_q8_0x8 (8 rows × 8-byte stride
+// interleave). One `block_q8_0x8` carries 8 rows × QK8_0 (=32) i8 weights plus
+// 8 fp16 per-row scales; the 256-byte `.qs` buffer lays out the 4 K-subchunks
+// so that each subchunk is a single 64-byte ZMM with all 8 rows packed in
+// row-major order: [R0[0..7], R1[0..7], ..., R7[0..7]] for subchunk 0, etc.
+//
+// Per K-block `l`:
+//   - 4 ZMM loads cover all 8 rows × 32 K bytes.
+//   - Activation is a non-interleaved `block_q8_0` (32 i8 + 1 fp16 scale);
+//     each 8-byte subchunk is broadcast 8× across all rows via set1_epi64.
+//   - `mul_sum_i8_pairs_acc_int32x16` folds signed×signed i8 dots into 16×i32
+//     via VPMADDUBSW (2/cycle on Zen 5, vs 1/cycle for VPDPBUSD) + VPMADDWD.
+//     After 4 subchunks, lanes (2j, 2j+1) hold the two halves of row j's dot
+//     product for this K-block.
+//   - Reduce lane-pairs via srli_epi64+add+cvtepi64_epi32 → 8 per-row i32.
+//   - Apply (d_B[8] × d_A) fp32 scales and FMA-accumulate across K-blocks.
+static void gemv_q8_0_8x8_q8_0_avx512bw(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    UNUSED(bs);
+
+    const block_q8_0x8 * b_ptr_start = (const block_q8_0x8 *) vx;
+    const block_q8_0   * a_ptr       = (const block_q8_0   *) vy;
+
+    for (int x = 0; x < nc / 8; ++x) {
+        const block_q8_0x8 * b_ptr = b_ptr_start + x * nb;
+
+        __m256 acc_row = _mm256_setzero_ps();
+
+        const __m512i ones_i16 = _mm512_set1_epi16(1);
+        const __m512i zero     = _mm512_setzero_si512();
+
+        for (int l = 0; l < nb; ++l) {
+            __m512i iacc = _mm512_setzero_si512();
+
+            // Force the AVX-512BW (VPMADDUBSW + VPMADDWD) path explicitly rather
+            // than calling mul_sum_i8_pairs_acc_int32x16 in avx512-helpers.h --
+            // that helper picks VPDPBUSD (VNNI) when __AVX512VNNI__ is defined,
+            // and on Zen 5 VPMADDUBSW runs at 2/cycle vs VPDPBUSD at 1/cycle
+            // (CPU2 session 13/14 Q4_K + Q8_0 VNNI probes both falsified for
+            // this reason). See project_zen5_vnni_vs_maddubs memory.
+            for (int k_sub = 0; k_sub < 4; ++k_sub) {
+                const __m512i B = _mm512_loadu_si512((const __m512i *)(b_ptr[l].qs + k_sub * 64));
+                uint64_t a_bytes;
+                memcpy(&a_bytes, a_ptr[l].qs + k_sub * 8, sizeof(uint64_t));
+                const __m512i A = _mm512_set1_epi64((int64_t) a_bytes);
+
+                // signed(B) * signed(A) via abs(B) * (sign(B) * A), then
+                // VPMADDUBSW (64×i8 → 32×i16 pair-summed), then VPMADDWD
+                // (32×i16 → 16×i32 pair-summed) accumulated into iacc.
+                const __m512i  abs_B    = _mm512_abs_epi8(B);
+                const __mmask64 B_neg   = _mm512_movepi8_mask(B);
+                const __m512i  signed_A = _mm512_mask_sub_epi8(A, B_neg, zero, A);
+                const __m512i  dot_i16  = _mm512_maddubs_epi16(abs_B, signed_A);
+                iacc = _mm512_add_epi32(iacc, _mm512_madd_epi16(ones_i16, dot_i16));
+            }
+
+            // Reduce 16 i32 lanes to 8 per-row i32 sums: view as 8 i64, sum
+            // each (lo, hi) pair by shifting the hi i32 down and adding, then
+            // truncate each i64 to its low 32 bits.
+            const __m512i iacc_hi = _mm512_srli_epi64(iacc, 32);
+            const __m512i iacc_sum = _mm512_add_epi32(iacc, iacc_hi);
+            const __m256i row_sums_i32 = _mm512_cvtepi64_epi32(iacc_sum);
+            const __m256 row_sums_fp32 = _mm256_cvtepi32_ps(row_sums_i32);
+
+            const __m128i d_B_fp16 = _mm_loadu_si128((const __m128i *) b_ptr[l].d);
+            const __m256 d_B_fp32 = _mm256_cvtph_ps(d_B_fp16);
+            const __m256 d_A_fp32 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_ptr[l].d));
+            const __m256 scales = _mm256_mul_ps(d_B_fp32, d_A_fp32);
+
+            acc_row = _mm256_fmadd_ps(row_sums_fp32, scales, acc_row);
+        }
+
+        _mm256_storeu_ps(s + x * 8, acc_row);
+    }
+}
+#endif // __AVX512F__ && __AVX512BW__
+
+void ggml_gemv_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    // Runtime switch: GGML_Q8_0_8X8_AVX=1 picks the AVX-512BW path, otherwise
+    // falls through to the portable C reference. Handy for A/B testing the
+    // SIMD kernel against the scaffold without rebuilding.
+    static const bool use_avx512bw = []() {
+        const char * env = std::getenv("GGML_Q8_0_8X8_AVX");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (use_avx512bw) {
+        assert(nr == 1);
+        UNUSED(nr);
+        gemv_q8_0_8x8_q8_0_avx512bw(n, s, bs, vx, vy, nc);
+        return;
+    }
+#endif
+    ggml_gemv_q8_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    // Prefill/GEMM path: scalar fallback for now. The decode hot path is GEMV;
+    // GEMM acceleration is out of scope for the CPU2 kernel session.
+    ggml_gemm_q8_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
