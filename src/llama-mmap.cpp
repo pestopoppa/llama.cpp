@@ -502,7 +502,32 @@ struct llama_mmap::impl {
                         LLAMA_LOG_INFO("numa-weights: only %d NUMA node(s); nothing to do\n", n_nodes);
                     }
                 } else if (numa_weights_mode == 2) {
-                    LLAMA_LOG_INFO("numa-weights: local mode — readahead disabled, first-touch placement\n");
+                    // Local mode: weights will be first-touched by a per-CCD warmup pass
+                    // (in llama-model-loader.cpp). We also need scratch/heap allocations to
+                    // spread across nodes — otherwise the compute buffer sits on node 0 and
+                    // all 96 threads' write traffic lands there. Set MPOL_INTERLEAVE as the
+                    // process-wide default; warmup threads will override with MPOL_LOCAL.
+                    int n_nodes_l = 0;
+                    if (DIR * d = opendir("/sys/devices/system/node")) {
+                        struct dirent * ent;
+                        while ((ent = readdir(d))) {
+                            if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes_l++;
+                        }
+                        closedir(d);
+                    }
+                    if (n_nodes_l > 1) {
+                        const unsigned long maxnode = 64UL;
+                        std::vector<unsigned long> mask(1, 0);
+                        for (int n = 0; n < n_nodes_l; ++n) mask[0] |= (1UL << n);
+                        long rc = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode);
+                        if (rc != 0) {
+                            LLAMA_LOG_WARN("numa-weights: local mode set_mempolicy(MPOL_INTERLEAVE) failed: %s\n", strerror(errno));
+                        } else {
+                            LLAMA_LOG_INFO("numa-weights: local mode — readahead disabled, MPOL_INTERLEAVE for scratch across %d nodes\n", n_nodes_l);
+                        }
+                    } else {
+                        LLAMA_LOG_INFO("numa-weights: local mode — readahead disabled, only %d node(s)\n", n_nodes_l);
+                    }
                 }
             }
         }
