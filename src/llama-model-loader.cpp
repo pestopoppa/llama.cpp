@@ -13,6 +13,19 @@
 #include <future>
 #include <regex>
 
+#if defined(__linux__)
+#  include <pthread.h>
+#  include <sched.h>
+#  include <unistd.h>
+#  include <dirent.h>
+#  include <cctype>
+#  include <sys/syscall.h>
+#  if __has_include(<numaif.h>)
+#    include <numaif.h>
+#    define LLAMA_LOADER_HAS_NUMAIF 1
+#  endif
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1354,6 +1367,110 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
     }
+
+#if defined(__linux__)
+    // Phase 1.3 v2 (CPU1): optional per-CCD warm-up touch pass. Triggered by
+    // GGML_NUMA_WEIGHTS=local + GGML_CCD_POOLS=1. Spawns one pthread per CCD,
+    // pinned to that CCD's physical cores. Each thread touches one byte per
+    // page of its assigned row-range of every weight tensor, causing
+    // first-touch to place those pages on that CCD's NUMA node. Partitioning
+    // mirrors Phase 1.2's CCD-block-contiguous work distribution, so threads
+    // later accessing rows [c*N/n_ccd, (c+1)*N/n_ccd) find them on the local
+    // node.
+    if (use_mmap) {
+        const char * env_nw = std::getenv("GGML_NUMA_WEIGHTS");
+        const char * env_pools = std::getenv("GGML_CCD_POOLS");
+        const bool want_warmup = env_nw && strcmp(env_nw, "local") == 0
+                              && env_pools && (env_pools[0] == '1' || env_pools[0] == 'y' || env_pools[0] == 'Y');
+        if (want_warmup) {
+            // Determine CCD count. Default to 12 for EPYC 9655; overridable.
+            int n_ccd = 12;
+            if (const char * env_nc = std::getenv("GGML_NUMA_WARMUP_CCD")) {
+                int v = atoi(env_nc);
+                if (v > 0) n_ccd = v;
+            }
+            int n_phys_per_ccd = 8; // EPYC 9655
+            if (const char * env_pp = std::getenv("GGML_NUMA_WARMUP_PHYS_PER_CCD")) {
+                int v = atoi(env_pp);
+                if (v > 0) n_phys_per_ccd = v;
+            }
+            // Count NUMA nodes (purely diagnostic).
+            int n_nodes = 0;
+            if (DIR * d = opendir("/sys/devices/system/node")) {
+                struct dirent * ent;
+                while ((ent = readdir(d))) {
+                    if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
+                }
+                closedir(d);
+            }
+            if (n_nodes < 2) {
+                LLAMA_LOG_INFO("numa-warmup: only %d NUMA node(s); skipping\n", n_nodes);
+            } else {
+                LLAMA_LOG_INFO("numa-warmup: %d CCDs x %d phys cores, touching weights across %d nodes\n",
+                               n_ccd, n_phys_per_ccd, n_nodes);
+                const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+
+                // Snapshot weight refs into a flat array for thread workers.
+                struct wentry { void * addr; size_t nbytes; };
+                std::vector<wentry> entries;
+                entries.reserve(weights_map.size());
+                size_t threshold = 0;
+                if (const char * env_thr = std::getenv("GGML_NUMA_WARMUP_MIN_BYTES")) {
+                    threshold = (size_t)atoll(env_thr);
+                }
+                for (const auto & it : weights_map) {
+                    const auto & w = it.second;
+                    if (w.idx >= mappings.size()) continue;
+                    size_t nbytes = ggml_nbytes(w.tensor);
+                    if (nbytes < threshold) continue;
+                    entries.push_back({ (char *)mappings[w.idx]->addr() + w.offs, nbytes });
+                }
+                LLAMA_LOG_INFO("numa-warmup: touching %zu large tensors\n", entries.size());
+
+                struct targs { int ccd_id; int n_ccd; int n_phys_per_ccd; size_t page_size;
+                               const std::vector<wentry> * entries; volatile char dummy; };
+                std::vector<targs> ta(n_ccd);
+                std::vector<pthread_t> tids(n_ccd);
+                auto worker = +[](void * arg) -> void * {
+                    auto * a = (targs *)arg;
+                    // Pin to this CCD's physical cores.
+                    cpu_set_t cs;
+                    CPU_ZERO(&cs);
+                    int core_start = a->ccd_id * a->n_phys_per_ccd;
+                    int core_end   = core_start + a->n_phys_per_ccd;
+                    for (int core = core_start; core < core_end; ++core) CPU_SET(core, &cs);
+                    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#if defined(LLAMA_LOADER_HAS_NUMAIF)
+                    // Override inherited MPOL_INTERLEAVE with MPOL_LOCAL so our touches
+                    // place pages on the CPU-local node (not interleaved).
+                    syscall(SYS_set_mempolicy, MPOL_LOCAL, (unsigned long *)nullptr, 0UL);
+#endif
+                    // Touch assigned row-range of each tensor.
+                    volatile char d = 0;
+                    for (const auto & w : *a->entries) {
+                        size_t beg = ((size_t)a->ccd_id * w.nbytes) / (size_t)a->n_ccd;
+                        size_t end = ((size_t)(a->ccd_id + 1) * w.nbytes) / (size_t)a->n_ccd;
+                        beg = (beg / a->page_size) * a->page_size;
+                        char * base = (char *)w.addr;
+                        for (size_t p = beg; p < end; p += a->page_size) {
+                            d ^= base[p];
+                        }
+                    }
+                    a->dummy = d;
+                    return nullptr;
+                };
+                for (int c = 0; c < n_ccd; ++c) {
+                    ta[c] = targs{ c, n_ccd, n_phys_per_ccd, page_size, &entries, 0 };
+                    pthread_create(&tids[c], nullptr, worker, &ta[c]);
+                }
+                for (int c = 0; c < n_ccd; ++c) {
+                    pthread_join(tids[c], nullptr);
+                }
+                LLAMA_LOG_INFO("numa-warmup: complete\n");
+            }
+        }
+    }
+#endif
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
