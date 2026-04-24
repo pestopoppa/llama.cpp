@@ -4401,6 +4401,27 @@ static void ggml_compute_forward_scale_f32(
     const int nc = src0->ne[0];
     const int nr = ggml_nrows(src0);
 
+    // Phase 1.4 axis-0 fallback: decode shape nr=1, partition ne[0] instead.
+    if (nr == 1 && nth > 1 && nc > nth) {
+        const int dr  = (nc + nth - 1) / nth;
+        const int i0a = dr * ith;
+        const int i0b = MIN(i0a + dr, nc);
+        const int n_slice = i0b - i0a;
+        if (n_slice > 0) {
+            float * dst_ptr  = (float *) dst->data  + i0a;
+            const float * src0_ptr = (const float *) src0->data + i0a;
+            if (b == 0.0f) {
+                if (dst_ptr != src0_ptr) {
+                    memcpy(dst_ptr, src0_ptr, n_slice * sizeof(float));
+                }
+                ggml_vec_scale_f32(n_slice, dst_ptr, s);
+            } else {
+                ggml_vec_mad1_f32(n_slice, dst_ptr, src0_ptr, s, b);
+            }
+        }
+        return;
+    }
+
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
 

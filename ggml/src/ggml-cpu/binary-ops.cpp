@@ -58,6 +58,41 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
+    // Phase 1.4 axis-0 fallback: when the tensor has nrows=1 (typical decode
+    // shape [N, 1, 1, 1]) the default row-based partition leaves only thread-0
+    // working. Parallelize along ne00 instead so every thread participates
+    // AND the partition matches MUL_MAT's Phase 1.2 ith-per-row output.
+    // Safe only when src1 is either same-shape or fully broadcast in axis-0
+    // (ne10 == ne00 OR ne10 == 1) — otherwise we fall through to the default.
+    const int64_t outer = ne01 * ne02 * ne03;
+    if (outer == 1 && params->nth > 1 && ne00 > params->nth &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+        (ne10 == ne00 || ne10 == 1)) {
+        const int64_t ith = params->ith;
+        const int64_t nth = params->nth;
+        const int64_t dr  = (ne00 + nth - 1) / nth;
+        const int64_t i0a = dr * ith;
+        const int64_t i0b = MIN(i0a + dr, ne00);
+        const int64_t n_slice = i0b - i0a;
+        if (n_slice > 0) {
+            dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data)  + i0a;
+            const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data) + i0a;
+            if (ne10 == 1) {
+                // src1 is a scalar broadcast to all ne00 positions
+                const src1_t * src1_ptr = (const src1_t *) src1->data;
+                for (int64_t i = 0; i < n_slice; ++i) {
+                    const float a = type_conversion_table<src0_t>::to_f32(src0_ptr[i]);
+                    const float b = type_conversion_table<src1_t>::to_f32(*src1_ptr);
+                    dst_ptr[i] = type_conversion_table<dst_t>::from_f32(op(a, b));
+                }
+            } else {
+                const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data) + i0a;
+                vec_binary_op_contiguous<op>(n_slice, dst_ptr, src0_ptr, src1_ptr);
+            }
+        }
+        return;
+    }
+
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
 

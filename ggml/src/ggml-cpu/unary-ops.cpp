@@ -118,6 +118,24 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
+    // Phase 1.4 axis-0 fallback for decode shape [N, 1, 1, 1].
+    const int64_t outer = ne01 * ne02 * ne03;
+    if (outer == 1 && params->nth > 1 && ne00 > params->nth &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        const int64_t ith = params->ith;
+        const int64_t nth = params->nth;
+        const int64_t dr  = (ne00 + nth - 1) / nth;
+        const int64_t i0a = dr * ith;
+        const int64_t i0b = MIN(i0a + dr, ne00);
+        const int64_t n_slice = i0b - i0a;
+        if (n_slice > 0) {
+            dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data)  + i0a;
+            const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data) + i0a;
+            vec_unary_op<op>(n_slice, dst_ptr, src0_ptr);
+        }
+        return;
+    }
+
     const auto [ir0, ir1] = get_thread_range(params, src0);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
