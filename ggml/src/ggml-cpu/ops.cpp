@@ -3734,7 +3734,87 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
+    const int64_t total_rows = ne01 * ne02 * ne03;
+
+    // Decode-style fast path: when there are fewer rows than threads, the
+    // upstream `for (i01 = ith; i01 < ne01; i01 += nth)` loop leaves most
+    // threads idle (only `ith < total_rows` does anything). At nth=96 with
+    // ne01=ne02=ne03=1 that's 1 thread doing all the work and 95 threads
+    // immediately hitting the next ggml_barrier. Profile of Qwen3.6-27B
+    // Q8_0 decode confirms RMS_NORMs surrounded by long barrier waits.
+    //
+    // Parallelize across the inner axis (ne00) for each row when total_rows
+    // < nth, so all threads contribute. Two phases with one intra-op
+    // reduction barrier: (1) each thread computes a partial sum-of-squares
+    // over its k-slice; (2) all threads read the small partial-sum array
+    // (nth doubles fits in one cache line per thread), compute the same
+    // scale factor, and write their k-slice of the output.
+    //
+    // Env gate: GGML_RMS_NORM_PARALLEL=1 enables. Default OFF because the
+    // intra-op reduction barrier costs more than the single-thread RMS norm
+    // it parallelizes — measured 4.02 vs 4.41 t/s at 96t on Qwen3.6-27B Q8_0
+    // (-9% throughput when ON). Kept env-gated for future probing on
+    // workloads where the math might flip (very wide ne00, or barrier
+    // implementations cheaper than the current 2-level CCD-hierarchical).
+    static int s_parallel = -1;
+    if (s_parallel < 0) {
+        const char * env = getenv("GGML_RMS_NORM_PARALLEL");
+        s_parallel = (env && env[0] && env[0] != '0') ? 1 : 0; // default OFF
+    }
+
+    if (s_parallel && total_rows < nth && total_rows > 0 && ne00 >= nth) {
+        // Each row processed serially across the row dim, parallelized across ne00.
+        // Per-thread scratch occupies one cache line at offset `ith * CACHE_LINE_SIZE_F32`
+        // in params->wdata, written below.
+        ggml_float * partial_buf = (ggml_float *)((float *)params->wdata + (size_t)ith * CACHE_LINE_SIZE_F32);
+
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = 0; i01 < ne01; i01++) {
+                    const float * x = (const float *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                    float       * y = (float       *) ((char       *) dst->data  + i01*nb1  + i02*nb2  + i03*nb3 );
+
+                    const int64_t k_per_thread = (ne00 + nth - 1) / nth;
+                    const int64_t k_start = ith * k_per_thread;
+                    const int64_t k_end   = MIN(k_start + k_per_thread, ne00);
+
+                    ggml_float partial = 0.0;
+                    for (int64_t i00 = k_start; i00 < k_end; i00++) {
+                        partial += (ggml_float)(x[i00] * x[i00]);
+                    }
+                    *partial_buf = partial;
+
+                    ggml_barrier(params->threadpool);
+
+                    ggml_float total = 0.0;
+                    for (int t = 0; t < nth; t++) {
+                        total += *((ggml_float *)((float *)params->wdata + (size_t)t * CACHE_LINE_SIZE_F32));
+                    }
+
+                    const float mean  = (float)(total / ne00);
+                    const float scale = 1.0f / sqrtf(mean + eps);
+                    assert(scale > 0.0f);
+
+                    for (int64_t i00 = k_start; i00 < k_end; i00++) {
+                        y[i00] = x[i00] * scale;
+                    }
+
+                    // If there are more rows still to process for the same op,
+                    // we need to barrier so the partial_buf is reset before
+                    // the next row's writes start (avoiding read-write races
+                    // on the shared scratch). Cheap, since the next phase A
+                    // also needs all threads at the same row.
+                    if (i01 + 1 < ne01 || i02 + 1 < ne02 || i03 + 1 < ne03) {
+                        ggml_barrier(params->threadpool);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Original per-row partition (unchanged): used when total_rows >= nth
+    // or when the parallel path is disabled.
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
