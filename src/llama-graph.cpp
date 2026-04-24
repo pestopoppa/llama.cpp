@@ -2249,8 +2249,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il,
-        ggml_tensor * residual) const {
+            int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2309,7 +2308,6 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
-    bool fused_residual = false;
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
@@ -2319,36 +2317,12 @@ ggml_tensor * llm_graph_context::build_attn(
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            // Fusion path: MUL_MAT(wo, cur) + residual, bypassing separate ADD and its
-            // barrier. Only safe when there are no LoRA adapters, no per-weight scale
-            // (wo_s), no bias (wo_b), residual is F32, and shapes match.
-            const bool can_fuse = residual != nullptr
-                               && wo_b == nullptr
-                               && wo_s == nullptr
-                               && residual->type == GGML_TYPE_F32
-                               && loras->empty()
-                               && residual->ne[0] == wo->ne[1]
-                               && residual->ne[1] == cur->ne[1]
-                               && residual->ne[2] == cur->ne[2]
-                               && residual->ne[3] == cur->ne[3];
-            if (can_fuse) {
-                cur = ggml_mul_mat_add_residual(ctx0, wo, cur, residual);
-                fused_residual = true;
-            } else {
-                cur = build_lora_mm(wo, cur, wo_s);
-            }
+            cur = build_lora_mm(wo, cur, wo_s);
         }
     }
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
-    }
-
-    // If the caller supplied a residual but fusion could not be used above,
-    // add it explicitly here so the caller can always treat the result as
-    // "attn_out + residual" regardless of fusion eligibility.
-    if (residual && !fused_residual) {
-        cur = ggml_add(ctx0, cur, residual);
     }
 
     return cur;
