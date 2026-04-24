@@ -1459,6 +1459,61 @@ UseGgmlGemm2:;
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
 
+    // Phase 1.2 (CPU1): CCD-block-contiguous work distribution, env-gated.
+    // When GGML_CCD_WORK_DIST=1 AND CCD pools are enabled AND the big dim is
+    // large enough to divide cleanly, each CCD's threads process a contiguous
+    // block of output rows (or output cols, whichever dim we're splitting).
+    // Combined with GGML_NUMA_WEIGHTS=stripe this gives true per-node locality.
+    // Bit-exact with default when env unset.
+    {
+#ifndef GGML_USE_OPENMP
+        static int s_ccd_wd_env = -1;
+        if (s_ccd_wd_env < 0) {
+            const char * env = getenv("GGML_CCD_WORK_DIST");
+            s_ccd_wd_env = (env && *env && env[0] != '0') ? 1 : 0;
+        }
+        struct ggml_threadpool * tp = params->threadpool;
+        if (s_ccd_wd_env && tp->ccd_pool_enabled && tp->ccd_count > 0 &&
+                nth == tp->ccd_count * tp->ccd_threads) {
+            const int ccd_id       = ith / tp->ccd_threads;
+            const int ccd_local_id = ith % tp->ccd_threads;
+            const int n_ccd        = tp->ccd_count;
+            const int n_ccd_local  = tp->ccd_threads;
+
+            // Split the larger dim (same choice as default path below).
+            const bool split_nr0 = (nr0 > nr1);
+            const int64_t big = split_nr0 ? nr0 : nr1;
+
+            if (big >= (int64_t)n_ccd) {
+                // Partition big dim: CCD block → thread sub-slice.
+                const int64_t ccd_beg = (ccd_id * big) / n_ccd;
+                const int64_t ccd_end = ((ccd_id + 1) * big) / n_ccd;
+                const int64_t my_beg  = ccd_beg + ((ccd_local_id * (ccd_end - ccd_beg)) / n_ccd_local);
+                const int64_t my_end  = ccd_beg + (((ccd_local_id + 1) * (ccd_end - ccd_beg)) / n_ccd_local);
+
+                if (my_end > my_beg) {
+                    int64_t ir0_start, ir0_end, ir1_start, ir1_end;
+                    if (split_nr0) {
+                        ir0_start = my_beg; ir0_end = my_end;
+                        ir1_start = 0;      ir1_end = nr1;
+                    } else {
+                        ir0_start = 0;      ir0_end = nr0;
+                        ir1_start = my_beg; ir1_end = my_end;
+                    }
+                    int64_t num_rows_per_vec_dot = vec_dot_num_rows;
+                    if ((nr0 % 2 != 0) || (ne11 % 2 != 0) ||
+                        ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+                        num_rows_per_vec_dot = 1;
+                    }
+                    ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type,
+                            num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+                }
+                return;
+            }
+        }
+#endif
+    }
+
     // Now select a reasonable chunk size.
     int chunk_size = 16;
 
