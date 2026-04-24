@@ -1420,18 +1420,6 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
-    // Fused MUL_MAT + residual ADD: computes dst = (a @ b) + residual
-    // where residual is same shape as the MUL_MAT output. Eliminates the
-    // intermediate ADD op and its barrier. residual is stored in src[2]
-    // and op_params[1] is set to 1 to flag the fused op on the CPU backend.
-    // Note: CPU backend only for now — other backends will fall back to
-    // unfused path if they encounter src[2] without corresponding handling.
-    GGML_API struct ggml_tensor * ggml_mul_mat_add_residual(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            struct ggml_tensor  * b,
-            struct ggml_tensor  * residual);
-
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
