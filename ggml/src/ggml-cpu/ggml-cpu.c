@@ -3235,27 +3235,57 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            // Phase 1.4 / Lever B: graph-level between-op barrier downgrade was
-            // attempted and REJECTED as unsafe (2026-04-24). Root causes from
-            // perplexity validation:
+#ifndef GGML_USE_OPENMP
+            // Phase 1.4: downgrade the between-op barrier to CCD-local when:
+            //   (a) current op is MUL_MAT/MUL_MAT_ID or a pointwise op — writes
+            //       under the axis-0 partition (thread i writes ne0 range
+            //       [i*ne0/nth, (i+1)*ne0/nth) — both in decode nrows=1 via
+            //       Phase 1.2 and in downstream ops via the axis-0 fallback).
+            //   (b) next op is pointwise (ADD, MUL, SCALE, UNARY) so it reads
+            //       only its own axis-0 range.
+            //   (c) GGML_CCD_WORK_DIST=1 so MUL_MAT uses static (not stealing)
+            //       partitioning.
             //
-            //  1) MUL_MAT and ADD/MUL/SCALE/UNARY pick their partition axis
-            //     independently. MUL_MAT under Phase 1.2 splits the larger of
-            //     nr0/nr1; ADD partitions by ggml_nrows(src0). When axes
-            //     disagree (typical prefill: MUL_MAT splits N, ADD splits T),
-            //     local-barrier misses cross-CCD writes.
-            //  2) ADD on tiny tensors (nrows=1, typical decode) has only
-            //     thread-0 doing work — and thread-0 reads from *every* other
-            //     thread's MUL_MAT output, spanning all CCDs. Local barrier
-            //     misses other-CCD writes.
-            //  3) Even when partitioning axes match, ADD's ceiling-div and
-            //     Phase 1.2's floor-div disagree by ~1 row at CCD boundaries.
-            //     Fixed by aligning formulas, but (1) and (2) remain.
-            //
-            // A correct Lever B / Phase 1.4 needs per-op annotated partitioning
-            // + graph-level consistency check, not a global flag. Tracked as
-            // dedicated work.
+            // Perplexity-verified before shipping. Env gate:
+            // GGML_BARRIER_LOCAL_BETWEEN_OPS=1.
+            static int s_local_between = -1;
+            static int s_wd_on         = -1;
+            if (s_local_between < 0) {
+                const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
+                s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            if (s_wd_on < 0) {
+                const char * env = getenv("GGML_CCD_WORK_DIST");
+                s_wd_on = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            if (s_local_between && s_wd_on) {
+                enum ggml_op cur_op  = node->op;
+                enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
+                bool cur_partitioned = (cur_op == GGML_OP_MUL_MAT ||
+                                        cur_op == GGML_OP_MUL_MAT_ID ||
+                                        cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
+                                        cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
+                bool next_elementwise = (next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
+                                         next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
+                // Only safe when next op is decode-shape (nrows_dst==1). Check
+                // dst of NEXT op — if outer > 1, fall through to global.
+                if (cur_partitioned && next_elementwise) {
+                    const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
+                    const int64_t next_outer = (next_node->ne[1] * next_node->ne[2] * next_node->ne[3]);
+                    if (next_outer == 1 && next_node->ne[0] > params.nth) {
+                        ggml_barrier_local(state->threadpool);
+                    } else {
+                        ggml_barrier(state->threadpool);
+                    }
+                } else {
+                    ggml_barrier(state->threadpool);
+                }
+            } else {
+                ggml_barrier(state->threadpool);
+            }
+#else
             ggml_barrier(state->threadpool);
+#endif
         }
     }
 
