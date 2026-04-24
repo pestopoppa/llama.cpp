@@ -593,6 +593,40 @@ static struct ggml_state g_state = {0};
 static __thread struct ggml_compute_state * ggml_tls_state = NULL;
 #endif
 
+// Lever B: CCD-local-only variant of ggml_barrier. Syncs threads within one
+// CCD (8-way) without the cross-CCD portion. Safe ONLY when all threads in
+// the same CCD consume data written by their same-CCD peers (e.g., a chain
+// of matmuls with CCD-block-contiguous partitioning). UNSAFE before ops that
+// need cross-CCD data (reductions, attention). Caller must verify safety.
+void ggml_barrier_local(struct ggml_threadpool * tp) {
+    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+    if (n_threads == 1) {
+        return;
+    }
+#ifdef GGML_USE_OPENMP
+    #pragma omp barrier
+#else
+    if (tp->ccd_pool_enabled && n_threads == tp->ccd_count * tp->ccd_threads && ggml_tls_state != NULL) {
+        struct ggml_compute_state * st = ggml_tls_state;
+        int ccd_id = st->ccd_id;
+        struct ggml_ccd_sync * csync = &tp->ccd[ccd_id];
+        int my_local = st->local_sense ^ 1;
+        st->local_sense = my_local;
+        int local_n = atomic_fetch_add_explicit(&csync->n_arrived, 1, memory_order_acq_rel);
+        if (local_n == (tp->ccd_threads - 1)) {
+            atomic_store_explicit(&csync->n_arrived, 0, memory_order_relaxed);
+            atomic_store_explicit(&csync->sense, my_local, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&csync->sense, memory_order_acquire) != my_local) {
+                ggml_thread_cpu_relax();
+            }
+        }
+        return;
+    }
+    ggml_barrier(tp);
+#endif
+}
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -3201,7 +3235,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+#ifndef GGML_USE_OPENMP
+            // Lever B: optionally downgrade the between-op barrier to CCD-local
+            // when both the current op wrote CCD-block-partitioned output AND the
+            // next op consumes it with the same partitioning. Gated by env var
+            // GGML_BARRIER_LOCAL_BETWEEN_OPS=1. Unsafe in the general case —
+            // experimental, should be validated via perplexity before enabling.
+            static int s_local_between = -1;
+            if (s_local_between < 0) {
+                const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
+                s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
+            }
+            if (s_local_between) {
+                enum ggml_op cur_op  = node->op;
+                enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
+                bool cur_preserves = (cur_op == GGML_OP_MUL_MAT ||
+                                      cur_op == GGML_OP_MUL_MAT_ID ||
+                                      cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
+                                      cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
+                bool next_local = (next_op == GGML_OP_MUL_MAT ||
+                                   next_op == GGML_OP_MUL_MAT_ID ||
+                                   next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
+                                   next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
+                if (cur_preserves && next_local) {
+                    ggml_barrier_local(state->threadpool);
+                } else {
+                    ggml_barrier(state->threadpool);
+                }
+            } else {
+                ggml_barrier(state->threadpool);
+            }
+#else
             ggml_barrier(state->threadpool);
+#endif
         }
     }
 
