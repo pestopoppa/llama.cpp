@@ -1463,7 +1463,9 @@ UseGgmlGemm2:;
     // When GGML_CCD_WORK_DIST=1 AND CCD pools are enabled AND the big dim is
     // large enough to divide cleanly, each CCD's threads process a contiguous
     // block of output rows (or output cols, whichever dim we're splitting).
-    // Combined with GGML_NUMA_WEIGHTS=stripe this gives true per-node locality.
+    // Combined with GGML_NUMA_REPLICATE=1 (Lever A') each CCD reads its src0
+    // from the replica on its local NUMA node — eliminating cross-node
+    // Infinity Fabric traffic that plain interleave pays 75% of the time.
     // Bit-exact with default when env unset.
     {
 #ifndef GGML_USE_OPENMP
@@ -1504,6 +1506,30 @@ UseGgmlGemm2:;
                     if ((nr0 % 2 != 0) || (ne11 % 2 != 0) ||
                         ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
                         num_rows_per_vec_dot = 1;
+                    }
+                    // Lever A': redirect src0->data to the replica on this CCD's local NUMA
+                    // node if replicas are configured and src0 points into the source (file)
+                    // range. Uses a temporary tensor object; does not mutate the shared src0.
+                    extern int ggml_numa_replica_count_(void);
+                    extern void * ggml_numa_replica_src_base_(void);
+                    extern size_t ggml_numa_replica_size_(void);
+                    extern ptrdiff_t ggml_numa_replica_offset_for_(int idx);
+                    int n_rep = ggml_numa_replica_count_();
+                    if (n_rep > 0) {
+                        char * src0_data = (char *)src0->data;
+                        char * rep_base  = (char *)ggml_numa_replica_src_base_();
+                        size_t rep_sz    = ggml_numa_replica_size_();
+                        if (src0_data >= rep_base && src0_data < rep_base + rep_sz) {
+                            int node = (ccd_id * n_rep) / n_ccd;
+                            ptrdiff_t off = ggml_numa_replica_offset_for_(node);
+                            struct ggml_tensor tmp_src0 = *src0;
+                            tmp_src0.data = src0_data + off;
+                            struct ggml_tensor tmp_dst = *dst;
+                            tmp_dst.src[0] = &tmp_src0;
+                            ggml_compute_forward_mul_mat_one_chunk(params, &tmp_dst, src0->type,
+                                    num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+                            return;
+                        }
                     }
                     ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type,
                             num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);

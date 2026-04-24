@@ -20,10 +20,31 @@
 #  include <dirent.h>
 #  include <cctype>
 #  include <sys/syscall.h>
+#  include <sys/mman.h>
 #  if __has_include(<numaif.h>)
 #    include <numaif.h>
 #    define LLAMA_LOADER_HAS_NUMAIF 1
 #  endif
+#endif
+
+// ---- Phase 1.4 (Lever A'): per-NUMA-node weight replication ----
+// Globals set by init_mappings when GGML_NUMA_REPLICATE=1.
+// Consumed by ggml_compute_forward_mul_mat (ggml-cpu.c) via the C-linkage
+// accessors below.
+#if defined(__linux__) && defined(LLAMA_LOADER_HAS_NUMAIF)
+#define LLAMA_NUMA_REPLICA_MAX 16
+static int        g_numa_replica_n = 0;
+static void *     g_numa_replica_bases[LLAMA_NUMA_REPLICA_MAX] = {nullptr};
+static void *     g_numa_replica_src_base = nullptr;   // the file mmap base we replicated from
+static size_t     g_numa_replica_size = 0;
+static ptrdiff_t  g_numa_replica_offsets[LLAMA_NUMA_REPLICA_MAX] = {0};
+
+extern "C" {
+    int        ggml_numa_replica_count_(void)            { return g_numa_replica_n; }
+    void *     ggml_numa_replica_src_base_(void)         { return g_numa_replica_src_base; }
+    size_t     ggml_numa_replica_size_(void)             { return g_numa_replica_size; }
+    ptrdiff_t  ggml_numa_replica_offset_for_(int idx)    { return (idx >= 0 && idx < g_numa_replica_n) ? g_numa_replica_offsets[idx] : 0; }
+}
 #endif
 
 static const size_t kiB = 1024;
@@ -1368,7 +1389,109 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         size_data += ggml_nbytes(it.second.tensor);
     }
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(LLAMA_LOADER_HAS_NUMAIF)
+    // Phase 1.4 / Lever A' (CPU1): per-NUMA-node weight replication.
+    // Triggered by GGML_NUMA_REPLICATE=1. Allocates one anonymous region per
+    // NUMA node, mbind'd to that node, and memcpy's the file mapping into
+    // each replica. The Phase 1.2 work-distribution path in ggml-cpu.c then
+    // redirects src0 reads through the replica on the CCD's local node,
+    // eliminating the ~75% cross-node access rate that plain interleave
+    // pays on Infinity Fabric.
+    if (use_mmap && g_numa_replica_n == 0) {
+        const char * env_rep = std::getenv("GGML_NUMA_REPLICATE");
+        if (env_rep && *env_rep && env_rep[0] != '0') {
+            if (mappings.size() != 1) {
+                LLAMA_LOG_WARN("numa-replicate: only 1-mapping models supported; have %zu, skipping\n", mappings.size());
+            } else {
+                int n_nodes = 0;
+                if (DIR * d = opendir("/sys/devices/system/node")) {
+                    struct dirent * ent;
+                    while ((ent = readdir(d))) {
+                        if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
+                    }
+                    closedir(d);
+                }
+                if (n_nodes < 2) {
+                    LLAMA_LOG_INFO("numa-replicate: only %d node(s); skipping\n", n_nodes);
+                } else if (n_nodes > LLAMA_NUMA_REPLICA_MAX) {
+                    LLAMA_LOG_WARN("numa-replicate: %d nodes > max %d, skipping\n", n_nodes, LLAMA_NUMA_REPLICA_MAX);
+                } else {
+                    const size_t sz = mappings[0]->size();
+                    void * src = mappings[0]->addr();
+                    LLAMA_LOG_INFO("numa-replicate: allocating %d replicas of %zu MB each (%zu GB total)\n",
+                                   n_nodes, sz >> 20, ((size_t)n_nodes * sz) >> 30);
+                    bool ok = true;
+                    for (int n = 0; n < n_nodes; ++n) {
+                        void * p = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (p == MAP_FAILED) {
+                            LLAMA_LOG_WARN("numa-replicate: mmap for node %d failed: %s\n", n, strerror(errno));
+                            ok = false; break;
+                        }
+                        // mbind this region to node n. Anonymous mmap's policy governs faults.
+                        const unsigned long maxnode = 64UL;
+                        unsigned long mask = (1UL << n);
+                        long rc = syscall(SYS_mbind, p, sz, MPOL_BIND, &mask, maxnode, 0);
+                        if (rc != 0) {
+                            LLAMA_LOG_WARN("numa-replicate: mbind node %d failed: %s\n", n, strerror(errno));
+                        }
+                        g_numa_replica_bases[n] = p;
+                    }
+                    if (ok) {
+                        // Copy from file mmap into each replica, in parallel. Each copy uses a
+                        // thread pinned to that node's CPUs so first-touch (for the destination
+                        // pages) happens on the intended node.
+                        struct cargs { void * dst; const void * src; size_t sz; int node; };
+                        std::vector<cargs> ca(n_nodes);
+                        std::vector<pthread_t> ctids(n_nodes);
+                        // Determine a CPU for each node (first cpu of the node). Read
+                        // /sys/devices/system/node/nodeN/cpulist for simplicity.
+                        std::vector<int> node_first_cpu(n_nodes, -1);
+                        for (int n = 0; n < n_nodes; ++n) {
+                            char path[128];
+                            snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", n);
+                            FILE * f = fopen(path, "r");
+                            if (f) {
+                                int v = 0;
+                                if (fscanf(f, "%d", &v) == 1) node_first_cpu[n] = v;
+                                fclose(f);
+                            }
+                        }
+                        auto cworker = +[](void * arg) -> void * {
+                            auto * a = (cargs *)arg;
+                            memcpy(a->dst, a->src, a->sz);
+                            return nullptr;
+                        };
+                        for (int n = 0; n < n_nodes; ++n) {
+                            ca[n] = cargs{ g_numa_replica_bases[n], src, sz, n };
+                            pthread_create(&ctids[n], nullptr, cworker, &ca[n]);
+                            // Pin the copy-thread to the node's first CPU.
+                            if (node_first_cpu[n] >= 0) {
+                                cpu_set_t cs;
+                                CPU_ZERO(&cs);
+                                // Pin to all CPUs on this node for memcpy parallelism if we could…
+                                // here just the first CPU to keep it simple. The mbind'd region
+                                // governs placement so any CPU is fine, but local first-touch
+                                // is a belt-and-suspenders.
+                                CPU_SET(node_first_cpu[n], &cs);
+                                pthread_setaffinity_np(ctids[n], sizeof(cs), &cs);
+                            }
+                        }
+                        for (int n = 0; n < n_nodes; ++n) pthread_join(ctids[n], nullptr);
+
+                        g_numa_replica_src_base = src;
+                        g_numa_replica_size = sz;
+                        for (int n = 0; n < n_nodes; ++n) {
+                            g_numa_replica_offsets[n] = (char *)g_numa_replica_bases[n] - (char *)src;
+                        }
+                        g_numa_replica_n = n_nodes;
+                        LLAMA_LOG_INFO("numa-replicate: complete; %d replicas ready\n", n_nodes);
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 1.3 v2 (CPU1): optional per-CCD warm-up touch pass. Triggered by
     // GGML_NUMA_WEIGHTS=local + GGML_CCD_POOLS=1. Spawns one pthread per CCD,
     // pinned to that CCD's physical cores. Each thread touches one byte per
