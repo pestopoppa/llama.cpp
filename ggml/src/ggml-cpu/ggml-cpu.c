@@ -3443,22 +3443,33 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
                             count++;
                         }
                     }
-                    // Heuristic: for ccd_threads==8 (physical-only) we expect exactly
-                    // need_cores contiguous cores at [first..first+need_cores-1].
-                    // For ccd_threads==16 (phys+HT) the set includes SMT siblings; skip
-                    // strict fit check and just use first allowed core as base.
                     if (first < 0) {
                         fit_cpuset = 0;
                     } else {
                         base_core = first;
-                        if (tpcc == 8) {
-                            // Physical-only: require contiguous first..first+need_cores-1
-                            if (last - first + 1 != need_cores || count != need_cores) {
-                                fit_cpuset = 0;
+                        // Compute the exact set of pin targets we'd emit below and
+                        // verify every one is in the process's cpuset. If not, disable
+                        // pinning — the 2-level barrier still runs, kernel schedules
+                        // threads within the inherited cpuset.
+                        for (int c = 0; c < ccds && fit_cpuset; ++c) {
+                            for (int l = 0; l < tpcc; ++l) {
+                                int core;
+                                if (tpcc == 8) {
+                                    core = base_core + c * 8 + l;
+                                } else if (tpcc == 16) {
+                                    int phys_start = base_core + c * 8;
+                                    core = (l < 8) ? (phys_start + l)
+                                                   : (96 + phys_start + (l - 8));
+                                } else {
+                                    core = base_core + c * tpcc + l;
+                                }
+                                if (core < 0 || core >= (int)(sizeof(allowed)*8)
+                                    || !CPU_ISSET(core, &allowed)) {
+                                    fit_cpuset = 0;
+                                    break;
+                                }
                             }
                         }
-                        // For other ccd_threads values and tpcc=16 (phys+HT), we don't
-                        // strictly validate — just warn if size doesn't match.
                     }
                 } else {
                     fit_cpuset = 0;
