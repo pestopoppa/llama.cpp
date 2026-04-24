@@ -4296,36 +4296,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
-    // Add residual (src[2]) to dst over [src0_start, src0_end) x [src1_start, src1_end).
-    // Mirrors the region written by forward_mul_mat_one_chunk so the two can be fused
-    // per-chunk without any additional barriers.
-    static void apply_residual_chunk(ggml_tensor * dst,
-                                     const ggml_tensor * src2,
-                                     int64_t src0_start, int64_t src0_end,
-                                     int64_t src1_start, int64_t src1_end,
-                                     int64_t ne1) {
-        if (src0_end <= src0_start || src1_end <= src1_start) return;
-        // forward_mul_mat_one_chunk indexes src1 across (i1 = i11, i2 = i12) where
-        // i12 = src1_start / ne1 and the row index cycles through ne1 rows.
-        for (int64_t k = src1_start; k < src1_end; k++) {
-            const int64_t i12 = k / ne1;
-            const int64_t i11 = k - i12 * ne1;
-            float * dst_row = (float *)((char *)dst->data + i11 * dst->nb[1] + i12 * dst->nb[2]);
-            const float * s2_row = (const float *)((const char *)src2->data + i11 * src2->nb[1] + i12 * src2->nb[2]);
-            for (int64_t i0 = src0_start; i0 < src0_end; i0++) {
-                dst_row[i0] += s2_row[i0];
-            }
-        }
-    }
-
     void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
         ggml_tensor *       dst  = op;
-        // Fused residual (op fusion): if op_params[1]==1 and src[2] present, each
-        // chunk's write is followed by an in-place += of the corresponding residual
-        // slice. Same region, same thread — no extra barriers required.
-        const ggml_tensor * src2 = (ggml_get_op_params_i32(op, 1) == 1) ? op->src[2] : nullptr;
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -4450,9 +4424,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
-            if (src2) {
-                apply_residual_chunk(dst, src2, src0_start, src0_end, src1_start, src1_end, dst->ne[1]);
-            }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
