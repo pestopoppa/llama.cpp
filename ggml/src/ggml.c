@@ -3261,6 +3261,37 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+// Fused MUL_MAT + residual ADD. Output = (a @ b) + residual. Residual must
+// be shape-compatible with the matmul output. Uses src[2] for residual and
+// op_params[1] as a flag so the CPU compute path adds the residual during
+// the chunk-write phase, skipping the intermediate ADD op and its barrier.
+struct ggml_tensor * ggml_mul_mat_add_residual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * residual) {
+    GGML_ASSERT(ggml_can_mul_mat(a, b));
+    GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(residual != NULL);
+
+    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    GGML_ASSERT(residual->ne[0] == ne[0] && residual->ne[1] == ne[1] &&
+                residual->ne[2] == ne[2] && residual->ne[3] == ne[3]);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+
+    result->op     = GGML_OP_MUL_MAT;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = residual;
+
+    // Flag: op_params[1] = 1 indicates fused residual add (CPU only)
+    ggml_set_op_params_i32(result, 1, 1);
+
+    return result;
+}
+
 // ggml_mul_mat_id
 
 /*
