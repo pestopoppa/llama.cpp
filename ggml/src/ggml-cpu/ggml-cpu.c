@@ -3235,16 +3235,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            // Lever B v1 (between-op barrier downgrade by op-pair heuristic) was
-            // attempted 2026-04-24 and REVERTED — perplexity verified that even
-            // the tightest heuristic (current partitioned-write + next element-wise)
-            // corrupts output. Root cause: ADD/MUL/SCALE op implementations use
-            // their own internal chunking that doesn't necessarily align with
-            // the previous MUL_MAT's per-thread write partition, even under
-            // GGML_CCD_WORK_DIST=1. A safe Lever B requires per-op refactor to
-            // guarantee matching partitioning, not a graph-level shortcut. The
-            // ggml_barrier_local() primitive remains available for future
-            // per-op-site use when that refactor happens.
+            // Phase 1.4 / Lever B: graph-level between-op barrier downgrade was
+            // attempted and REJECTED as unsafe (2026-04-24). Root causes from
+            // perplexity validation:
+            //
+            //  1) MUL_MAT and ADD/MUL/SCALE/UNARY pick their partition axis
+            //     independently. MUL_MAT under Phase 1.2 splits the larger of
+            //     nr0/nr1; ADD partitions by ggml_nrows(src0). When axes
+            //     disagree (typical prefill: MUL_MAT splits N, ADD splits T),
+            //     local-barrier misses cross-CCD writes.
+            //  2) ADD on tiny tensors (nrows=1, typical decode) has only
+            //     thread-0 doing work — and thread-0 reads from *every* other
+            //     thread's MUL_MAT output, spanning all CCDs. Local barrier
+            //     misses other-CCD writes.
+            //  3) Even when partitioning axes match, ADD's ceiling-div and
+            //     Phase 1.2's floor-div disagree by ~1 row at CCD boundaries.
+            //     Fixed by aligning formulas, but (1) and (2) remain.
+            //
+            // A correct Lever B / Phase 1.4 needs per-op annotated partitioning
+            // + graph-level consistency check, not a global flag. Tracked as
+            // dedicated work.
             ggml_barrier(state->threadpool);
         }
     }
