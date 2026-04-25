@@ -1654,6 +1654,12 @@ UseGgmlGemm2:;
     }
 }
 
+// Phase 3.2(d.1.b) shared scratch for inter-process EP gather pointers.
+// Single-writer (master/worker ith==0) before barrier; multi-reader (all
+// threads) after. Safe because mul_mat_id ops execute sequentially in the
+// graph executor — no two ops are computing concurrently in the same process.
+static const void * g_ep_partials[EP_MAX_WORKERS];
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1859,23 +1865,33 @@ static void ggml_compute_forward_mul_mat_id(
         (ep_session_n_workers(ep_sess) > 0);
     const bool ep_worker_active = (ep_sess != NULL) &&
         (ep_session_role(ep_sess) == EP_ROLE_WORKER);
+    const bool ep_inter         = ep_master_active || ep_worker_active;
+    // ep_n_inst = total instances (master + workers); ep_my_id = my index in [0, ep_n_inst).
+    // ep_session_instance_id returns 0 for master, 1..n_workers for workers, which lines
+    // up directly with our (cur_a % ep_n_inst) skip predicate.
+    const int  ep_n_inst        = ep_inter ? (ep_session_n_workers(ep_sess) + 1) : 1;
+    const int  ep_my_id         = ep_inter ? ep_session_instance_id(ep_sess) : 0;
+    // Disable inter-process slicing when there are fewer experts than instances —
+    // some instances would have nothing to do and the gather/merge cost would
+    // exceed the saved compute. Threshold could be tuned later.
+    const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
     if (ep_master_active && ith == 0) {
-        // Signal-only broadcast: workers wake from ep_worker_wait_go inside
-        // their own mul_mat_id call. No data transferred — each instance
-        // already has the same hidden state via deterministic forward pass.
-        // ep_broadcast(NULL,0) skips the memcpy and just signals.
+        // Signal-only broadcast. No data transferred — each instance has the
+        // same hidden state via deterministic forward pass. The merged dst
+        // is published in the second round below.
         ep_broadcast(ep_sess, NULL, 0);
     } else if (ep_worker_active && ith == 0) {
-        // Worker waits for master's GO signal before computing. EXIT means
-        // master has shut down — worker should exit cleanly. Mid-graph EXIT
-        // is unexpected (master is supposed to teardown via atexit), so
-        // assert; relax to a warn+skip if it ever fires legitimately.
+        // Worker waits for master's GO. Mid-graph EXIT shouldn't happen.
         int r = ep_worker_wait_go(ep_sess);
         GGML_ASSERT(r == 0);
     }
 #else
     const bool ep_master_active = false;
     const bool ep_worker_active = false;
+    const bool ep_inter         = false;
+    const bool ep_slice         = false;
+    const int  ep_n_inst        = 1;
+    const int  ep_my_id         = 0;
     struct ep_session * ep_sess = NULL;
 #endif
 
@@ -1952,6 +1968,16 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    // CPU15 Phase 3.2(d.1.b): zero dst before the partial expert loop. Slots
+    // not handled by my instance must read as 0 so the cross-instance
+    // sum-reduce below produces the full result. Without slicing, the loop
+    // covers all (token, k) slots and dst contents at entry don't matter.
+#ifndef GGML_USE_OPENMP
+    if (ep_slice && ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+#endif
+
     ggml_barrier(params->threadpool);
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -1961,7 +1987,14 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // Sharded: skip experts not assigned to my CCD.
+        // Inter-process: skip experts not assigned to my instance. Each
+        // instance handles 1/N of the experts and writes only those (token,
+        // k) slots; the gather/sum-reduce below merges partials.
+        if (ep_slice && (cur_a % ep_n_inst) != ep_my_id) {
+            continue;
+        }
+
+        // Intra-process: skip experts not assigned to my CCD.
         if (ep_active && (cur_a % n_ccd) != my_ccd) {
             continue;
         }
@@ -2043,20 +2076,66 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // CPU15 Phase 3.2(d.1) inter-process EP harness (close).
-    // Master waits for workers' DONE; each worker signals DONE. Both forms
-    // gate this process's other threads at a barrier so they don't exit
-    // the op before IPC completes.
+    // CPU15 Phase 3.2(d.1.b) inter-process EP close.
+    //
+    // Three-state close:
+    //  (a) ep_slice — actual work distribution: workers send partials,
+    //      master gathers + parallel sum-reduces all partials into dst,
+    //      master broadcasts merged dst, workers receive.
+    //  (b) ep_inter without slicing — N < instances or fallback; just close
+    //      the round-1 sync that we opened at the top (master waits for
+    //      worker DONEs; workers signal DONE).
+    //  (c) no EP active — fall through, no IPC.
 #ifndef GGML_USE_OPENMP
-    if (ep_master_active) {
-        ggml_barrier(params->threadpool);
-        if (ith == 0) {
-            ep_wait_workers(ep_sess);
+    if (ep_slice) {
+        // Round 1 close: gather + sum-reduce
+        if (ep_master_active) {
+            if (ith == 0) {
+                ep_wait_workers(ep_sess);
+                ep_gather(ep_sess, g_ep_partials);
+            }
+            ggml_barrier(params->threadpool);
+            // Parallel sum-reduce: each thread owns a contiguous slice of
+            // the dst float array and adds workers' partials into it.
+            const int64_t n_floats = ggml_nelements(dst);
+            const int64_t i_start = (ith     * n_floats) / nth;
+            const int64_t i_end   = ((ith+1) * n_floats) / nth;
+            const int     n_w     = ep_session_n_workers(ep_sess);
+            float *       d       = (float *) dst->data;
+            for (int w = 0; w < n_w; ++w) {
+                const float * p = (const float *) g_ep_partials[w];
+                for (int64_t i = i_start; i < i_end; ++i) {
+                    d[i] += p[i];
+                }
+            }
+            ggml_barrier(params->threadpool);
+            // Round 2: master publishes merged, waits for workers to receive.
+            if (ith == 0) {
+                memcpy(ep_master_broadcast_buffer(ep_sess), dst->data, ggml_nbytes(dst));
+                ep_broadcast(ep_sess, NULL, 0);
+                ep_wait_workers(ep_sess);
+            }
+        } else if (ep_worker_active) {
+            // Worker: write partial dst to gather slot, then receive merged.
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                memcpy(ep_worker_gather_buffer(ep_sess), dst->data, ggml_nbytes(dst));
+                ep_worker_signal_done(ep_sess);
+                int r = ep_worker_wait_go(ep_sess);
+                GGML_ASSERT(r == 0);
+                memcpy(dst->data, ep_worker_broadcast_buffer(ep_sess), ggml_nbytes(dst));
+                ep_worker_signal_done(ep_sess);
+            }
         }
-    } else if (ep_worker_active) {
+    } else if (ep_inter) {
+        // No slicing — close the (d.1.a) sync round opened at the top.
         ggml_barrier(params->threadpool);
         if (ith == 0) {
-            ep_worker_signal_done(ep_sess);
+            if (ep_master_active) {
+                ep_wait_workers(ep_sess);
+            } else if (ep_worker_active) {
+                ep_worker_signal_done(ep_sess);
+            }
         }
     }
 #endif
