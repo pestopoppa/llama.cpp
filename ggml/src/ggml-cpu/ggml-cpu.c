@@ -1788,6 +1788,56 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // CPU15 Phase 3.2(d.0..e.2) inter-process EP TOP — must happen BEFORE
+    // the src1 quantization loop below, because in drone mode workers'
+    // src1 contents are uninitialized until master broadcasts them. If
+    // the quantization runs before the EP copy, it quantizes garbage into
+    // wdata and the expert compute reads garbage. Consequence: this block
+    // sets ep_* flags AND issues the broadcast/wait_go round 1, with a
+    // ggml_barrier so all threads see the post-copy src1/ids before the
+    // quantization loop runs.
+    struct ep_session * ep_sess = ggml_ep_get_session();
+    const bool ep_master_active = (ep_sess != NULL) &&
+        (ep_session_role(ep_sess) == EP_ROLE_MASTER) &&
+        (ep_session_n_workers(ep_sess) > 0);
+    const bool ep_worker_active = (ep_sess != NULL) &&
+        (ep_session_role(ep_sess) == EP_ROLE_WORKER);
+    const bool ep_inter         = ep_master_active || ep_worker_active;
+    const int  ep_n_inst        = ep_inter ? (ep_session_n_workers(ep_sess) + 1) : 1;
+    const int  ep_my_id         = ep_inter ? ep_session_instance_id(ep_sess) : 0;
+    const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
+    const int  ep_drone         = ggml_ep_drone_mode();
+    if (ep_master_active && ith == 0) {
+        if (ep_drone) {
+            char * bcast = (char *) ep_master_broadcast_buffer(ep_sess);
+            const size_t s1b = ggml_nbytes(src1);
+            const size_t idb = ggml_nbytes(ids);
+            GGML_ASSERT(s1b + idb <= 32ULL * 1024 * 1024);
+            memcpy(bcast,         src1->data, s1b);
+            memcpy(bcast + s1b,   ids->data,  idb);
+            ep_broadcast(ep_sess, NULL, 0);
+        } else {
+            ep_broadcast(ep_sess, NULL, 0);
+        }
+    } else if (ep_worker_active && ith == 0) {
+        int r = ep_worker_wait_go(ep_sess);
+        GGML_ASSERT(r == 0);
+        if (ep_drone) {
+            const char * bcast = (const char *) ep_worker_broadcast_buffer(ep_sess);
+            const size_t s1b = ggml_nbytes(src1);
+            const size_t idb = ggml_nbytes(ids);
+            memcpy(src1->data, bcast,       s1b);
+            memcpy(ids->data,  bcast + s1b, idb);
+        }
+    }
+    // Barrier so all threads of this process see ith==0's src1+ids writes
+    // BEFORE the quantization loop reads src1. Only needed in drone mode
+    // (in non-drone mode src1/ids weren't touched by EP), but the cost is
+    // ~few μs per op which is negligible vs the IPC RTT we just paid.
+    if (ep_inter) {
+        ggml_barrier(params->threadpool);
+    }
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1856,71 +1906,6 @@ static void ggml_compute_forward_mul_mat_id(
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
-        }
-    }
-
-    // CPU15 Phase 3.2(d.0..e.2) inter-process EP harness.
-    //
-    // When ggml_ep_get_session() returns non-NULL, the process is participating
-    // in inter-process expert parallelism: master broadcasts at the start of
-    // every MoE op, workers wait_go, both compute their assigned 1/N slice,
-    // workers send partial via gather, master parallel sum-reduces, and
-    // (outside drone mode) master broadcasts merged dst back. This block
-    // computes flags + opens the round; the close happens after the expert
-    // loop.
-    //
-    // NOTE: this code lives OUTSIDE the `#ifndef GGML_USE_OPENMP` guard
-    // because it doesn't depend on threadpool internals (only on
-    // ggml_barrier and ith/nth, which work in both modes). The Phase 1/2
-    // intra-process EP code below DOES depend on `tp->ccd_*` fields and
-    // stays guarded. Keeping inter-process EP visible to OPENMP builds is
-    // necessary because the production llama.cpp build defaults to OPENMP.
-    struct ep_session * ep_sess = ggml_ep_get_session();
-    const bool ep_master_active = (ep_sess != NULL) &&
-        (ep_session_role(ep_sess) == EP_ROLE_MASTER) &&
-        (ep_session_n_workers(ep_sess) > 0);
-    const bool ep_worker_active = (ep_sess != NULL) &&
-        (ep_session_role(ep_sess) == EP_ROLE_WORKER);
-    const bool ep_inter         = ep_master_active || ep_worker_active;
-    // ep_n_inst = total instances (master + workers); ep_my_id = my index in [0, ep_n_inst).
-    // ep_session_instance_id returns 0 for master, 1..n_workers for workers, which lines
-    // up directly with our (cur_a % ep_n_inst) skip predicate.
-    const int  ep_n_inst        = ep_inter ? (ep_session_n_workers(ep_sess) + 1) : 1;
-    const int  ep_my_id         = ep_inter ? ep_session_instance_id(ep_sess) : 0;
-    // Disable inter-process slicing when there are fewer experts than instances —
-    // some instances would have nothing to do and the gather/merge cost would
-    // exceed the saved compute. Threshold could be tuned later.
-    const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
-    const int  ep_drone         = ggml_ep_drone_mode();
-    if (ep_master_active && ith == 0) {
-        if (ep_drone) {
-            // Drone mode: workers skipped non-MoE ops and have stale src1
-            // (hidden state) and ids (routing). Broadcast both so workers can
-            // compute correctly. Layout: [src1 bytes][ids bytes].
-            char * bcast = (char *) ep_master_broadcast_buffer(ep_sess);
-            const size_t s1b = ggml_nbytes(src1);
-            const size_t idb = ggml_nbytes(ids);
-            GGML_ASSERT(s1b + idb <= 32ULL * 1024 * 1024);
-            memcpy(bcast,         src1->data, s1b);
-            memcpy(bcast + s1b,   ids->data,  idb);
-            ep_broadcast(ep_sess, NULL, 0);
-        } else {
-            // Signal-only — workers ran the same forward pass and have valid
-            // src1/ids deterministically.
-            ep_broadcast(ep_sess, NULL, 0);
-        }
-    } else if (ep_worker_active && ith == 0) {
-        int r = ep_worker_wait_go(ep_sess);
-        GGML_ASSERT(r == 0);
-        if (ep_drone) {
-            // Drone mode: pull src1 and ids from broadcast region so we can
-            // compute. src1->data and ids->data point at our own graph node
-            // memory; we overwrite with master's contents.
-            const char * bcast = (const char *) ep_worker_broadcast_buffer(ep_sess);
-            const size_t s1b = ggml_nbytes(src1);
-            const size_t idb = ggml_nbytes(ids);
-            memcpy(src1->data, bcast,       s1b);
-            memcpy(ids->data,  bcast + s1b, idb);
         }
     }
 
