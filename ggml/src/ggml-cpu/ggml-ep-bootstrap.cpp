@@ -59,11 +59,14 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
 
     struct ep_config cfg = {};
     cfg.n_workers              = n_workers;
-    // 1 MiB scratch is comfortably above the largest expected hidden state
-    // (e.g. 5120 floats = 20 KiB for Qwen3-Coder-REAP-246B). Step (d)+ will
-    // size this to the model's hidden dim once the integration knows it.
-    cfg.broadcast_bytes        = 1024 * 1024;
-    cfg.gather_bytes_per_worker = 1024 * 1024;
+    // 32 MiB sized to comfortably hold a `mul_mat_id` dst tensor at typical
+    // configurations: decode (batch=1) writes ~hidden_dim × n_ids × 4B ≈ 72 KiB
+    // for gemma-26B-A4B, ≈ 160 KiB for REAP-246B; prompt processing at
+    // batch=512 is ~32-50 MiB depending on hidden size. 32 MiB shared mem
+    // is trivial on a 1 TB system. Step (e) GGUF shard loading will let
+    // us right-size this to the actual graph need.
+    cfg.broadcast_bytes        = 32ULL * 1024 * 1024;
+    cfg.gather_bytes_per_worker = 32ULL * 1024 * 1024;
     cfg.master_cpu             = -1;
     cfg.master_numa_node       = -1;
     cfg.worker_cpus            = nullptr;
