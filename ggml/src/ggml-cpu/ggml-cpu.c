@@ -1674,6 +1674,23 @@ static int ggml_ep_drone_mode(void) {
     return s;
 }
 
+// Phase 3.2(h) master-park flag. When set, master in EP-slice mode restricts
+// itself to nth/N threads during the MoE op (parker threads skip quantization
+// and the expert loop, sit at the close barrier, then participate in
+// parallel sum-reduce). Targeted at configurations where master is "over-
+// threaded" relative to workers — typically GGML_EP_MASTER_ALL_NODES=1 with
+// master at -t 96 and 3 workers at -t 24 each. For symmetric configurations
+// (Qwen3.6 N=2 multi-node-pin: master 48 + worker 48 = 96 threads on 96
+// cores) leaving this OFF preserves full master parallelism.
+static int ggml_ep_master_park(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * env = getenv("GGML_EP_MASTER_PARK");
+        s = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return s;
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1807,6 +1824,20 @@ static void ggml_compute_forward_mul_mat_id(
     const int  ep_my_id         = ep_inter ? ep_session_instance_id(ep_sess) : 0;
     const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
     const int  ep_drone         = ggml_ep_drone_mode();
+    // Phase 3.2(h) master phase-aware threading: when running EP with
+    // GGML_EP_MASTER_ALL_NODES=1 (or any master with -t > nth/N), master has
+    // many more threads than workers. During the MoE op all instances run in
+    // parallel, so master should restrict itself to nth/N threads to avoid
+    // thread oversubscription on the physical core count. Threads with
+    // ith >= master_moe_nth on master become "parkers": they skip
+    // quantization, counter-init, and the expert loop, but still participate
+    // in the close barrier and the parallel sum-reduce (which is bandwidth-
+    // friendly and finishes after workers signal DONE so no oversubscription).
+    const bool ep_master_park   = ggml_ep_master_park();
+    const int  master_moe_nth   = (ep_master_active && ep_slice && ep_master_park)
+                                  ? ((nth + ep_n_inst - 1) / ep_n_inst)
+                                  : nth;
+    const bool master_parker    = ep_master_active && ep_slice && ep_master_park && (ith >= master_moe_nth);
     if (ep_master_active && ith == 0) {
         if (ep_drone) {
             char * bcast = (char *) ep_master_broadcast_buffer(ep_sess);
@@ -1877,15 +1908,20 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+        // Phase 3.2(h): in master_parker mode, this thread doesn't participate
+        // in quantization. The first master_moe_nth threads cover the work.
+        if (!master_parker) {
+            const int qnth = (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth : nth;
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        size_t bs = ggml_blck_size(vec_dot_type);
+                        int64_t ne10_block_start = (ith * ne10/bs) / qnth;
+                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / qnth;
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
@@ -1976,9 +2012,15 @@ static void ggml_compute_forward_mul_mat_id(
             *current_chunk_ctr = ccd_threads;
         }
     } else {
-        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-            *current_chunk_ctr = nth;
+        // Phase 3.2(h): use master_moe_nth as effective count when master is
+        // restricted, so the chunk-counter starts at the right value for the
+        // chunk-grabbing loop below. Master parkers don't participate.
+        const int init_nth = (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth : nth;
+        if (!master_parker) {
+            for (int cur_a = ith; cur_a < n_as; cur_a += init_nth) {
+                atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+                *current_chunk_ctr = init_nth;
+            }
         }
     }
 
@@ -1992,7 +2034,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    // Phase 3.2(h): master parker threads skip the entire expert loop. They
+    // participate in the close barrier and parallel sum-reduce below, but
+    // contribute no compute here so total memory-active threads across all
+    // EP instances stay at the physical core count.
+    for (int cur_a = 0; !master_parker && cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
@@ -2061,7 +2107,12 @@ static void ggml_compute_forward_mul_mat_id(
 
         // Effective parallelism: when sharded, only ccd_threads threads work
         // on this expert; chunking and atomic counter must use that count.
-        const int eff_nth = ep_active ? ccd_threads : nth;
+        // Phase 3.2(h): master in inter-process EP also uses a reduced count
+        // (master_moe_nth = nth / N_instances) so total memory-active threads
+        // across all instances stay at the physical core count.
+        const int eff_nth = ep_active                                       ? ccd_threads
+                          : (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth
+                          :                                                   nth;
         const int eff_ith = ep_active ? my_ccd_local : ith;
 
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
