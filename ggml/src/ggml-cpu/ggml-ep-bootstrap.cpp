@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <unistd.h>
 
 static struct ep_session * g_ep_session = nullptr;
@@ -78,28 +79,35 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
     if (ep_session_role(g_ep_session) == EP_ROLE_WORKER) {
         // Worker child path. We forked out of master's address space; the
         // caller (llama.cpp main()) is sitting just above ggml_cpu_init().
-        // Returning would cause the worker to load a model and run inference
-        // independently — not what we want. Instead, sit in a wait loop
-        // that ack's every GO immediately with no compute. Master will
-        // teardown via EXIT signal when it shuts down (or PR_SET_PDEATHSIG
-        // will SIGTERM us if master crashes).
         //
-        // This is intentionally a no-op for step (b): we are validating the
-        // fork+lifecycle harness only. Step (d)+ will replace this body
-        // with the actual MoE expert compute path.
+        // Phase 3.2(d.1) design: workers RETURN from bootstrap and run
+        // llama.cpp normally. They independently mmap the same GGUF (kernel
+        // page-cache de-dup means one set of physical pages, four VAs) and
+        // execute the same forward pass deterministically. Synchronization
+        // happens at MoE op boundaries via the EP path inside
+        // ggml_compute_forward_mul_mat_id.
+        //
+        // To prevent multiple processes fighting over a TTY (or workers
+        // EOF'ing on /dev/null'd stdin), redirect stdin/stdout to /dev/null.
+        // stderr stays attached so worker errors are visible.
         const int wid = ep_session_instance_id(g_ep_session) - 1;
-        fprintf(stderr, "ggml-ep: worker %d (pid=%d) entering passive wait loop\n",
+        fprintf(stderr, "ggml-ep: worker %d (pid=%d) returning to caller (will run llama.cpp normally)\n",
                 wid, (int) getpid());
-        while (true) {
-            int r = ep_worker_wait_go(g_ep_session);
-            if (r != 0) break;  // EXIT received
-            ep_worker_signal_done(g_ep_session);  // immediate ack, no compute
-        }
-        // Worker only: do not run atexit handlers (they belong to master's
-        // pre-fork state and would corrupt master-only globals).
-        ep_session_destroy(g_ep_session);
-        g_ep_session = nullptr;
-        _exit(0);
+        fflush(stderr);
+
+        // Disconnect stdin/stdout. We open /dev/null fresh and dup2 over the
+        // existing fds so the inherited TTY mappings are replaced; freopen
+        // would also work but dup2 is more explicit about which fds we
+        // touch (we deliberately leave stderr alone for diagnostics).
+        int devnull_r = open("/dev/null", O_RDONLY);
+        int devnull_w = open("/dev/null", O_WRONLY);
+        if (devnull_r >= 0) { dup2(devnull_r, 0); close(devnull_r); }
+        if (devnull_w >= 0) { dup2(devnull_w, 1); close(devnull_w); }
+
+        // Caller continues — for llama-cli/llama-bench/etc this means the
+        // worker proceeds to parse args (inherited via fork), load model,
+        // run inference, participate in EP sync at mul_mat_id ops, and exit.
+        return 1;
     }
 
     // Master path. Register cleanup so workers are reaped at normal exit.
