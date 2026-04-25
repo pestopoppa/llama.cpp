@@ -16,6 +16,7 @@
 #include "common.h"
 #include "ggml-ep-bootstrap.h"
 #include "ggml-ep-dispatcher.h"
+#include "ggml-ep-shard.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1858,20 +1859,22 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // CPU15 Phase 3.2(d.0) inter-process EP harness (master-only side).
+    // CPU15 Phase 3.2(d.0..e.2) inter-process EP harness.
     //
     // When ggml_ep_get_session() returns non-NULL, the process is participating
-    // in inter-process expert parallelism. The master signals workers at the
-    // start of every MoE op and waits for their ack at the end, validating the
-    // IPC harness inside the graph executor without yet distributing work
-    // (workers stay in their bootstrap passive-ack loop, contributing nothing
-    // to the compute). PPL must be bit-exact to baseline because master still
-    // does the full computation.
+    // in inter-process expert parallelism: master broadcasts at the start of
+    // every MoE op, workers wait_go, both compute their assigned 1/N slice,
+    // workers send partial via gather, master parallel sum-reduces, and
+    // (outside drone mode) master broadcasts merged dst back. This block
+    // computes flags + opens the round; the close happens after the expert
+    // loop.
     //
-    // Step (d.1, next session) will move workers out of the passive loop and
-    // have them compute their assigned expert slice; (e) will skip experts
-    // not assigned to my instance via `(cur_a % ep_n_inst) != ep_my_id`.
-#ifndef GGML_USE_OPENMP
+    // NOTE: this code lives OUTSIDE the `#ifndef GGML_USE_OPENMP` guard
+    // because it doesn't depend on threadpool internals (only on
+    // ggml_barrier and ith/nth, which work in both modes). The Phase 1/2
+    // intra-process EP code below DOES depend on `tp->ccd_*` fields and
+    // stays guarded. Keeping inter-process EP visible to OPENMP builds is
+    // necessary because the production llama.cpp build defaults to OPENMP.
     struct ep_session * ep_sess = ggml_ep_get_session();
     const bool ep_master_active = (ep_sess != NULL) &&
         (ep_session_role(ep_sess) == EP_ROLE_MASTER) &&
@@ -1888,7 +1891,7 @@ static void ggml_compute_forward_mul_mat_id(
     // some instances would have nothing to do and the gather/merge cost would
     // exceed the saved compute. Threshold could be tuned later.
     const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
-    const int  ep_drone        = ggml_ep_drone_mode();
+    const int  ep_drone         = ggml_ep_drone_mode();
     if (ep_master_active && ith == 0) {
         if (ep_drone) {
             // Drone mode: workers skipped non-MoE ops and have stale src1
@@ -1920,15 +1923,6 @@ static void ggml_compute_forward_mul_mat_id(
             memcpy(ids->data,  bcast + s1b, idb);
         }
     }
-#else
-    const bool ep_master_active = false;
-    const bool ep_worker_active = false;
-    const bool ep_inter         = false;
-    const bool ep_slice         = false;
-    const int  ep_n_inst        = 1;
-    const int  ep_my_id         = 0;
-    struct ep_session * ep_sess = NULL;
-#endif
 
     // CPU15 Phase 2 anon-expert lookup (set once per op, used per-expert below).
     // Look up this MoE op's expert tensor in the per-node anon registry built
@@ -2007,11 +2001,9 @@ static void ggml_compute_forward_mul_mat_id(
     // not handled by my instance must read as 0 so the cross-instance
     // sum-reduce below produces the full result. Without slicing, the loop
     // covers all (token, k) slots and dst contents at entry don't matter.
-#ifndef GGML_USE_OPENMP
     if (ep_slice && ith == 0) {
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-#endif
 
     ggml_barrier(params->threadpool);
 
@@ -2036,10 +2028,25 @@ static void ggml_compute_forward_mul_mat_id(
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
 
+        // CPU15 Phase 3.2(e.1) inter-process expert sharding: when
+        // GGML_EP_SHARD=1 + EP active, redirect this expert's read to the
+        // node-local compact buffer holding only this instance's 1/N of
+        // experts. Index into the compact buffer is (cur_a / ep_n_inst).
+        // ep_slice already gated cur_a so (cur_a % ep_n_inst) == ep_my_id,
+        // hence cur_a / ep_n_inst is a valid 0..n_kept-1 slot.
+        if (ep_slice && ggml_ep_shard_enabled()) {
+            void * shard_buf = ggml_ep_shard_lookup(src0, ep_my_id, ep_n_inst);
+            if (shard_buf) {
+                src0_cur = (const char *) shard_buf + (size_t)(cur_a / ep_n_inst) * nb02;
+            }
+        }
+
 #ifndef GGML_USE_OPENMP
         // CPU15 Phase 2: redirect to local-node anonymous copy when ep_active
         // and the tensor was registered by GGML_EXPERT_ANON_COPIES=1. The
         // copy was first-touched on the target node so reads are local.
+        // (Mutually exclusive with Phase 3.2(e.1) above — only one sharding
+        // mechanism is active at a time.)
         if (ep_active && ep_info_local && cur_a < ep_info_local->n_experts) {
             const int my_node = my_ccd / ep_info_local->n_ccd_per_node;
             if (my_node < ep_info_local->n_nodes &&
@@ -2121,7 +2128,6 @@ static void ggml_compute_forward_mul_mat_id(
     //      the round-1 sync that we opened at the top (master waits for
     //      worker DONEs; workers signal DONE).
     //  (c) no EP active — fall through, no IPC.
-#ifndef GGML_USE_OPENMP
     if (ep_slice) {
         // Round 1 close: gather + sum-reduce
         if (ep_master_active) {
@@ -2178,7 +2184,6 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
     }
-#endif
 }
 
 /////////////////////////////////
@@ -2197,8 +2202,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     // executing the rest of the graph would just burn cycles producing
     // garbage that nothing reads. The mul_mat_id EP path inside the op
     // itself handles the broadcast/compute/gather; here we just early-exit
-    // for everything else.
-#ifndef GGML_USE_OPENMP
+    // for everything else. This runs in both OPENMP and non-OPENMP builds
+    // — inter-process EP is independent of the intra-process threadpool.
     {
         static int s_drone_mode = -1;
         if (s_drone_mode < 0) {
@@ -2213,7 +2218,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             }
         }
     }
-#endif
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
