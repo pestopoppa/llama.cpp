@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "ggml-ep-bootstrap.h"
+#include "ggml-ep-dispatcher.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1838,6 +1839,35 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    // CPU15 Phase 3.2(d.0) inter-process EP harness (master-only side).
+    //
+    // When ggml_ep_get_session() returns non-NULL, the process is participating
+    // in inter-process expert parallelism. The master signals workers at the
+    // start of every MoE op and waits for their ack at the end, validating the
+    // IPC harness inside the graph executor without yet distributing work
+    // (workers stay in their bootstrap passive-ack loop, contributing nothing
+    // to the compute). PPL must be bit-exact to baseline because master still
+    // does the full computation.
+    //
+    // Step (d.1, next session) will move workers out of the passive loop and
+    // have them compute their assigned expert slice; (e) will skip experts
+    // not assigned to my instance via `(cur_a % ep_n_inst) != ep_my_id`.
+#ifndef GGML_USE_OPENMP
+    struct ep_session * ep_sess = ggml_ep_get_session();
+    const bool ep_master_active = (ep_sess != NULL) &&
+        (ep_session_role(ep_sess) == EP_ROLE_MASTER) &&
+        (ep_session_n_workers(ep_sess) > 0);
+    if (ep_master_active && ith == 0) {
+        // Signal-only broadcast: workers will wake from ep_worker_wait_go in
+        // their bootstrap loop. No data is transferred — master will compute
+        // the full op locally in this step. ep_broadcast(NULL,0) skips memcpy.
+        ep_broadcast(ep_sess, NULL, 0);
+    }
+#else
+    const bool ep_master_active = false;
+    struct ep_session * ep_sess = NULL;
+#endif
+
     // CPU15 Phase 2 anon-expert lookup (set once per op, used per-expert below).
     // Look up this MoE op's expert tensor in the per-node anon registry built
     // by llama-model-loader.cpp's GGML_EXPERT_ANON_COPIES=1 pass. If found,
@@ -2001,6 +2031,19 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+    // CPU15 Phase 3.2(d.0) inter-process EP harness (master-only side).
+    // Wait for workers' ack before exiting the op. Pair with the broadcast
+    // at the top of the function. Single thread does the IPC; ggml_barrier
+    // gates other threads of this process so they don't return early.
+#ifndef GGML_USE_OPENMP
+    if (ep_master_active) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            ep_wait_workers(ep_sess);
+        }
+    }
+#endif
 }
 
 /////////////////////////////////
