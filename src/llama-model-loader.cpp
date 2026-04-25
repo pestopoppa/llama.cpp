@@ -1593,6 +1593,102 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             }
         }
     }
+
+    // CPU15 Phase 1b: per-expert NUMA pinning for MoE. When GGML_EXPERT_CCD_LAYOUT=1
+    // is set, each MoE expert tensor (`*ffn_*_exps.weight` etc.) is split along its
+    // `ne[2]` axis (the expert dimension) and each expert slice is mbind()'d to a
+    // specific NUMA node = (e % n_ccd) / n_ccd_per_node. Composes with the work-
+    // distribution change in ggml_compute_forward_mul_mat_id (CPU15 Phase 1a) so
+    // that the threads on CCD K work only on experts pinned to CCD K's NUMA node,
+    // converting cross-NUMA reads into local reads.
+    //
+    // Default OFF; preserves baseline behavior. Operates on the file mmap pages
+    // directly — no extra RAM allocation (unlike GGML_NUMA_REPLICATE which 4×'s
+    // RAM use).
+    if (use_mmap) {
+        const char * env_layout = std::getenv("GGML_EXPERT_CCD_LAYOUT");
+        if (env_layout && env_layout[0] && env_layout[0] != '0') {
+            // Need at least 2 NUMA nodes
+            int n_nodes = 0;
+            if (DIR * d = opendir("/sys/devices/system/node")) {
+                struct dirent * ent;
+                while ((ent = readdir(d))) {
+                    if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
+                }
+                closedir(d);
+            }
+            int n_ccd = 12;
+            if (const char * env_nc = std::getenv("GGML_NUMA_WARMUP_CCD")) {
+                int v = atoi(env_nc);
+                if (v > 0) n_ccd = v;
+            }
+            const int n_ccd_per_node = (n_nodes > 0) ? (n_ccd + n_nodes - 1) / n_nodes : 1;
+            const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+
+            if (n_nodes < 2) {
+                LLAMA_LOG_INFO("expert-ccd-layout: only %d NUMA node(s); skipping\n", n_nodes);
+            } else {
+                size_t n_tensors_pinned = 0;
+                size_t n_experts_pinned = 0;
+                size_t bytes_pinned = 0;
+                size_t n_unaligned = 0;
+                for (const auto & it : weights_map) {
+                    const auto & w = it.second;
+                    const ggml_tensor * t = w.tensor;
+                    if (w.idx >= mappings.size()) continue;
+                    if (!t) continue;
+                    // Identify MoE expert tensors. Standard llama.cpp naming:
+                    // *ffn_(up|down|gate)_exps.weight* — the expert dim is ne[2].
+                    // We require ne[2] >= n_ccd to make CCD partitioning sensible.
+                    const std::string name = it.first;
+                    const bool is_expert = (name.find("ffn_") != std::string::npos &&
+                                             name.find("_exps") != std::string::npos);
+                    if (!is_expert) continue;
+                    const int64_t n_experts = t->ne[2];
+                    if (n_experts < n_ccd) continue;
+                    const size_t total_bytes = ggml_nbytes(t);
+                    const size_t per_expert_bytes = total_bytes / (size_t)n_experts;
+                    if (per_expert_bytes * (size_t)n_experts != total_bytes) {
+                        // Unexpected layout; skip.
+                        continue;
+                    }
+                    char * base = (char *)mappings[w.idx]->addr() + w.offs;
+                    for (int64_t e = 0; e < n_experts; ++e) {
+                        const int ccd  = (int)(e % n_ccd);
+                        const int node = ccd / n_ccd_per_node;
+                        // mbind operates on full pages. Round start down, end up.
+                        char * exp_addr = base + (size_t)e * per_expert_bytes;
+                        size_t exp_size = per_expert_bytes;
+                        uintptr_t aligned_addr = (uintptr_t)exp_addr & ~(uintptr_t)(page_size - 1);
+                        size_t leading = (uintptr_t)exp_addr - aligned_addr;
+                        size_t aligned_size = leading + exp_size;
+                        aligned_size = (aligned_size + page_size - 1) & ~(page_size - 1);
+                        if (leading != 0) n_unaligned++;
+                        const unsigned long maxnode = 64UL;
+                        unsigned long mask = (1UL << node);
+                        // MPOL_MF_MOVE: move pages that are already faulted in
+                        // on the wrong node. The mmap may have triggered kernel
+                        // readahead before init_mappings runs, so without this
+                        // flag mbind would only affect future page faults.
+                        // 1 = MPOL_MF_MOVE.
+                        long rc = syscall(SYS_mbind, (void *)aligned_addr, aligned_size,
+                                           MPOL_BIND, &mask, maxnode, 1);
+                        if (rc != 0) {
+                            LLAMA_LOG_WARN("expert-ccd-layout: mbind expert %lld of '%s' to node %d failed: %s\n",
+                                           (long long)e, name.c_str(), node, strerror(errno));
+                            continue;
+                        }
+                        n_experts_pinned++;
+                        bytes_pinned += exp_size;
+                    }
+                    n_tensors_pinned++;
+                }
+                LLAMA_LOG_INFO("expert-ccd-layout: pinned %zu experts across %zu tensors = %.1f GiB to %d NUMA nodes (n_ccd=%d, %s%zu page-unaligned slices)\n",
+                               n_experts_pinned, n_tensors_pinned, bytes_pinned / (1024.0*1024.0*1024.0), n_nodes, n_ccd,
+                               n_unaligned ? "" : "no ", n_unaligned);
+            }
+        }
+    }
 #endif
 }
 
