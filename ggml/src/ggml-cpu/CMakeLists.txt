@@ -32,6 +32,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/ep-dispatcher.cpp
+        ggml-cpu/ggml-ep-bootstrap.cpp
+        ggml-cpu/ggml-ep-bootstrap.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
         ggml-cpu/quants.c
