@@ -1857,14 +1857,25 @@ static void ggml_compute_forward_mul_mat_id(
     const bool ep_master_active = (ep_sess != NULL) &&
         (ep_session_role(ep_sess) == EP_ROLE_MASTER) &&
         (ep_session_n_workers(ep_sess) > 0);
+    const bool ep_worker_active = (ep_sess != NULL) &&
+        (ep_session_role(ep_sess) == EP_ROLE_WORKER);
     if (ep_master_active && ith == 0) {
-        // Signal-only broadcast: workers will wake from ep_worker_wait_go in
-        // their bootstrap loop. No data is transferred — master will compute
-        // the full op locally in this step. ep_broadcast(NULL,0) skips memcpy.
+        // Signal-only broadcast: workers wake from ep_worker_wait_go inside
+        // their own mul_mat_id call. No data transferred — each instance
+        // already has the same hidden state via deterministic forward pass.
+        // ep_broadcast(NULL,0) skips the memcpy and just signals.
         ep_broadcast(ep_sess, NULL, 0);
+    } else if (ep_worker_active && ith == 0) {
+        // Worker waits for master's GO signal before computing. EXIT means
+        // master has shut down — worker should exit cleanly. Mid-graph EXIT
+        // is unexpected (master is supposed to teardown via atexit), so
+        // assert; relax to a warn+skip if it ever fires legitimately.
+        int r = ep_worker_wait_go(ep_sess);
+        GGML_ASSERT(r == 0);
     }
 #else
     const bool ep_master_active = false;
+    const bool ep_worker_active = false;
     struct ep_session * ep_sess = NULL;
 #endif
 
@@ -2032,15 +2043,20 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // CPU15 Phase 3.2(d.0) inter-process EP harness (master-only side).
-    // Wait for workers' ack before exiting the op. Pair with the broadcast
-    // at the top of the function. Single thread does the IPC; ggml_barrier
-    // gates other threads of this process so they don't return early.
+    // CPU15 Phase 3.2(d.1) inter-process EP harness (close).
+    // Master waits for workers' DONE; each worker signals DONE. Both forms
+    // gate this process's other threads at a barrier so they don't exit
+    // the op before IPC completes.
 #ifndef GGML_USE_OPENMP
     if (ep_master_active) {
         ggml_barrier(params->threadpool);
         if (ith == 0) {
             ep_wait_workers(ep_sess);
+        }
+    } else if (ep_worker_active) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            ep_worker_signal_done(ep_sess);
         }
     }
 #endif
