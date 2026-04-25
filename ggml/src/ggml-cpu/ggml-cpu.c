@@ -1837,10 +1837,53 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+    // CPU15 Phase 1: per-CCD expert sharding. When GGML_EXPERT_CCD_SHARDING=1
+    // and CCD pools are configured, expert `cur_a` is computed only by the
+    // ccd_threads threads on CCD(cur_a % n_ccd). Within those threads,
+    // chunking uses ccd_threads as effective parallelism. Default OFF.
+    //
+    // Hypothesis (CPU15 D3): if expert weights are NUMA-interleaved (current
+    // state with GGML_NUMA_WEIGHTS=1), 75% of expert reads under flat work
+    // distribution land on a remote NUMA node. Pinning experts to specific
+    // CCDs converts those into local reads when paired with a future per-
+    // expert mbind pass (GGML_EXPERT_CCD_LAYOUT=1, not yet implemented).
+    // Phase 1 ships work distribution alone to measure the partial effect.
+#ifndef GGML_USE_OPENMP
+    static int s_ep_sharding = -1;
+    if (s_ep_sharding < 0) {
+        const char * env = getenv("GGML_EXPERT_CCD_SHARDING");
+        s_ep_sharding = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    const struct ggml_threadpool * tp = params->threadpool;
+    const struct ggml_compute_state * st = ggml_tls_state;
+    const bool ep_active = s_ep_sharding && tp->ccd_pool_enabled && st != NULL &&
+                            tp->ccd_count > 0 && nth == tp->ccd_count * tp->ccd_threads &&
+                            n_as >= tp->ccd_count;
+    const int my_ccd       = ep_active ? st->ccd_id        : -1;
+    const int my_ccd_local = ep_active ? st->ccd_local_id  : -1;
+    const int n_ccd        = ep_active ? tp->ccd_count     : -1;
+    const int ccd_threads  = ep_active ? tp->ccd_threads   : -1;
+#else
+    const bool ep_active = false;
+    const int my_ccd       = -1;
+    const int my_ccd_local = -1;
+    const int n_ccd        = -1;
+    const int ccd_threads  = -1;
+#endif
+
+    // reset current_chunk: when sharded, only this CCD's threads init this
+    // CCD's experts' counters (to ccd_threads instead of nth). Multiple
+    // threads writing the same value is benign.
+    if (ep_active) {
+        for (int cur_a = my_ccd; cur_a < n_as; cur_a += n_ccd) {
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+            *current_chunk_ctr = ccd_threads;
+        }
+    } else {
+        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+            *current_chunk_ctr = nth;
+        }
     }
 
     ggml_barrier(params->threadpool);
@@ -1849,6 +1892,11 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // Sharded: skip experts not assigned to my CCD.
+        if (ep_active && (cur_a % n_ccd) != my_ccd) {
             continue;
         }
 
@@ -1867,18 +1915,23 @@ static void ggml_compute_forward_mul_mat_id(
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
+        // Effective parallelism: when sharded, only ccd_threads threads work
+        // on this expert; chunking and atomic counter must use that count.
+        const int eff_nth = ep_active ? ccd_threads : nth;
+        const int eff_ith = ep_active ? my_ccd_local : ith;
+
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
+        if (nchunk0 * nchunk1 < eff_nth * 4 || disable_chunking) {
+            nchunk0 = nr0 > nr1 ? eff_nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : eff_nth;
         }
 
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        int current_chunk = ith;
+        int current_chunk = eff_ith;
 
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
 
@@ -1898,7 +1951,7 @@ static void ggml_compute_forward_mul_mat_id(
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
 
-            if (nth >= nchunk0 * nchunk1) {
+            if (eff_nth >= nchunk0 * nchunk1) {
                 break;
             }
 
