@@ -176,10 +176,25 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
     // pinning (worker w → node (w+1) mod n_nodes) — same as the prior behaviour.
     const char * pin_env = getenv("GGML_EP_NUMA_PIN");
     const bool pin_numa = (pin_env && pin_env[0] && pin_env[0] != '0');
+    // Optional: pin master across ALL NUMA nodes (MPOL_INTERLEAVE) while
+    // workers stay pinned to their assigned node blocks. Useful for
+    // bandwidth-bound large MoE where master's non-MoE compute would
+    // otherwise be bottlenecked by single-node bandwidth. Workers still
+    // get NUMA-local expert reads on their assigned node block.
+    const char * mall_env = getenv("GGML_EP_MASTER_ALL_NODES");
+    const bool master_all_nodes = (mall_env && mall_env[0] && mall_env[0] != '0');
     if (pin_numa) {
         int n_nodes = 4;  // EPYC NPS4 default; extend later if other topologies appear
         const int my_id = ep_session_instance_id(g_ep_session);  // master=0, workers=1..N-1
-        if (n_nodes % n_instances == 0) {
+        const bool is_master = (ep_session_role(g_ep_session) == EP_ROLE_MASTER);
+        if (master_all_nodes && is_master) {
+            // Master gets all nodes — preserves full system bandwidth for
+            // non-MoE compute. MPOL_INTERLEAVE spreads master's allocations
+            // across all nodes evenly.
+            int all_nodes[16];
+            for (int i = 0; i < n_nodes && i < 16; ++i) all_nodes[i] = i;
+            ggml_ep_pin_to_numa_nodes(all_nodes, n_nodes);
+        } else if (n_nodes % n_instances == 0) {
             const int nodes_per_inst = n_nodes / n_instances;
             int nodes_buf[16];
             for (int i = 0; i < nodes_per_inst && i < 16; ++i) {
