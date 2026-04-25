@@ -3,15 +3,83 @@
 #include "ggml-ep-bootstrap.h"
 #include "ggml-ep-dispatcher.h"
 
+#define _GNU_SOURCE 1
+
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/mempolicy.h>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static struct ep_session * g_ep_session = nullptr;
 static std::atomic<bool>   g_ep_bootstrapped{false};
+
+// Pin the calling process to all CPUs in `node_id` (parsed from
+// /sys/devices/system/node/nodeN/cpulist) and set the default memory
+// allocation policy to prefer that node. Returns 0 on success, -1 if the
+// node sysfs path is missing or unparseable. Best-effort: failure is
+// logged but doesn't abort EP — the process just runs unpinned.
+static int ggml_ep_pin_to_numa_node(int node_id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node_id);
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "ggml-ep: cpulist for node %d missing (%s); skipping pin\n",
+                node_id, path);
+        return -1;
+    }
+    char buf[1024] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        fprintf(stderr, "ggml-ep: cpulist for node %d empty; skipping pin\n", node_id);
+        return -1;
+    }
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    int n_cpus = 0;
+    char * tok = strtok(buf, ",\n");
+    while (tok) {
+        int s = -1, e = -1;
+        if (sscanf(tok, "%d-%d", &s, &e) == 2) {
+            for (int c = s; c <= e; ++c) { CPU_SET(c, &cpuset); ++n_cpus; }
+        } else if (sscanf(tok, "%d", &s) == 1) {
+            CPU_SET(s, &cpuset); ++n_cpus;
+        }
+        tok = strtok(nullptr, ",\n");
+    }
+    if (n_cpus == 0) {
+        fprintf(stderr, "ggml-ep: parsed 0 cpus for node %d; skipping pin\n", node_id);
+        return -1;
+    }
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+        fprintf(stderr, "ggml-ep: sched_setaffinity for node %d failed (%s)\n",
+                node_id, strerror(errno));
+        return -1;
+    }
+
+    // MPOL_PREFERRED: future allocations prefer this node, fall back to
+    // others on pressure. This affects heap (KV cache, scratch buffers)
+    // and anonymous mmaps; it does NOT relocate the GGUF file mmap (those
+    // pages are governed by the kernel page cache + first-toucher).
+    unsigned long nodemask = 1UL << node_id;
+    long mp_rc = syscall(SYS_set_mempolicy, MPOL_PREFERRED, &nodemask, sizeof(nodemask) * 8);
+    if (mp_rc != 0) {
+        fprintf(stderr, "ggml-ep: set_mempolicy(node %d) failed (rc=%ld, %s)\n",
+                node_id, mp_rc, strerror(errno));
+        // not fatal — affinity is the bigger lever
+    }
+
+    fprintf(stderr, "ggml-ep: pinned (pid=%d) to NUMA node %d (%d cpus, MPOL_PREFERRED)\n",
+            (int) getpid(), node_id, n_cpus);
+    return 0;
+}
 
 extern "C" struct ep_session * ggml_ep_get_session(void) {
     return g_ep_session;
@@ -77,6 +145,25 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
         fprintf(stderr, "ggml-ep: ep_session_create_master failed rc=%d\n", rc);
         g_ep_session = nullptr;
         return 0;
+    }
+
+    // Optional NUMA pinning: GGML_EP_NUMA_PIN=1 spreads instances one-per-node
+    // (master → node 0, worker w → node (w+1) mod n_nodes). On EPYC NPS4 this
+    // gives each instance a dedicated 24-core CCD-quad and dedicated DDR
+    // channels — escapes the cross-instance memory-bandwidth contention that
+    // currently throttles the unpinned multi-process configuration.
+    const char * pin_env = getenv("GGML_EP_NUMA_PIN");
+    const bool pin_numa = (pin_env && pin_env[0] && pin_env[0] != '0');
+    if (pin_numa) {
+        int n_nodes = 4;  // EPYC NPS4 default; extend later if other topologies appear
+        int my_node;
+        if (ep_session_role(g_ep_session) == EP_ROLE_MASTER) {
+            my_node = 0;
+        } else {
+            // worker instance_id is 1..n_workers; assign to node (1..N-1) % n_nodes
+            my_node = ep_session_instance_id(g_ep_session) % n_nodes;
+        }
+        ggml_ep_pin_to_numa_node(my_node);
     }
 
     if (ep_session_role(g_ep_session) == EP_ROLE_WORKER) {
