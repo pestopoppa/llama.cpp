@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "ggml-ep-bootstrap.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -4247,6 +4248,14 @@ int ggml_cpu_has_sme(void) {
 }
 
 void ggml_cpu_init(void) {
+    // EP bootstrap MUST happen before any other ggml initialisation that
+    // could spawn threads, take locks, or write to global state — workers
+    // fork off here and inherit only what's been done up to this point.
+    // The bootstrap is idempotent (atomic guard inside) and a no-op when
+    // no GGML_EP_ROLE env var is set. Worker children never return from
+    // this call: they enter a passive wait loop and _exit() on EXIT signal.
+    ggml_ep_bootstrap_if_requested();
+
     // needed to initialize ggml_time
     {
         struct ggml_init_params params = { 0, NULL, false };
