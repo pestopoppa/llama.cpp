@@ -1660,6 +1660,19 @@ UseGgmlGemm2:;
 // graph executor — no two ops are computing concurrently in the same process.
 static const void * g_ep_partials[EP_MAX_WORKERS];
 
+// Phase 3.2(e) drone-mode flag. When set, workers skip non-MoE ops, and at
+// each mul_mat_id master broadcasts src1+ids contents (instead of just the
+// signal) and workers copy them into their local src1/ids before computing
+// their assigned expert slice. Read once at first use.
+static int ggml_ep_drone_mode(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * env = getenv("GGML_EP_WORKER_DRONE");
+        s = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return s;
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1875,15 +1888,37 @@ static void ggml_compute_forward_mul_mat_id(
     // some instances would have nothing to do and the gather/merge cost would
     // exceed the saved compute. Threshold could be tuned later.
     const bool ep_slice         = ep_inter && (n_as >= ep_n_inst);
+    const int  ep_drone        = ggml_ep_drone_mode();
     if (ep_master_active && ith == 0) {
-        // Signal-only broadcast. No data transferred — each instance has the
-        // same hidden state via deterministic forward pass. The merged dst
-        // is published in the second round below.
-        ep_broadcast(ep_sess, NULL, 0);
+        if (ep_drone) {
+            // Drone mode: workers skipped non-MoE ops and have stale src1
+            // (hidden state) and ids (routing). Broadcast both so workers can
+            // compute correctly. Layout: [src1 bytes][ids bytes].
+            char * bcast = (char *) ep_master_broadcast_buffer(ep_sess);
+            const size_t s1b = ggml_nbytes(src1);
+            const size_t idb = ggml_nbytes(ids);
+            GGML_ASSERT(s1b + idb <= 32ULL * 1024 * 1024);
+            memcpy(bcast,         src1->data, s1b);
+            memcpy(bcast + s1b,   ids->data,  idb);
+            ep_broadcast(ep_sess, NULL, 0);
+        } else {
+            // Signal-only — workers ran the same forward pass and have valid
+            // src1/ids deterministically.
+            ep_broadcast(ep_sess, NULL, 0);
+        }
     } else if (ep_worker_active && ith == 0) {
-        // Worker waits for master's GO. Mid-graph EXIT shouldn't happen.
         int r = ep_worker_wait_go(ep_sess);
         GGML_ASSERT(r == 0);
+        if (ep_drone) {
+            // Drone mode: pull src1 and ids from broadcast region so we can
+            // compute. src1->data and ids->data point at our own graph node
+            // memory; we overwrite with master's contents.
+            const char * bcast = (const char *) ep_worker_broadcast_buffer(ep_sess);
+            const size_t s1b = ggml_nbytes(src1);
+            const size_t idb = ggml_nbytes(ids);
+            memcpy(src1->data, bcast,       s1b);
+            memcpy(ids->data,  bcast + s1b, idb);
+        }
     }
 #else
     const bool ep_master_active = false;
@@ -2109,22 +2144,27 @@ static void ggml_compute_forward_mul_mat_id(
                 }
             }
             ggml_barrier(params->threadpool);
-            // Round 2: master publishes merged, waits for workers to receive.
-            if (ith == 0) {
+            // Round 2 (skipped in drone mode — workers don't need merged dst
+            // because they aren't running subsequent ops in this graph).
+            if (ith == 0 && !ep_drone) {
                 memcpy(ep_master_broadcast_buffer(ep_sess), dst->data, ggml_nbytes(dst));
                 ep_broadcast(ep_sess, NULL, 0);
                 ep_wait_workers(ep_sess);
             }
         } else if (ep_worker_active) {
-            // Worker: write partial dst to gather slot, then receive merged.
+            // Worker: write partial dst to gather slot. In normal mode also
+            // wait for and receive merged dst; in drone mode the round ends
+            // here and the worker proceeds to its next mul_mat_id.
             ggml_barrier(params->threadpool);
             if (ith == 0) {
                 memcpy(ep_worker_gather_buffer(ep_sess), dst->data, ggml_nbytes(dst));
                 ep_worker_signal_done(ep_sess);
-                int r = ep_worker_wait_go(ep_sess);
-                GGML_ASSERT(r == 0);
-                memcpy(dst->data, ep_worker_broadcast_buffer(ep_sess), ggml_nbytes(dst));
-                ep_worker_signal_done(ep_sess);
+                if (!ep_drone) {
+                    int r = ep_worker_wait_go(ep_sess);
+                    GGML_ASSERT(r == 0);
+                    memcpy(dst->data, ep_worker_broadcast_buffer(ep_sess), ggml_nbytes(dst));
+                    ep_worker_signal_done(ep_sess);
+                }
             }
         }
     } else if (ep_inter) {
@@ -2149,6 +2189,31 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
+
+    // CPU15 Phase 3.2(e) — worker drone mode. When `GGML_EP_WORKER_DRONE=1`
+    // is set and we're a worker, skip every op except MUL_MAT_ID. The
+    // worker's hidden-state inputs (src1) and routing decision (ids) for
+    // each MoE op are received from master via the EP broadcast region, so
+    // executing the rest of the graph would just burn cycles producing
+    // garbage that nothing reads. The mul_mat_id EP path inside the op
+    // itself handles the broadcast/compute/gather; here we just early-exit
+    // for everything else.
+#ifndef GGML_USE_OPENMP
+    {
+        static int s_drone_mode = -1;
+        if (s_drone_mode < 0) {
+            const char * env = getenv("GGML_EP_WORKER_DRONE");
+            s_drone_mode = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+        if (s_drone_mode) {
+            struct ep_session * sess = ggml_ep_get_session();
+            if (sess && ep_session_role(sess) == EP_ROLE_WORKER &&
+                tensor->op != GGML_OP_MUL_MAT_ID) {
+                return;
+            }
+        }
+    }
+#endif
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
