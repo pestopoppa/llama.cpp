@@ -1837,6 +1837,30 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    // CPU15 Phase 2 anon-expert lookup (set once per op, used per-expert below).
+    // Look up this MoE op's expert tensor in the per-node anon registry built
+    // by llama-model-loader.cpp's GGML_EXPERT_ANON_COPIES=1 pass. If found,
+    // the EP path will redirect each expert's read to the local-node copy
+    // instead of reading from the file mmap.
+#ifndef GGML_USE_OPENMP
+    extern int ggml_ep_anon_n_tensors_(void);
+    extern const struct ggml_ep_tensor_info * ggml_ep_anon_lookup_(const void * file_base);
+    struct ggml_ep_tensor_info_local {
+        void * file_base;
+        int    n_experts;
+        int    n_nodes;
+        int    n_ccd;
+        int    n_ccd_per_node;
+        size_t per_expert_bytes;
+        void * per_node_base[16];
+        int    expert_to_node_idx[256];
+    };
+    const struct ggml_ep_tensor_info_local * ep_info_local = NULL;
+    if (ggml_ep_anon_n_tensors_() > 0) {
+        ep_info_local = (const struct ggml_ep_tensor_info_local *) ggml_ep_anon_lookup_(src0->data);
+    }
+#endif
+
     // CPU15 Phase 1: per-CCD expert sharding. When GGML_EXPERT_CCD_SHARDING=1
     // and CCD pools are configured, expert `cur_a` is computed only by the
     // ccd_threads threads on CCD(cur_a % n_ccd). Within those threads,
@@ -1901,6 +1925,24 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+#ifndef GGML_USE_OPENMP
+        // CPU15 Phase 2: redirect to local-node anonymous copy when ep_active
+        // and the tensor was registered by GGML_EXPERT_ANON_COPIES=1. The
+        // copy was first-touched on the target node so reads are local.
+        if (ep_active && ep_info_local && cur_a < ep_info_local->n_experts) {
+            const int my_node = my_ccd / ep_info_local->n_ccd_per_node;
+            if (my_node < ep_info_local->n_nodes &&
+                ep_info_local->per_node_base[my_node] != NULL) {
+                const int e_idx = ep_info_local->expert_to_node_idx[cur_a];
+                if (e_idx >= 0) {
+                    src0_cur = (const char *) ep_info_local->per_node_base[my_node] +
+                               (size_t) e_idx * ep_info_local->per_expert_bytes;
+                }
+            }
+        }
+#endif
+
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
