@@ -5007,21 +5007,42 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     }
 
 #if defined(__linux__)
-    // NUMA placement: the underlying `ggml_aligned_malloc` returns unfaulted
-    // anonymous pages that, on first-touch, get pinned to whichever NUMA node
-    // the touching thread runs on. For a ~26 GB Q8_0 weight buffer on NPS4
-    // EPYC, first-touch from whatever thread runs `set_tensor` lands every
-    // page on that one node; decode traffic from 96 threads × 4 nodes then
-    // saturates that single node's memory controllers (measured 2026-04-24:
-    // 2.8× regression vs the mmap+interleave baseline).
+    // NUMA placement for CPU_REPACK buffers (CPU2 Session 15 follow-up).
     //
-    // Fix: mbind the whole region to MPOL_INTERLEAVE across all nodes so
-    // first-touch round-robins the pages. This is the allocation-time
-    // analog of the CPU1 Phase 1.3 `set_mempolicy(MPOL_INTERLEAVE)` that the
-    // mmap path applies before mapping GGUF weights, scoped to this buffer
-    // rather than process-wide. Gated `only_numa` (via ggml_is_numa()) so
-    // single-node hosts pay nothing.
-    if (ggml_is_numa() && buffer->context && buffer->size >= (1ull << 20)) {
+    // Background: `ggml_aligned_malloc` returns unfaulted anonymous pages
+    // that, on first-touch, get pinned to whichever NUMA node the touching
+    // thread runs on. For a ~26 GB Q8_0 weight buffer on NPS4 EPYC,
+    // first-touch from whatever thread runs `set_tensor` lands every page
+    // on that one node; decode traffic from 96 threads × 4 nodes then
+    // saturates that single node's memory controllers (2.8× regression
+    // vs the mmap+interleave baseline measured 2026-04-24).
+    //
+    // Fix: mbind(MPOL_INTERLEAVE) the whole region across all nodes so
+    // first-touch round-robins pages. This is the allocation-time analog
+    // of the CPU1 Phase 1.3 `set_mempolicy(MPOL_INTERLEAVE)` that the mmap
+    // path applies before mapping GGUF weights, scoped to this buffer
+    // rather than process-wide.
+    //
+    // Kill-switch: `GGML_NUMA_REPACK_INTERLEAVE=0` disables this mbind
+    // and falls back to whatever first-touch NUMA assignment the OS picks.
+    // Default-on for backward compatibility — set 0 only when measuring
+    // the baseline impact of the mbind itself, or when an alternative
+    // NUMA strategy (per-CCD bind, replication) is active.
+    //
+    // Gated `only_numa` (via ggml_is_numa()) so single-node hosts pay nothing.
+    static const bool numa_repack_interleave = []() {
+        const char * env = std::getenv("GGML_NUMA_REPACK_INTERLEAVE");
+        // Default ON: missing var or non-"0" value → enabled.
+        // Explicit "0" → disabled.
+        const bool enabled = (env == nullptr || env[0] != '0');
+        if (!enabled) {
+            GGML_LOG_INFO("cpu-repack: GGML_NUMA_REPACK_INTERLEAVE=0 — "
+                          "skipping mbind(MPOL_INTERLEAVE) on CPU_REPACK buffers; "
+                          "first-touch NUMA placement only\n");
+        }
+        return enabled;
+    }();
+    if (numa_repack_interleave && ggml_is_numa() && buffer->context && buffer->size >= (1ull << 20)) {
         int n_nodes = 0;
         if (DIR * d = opendir("/sys/devices/system/node")) {
             struct dirent * ent;
