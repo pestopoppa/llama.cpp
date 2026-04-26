@@ -453,10 +453,18 @@ struct llama_mmap::impl {
         if (numa) { prefetch = 0; }
         // Phase 1.3 (CPU1): GGML_NUMA_WEIGHTS controls NUMA-aware weight placement.
         //
-        // =1 / =interleave: set process-wide MPOL_INTERLEAVE before mmap. Pages round-robin
-        //                   across all nodes. Equivalent to `numactl --interleave=all` but
-        //                   inline. Governs both demand faults and kernel readahead (unlike
-        //                   per-region mbind which readahead bypasses).
+        // =1 / =interleave: weights mmap region gets MPOL_INTERLEAVE via per-region mbind
+        //                   AFTER mmap. Pages round-robin across all nodes on demand-fault.
+        //                   2026-04-26 fix: switched from process-wide set_mempolicy(MPOL_INTERLEAVE)
+        //                   to per-region mbind. The process-wide call leaked MPOL_INTERLEAVE
+        //                   into all subsequent allocations (KV cache, threadpool stacks,
+        //                   intermediate buffers), causing wildly variable performance
+        //                   (±13-22 t/s std on Coder-30B Q4_K_M; -38% mean on Qwen3.6-35B Q8_0).
+        //                   Per-region mbind keeps the policy scoped to the GGUF mapping;
+        //                   everything else uses the default LOCAL policy. Trade-off: kernel
+        //                   readahead bypasses mbind (placement uses readahead-thread's node),
+        //                   but with MAP_POPULATE off and POSIX_FADV_RANDOM, demand faults
+        //                   dominate and pages still round-robin across nodes.
         // =local          : no global policy; suppress MAP_POPULATE and set POSIX_FADV_RANDOM
         //                   to disable readahead. Each page faults in under the *touching
         //                   thread's* default LOCAL policy → lands on that thread's node.
@@ -466,6 +474,10 @@ struct llama_mmap::impl {
         // =stripe         : per-tensor mbind striping (not yet implemented in this file —
         //                   requires weights_map access at llama-model-loader level).
         int numa_weights_mode = 0; // 0 = off, 1 = interleave, 2 = local
+        // Held across the post-mmap mbind call for mode==1; populated below if applicable.
+        int               numa_weights_n_nodes = 0;
+        unsigned long     numa_weights_maxnode = 0UL;
+        unsigned long     numa_weights_mask    = 0UL;
 #if defined(__linux__) && defined(LLAMA_HAS_NUMAIF)
         {
             const char * env = std::getenv("GGML_NUMA_WEIGHTS");
@@ -489,15 +501,10 @@ struct llama_mmap::impl {
                         closedir(d);
                     }
                     if (n_nodes > 1) {
-                        const unsigned long maxnode = 64UL;
-                        std::vector<unsigned long> mask(1, 0);
-                        for (int n = 0; n < n_nodes; ++n) mask[0] |= (1UL << n);
-                        long rc = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode);
-                        if (rc != 0) {
-                            LLAMA_LOG_WARN("numa-weights: set_mempolicy(MPOL_INTERLEAVE) failed: %s\n", strerror(errno));
-                        } else {
-                            LLAMA_LOG_INFO("numa-weights: set_mempolicy(MPOL_INTERLEAVE) across %d nodes\n", n_nodes);
-                        }
+                        // Build mask + record state; the actual mbind happens AFTER mmap below.
+                        numa_weights_n_nodes = n_nodes;
+                        numa_weights_maxnode = 64UL;
+                        for (int n = 0; n < n_nodes && n < 64; ++n) numa_weights_mask |= (1UL << n);
                     } else {
                         LLAMA_LOG_INFO("numa-weights: only %d NUMA node(s); nothing to do\n", n_nodes);
                     }
@@ -545,6 +552,23 @@ struct llama_mmap::impl {
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+
+#if defined(__linux__) && defined(LLAMA_HAS_NUMAIF)
+        // Phase 1.3 (CPU1) 2026-04-26 fix: per-region mbind instead of process-wide
+        // set_mempolicy. Scopes MPOL_INTERLEAVE to JUST this mmap region — KV cache,
+        // threadpool stacks, intermediate buffers etc. retain default LOCAL policy.
+        if (numa_weights_mode == 1 && numa_weights_n_nodes > 1) {
+            long rc = syscall(SYS_mbind, addr, file->size(),
+                              MPOL_INTERLEAVE, &numa_weights_mask, numa_weights_maxnode, 0ul);
+            if (rc != 0) {
+                LLAMA_LOG_WARN("numa-weights: mbind(MPOL_INTERLEAVE) on %.1f GiB mmap failed: %s\n",
+                               file->size() / (1024.0 * 1024.0 * 1024.0), strerror(errno));
+            } else {
+                LLAMA_LOG_INFO("numa-weights: mbind(MPOL_INTERLEAVE) on %.1f GiB mmap across %d NUMA nodes (per-region scope)\n",
+                               file->size() / (1024.0 * 1024.0 * 1024.0), numa_weights_n_nodes);
+            }
+        }
+#endif
 
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
