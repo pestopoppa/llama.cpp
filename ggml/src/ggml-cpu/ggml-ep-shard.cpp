@@ -2,6 +2,7 @@
 
 #include "ggml-ep-shard.h"
 #include "ggml.h"
+#include "ggml-cpu-impl.h"  // for ggml_barrier prototype
 
 #include <atomic>
 #include <cstdio>
@@ -27,6 +28,13 @@ struct ShardEntry {
     int    n_kept;
     int    my_instance_id;
     int    n_instances;
+    // Phase 3.2(g.1): true once ALL kept experts have been memcpy'd into
+    // `buf`. The warm-parallel path sets buf first under the mutex, then
+    // releases the mutex so all threads of the calling op can participate
+    // in a parallel memcpy of disjoint expert slices, then atomically
+    // marks `ready` after a barrier. Other lookups (per-expert inside the
+    // expert loop) check ready before returning buf.
+    std::atomic<bool> ready{false};
 };
 
 std::unordered_map<const ggml_tensor *, ShardEntry> g_shards;
@@ -142,17 +150,145 @@ extern "C" void * ggml_ep_shard_lookup(const ggml_tensor * src0,
         memcpy(dst, src, per_expert_bytes);
     }
 
-    ShardEntry entry = {};
+    auto [iter, inserted] = g_shards.try_emplace(src0);
+    auto & entry = iter->second;
     entry.buf              = buf;
     entry.buf_bytes        = buf_bytes;
     entry.per_expert_bytes = per_expert_bytes;
     entry.n_kept           = n_kept;
     entry.my_instance_id   = my_id;
     entry.n_instances      = n_inst;
-    g_shards.emplace(src0, entry);
+    entry.ready.store(true, std::memory_order_release);  // single-threaded path: ready immediately
 
     fprintf(stderr, "ggml-ep-shard: %s sharded (%d/%lld experts, %zu MiB local)\n",
             src0->name ? src0->name : "(anon)",
             n_kept, (long long) n_experts, buf_bytes >> 20);
+    return buf;
+}
+
+extern "C" void * ggml_ep_shard_warm_parallel(const ggml_tensor * src0,
+                                             int my_id,
+                                             int n_inst,
+                                             int ith,
+                                             int nth,
+                                             ggml_threadpool * threadpool) {
+    if (n_inst <= 1 || src0 == nullptr) {
+        return nullptr;
+    }
+
+    // Fast path: entry exists AND ready. All threads return immediately.
+    {
+        std::lock_guard<std::mutex> lock(g_shards_mutex);
+        auto it = g_shards.find(src0);
+        if (it != g_shards.end() &&
+            it->second.ready.load(std::memory_order_acquire) &&
+            it->second.my_instance_id == my_id &&
+            it->second.n_instances    == n_inst) {
+            return it->second.buf;
+        }
+    }
+
+    // Slow path: ith==0 allocates. Other threads wait at the barrier below.
+    void * buf              = nullptr;
+    size_t per_expert_bytes = 0;
+    int    n_kept           = 0;
+    bool   need_copy        = false;
+
+    if (ith == 0) {
+        std::lock_guard<std::mutex> lock(g_shards_mutex);
+        auto [iter, inserted] = g_shards.try_emplace(src0);
+        auto & entry = iter->second;
+        if (inserted) {
+            const int64_t n_experts = src0->ne[2];
+            if (n_experts < n_inst) {
+                g_shards.erase(iter);
+            } else {
+                const size_t total_bytes = ggml_nbytes(src0);
+                per_expert_bytes = total_bytes / (size_t) n_experts;
+                if (per_expert_bytes * (size_t) n_experts != total_bytes) {
+                    g_shards.erase(iter);
+                } else {
+                    int kept = 0;
+                    for (int e = my_id; e < (int) n_experts; e += n_inst) ++kept;
+                    const size_t buf_bytes = (size_t) kept * per_expert_bytes;
+                    void * b = mmap(nullptr, buf_bytes, PROT_READ | PROT_WRITE,
+                                    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+                    if (b == MAP_FAILED) {
+                        fprintf(stderr, "ggml-ep-shard-warm: mmap %zu bytes failed for %s\n",
+                                buf_bytes, src0->name);
+                        g_shards.erase(iter);
+                    } else {
+                        mbind_to_current(b, buf_bytes);
+                        entry.buf              = b;
+                        entry.buf_bytes        = buf_bytes;
+                        entry.per_expert_bytes = per_expert_bytes;
+                        entry.n_kept           = kept;
+                        entry.my_instance_id   = my_id;
+                        entry.n_instances      = n_inst;
+                        entry.ready.store(false, std::memory_order_relaxed);
+                        n_kept = kept;
+                        buf    = b;
+                        need_copy = true;
+                        fprintf(stderr, "ggml-ep-shard-warm: %s alloc'd (%d/%lld experts, %zu MiB local)\n",
+                                src0->name ? src0->name : "(anon)",
+                                kept, (long long) n_experts, buf_bytes >> 20);
+                    }
+                }
+            }
+        } else if (!entry.ready.load(std::memory_order_acquire)) {
+            // Race: another op's warm has the alloc in progress. Re-use what's there.
+            buf              = entry.buf;
+            per_expert_bytes = entry.per_expert_bytes;
+            n_kept           = entry.n_kept;
+            need_copy        = true;
+        }
+    }
+
+    // Barrier #1: ith==0's allocation result is now visible to all threads.
+    ggml_barrier(threadpool);
+
+    // All threads re-read the entry under the lock to pick up buf/n_kept/etc.
+    {
+        std::lock_guard<std::mutex> lock(g_shards_mutex);
+        auto it = g_shards.find(src0);
+        if (it == g_shards.end()) {
+            return nullptr;  // alloc failed on ith==0
+        }
+        if (it->second.ready.load(std::memory_order_acquire)) {
+            return it->second.buf;  // already populated by an earlier warm
+        }
+        buf              = it->second.buf;
+        per_expert_bytes = it->second.per_expert_bytes;
+        n_kept           = it->second.n_kept;
+        need_copy        = true;
+    }
+
+    if (!need_copy || buf == nullptr) {
+        // Sanity fallthrough: barrier already happened, just return.
+        return buf;
+    }
+
+    // Phase 3.2(g.1) parallel memcpy. Each thread handles its 1/nth slice
+    // of the n_kept experts. With 96 threads doing 246 MiB / 96 = 2.5 MiB
+    // each at ~10 GB/s memcpy, full population is ~250 μs vs ~250 ms
+    // single-threaded.
+    for (int k = ith; k < n_kept; k += nth) {
+        const int e = my_id + k * n_inst;  // original expert index
+        const char * src = (const char *) src0->data + (size_t) e * per_expert_bytes;
+        char *       dst = (char *) buf            + (size_t) k * per_expert_bytes;
+        memcpy(dst, src, per_expert_bytes);
+    }
+
+    // Barrier #2: all chunks committed. ith==0 marks the entry ready.
+    ggml_barrier(threadpool);
+
+    if (ith == 0) {
+        std::lock_guard<std::mutex> lock(g_shards_mutex);
+        auto it = g_shards.find(src0);
+        if (it != g_shards.end()) {
+            it->second.ready.store(true, std::memory_order_release);
+        }
+    }
+
     return buf;
 }

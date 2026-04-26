@@ -41,6 +41,30 @@ void * ggml_ep_shard_lookup(const struct ggml_tensor * src0,
                             int my_instance_id,
                             int n_instances);
 
+// Phase 3.2(g.1) collective warm-up. Call from the top of mul_mat_id by
+// ALL threads of the calling op (ith=0..nth-1), passing the same
+// threadpool. The function allocates the shard buffer if needed (ith==0
+// under mutex), then has all threads cooperatively memcpy disjoint slices
+// of kept experts into the buffer in parallel — collapsing a ~250 ms
+// single-threaded first-call cost on REAP-246B-class tensors to a few ms
+// across all 96 master threads.
+//
+// Behaviour matches `ggml_ep_shard_lookup` for the steady-state case:
+// returns the same pointer once the entry is ready; subsequent
+// per-expert lookups inside the op's expert loop hit the fast cache.
+//
+// Internally calls `ggml_barrier(threadpool)` twice (once after the
+// allocation, once after the parallel memcpy), so caller is responsible
+// for ensuring all threads of the op reach this point. ggml_barrier is
+// already used elsewhere inside mul_mat_id for the same all-threads
+// invariant.
+void * ggml_ep_shard_warm_parallel(const struct ggml_tensor * src0,
+                                   int my_instance_id,
+                                   int n_instances,
+                                   int ith,
+                                   int nth,
+                                   struct ggml_threadpool * threadpool);
+
 #ifdef __cplusplus
 }
 #endif

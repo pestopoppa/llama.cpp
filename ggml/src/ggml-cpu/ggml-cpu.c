@@ -2034,6 +2034,19 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // Phase 3.2(g.1) parallel shard warmup. On first encounter of this
+    // src0 expert tensor, ALL threads of this op cooperatively allocate +
+    // memcpy the compact node-local buffer (each thread copies 1/nth of
+    // the kept experts). Steady-state behaviour matches the lazy lookup
+    // (cache hit, no work). This collapses ~250 ms single-threaded first-
+    // call cost on REAP-246B-class tensors to ~few ms across all threads.
+    // Both master_parker and master non-parker threads participate — warm
+    // happens BEFORE the expert loop, so the parker skip-rule doesn't
+    // apply yet.
+    if (ep_slice && ggml_ep_shard_enabled()) {
+        ggml_ep_shard_warm_parallel(src0, ep_my_id, ep_n_inst, ith, nth, params->threadpool);
+    }
+
     // Phase 3.2(h): master parker threads skip the entire expert loop. They
     // participate in the close barrier and parallel sum-reduce below, but
     // contribute no compute here so total memory-active threads across all
