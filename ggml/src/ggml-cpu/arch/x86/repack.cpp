@@ -1566,6 +1566,97 @@ void ggml_gemm_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemm_q8_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+// =============================================================================
+// CPU2 Session 16 (2026-04-26): Q6_K 8x8 GEMV — AVX-512BW dispatcher scaffolding
+// =============================================================================
+//
+// Q6_K is the second-largest cycle consumer in Q4_K_M MoE decode (perf-record
+// 2026-04-26 on REAP-246B Q4_K_M @ 96t shows ggml_vec_dot_q6_K_q8_K = 15.64% of
+// samples). The repack-buffer 8x8 GEMV path currently falls through to the
+// portable scalar reference (`ggml_gemv_q6_K_8x8_q8_K_generic` in repack.cpp)
+// because `arch-fallback.h` aliased the entry point on x86. CPU2 Session 16
+// adds an env-gated AVX-512BW dispatcher (mirroring the Q8_0 8x8 setup at line
+// ~1544) so a follow-up session can drop in the actual SIMD body without
+// touching the dispatch plumbing.
+//
+// Algorithm (planned for follow-up session — design notes here for handoff
+// continuity; SIMD body is currently a pass-through to generic):
+//
+// 1. Bias precomputation per super-block. Each q6_K weight encodes
+//    `q = ((qh_2 << 4) | ql_4) - 32`. NEON does the -32 offset out of the
+//    inner loop by computing
+//        bias[col] = 32 * sum_i(bsums[i] * widen(scales[i*8 + col]))
+//    where bsums[16] are int16 q8_K activation sums per 16-weight sub-block,
+//    and scales[128] are int8 per-sub-block × per-column scales. We can do the
+//    same on AVX-512 with VPMOVSXBW + VPMADDWD on widened i16 vectors and
+//    finish with VPSLLD by 5 (= multiply by 32).
+//
+// 2. Per super-block: split into 2 halves x 4 sub-blocks x 8 cols x 8 weights.
+//    For each (half, sub-block):
+//      a. Load 64 ql bytes covering 8 cols × 8 weight-pairs (one __m512i).
+//         Each ql byte holds two weights' low-4-bits (low nibble = even slot,
+//         high nibble = odd slot in the chunk-of-8 layout).
+//      b. Load 32 qh bytes covering 8 cols × 8 weights of high-2-bits. The qh
+//         shift is 0 for sub-blocks 0,1 and 2 for sub-blocks 2,3 (NEON does a
+//         right-shift-by-2 in-place on the qh load for sb >= 2 — we'll do the
+//         same with VPSRLQ).
+//      c. Reconstruct unsigned 6-bit weights:
+//           q = ((qh_byte >> qh_shift) & 0x33) << 4 | (ql_byte & 0x0F)   for low
+//           q = ((qh_byte >> qh_shift) & 0xCC) << 2 | (ql_byte >> 4)     for high
+//         (operating on 64-byte chunks; NEON uses VSLI; AVX-512 uses VPOR after
+//         shifts and masks.)
+//      d. Load 16 i8 q8 activations broadcast across 8 cols (VPBROADCASTQ).
+//      e. Dot product via VPMADDUBSW (unsigned q6 weights × signed q8 acts) +
+//         VPMADDWD chain. Zen 5 prefers this over VPDPBUSD per
+//         project_zen5_vnni_vs_maddubs memory.
+//      f. Multiply per-sub-block × per-col scale (int16 × int32) and add into
+//         column-wise int32 accumulator.
+//
+// 3. After all sub-blocks: subtract the precomputed bias from the int32
+//    accumulator, convert to FP32, multiply by per-col q6 d (FP16→FP32) and
+//    activation d (FP32 broadcast), FMA into the FP32 row accumulator.
+//
+// 4. Store 8 FP32 results to s[x*8..x*8+8].
+//
+// Estimated complexity: ~150-200 lines of intrinsics, comparable to the NEON
+// implementation in arch/arm/repack.cpp:1498. Bit-exact PPL gate required
+// before flipping the env default.
+//
+// Env: `GGML_Q6_K_8X8_AVX=1` opts in to the AVX-512BW path. Default off until
+// PPL gate passes on production lineup.
+// =============================================================================
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static void gemv_q6_K_8x8_q8_K_avx512bw(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
+    // STUB (CPU2 Session 16 scaffolding): until the SIMD body lands in a
+    // follow-up session, fall back to the portable generic reference. This
+    // keeps the dispatcher wired so toggling GGML_Q6_K_8X8_AVX=1 is a no-op
+    // on output values but exercises the code path for build/load-time tests.
+    // The handoff `cpu-shape-specialized-gemv-decode.md` tracks the actual
+    // implementation milestone.
+    UNUSED(bs);
+    ggml_gemv_q6_K_8x8_q8_K_generic(n, s, bs, vx, vy, /*nr=*/1, nc);
+}
+#endif // __AVX512F__ && __AVX512BW__
+
+void ggml_gemv_q6_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    // Runtime switch: GGML_Q6_K_8X8_AVX=1 picks the AVX-512BW path (currently a
+    // stub that calls the generic reference; see scaffolding notes above).
+    static const bool use_avx512bw = []() {
+        const char * env = std::getenv("GGML_Q6_K_8X8_AVX");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (use_avx512bw) {
+        assert(nr == 1);
+        UNUSED(nr);
+        gemv_q6_K_8x8_q8_K_avx512bw(n, s, bs, vx, vy, nc);
+        return;
+    }
+#endif
+    ggml_gemv_q6_K_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
