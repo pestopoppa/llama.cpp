@@ -1334,9 +1334,9 @@ struct tinygemm_kernel_avx<float, ggml_fp16_t, float, BLOCK_M, BLOCK_N, BLOCK_K>
 
 #define LAUNCH_TINYGEMM_KERNEL_AVX(MB_SIZE, NB_SIZE)                                \
     tinygemm_kernel_avx<float, type, float, MB_SIZE, NB_SIZE, blck_size>::apply(    \
-        K, (const float *)src1->data + src1_offset + mb_start * K,                  \
-        (const type *)src0->data + src0_offset + nb_start * K,                      \
-        (float *)dst->data + dst_offset + mb_start * ldc + nb_start, ldc)
+        K, (const float *)tensor_data(src1) + src1_offset + mb_start * K,                  \
+        (const type *)tensor_data(src0) + src0_offset + nb_start * K,                      \
+        (float *)tensor_data(dst) + dst_offset + mb_start * ldc + nb_start, ldc)
 
 
 // re-organize in the format {NB, KB, TILE_SIZE}:
@@ -1986,8 +1986,8 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
-        (const char *)src0->data + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
-        (float *) dst->data + dst_offset + nb_start, ldc)
+        (const char *)tensor_data(src0) + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
+        (float *) tensor_data(dst) + dst_offset + nb_start, ldc)
 
 template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
@@ -2296,7 +2296,7 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     const int N = tensor->ne[1]; // ne1: out_features
 
     GGML_DISPATCH_QTYPES(TYPE, [&] {
-        convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
+        convert_B_packed_format<type, blck_size>((void *)((char *)tensor_data(tensor) + offset), (const type *)data, N, K);
     });
 }
 
@@ -2420,7 +2420,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             parallel_for_ggml(params, n_batch, [&](int begin, int end) {
                 for (int batch_idx = begin; batch_idx < end; ++batch_idx) {
                     int64_t src1_offset = ggml_batch_offset(src1, batch_idx, ne2);
-                    const float * A_data = (const float *)((const char *)src1->data + src1_offset);
+                    const float * A_data = (const float *)((const char *)tensor_data(src1) + src1_offset);
                     char * wdata_batch = (char *)wdata + batch_idx * M * row_size_A;
 
                     for (int m = 0; m < M; ++m) {
@@ -2502,8 +2502,8 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                 tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
                     mb_size, nb_size, KB,
                     wdata_batch + mb_start * row_size_A,
-                    (const char *)src0->data + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                    (float *) dst->data + dst_offset + mb_start * N + nb_start, ldc);
+                    (const char *)tensor_data(src0) + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
+                    (float *) tensor_data(dst) + dst_offset + mb_start * N + nb_start, ldc);
             }
         });
     });

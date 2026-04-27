@@ -611,8 +611,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
         for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
             const int64_t rhs_batch_idx = batch_idx / r;
-            const uint8_t * rhs_batch_base = static_cast<const uint8_t *>(src0->data) + rhs_batch_idx * src0->nb[2];
-            uint8_t * dst_batch_base = static_cast<uint8_t *>(dst->data) + batch_idx * dst->nb[2];
+            const uint8_t * rhs_batch_base = static_cast<const uint8_t *>(tensor_data(src0)) + rhs_batch_idx * src0->nb[2];
+            uint8_t * dst_batch_base = static_cast<uint8_t *>(tensor_data(dst)) + batch_idx * dst->nb[2];
 
             // LHS packing (threaded over m, honoring mr alignment and KV groups)
             {
@@ -639,7 +639,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                         const int64_t avail        = m_group - row_in_group;
                         const int64_t take         = std::min(avail, remaining);
 
-                        const uint8_t * lhs_batch_base = static_cast<const uint8_t *>(src1->data) + batch_idx * src1->nb[2];
+                        const uint8_t * lhs_batch_base = static_cast<const uint8_t *>(tensor_data(src1)) + batch_idx * src1->nb[2];
                         const void * src_ptr = lhs_batch_base + (size_t)row_in_group * lhs_stride;
                         const size_t dst_off = base_packed_off + (size_t)(cur - m_start) * row_stride_bytes;
                         void * dst_ptr       = lhs_packed + dst_off;
@@ -710,7 +710,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
-        const kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(src0->data);
+        const kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(tensor_data(src0));
         const bool has_header = kleidiai_is_weight_header_valid(header);
         const bool is_gemv = src1->ne[1] == 1;
         std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
@@ -729,7 +729,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             }
             if (slot_index == 0) {
                 size_out = ggml_nbytes(src0);
-                return static_cast<const uint8_t *>(src0->data);
+                return static_cast<const uint8_t *>(tensor_data(src0));
             }
             return nullptr;
         };
@@ -830,7 +830,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             size_t rhs_size_fallback = 0;
             const uint8_t * rhs_base = weight_for_slot(0, rhs_size_fallback);
             if (!rhs_base) {
-                rhs_base = static_cast<const uint8_t *>(src0->data);
+                rhs_base = static_cast<const uint8_t *>(tensor_data(src0));
             }
             runtime[0].rhs_base = rhs_base;
             runtime_count = 1;
@@ -1011,8 +1011,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         const size_t dst_stride = dst->nb[1];
 
         for (int64_t batch_idx = 0; batch_idx < ne12; ++batch_idx) {
-            const uint8_t * lhs_batch_base = static_cast<const uint8_t *>(src1->data) + batch_idx * src1->nb[2];
-            uint8_t * dst_batch_base = static_cast<uint8_t *>(dst->data) + batch_idx * dst->nb[2];
+            const uint8_t * lhs_batch_base = static_cast<const uint8_t *>(tensor_data(src1)) + batch_idx * src1->nb[2];
+            uint8_t * dst_batch_base = static_cast<uint8_t *>(tensor_data(dst)) + batch_idx * dst->nb[2];
 
             if (runtime[local_slot].assigned_threads > 0) {
                 runtime_slot & slot = runtime[local_slot];
@@ -1117,7 +1117,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
-        const kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(src0->data);
+        const kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(tensor_data(src0));
         const bool has_header = kleidiai_is_weight_header_valid(header);
 
         std::array<ggml_kleidiai_kernels *, GGML_KLEIDIAI_MAX_KERNEL_SLOTS> kernel_chain;
@@ -1126,7 +1126,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                                         : kleidiai_collect_q4_chain(kernel_chain);
 
         ggml_kleidiai_kernels * kernels = nullptr;
-        const uint8_t * packed_base = static_cast<const uint8_t *>(src0->data);
+        const uint8_t * packed_base = static_cast<const uint8_t *>(tensor_data(src0));
 
         if (has_header && chain_count > 0) {
             int select_slot = 0;
@@ -1192,10 +1192,10 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
         for (int64_t i = ir0; i < ir1; ++i) {
             GGML_ASSERT(src1->type == GGML_TYPE_I32);
-            int64_t row_idx = ((const int32_t *)src1->data)[i];
+            int64_t row_idx = ((const int32_t *)tensor_data(src1))[i];
             GGML_ASSERT(row_idx >= 0 && row_idx < src0->ne[1]);
 
-            float *out = (float *)((char *)dst->data + i * nb1);
+            float *out = (float *)((char *)tensor_data(dst) + i * nb1);
             rhs_info->to_float(packed_base, row_idx, nc, out, block_rows, packed_stride, kr, block_len, num_bytes_multiplier);
         }
 
@@ -1208,7 +1208,7 @@ public:
         const size_t n = tensor->ne[1];
         const size_t k = tensor->ne[0];
 
-        kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(tensor->data);
+        kleidiai_weight_header * header = kleidiai_weight_header_from_ptr(tensor_data(tensor));
         if (!header) {
             return -1;
         }
@@ -1217,7 +1217,7 @@ public:
         header->version    = GGML_KLEIDIAI_PACK_VERSION;
         header->slot_count = 0;
 
-        uint8_t * base_ptr = static_cast<uint8_t *>(tensor->data);
+        uint8_t * base_ptr = static_cast<uint8_t *>(tensor_data(tensor));
         size_t cursor = sizeof(kleidiai_weight_header);
         cursor = align_up(cursor, GGML_KLEIDIAI_PACK_ALIGN);
 
@@ -1330,7 +1330,7 @@ public:
         if (header->slot_count == 0) {
             header->magic   = 0;
             header->version = 0;
-            memcpy(tensor->data, data, data_size);
+            memcpy(tensor_data(tensor), data, data_size);
         }
 
         return 0;
