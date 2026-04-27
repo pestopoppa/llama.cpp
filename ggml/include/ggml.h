@@ -657,6 +657,10 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+#ifndef GGML_NUMA_MAX_NODES
+#define GGML_NUMA_MAX_NODES 8
+#endif
+
     // n-dimensional tensor
     struct ggml_tensor {
         enum ggml_type type;
@@ -685,6 +689,17 @@ extern "C" {
 
         void * data;
 
+#ifdef GGML_NUMA_MIRROR
+        // CPU25 NUMA_MIRROR: per-NUMA-node weight pointers. tensor_data() picks
+        // the right pointer based on the calling thread's TLS
+        // ggml_current_numa_node. tensor_set_data() sets ALL N to the same p
+        // (Phase 1a framework). tensor_set_data_per_node() sets one specific
+        // node (Phase 1b mmap path). The raw `data` field above is kept as a
+        // mirror of data_per_node[0] for code that hasn't been migrated to
+        // the accessor yet.
+        void * data_per_node[GGML_NUMA_MAX_NODES];
+#endif
+
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
@@ -695,34 +710,71 @@ extern "C" {
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
     // ============================================================================
-    // CPU25 NUMA_MIRROR — Phase 0a (2026-04-27): tensor data accessor abstraction
+    // CPU25 NUMA_MIRROR — Phase 0a (accessor) + Phase 1 (multi-node plumbing)
     // ============================================================================
     //
-    // tensor_data(t) and tensor_set_data(t, p) are inline accessors that abstract
-    // the raw `t->data` field. Phase 0a (this commit): both functions compile to
-    // direct field access — zero behavior change vs `t->data`. Phase 1 (future
-    // session): when GGML_NUMA_MIRROR is defined, the accessor returns a per-NUMA-
-    // node weight pointer based on the calling thread's current NUMA node (via
-    // a TLS variable set at graph-compute entry).
+    // tensor_data(t) and tensor_set_data(t, p) abstract the raw `t->data` field.
     //
-    // Design:
-    //   - Phase 0a: identity inline (current behavior preserved)
-    //   - Phase 1:  multi-node storage (either tensor->data_per_node[N] or a
-    //               separate hash-table; TBD pending integration)
+    //   - Default build (GGML_NUMA_MIRROR not defined): both functions compile to
+    //     direct field access — zero behavior change.
+    //   - GGML_NUMA_MIRROR=N defined at compile time: tensor stores N pointers
+    //     in `data_per_node[]`; tensor_data(t) returns the pointer for the calling
+    //     thread's current NUMA node (TLS `ggml_current_numa_node` set at graph-
+    //     compute entry); tensor_set_data(t, p) initially sets ALL N pointers to
+    //     the same p (Phase 1a — framework only; actual per-node replication is
+    //     Phase 1b in llama-mmap.cpp).
     //
-    // Migration plan: callers are migrated incrementally. The CPU compute path
-    // (GEMV, mul_mat, mul_mat_id) gets migrated first since that's where the
-    // mirror would matter. KV cache, scratch buffers, and other dynamic
-    // allocations stay on the raw field (they should NOT be mirrored).
+    // Set-data-per-node API (Phase 1b will use this from the mmap path):
+    //   tensor_set_data_per_node(t, node, p) — set node-specific pointer
+    //
+    // KV cache, scratch buffers, and dynamic allocations should NOT be mirrored;
+    // they call tensor_set_data() which sets all N pointers identical (effectively
+    // the non-mirrored fallback path).
     //
     // See handoffs/active/numa-mirror-integration.md for full design notes.
     // ============================================================================
+
+#ifdef GGML_NUMA_MIRROR
+    // TLS variable: each thread sets this at graph-compute entry to its NUMA
+    // node (0..GGML_NUMA_MAX_NODES-1). Default -1 means "use node 0".
+    extern __thread int ggml_current_numa_node;
+
+    // Number of nodes actually populated (set at first tensor_set_data call,
+    // or explicitly via ggml_numa_set_n_nodes). Default 1 means single-node
+    // (mirror-OFF behavior).
+    extern int ggml_numa_n_nodes;
+
+    static inline void * tensor_data(const struct ggml_tensor * t) {
+        const int n = ggml_current_numa_node;
+        return t->data_per_node[(n >= 0 && n < GGML_NUMA_MAX_NODES) ? n : 0];
+    }
+    static inline void tensor_set_data(struct ggml_tensor * t, void * data) {
+        // Phase 1a: set ALL N pointers to the same value (framework plumbing
+        // with no actual replication). Phase 1b will set per-node pointers
+        // from the mmap path via tensor_set_data_per_node().
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; ++i) {
+            t->data_per_node[i] = data;
+        }
+        t->data = data;  // keep raw field synchronized for code that hasn't
+                         // been migrated to the accessor yet (Phase 0c, etc.)
+    }
+    static inline void tensor_set_data_per_node(struct ggml_tensor * t, int node, void * data) {
+        if (node >= 0 && node < GGML_NUMA_MAX_NODES) {
+            t->data_per_node[node] = data;
+            if (node == 0) {
+                t->data = data;  // node 0 also goes to raw field for non-migrated
+                                  // callers
+            }
+        }
+    }
+#else
     static inline void * tensor_data(const struct ggml_tensor * t) {
         return t->data;
     }
     static inline void tensor_set_data(struct ggml_tensor * t, void * data) {
         t->data = data;
     }
+#endif
 
     // Abort callback
     // If not NULL, called before ggml computation

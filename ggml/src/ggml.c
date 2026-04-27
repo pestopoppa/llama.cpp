@@ -10,6 +10,18 @@
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
+#ifdef GGML_NUMA_MIRROR
+// CPU25 NUMA_MIRROR Phase 1: TLS variable holding the calling thread's NUMA
+// node. Default -1 → tensor_data() falls back to node 0. Set at graph-compute
+// entry by ggml-cpu.c (ggml_graph_compute) using getcpu(2) or sched_getcpu().
+__thread int ggml_current_numa_node = -1;
+
+// Number of NUMA nodes actually populated with mirrored weights.
+// Default 1 = single-node behavior (mirror-OFF semantically).
+// Set by the mmap path or ggml_numa_set_n_nodes() before any compute.
+int ggml_numa_n_nodes = 1;
+#endif
+
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -1776,10 +1788,21 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
+#ifdef GGML_NUMA_MIRROR
+        /*.data_per_node=*/ { 0 },
+#endif
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
         /*.padding      =*/ { 0 },
     };
+#ifdef GGML_NUMA_MIRROR
+    {
+        void * d = obj_alloc_size > 0 ? (void *)(result + 1) : data;
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; ++i) {
+            result->data_per_node[i] = d;
+        }
+    }
+#endif
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(tensor_data(result));
