@@ -32,6 +32,93 @@
 
 #define UNUSED GGML_UNUSED
 
+#if defined(GGML_NUMA_MIRROR) && defined(__linux__)
+#include <mutex>
+#include <unordered_map>
+#include <sys/mman.h>
+// CPU25 NUMA_MIRROR Phase 1c: per-buffer mirror state. For each CPU_REPACK
+// buffer, we allocate N anon mmap replicas (one per NUMA node, mbind'd
+// MPOL_BIND). The primary is replica[0]; replicas[1..N-1] live separately.
+// Tensors bound to the buffer get their data_per_node[] fanned out via
+// init_tensor; set_tensor's repack write to primary is followed by a copy
+// to each replica at the same offset so all N hold byte-identical content.
+//
+// State is keyed on the buffer pointer; lookup happens at each init_tensor
+// and set_tensor call. Map is small (one entry per buffer = a handful per
+// model) so an unordered_map is fine.
+namespace {
+struct cpu_repack_mirror {
+    void * replicas[GGML_NUMA_MAX_NODES];  // replicas[0] == primary (= buffer->context)
+    int    n_nodes;
+    size_t size;
+};
+
+static std::mutex                                                 g_repack_mirror_mu;
+static std::unordered_map<ggml_backend_buffer_t, cpu_repack_mirror> g_repack_mirrors;
+
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef SYS_mbind
+#define SYS_mbind 237
+#endif
+
+static cpu_repack_mirror * cpu_repack_mirror_alloc(ggml_backend_buffer_t buffer, void * primary, size_t size, int n_nodes) {
+    cpu_repack_mirror m;
+    m.size     = size;
+    m.n_nodes  = n_nodes;
+    m.replicas[0] = primary;  // replica 0 IS the primary (caller mbind'd it to node 0)
+    for (int n = 1; n < GGML_NUMA_MAX_NODES; ++n) {
+        m.replicas[n] = nullptr;
+    }
+    for (int n = 1; n < n_nodes; ++n) {
+        void * rep = mmap(nullptr, size, PROT_READ|PROT_WRITE,
+                          MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
+        if (rep == MAP_FAILED) {
+            GGML_LOG_ERROR("cpu-repack-mirror: mmap(%.1f GiB) for node %d failed: %s\n",
+                           size / (1024.0 * 1024.0 * 1024.0), n, strerror(errno));
+            // unwind partial allocations
+            for (int k = 1; k < n; ++k) {
+                munmap(m.replicas[k], size);
+                m.replicas[k] = nullptr;
+            }
+            return nullptr;
+        }
+        unsigned long mask = 1UL << n;
+        long rc = syscall(SYS_mbind, rep, size, MPOL_BIND, &mask, 64UL, 0ul);
+        if (rc != 0) {
+            GGML_LOG_WARN("cpu-repack-mirror: mbind(MPOL_BIND, node=%d) on %.1f GiB failed: %s\n",
+                          n, size / (1024.0 * 1024.0 * 1024.0), strerror(errno));
+        }
+        m.replicas[n] = rep;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_repack_mirror_mu);
+        auto [it, ok] = g_repack_mirrors.emplace(buffer, m);
+        return ok ? &it->second : nullptr;
+    }
+}
+
+static cpu_repack_mirror * cpu_repack_mirror_lookup(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lk(g_repack_mirror_mu);
+    auto it = g_repack_mirrors.find(buffer);
+    return it == g_repack_mirrors.end() ? nullptr : &it->second;
+}
+
+static void cpu_repack_mirror_free(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lk(g_repack_mirror_mu);
+    auto it = g_repack_mirrors.find(buffer);
+    if (it == g_repack_mirrors.end()) return;
+    for (int n = 1; n < it->second.n_nodes; ++n) {
+        if (it->second.replicas[n]) {
+            munmap(it->second.replicas[n], it->second.size);
+        }
+    }
+    g_repack_mirrors.erase(it);
+}
+} // anonymous namespace
+#endif // GGML_NUMA_MIRROR && __linux__
+
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
     float val = fval + 12582912.f;
@@ -4446,9 +4533,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i1 = i11;
         const int64_t i2 = i12;
 
-        const char * src0_ptr = (const char *) src0->data + i02 * nb02;
+        const char * src0_ptr = (const char *) tensor_data(src0) + i02 * nb02;
         const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
-        char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
+        char *       dst_ptr  = ((char *) tensor_data(dst) + (i1 * nb1 + i2 * nb2));
 
         const int64_t nrows = src1_end - src1_start;
         const int64_t ncols = src0_end - src0_start;
@@ -4512,7 +4599,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
         for (int64_t i12 = 0; i12 < ne12; i12++) {
-            char * data_ptr  = (char *) src1->data + i12 * nb12;
+            char * data_ptr  = (char *) tensor_data(src1) + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
@@ -4679,7 +4766,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
+                from_float((float *)((char *) tensor_data(src1) + i12 * nb12 + i11 * nb11),
                            (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
                            ne10);
             }
@@ -4715,7 +4802,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 continue;
             }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur = (const char *) tensor_data(src0) + cur_a*nb02;
 
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
@@ -4748,7 +4835,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
+                    ne00, (float *) ((char *) tensor_data(dst) + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
         }
@@ -4977,6 +5064,24 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
 
+#if defined(GGML_NUMA_MIRROR) && defined(__linux__)
+    // CPU25 NUMA_MIRROR Phase 1c: fan out tensor->data_per_node[] to per-node
+    // replica offsets. The tensor's primary `data` was already set by the
+    // allocator to (buffer_base + tensor_offset); we mirror that offset
+    // across all replicas. set_tensor will fill the replica bytes.
+    auto * m = cpu_repack_mirror_lookup(buffer);
+    if (m) {
+        const uintptr_t prim = (uintptr_t) m->replicas[0];
+        const uintptr_t td   = (uintptr_t) tensor_data(tensor);
+        if (td >= prim && td < prim + m->size) {
+            const size_t off = td - prim;
+            for (int n = 0; n < m->n_nodes; ++n) {
+                tensor_set_data_per_node(tensor, n, (uint8_t *) m->replicas[n] + off);
+            }
+        }
+    }
+#endif
+
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
 }
@@ -4990,8 +5095,37 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+
+#if defined(GGML_NUMA_MIRROR) && defined(__linux__)
+    // CPU25 NUMA_MIRROR Phase 1c: the repack just wrote to data_per_node[0]
+    // (= primary). Copy those bytes to each non-primary replica at the same
+    // offset so all N nodes hold byte-identical repacked content.
+    auto * m = cpu_repack_mirror_lookup(buffer);
+    if (m) {
+        const uintptr_t prim = (uintptr_t) m->replicas[0];
+        const uintptr_t td   = (uintptr_t) tensor->data_per_node[0];
+        if (td >= prim && td < prim + m->size) {
+            const size_t off = td - prim;
+            const size_t nb  = ggml_nbytes(tensor);
+            for (int n = 1; n < m->n_nodes; ++n) {
+                memcpy((uint8_t *) m->replicas[n] + off,
+                       (const uint8_t *) m->replicas[0] + off,
+                       nb);
+            }
+        }
+    }
+#endif
+
     GGML_UNUSED(buffer);
 }
+
+#if defined(GGML_NUMA_MIRROR) && defined(__linux__)
+static void ggml_backend_cpu_repack_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    cpu_repack_mirror_free(buffer);
+    // Forward to the underlying CPU buffer free: ggml_aligned_free on context.
+    ggml_aligned_free(buffer->context, buffer->size);
+}
+#endif
 
 static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU_REPACK";
@@ -5089,6 +5223,43 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
     buffer->iface.get_tensor  = nullptr;
     buffer->iface.cpy_tensor  = nullptr;
+
+#if defined(GGML_NUMA_MIRROR) && defined(__linux__)
+    // CPU25 NUMA_MIRROR Phase 1c: replace the MPOL_INTERLEAVE primary policy
+    // with MPOL_BIND-to-node-0 for the primary, plus N-1 anon-mmap replicas
+    // each mbind'd to its own node. init_tensor / set_tensor will fan out.
+    // Independent of ggml's NUMA strategy: fires whenever GGML_NUMA_MIRROR>=2,
+    // because thread->node mapping for the TLS setter uses getcpu(2) directly
+    // and depends only on the OS pinning the thread (numactl, taskset,
+    // OMP_PROC_BIND=spread, etc.), NOT on ggml_numa_init being called.
+    if (GGML_NUMA_MIRROR >= 2 && buffer->context && buffer->size >= (1ull << 20)) {
+        int n_mirror = GGML_NUMA_MIRROR;
+        if (n_mirror < 1) n_mirror = 1;
+        if (n_mirror > GGML_NUMA_MAX_NODES) n_mirror = GGML_NUMA_MAX_NODES;
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        // Re-mbind primary from MPOL_INTERLEAVE (set above) to MPOL_BIND
+        // node 0 so threads on node 0 read locally instead of round-robin.
+        {
+            uintptr_t addr_b = (uintptr_t) buffer->context;
+            uintptr_t a_addr = addr_b & ~(page - 1);
+            size_t    a_len  = ((addr_b - a_addr) + buffer->size + page - 1) & ~(page - 1);
+            unsigned long mask0 = 1UL;
+            long rc = syscall(SYS_mbind, (void *) a_addr, a_len, MPOL_BIND, &mask0, 64UL, 0ul);
+            if (rc != 0) {
+                GGML_LOG_WARN("cpu-repack-mirror: mbind(MPOL_BIND, node=0) on primary failed: %s\n", strerror(errno));
+            }
+        }
+        auto * m = cpu_repack_mirror_alloc(buffer, buffer->context, buffer->size, n_mirror);
+        if (m) {
+            GGML_LOG_INFO("cpu-repack-mirror: %.1f GiB primary on node 0 + %d node replicas (mirror=%d)\n",
+                          buffer->size / (1024.0 * 1024.0 * 1024.0), n_mirror - 1, n_mirror);
+            buffer->iface.free_buffer = ggml_backend_cpu_repack_buffer_free_buffer;
+        } else {
+            GGML_LOG_WARN("cpu-repack-mirror: failed to allocate replicas; falling back to single-buffer\n");
+        }
+    }
+#endif
+
     return buffer;
 }
 
