@@ -1664,6 +1664,24 @@ static void gemv_q6_K_8x8_q8_K_avx512bw(int n, float * GGML_RESTRICT s, size_t b
         __m256 acc_row = _mm256_setzero_ps();
 
         for (int l = 0; l < nb; ++l) {
+            // CPU2 Session 18 (2026-04-27): software prefetch hint for next
+            // super-block's data. T1 (L2/L3 only — skip L1) to avoid polluting
+            // the hot L1 cache and let the hardware prefetcher do L1 promotion
+            // closer to the actual access. Only the START of each large block
+            // (ql/qh/qs) is hinted; the HW prefetcher streams the rest.
+            //
+            // Initial T0 + 11-line variant regressed -1.6% on Coder-30B; the
+            // aggressive prefetch contended with the HW prefetcher's existing
+            // sequential streaming. Revised to 4 hints with T1.
+            if (l + 1 < nb) {
+                const block_q6_Kx8 * pf_b = b_ptr + (l + 1);
+                const block_q8_K   * pf_a = a_ptr + (l + 1);
+                _mm_prefetch((const char *)(pf_b->ql),        _MM_HINT_T1);
+                _mm_prefetch((const char *)(pf_b->qh),        _MM_HINT_T1);
+                _mm_prefetch((const char *)(pf_a->qs),        _MM_HINT_T1);
+                _mm_prefetch((const char *)(pf_b->scales),    _MM_HINT_T1);
+            }
+
             // (1) Bias precomputation: bias[col] = 32 * sum_i(bsums[i] * scales[i*8+col])
             // Loop over 16 sub-blocks; each iteration adds bsums[sb_i] * scales[sb_i*8 + col]
             // to the per-col i32 accumulator. Final shift-left by 5 = multiply by 32.
@@ -1838,6 +1856,14 @@ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             __m256 acc_min_rows = _mm256_setzero_ps();
 
             for (int64_t b = 0; b < nb; b++) {
+
+                // CPU2 Session 18 (2026-04-27): tested T1 prefetch on this
+                // Q4_K kernel (4 lines: qs, scales, a.qs, a.bsums) — REGRESSED
+                // -4% on Coder-30B Q4_K_M. The Q4_K AVX2 kernel's access
+                // pattern is already well-handled by the HW prefetcher; manual
+                // hints contend rather than help. Reverted; the Q6_K AVX-512BW
+                // kernel keeps T1 prefetch (+0.9% there). Path-specific
+                // prefetch decisions are required.
 
                 // Load and convert to FP32 scale from block_q8_K
                 const __m256 row_scale_f32 = _mm256_set1_ps((a_ptr[b].d));
