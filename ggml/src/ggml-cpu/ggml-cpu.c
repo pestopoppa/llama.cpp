@@ -3551,6 +3551,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     set_numa_thread_affinity(state->ith);
 
+#ifdef GGML_NUMA_MIRROR
+    // CPU25 NUMA_MIRROR Phase 1b: bind this thread's TLS to the actual NUMA
+    // node it is currently running on. tensor_data() will then read the
+    // matching data_per_node[] slot. In Phase 1a all slots are identical so
+    // this is a no-op; in Phase 1c (per-node mmap) it lifts each thread to
+    // its node-local weight copy.
+    {
+        unsigned int _cpu;
+        unsigned int _node;
+        int _rv;
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
+        _rv = getcpu(&_cpu, &_node);
+#else
+#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+#       define SYS_getcpu SYS_get_cpu
+#   endif
+        _rv = syscall(SYS_getcpu, &_cpu, &_node);
+#endif
+        if (_rv == 0 && (int) _node < GGML_NUMA_MAX_NODES) {
+            ggml_current_numa_node = (int) _node;
+        } else {
+            ggml_current_numa_node = 0;
+        }
+    }
+#endif
+
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
         /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
