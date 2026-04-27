@@ -230,11 +230,11 @@ static void llama_tensor_dequantize_impl(
 
     if (nthread < 2) {
         if (tensor->type == GGML_TYPE_F16) {
-            ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
+            ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor_data(tensor), f32_output, nelements);
         } else if (tensor->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor->data, f32_output, nelements);
+            ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor_data(tensor), f32_output, nelements);
         } else if (ggml_is_quantized(tensor->type)) {
-            qtype->to_float(tensor->data, f32_output, nelements);
+            qtype->to_float(tensor_data(tensor), f32_output, nelements);
         } else {
             GGML_ABORT("fatal error"); // unreachable
         }
@@ -273,7 +273,7 @@ static void llama_tensor_dequantize_impl(
                 qtype->to_float(inbuf, outbuf, nels);
             }
         };
-        workers.emplace_back(compute, tensor->type, (uint8_t *) tensor->data + in_buff_offs, f32_output + out_buff_offs, thr_elems);
+        workers.emplace_back(compute, tensor->type, (uint8_t *) tensor_data(tensor) + in_buff_offs, f32_output + out_buff_offs, thr_elems);
         in_buff_offs += thr_block_bytes;
         out_buff_offs += thr_elems;
     }
@@ -1124,7 +1124,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 if (read_data.size() < tensor_size) {
                     read_data.resize(tensor_size);
                 }
-                tensor->data = read_data.data();
+                tensor_set_data(tensor, read_data.data());
             }
             ml.load_data_for(tensor);
         }
@@ -1166,7 +1166,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } else {
             // no --dry-run, perform quantization
             if (!quantize) {
-                new_data = tensor->data;
+                new_data = tensor_data(tensor);
                 new_size = tensor_size;
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
             } else {
@@ -1206,7 +1206,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_F32) {
-                    f32_data = (float *) tensor->data;
+                    f32_data = (float *) tensor_data(tensor);
                 } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 } else {

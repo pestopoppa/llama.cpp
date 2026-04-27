@@ -1153,10 +1153,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
             }
         }
         if (t_ij->view_src != nullptr) {
-            t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
+            tensor_set_data(t_ij, (char *) tensor_data(t_ij->view_src) + t_ij->view_offs);
         } else if (simple_buf != nullptr) {
-            t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
-                + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(buffer));
+            tensor_set_data(t_ij, (char *) ggml_backend_buffer_get_base(simple_buf)
+                + size_t(tensor_data(tensor)) - size_t(ggml_backend_buffer_get_base(buffer)));
         }
         t_ij->extra = tensor->extra;
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1413,7 +1413,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor(meta_buf, t);
-        t->data = (void *) 0x2000000000000000; // FIXME
+        tensor_set_data(t, (void *) 0x2000000000000000); // FIXME
     }
     for (size_t i = 0; i < n_simple_bufts; i++) {
         meta_buf_ctx->buf_configs[i].buf = ggml_backend_alloc_ctx_tensors_from_buft(
@@ -1853,11 +1853,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // Tmp tensors to receive P2P copies
                 ggml_tensor * node_tmp_1 = get_node_aux(node1);
                 node_tmp_1->buffer = bcj1.buf.get();
-                node_tmp_1->data = ggml_backend_buffer_get_base(bcj1.buf.get());
+                tensor_set_data(node_tmp_1, ggml_backend_buffer_get_base(bcj1.buf.get()));
 
                 ggml_tensor * node_tmp_2 = get_node_aux(node2);
                 node_tmp_2->buffer = bcj2.buf.get();
-                node_tmp_2->data = ggml_backend_buffer_get_base(bcj2.buf.get());
+                tensor_set_data(node_tmp_2, ggml_backend_buffer_get_base(bcj2.buf.get()));
 
                 // 2 P2P copies: exchange full buffers
                 ggml_backend_tensor_copy_async(bcj1.backend, bcj2.backend, node1, node_tmp_2);

@@ -58,7 +58,7 @@ extern "C" {
 // across 4 NUMA nodes = ~33 GiB extra per node = ~132 GiB replica
 // overhead. Original file mmap stays as fallback.
 struct ggml_ep_tensor_info {
-    void * file_base;          // tensor->data in original file mmap
+    void * file_base;          // tensor_data(tensor) in original file mmap
     int    n_experts;
     int    n_nodes;            // number of NUMA nodes used (matches g_ep_anon_n_nodes)
     int    n_ccd;              // number of CCDs (matches g_ep_anon_n_ccd)
@@ -79,7 +79,7 @@ extern "C" {
     int ggml_ep_anon_n_tensors_(void) { return g_ep_anon_n_tensors; }
     // Linear-search lookup by file_base. Returns nullptr if not registered.
     // For the EP hot path, mul_mat_id calls this once per op (with the
-    // matmul's src0->data) and caches the result across all expert iterations.
+    // matmul's tensor_data(src0)) and caches the result across all expert iterations.
     const struct ggml_ep_tensor_info * ggml_ep_anon_lookup_(const void * file_base) {
         for (int i = 0; i < g_ep_anon_n_tensors; ++i) {
             if (g_ep_anon_tensors[i].file_base == file_base) {
@@ -1743,7 +1743,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // memcpy under the bound policy → reliably land on the target node.
     //
     // mul_mat_id (ggml-cpu.c) consumes via ggml_ep_anon_lookup_(): given
-    // src0->data (file_base of the first expert tensor), return the
+    // tensor_data(src0) (file_base of the first expert tensor), return the
     // ggml_ep_tensor_info with per-node base addresses. The EP path then
     // computes (my_node, expert_to_node_idx[cur_a]) and reads expert data
     // from the local-node copy.
@@ -1933,20 +1933,20 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
-        if (cur->data == nullptr) {
-            cur->data = (uint8_t *)mapping->addr() + w.offs;
+        if (tensor_data(cur) == nullptr) {
+            tensor_set_data(cur, (uint8_t *)mapping->addr() + w.offs);
         } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+            memcpy(tensor_data(cur), (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
         }
     } else {
-        GGML_ASSERT(cur->data != nullptr);
+        GGML_ASSERT(tensor_data(cur) != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
         file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        file->read_raw(tensor_data(cur), ggml_nbytes(cur));
     }
 
-    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+    if (check_tensors && !ggml_validate_row_data(cur->type, tensor_data(cur), ggml_nbytes(cur))) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
     }
 }
@@ -2095,8 +2095,8 @@ bool llama_model_loader::load_all_data(
                 }));
             }
 
-            GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
+            GGML_ASSERT(buf_mmap || tensor_data(cur)); // either we have a buffer to allocate the tensor in, or it is already allocated
+            if (buf_mmap && tensor_data(cur) == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
@@ -2114,10 +2114,10 @@ bool llama_model_loader::load_all_data(
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                file->read_raw(tensor_data(cur), n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, tensor_data(cur), n_size));
                     }));
                 }
             } else {

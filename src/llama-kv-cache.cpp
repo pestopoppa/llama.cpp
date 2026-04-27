@@ -32,7 +32,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 
     std::vector<float> data_f32;
 
-    float * data = (float *) tensor->data;
+    float * data = (float *) tensor_data(tensor);
 
     if (tensor->type != GGML_TYPE_F32) {
         data_f32.resize(n*n);
@@ -54,7 +54,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 
     if (tensor->type != GGML_TYPE_F32) {
-        ggml_quantize_chunk(tensor->type, data, tensor->data, 0, 1, n*n, nullptr);
+        ggml_quantize_chunk(tensor->type, data, tensor_data(tensor), 0, 1, n*n, nullptr);
     }
 }
 
@@ -351,7 +351,7 @@ llama_kv_cache::llama_kv_cache(
             ggml_context_ptr ctx { ggml_init(params) };
 
             ggml_tensor * tmp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n, n);
-            tmp->data = attn_rot_hadamard[n].data();
+            tensor_set_data(tmp, attn_rot_hadamard[n].data());
 
             ggml_gen_hadamard(tmp);
         }
@@ -1512,7 +1512,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
+    int64_t * data = (int64_t *) tensor_data(dst);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
@@ -1528,7 +1528,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
+    int64_t * data = (int64_t *) tensor_data(dst);
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1559,7 +1559,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    int32_t * data = (int32_t *) dst->data;
+    int32_t * data = (int32_t *) tensor_data(dst);
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
@@ -1767,7 +1767,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    float * data = (float *) dst->data;
+    float * data = (float *) tensor_data(dst);
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -1811,7 +1811,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
-    int32_t * data = (int32_t *) dst->data;
+    int32_t * data = (int32_t *) tensor_data(dst);
 
     const int32_t n_kv = dst->ne[0];
 
@@ -1833,7 +1833,7 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     const auto n_rot = dst->ne[0];
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    memcpy(tensor_data(dst), attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
@@ -1842,7 +1842,7 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     const auto n_rot = dst->ne[0];
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    memcpy(tensor_data(dst), attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2595,7 +2595,7 @@ ggml_tensor * llama_kv_cache::build_block_table_tensor(
 }
 
 void llama_kv_cache::set_input_block_table(ggml_tensor * dst, const slot_info & sinfo) const {
-    int32_t * data = (int32_t *) dst->data;
+    int32_t * data = (int32_t *) tensor_data(dst);
     const int64_t max_blocks = dst->ne[0];
     const int64_t n_seqs = dst->ne[1];
 
