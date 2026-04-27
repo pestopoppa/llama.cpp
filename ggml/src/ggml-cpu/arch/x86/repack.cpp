@@ -1627,15 +1627,139 @@ void ggml_gemm_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 // =============================================================================
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+// CPU2 Session 17 (2026-04-27) — Q6_K 8x8 AVX-512BW kernel body.
+//
+// Mirrors the NEON reference (arch/arm/repack.cpp:1498) algorithm:
+//   1. Bias precompute: bias[col] = 32 * sum_i(bsums[i] * scales[i*8+col])
+//      out of the inner loop, so q6 values stay UNSIGNED (range 0..63) and
+//      the dot-product chain uses VPMADDUBSW(unsigned, signed) cleanly.
+//   2. For each k in 0..15 (matching the generic's k iteration):
+//      - Load 64 ql bytes (1 ZMM): 8 cols × 8 weight-pairs
+//      - Load 64 qh bytes for the relevant qh chunk
+//      - Reconstruct unsigned 6-bit weights for low chunk (q6 = (qh_lo<<4)|ql_lo)
+//        and high chunk (q6 = (qh_hi<<4)|ql_hi) using shift+mask+OR
+//      - VPMADDUBSW + VPMADDWD chain on (q6, q8 broadcast) → 16 i32 lanes
+//      - Reduce to 8 per-col sums via shift+add+truncate (same pattern as
+//        the Q8_0 8x8 kernel above)
+//      - Multiply by per-(sub-block, col) scale, accumulate into per-col i32
+//   3. Subtract bias from accumulator, convert to fp32, FMA into row acc.
+//
+// Bit-exact target: matches generic ggml_gemv_q6_K_NxM_q8_K_generic_impl<8,8>
+// in repack.cpp:365 modulo arithmetic-equivalent reordering. PPL gate on
+// 32-chunk WikiText-2 is the validation requirement before flipping default.
 static void gemv_q6_K_8x8_q8_K_avx512bw(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
-    // STUB (CPU2 Session 16 scaffolding): until the SIMD body lands in a
-    // follow-up session, fall back to the portable generic reference. This
-    // keeps the dispatcher wired so toggling GGML_Q6_K_8X8_AVX=1 is a no-op
-    // on output values but exercises the code path for build/load-time tests.
-    // The handoff `cpu-shape-specialized-gemv-decode.md` tracks the actual
-    // implementation milestone.
+    const int qk = QK_K;
+    const int nb = n / qk;
     UNUSED(bs);
-    ggml_gemv_q6_K_8x8_q8_K_generic(n, s, bs, vx, vy, /*nr=*/1, nc);
+
+    const block_q6_Kx8 * b_ptr_start = (const block_q6_Kx8 *)vx;
+    const block_q8_K   * a_ptr       = (const block_q8_K   *)vy;
+
+    const __m512i ones_i16 = _mm512_set1_epi16(1);
+    const __m512i mask_4   = _mm512_set1_epi8((char)0x0F);
+    const __m512i mask_2   = _mm512_set1_epi8((char)0x03);
+
+    for (int x = 0; x < nc / 8; ++x) {
+        const block_q6_Kx8 * b_ptr = b_ptr_start + x * nb;
+        __m256 acc_row = _mm256_setzero_ps();
+
+        for (int l = 0; l < nb; ++l) {
+            // (1) Bias precomputation: bias[col] = 32 * sum_i(bsums[i] * scales[i*8+col])
+            // Loop over 16 sub-blocks; each iteration adds bsums[sb_i] * scales[sb_i*8 + col]
+            // to the per-col i32 accumulator. Final shift-left by 5 = multiply by 32.
+            __m256i bias_i32 = _mm256_setzero_si256();
+            for (int sb_i = 0; sb_i < 16; ++sb_i) {
+                const __m128i scales_i8  = _mm_loadl_epi64((const __m128i *)(b_ptr[l].scales + sb_i * 8));
+                const __m256i scales_i32 = _mm256_cvtepi8_epi32(scales_i8);
+                const __m256i bsum_bcast = _mm256_set1_epi32((int32_t) a_ptr[l].bsums[sb_i]);
+                bias_i32 = _mm256_add_epi32(bias_i32, _mm256_mullo_epi32(scales_i32, bsum_bcast));
+            }
+            bias_i32 = _mm256_slli_epi32(bias_i32, 5);  // × 32
+
+            // (2) Super-block scales: q6_d[col] × q8_d
+            const __m128i d_b_fp16     = _mm_loadu_si128((const __m128i *) b_ptr[l].d);
+            const __m256  d_b_fp32     = _mm256_cvtph_ps(d_b_fp16);
+            const __m256  d_a_fp32     = _mm256_set1_ps(a_ptr[l].d);
+            const __m256  super_scales = _mm256_mul_ps(d_b_fp32, d_a_fp32);
+
+            // (3) Per-col i32 accumulator (8 lanes in YMM)
+            __m256i acc_per_col = _mm256_setzero_si256();
+
+            // (4) Iterate k = 0..15, each k handles 8 cols × 16 weights (8 low + 8 high)
+            for (int k = 0; k < 16; ++k) {
+                const int base_l           = (k / 8) * 128 + (k % 8) * 8;
+                const int base_h           = base_l + 64;
+                const int half             = k / 8;
+                const int chunk_within_half = k % 4;
+                const int shift_l          = ((k % 8) / 4) * 2;  // 0 for k%8 in 0..3, 2 for k%8 in 4..7
+                const int shift_h          = shift_l + 4;        // 4 or 6
+                const int scale_idx_l      = base_l / 16;
+                const int scale_idx_h      = base_h / 16;
+
+                // Load 64 ql bytes for this k iteration (8 cols × 8 weight-pairs)
+                const __m512i ql = _mm512_loadu_si512((const __m512i *)(b_ptr[l].ql + k * 64));
+
+                // Load 64 qh bytes for the qh chunk (shared across k%8 = chunk and k%8 = chunk+4)
+                const __m512i qh = _mm512_loadu_si512((const __m512i *)(b_ptr[l].qh + half * 256 + chunk_within_half * 64));
+
+                // Extract ql nibbles (each ql byte holds 2 weights' low-4-bits)
+                const __m512i ql_lo_4 = _mm512_and_si512(ql, mask_4);
+                const __m512i ql_hi_4 = _mm512_and_si512(_mm512_srli_epi16(ql, 4), mask_4);
+
+                // Extract qh 2-bit fields with shifts (mask AFTER shift to discard cross-byte bits)
+                __m512i qh_l_2 = (shift_l == 0)
+                                 ? _mm512_and_si512(qh, mask_2)
+                                 : _mm512_and_si512(_mm512_srli_epi16(qh, shift_l), mask_2);
+                __m512i qh_h_2 = _mm512_and_si512(_mm512_srli_epi16(qh, shift_h), mask_2);
+
+                // Reconstruct unsigned 6-bit weights: q6 = (qh_2 << 4) | ql_4  (range 0..63)
+                const __m512i q6_l = _mm512_or_si512(_mm512_slli_epi16(qh_l_2, 4), ql_lo_4);
+                const __m512i q6_h = _mm512_or_si512(_mm512_slli_epi16(qh_h_2, 4), ql_hi_4);
+
+                // Load 8 i8 q8 activations for low + high chunks, broadcast as 8 copies
+                uint64_t a_l_bytes, a_h_bytes;
+                memcpy(&a_l_bytes, a_ptr[l].qs + base_l, sizeof(uint64_t));
+                memcpy(&a_h_bytes, a_ptr[l].qs + base_h, sizeof(uint64_t));
+                const __m512i a_l = _mm512_set1_epi64((int64_t) a_l_bytes);
+                const __m512i a_h = _mm512_set1_epi64((int64_t) a_h_bytes);
+
+                // VPMADDUBSW(unsigned q6, signed q8) → 32 i16 pair-sums
+                // VPMADDWD(ones, partial)            → 16 i32 pair-sums
+                // (chain matches Q8_0 kernel's Zen 5-preferred VPMADDUBSW+VPMADDWD path)
+                const __m512i partial_l_i16 = _mm512_maddubs_epi16(q6_l, a_l);
+                const __m512i partial_l_i32 = _mm512_madd_epi16(ones_i16, partial_l_i16);
+                const __m512i partial_h_i16 = _mm512_maddubs_epi16(q6_h, a_h);
+                const __m512i partial_h_i32 = _mm512_madd_epi16(ones_i16, partial_h_i16);
+
+                // Reduce 16 i32 lanes to 8 per-col i32 sums via shift+add+truncate (i64 view)
+                const __m512i sum_l_hi = _mm512_srli_epi64(partial_l_i32, 32);
+                const __m512i sum_l    = _mm512_add_epi32(partial_l_i32, sum_l_hi);
+                const __m256i row_sums_l = _mm512_cvtepi64_epi32(sum_l);
+
+                const __m512i sum_h_hi = _mm512_srli_epi64(partial_h_i32, 32);
+                const __m512i sum_h    = _mm512_add_epi32(partial_h_i32, sum_h_hi);
+                const __m256i row_sums_h = _mm512_cvtepi64_epi32(sum_h);
+
+                // Multiply by per-(sub-block, col) i8 scales (sign-extend to i32), accumulate
+                const __m128i scale_l_i8  = _mm_loadl_epi64((const __m128i *)(b_ptr[l].scales + scale_idx_l * 8));
+                const __m256i scale_l_i32 = _mm256_cvtepi8_epi32(scale_l_i8);
+                const __m128i scale_h_i8  = _mm_loadl_epi64((const __m128i *)(b_ptr[l].scales + scale_idx_h * 8));
+                const __m256i scale_h_i32 = _mm256_cvtepi8_epi32(scale_h_i8);
+
+                acc_per_col = _mm256_add_epi32(acc_per_col, _mm256_mullo_epi32(row_sums_l, scale_l_i32));
+                acc_per_col = _mm256_add_epi32(acc_per_col, _mm256_mullo_epi32(row_sums_h, scale_h_i32));
+            }
+
+            // (5) Subtract precomputed bias (already × 32) to apply the -32 offset
+            acc_per_col = _mm256_sub_epi32(acc_per_col, bias_i32);
+
+            // (6) Convert to fp32, FMA with super-block scales into row accumulator
+            const __m256 acc_fp32 = _mm256_cvtepi32_ps(acc_per_col);
+            acc_row = _mm256_fmadd_ps(acc_fp32, super_scales, acc_row);
+        }
+
+        _mm256_storeu_ps(s + x * 8, acc_row);
+    }
 }
 #endif // __AVX512F__ && __AVX512BW__
 
