@@ -1063,7 +1063,16 @@ struct common_speculative_state_tree : public common_speculative_state {
 
             const auto * vocab_tgt = llama_model_get_vocab(llama_get_model(ctx_tgt));
             int32_t n_chars = llama_detokenize(vocab_tgt, &id_last, 1, nullptr, 0, false, false);
-            GGML_ASSERT(n_chars < 0);
+            // n_chars semantics: <0 → buffer too small, returns -needed_size.  ==0 → empty
+            // piece (special token etc.). Pre-existing assertion `n_chars < 0` falsely
+            // aborted on empty-piece tokens; relax to <=0 and skip the round when empty.
+            GGML_ASSERT(n_chars <= 0);
+            if (n_chars == 0) {
+                // id_last has no detokenized text in the target vocab; cannot translate
+                // to draft vocab. Skip this spec-dec round so main loop falls back.
+                result.clear();
+                return;
+            }
             text.resize(-n_chars);
             llama_detokenize(vocab_tgt, &id_last, 1, text.data(), text.size(), false, false);
             for (const auto & pair : vocab_map) {
@@ -1073,7 +1082,14 @@ struct common_speculative_state_tree : public common_speculative_state {
                     pos = text.find(pair.first, pos + pair.second.length());
                 }
             }
-            id_last = common_tokenize(ctx_dft, text, false, true)[0];
+            llama_tokens dft_toks = common_tokenize(ctx_dft, text, false, true);
+            if (dft_toks.empty()) {
+                // Re-tokenization yielded no draft-vocab tokens (e.g., the text was
+                // whitespace that the draft tokenizer ignores). Skip this round.
+                result.clear();
+                return;
+            }
+            id_last = dft_toks[0];
         }
 
         const llama_tokens & prompt_cur = vocab_cmpt ? prompt_tgt : prompt_cnv;
