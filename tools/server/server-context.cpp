@@ -36,6 +36,51 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Phase 1.1 dispatcher — state sync helper.
+// Copies seq state (KV cache + recurrent state for hybrid models) from src ctx to dst
+// ctx for a given seq_id. Uses llama_state_seq_get/set_data_ext with PARTIAL_ONLY flag
+// to match the existing checkpoint pattern (server_get_checkpoint).
+// Returns true on success. Caller is responsible for ensuring the seq_id space on dst
+// ctx is clean (call llama_memory_seq_rm beforehand if needed).
+static bool numa_state_sync(llama_context * src, llama_context * dst, int seq_id) {
+    if (src == dst) return true;
+    const size_t sz = llama_state_seq_get_size_ext(src, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (sz == 0) return true;  // empty source seq — nothing to copy
+    static thread_local std::vector<uint8_t> buf;  // reused across calls
+    buf.resize(sz);
+    const size_t got = llama_state_seq_get_data_ext(src, buf.data(), sz, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (got != sz) {
+        SRV_WRN("numa_state_sync: get_data_ext returned %zu, expected %zu\n", got, sz);
+        return false;
+    }
+    // Clear dst seq before set, otherwise set_data_ext may fail due to existing state.
+    llama_memory_seq_rm(llama_get_memory(dst), seq_id, -1, -1);
+    const size_t set_n = llama_state_seq_set_data_ext(dst, buf.data(), sz, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (set_n != sz) {
+        SRV_WRN("numa_state_sync: set_data_ext consumed %zu, expected %zu\n", set_n, sz);
+        return false;
+    }
+    return true;
+}
+
+// Phase 1.1 dispatcher v0 (PASS-THROUGH): K-parallel verify is wired but not yet
+// parallelized. Currently calls common_sampler_sample_and_accept_n on the primary
+// ctx, identical to the K=1 path. The dispatcher integration point is now in place
+// and aux ctxs are reachable via numa_ctxs[]; the actual parallelism is the next
+// progressive enhancement (build K path-batches → std::thread over llama_decode
+// on K ctxs → reduce by longest accept → sync winner state to primary).
+static llama_tokens dispatch_numa_parallel_verify(
+        struct common_sampler * smpl,
+        const std::vector<llama_context *> & numa_ctxs,
+        int seq_id,
+        const std::vector<int32_t> & i_batch,
+        const llama_tokens & spec_draft) {
+    GGML_UNUSED(seq_id);
+    GGML_ASSERT(!numa_ctxs.empty());
+    // v0 pass-through — primary ctx is at index 0
+    return common_sampler_sample_and_accept_n(smpl, numa_ctxs[0], i_batch, spec_draft);
+}
+
 static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
@@ -3170,7 +3215,9 @@ private:
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    auto accepted = numa_quarters_active > 1
+                        ? dispatch_numa_parallel_verify(slot.smpl.get(), numa_ctxs, slot.id, slot.spec_i_batch, slot.spec_draft)
+                        : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
