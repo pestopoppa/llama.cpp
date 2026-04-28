@@ -929,25 +929,61 @@ private:
 
         slots.clear();
 
-        // NUMA-parallel candidate verify (Phase 1.1) — foundation v3 (CLI surface only).
-        // Earlier v1/v2 attempts to (a) create K aux contexts or (b) attach a quarter-pinned
-        // threadpool to the primary ctx CRASHED on Qwen3.6-35B-A3B Q8 (hybrid Delta Net):
-        // multiple "warn: failed to set affinity mask : Invalid argument (22)" from threadpool
-        // workers, then segfault during slot init. Same code worked fine on Qwen2.5-0.5B
-        // (dense, non-hybrid). Root cause appears to be an interaction between the spawned
-        // threadpool's sched_setaffinity calls and the recurrent-state allocation path on
-        // hybrid Delta Net models — needs deeper investigation in the dispatcher session.
+        // NUMA-parallel candidate verify (Phase 1.1) — foundation v4.
+        // Pins the primary llama_context to one NUMA quarter via a dedicated ggml_threadpool
+        // with quarter-restricted cpumask. Captures the over-threading-relief lever (e.g.,
+        // 1.7× on Q8 hybrid where 24t > 96t) for the verify pass.
         //
-        // For now: K>=2 is parsed but takes NO effect — K-context creation, threadpool
-        // attachment, and parallel dispatcher all deferred to next session. K=1 default
-        // path is unchanged. CLI surface preserved so registry/launcher configs can stage.
+        // Critical fix vs v2: ALSO call llama_set_n_threads(ctx, per_quarter, per_quarter).
+        // Without this, llama_context still tells OpenMP to spawn `params.cpuparams.n_threads`
+        // (e.g. 96) threads, but the threadpool's workers[] array only has `per_quarter`
+        // (e.g. 24) entries. OpenMP threads ith=24..95 then read out-of-bounds garbage from
+        // workers[ith].cpumask, producing 17+ "warn: failed to set affinity mask : Invalid
+        // argument (22)" and a segfault during slot warmup on hybrid Delta Net models.
+        // Aux ctxs + true K-parallel dispatcher = next session.
         {
             const int K = params_base.speculative.numa_quarters;
             if (K > 1) {
-                SRV_WRN("--spec-numa-quarters=%d parsed but inactive: foundation v2 (threadpool "
-                        "attach to primary ctx) crashes on hybrid Delta Net models. K>=2 path "
-                        "deferred to next session pending investigation.\n", K);
-                numa_quarters_active = 1;
+                const int n_threads_total = params_base.cpuparams.n_threads > 0
+                    ? params_base.cpuparams.n_threads
+                    : (int) std::thread::hardware_concurrency();
+                if (n_threads_total < K) {
+                    SRV_WRN("--spec-numa-quarters=%d but only %d threads available; disabling\n", K, n_threads_total);
+                } else {
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    auto * cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+                    auto * tp_new_fn = cpu_reg ?
+                        (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new") : nullptr;
+
+                    if (!tp_new_fn) {
+                        SRV_WRN("%s", "--spec-numa-quarters: ggml_threadpool_new not available; disabling\n");
+                    } else {
+                        const int per_quarter = n_threads_total / K;
+
+                        cpu_params cp = params_base.cpuparams;
+                        cp.n_threads  = per_quarter;
+                        cp.mask_valid = true;
+                        for (int b = 0; b < GGML_MAX_N_THREADS; b++) {
+                            cp.cpumask[b] = (b < per_quarter);
+                        }
+
+                        ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(cp);
+                        ggml_threadpool * tp = tp_new_fn(&tpp);
+                        if (tp) {
+                            numa_threadpools.push_back(tp);
+                            llama_attach_threadpool(ctx, tp, nullptr);
+                            // CRITICAL: align llama_context's thread count to the threadpool's
+                            // worker count, else OpenMP spawns threads that read OOB cpumasks.
+                            llama_set_n_threads(ctx, per_quarter, per_quarter);
+                            numa_quarters_active = K;
+                            SRV_WRN("Phase 1.1 foundation v4 active: primary ctx pinned to threads [0, %d) "
+                                    "(K=%d, %d threads/quarter). Aux ctxs + K-parallel dispatcher = next session.\n",
+                                    per_quarter, K, per_quarter);
+                        } else {
+                            SRV_WRN("%s", "--spec-numa-quarters: failed to create primary threadpool; disabling\n");
+                        }
+                    }
+                }
             }
         }
 
