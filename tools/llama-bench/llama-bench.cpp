@@ -1255,6 +1255,14 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // MoE-Spec budget (arXiv:2602.16052) via env var (CLI flag wired in common/arg.cpp; llama-bench has its own arg parser)
+        if (const char * s = std::getenv("LLAMA_ARG_MOE_SPEC_BUDGET")) {
+            cparams.moe_spec_budget = std::atoi(s);
+        }
+        if (const char * s = std::getenv("LLAMA_ARG_MOE_SPEC_MIN_BATCH")) {
+            cparams.moe_spec_min_batch = std::atoi(s);
+        }
+
         return cparams;
     }
 };

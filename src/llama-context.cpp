@@ -268,6 +268,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.moe_spec_budget = params.moe_spec_budget;
+    cparams.moe_spec_min_batch = params.moe_spec_min_batch > 0 ? params.moe_spec_min_batch : 4;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -3489,6 +3491,8 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.moe_spec_budget             =*/ 0,
+        /*.moe_spec_min_batch          =*/ 4,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

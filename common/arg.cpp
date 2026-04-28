@@ -2205,6 +2205,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_YARN_BETA_FAST"));
     add_opt(common_arg(
+        {"--moe-spec-budget"}, "N",
+        string_format("MoE-Spec (arXiv:2602.16052): top-B aggregate-routing-score expert shortlist\n"
+                      "applied per-batch before per-token argsort_top_k (default: %d = off)\n"
+                      "fires only when n_tokens >= --moe-spec-min-batch", params.moe_spec_budget),
+        [](common_params & params, int value) {
+            params.moe_spec_budget = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SPEC_BUDGET"));
+    add_opt(common_arg(
+        {"--moe-spec-min-batch"}, "N",
+        string_format("MoE-Spec: minimum n_tokens to trigger budgeting (default: %d)", params.moe_spec_min_batch),
+        [](common_params & params, int value) {
+            params.moe_spec_min_batch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SPEC_MIN_BATCH"));
+    add_opt(common_arg(
         {"-gan", "--grp-attn-n"}, "N",
         string_format("group-attention factor (default: %d)", params.grp_attn_n),
         [](common_params & params, int value) {

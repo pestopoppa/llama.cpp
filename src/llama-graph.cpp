@@ -1978,6 +1978,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // MoE-Spec budget (arXiv:2602.16052) — per-batch top-B routing-score expert shortlist.
+    // Aggregates probs across n_tokens to get per-expert scores, then masks selection_probs
+    // to -INFINITY for experts outside the top-B shortlist. Fires only on multi-token
+    // batches (e.g. spec-dec verification) when the budget is set < n_expert.
+    if (cparams.moe_spec_budget > 0 &&
+        cparams.moe_spec_budget < n_expert &&
+        n_tokens >= cparams.moe_spec_min_batch) {
+        const int B = cparams.moe_spec_budget;
+
+        // 1. Aggregate routing probs across n_tokens dim.
+        // probs is [n_expert, n_tokens]; transpose to [n_tokens, n_expert] then sum_rows -> [1, n_expert].
+        ggml_tensor * probs_t = ggml_cont(ctx0, ggml_transpose(ctx0, probs));         // [n_tokens, n_expert]
+        ggml_tensor * agg_1xN = ggml_sum_rows(ctx0, probs_t);                          // [1, n_expert]
+        ggml_tensor * agg_Nx1 = ggml_reshape_2d(ctx0, agg_1xN, n_expert, 1);           // [n_expert, 1]
+        cb(agg_Nx1, "moe_spec_agg", il);
+
+        // 2. Top-B select on the n_expert axis (dim 0).
+        ggml_tensor * top_b_2d = ggml_argsort_top_k(ctx0, agg_Nx1, B);                 // [B, 1]
+        ggml_tensor * top_b_idx = ggml_reshape_1d(ctx0, top_b_2d, B);                  // [B]
+        cb(top_b_idx, "moe_spec_top_b", il);
+
+        // 3. Build per-batch mask [1, n_expert]: -INFINITY everywhere, 0 at top-B positions.
+        // ggml_set_rows constraints: a->ne[0]==b->ne[0], b->ne[1]==c->ne[0], indexes along dim 1 of a.
+        // dst shape [1, n_expert] (n_expert is the indexable dim 1).
+        ggml_tensor * mask_dst = ggml_fill(ctx0, agg_1xN, -INFINITY);                  // [1, n_expert] all -INF
+        // src shape [1, B] of zeros; build via cast(top_b_idx)*0 to inherit graph dtype.
+        ggml_tensor * top_b_f32 = ggml_cast(ctx0, top_b_2d, GGML_TYPE_F32);             // [B, 1] f32
+        ggml_tensor * src_zero  = ggml_scale(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, top_b_f32)), 0.0f); // [1, B] all 0
+        ggml_tensor * mask_1xN  = ggml_set_rows(ctx0, mask_dst, src_zero, top_b_idx);  // [1, n_expert]
+        cb(mask_1xN, "moe_spec_mask", il);
+
+        // 4. Apply: selection_probs += mask, broadcasting [1, n_expert] -> [n_expert, n_tokens] requires transpose.
+        ggml_tensor * mask_Nx1 = ggml_cont(ctx0, ggml_transpose(ctx0, mask_1xN));      // [n_expert, 1]
+        selection_probs = ggml_add(ctx0, selection_probs, mask_Nx1);
+        cb(selection_probs, "moe_spec_masked_probs", il);
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {

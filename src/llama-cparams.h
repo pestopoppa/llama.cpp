@@ -55,6 +55,12 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // MoE-Spec budget (arXiv:2602.16052) for spec-dec verification batches:
+    // top-B aggregate-routing-score expert shortlist, applied per-batch before per-token argsort_top_k.
+    // 0 = off (default); 1..n_expert-1 = budget. Fires only when n_tokens >= moe_spec_min_batch.
+    int32_t moe_spec_budget;
+    int32_t moe_spec_min_batch;  // default 4; minimum batch size to trigger budgeting
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
