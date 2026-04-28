@@ -929,18 +929,16 @@ private:
 
         slots.clear();
 
-        // NUMA-parallel candidate verify (Phase 1.1) — foundation v4.
-        // Pins the primary llama_context to one NUMA quarter via a dedicated ggml_threadpool
-        // with quarter-restricted cpumask. Captures the over-threading-relief lever (e.g.,
-        // 1.7× on Q8 hybrid where 24t > 96t) for the verify pass.
+        // NUMA-parallel candidate verify (Phase 1.1) — foundation v5.
+        // Creates K target llama_context instances, each pinned to one NUMA quarter via a
+        // dedicated ggml_threadpool with quarter-restricted cpumask. Primary ctx (index 0)
+        // is the existing `ctx`; auxiliary ctxs (indices 1..K-1) are created from the same
+        // model. Each ctx has llama_set_n_threads matched to its threadpool's worker count
+        // (Blocker 1 fix).
         //
-        // Critical fix vs v2: ALSO call llama_set_n_threads(ctx, per_quarter, per_quarter).
-        // Without this, llama_context still tells OpenMP to spawn `params.cpuparams.n_threads`
-        // (e.g. 96) threads, but the threadpool's workers[] array only has `per_quarter`
-        // (e.g. 24) entries. OpenMP threads ith=24..95 then read out-of-bounds garbage from
-        // workers[ith].cpumask, producing 17+ "warn: failed to set affinity mask : Invalid
-        // argument (22)" and a segfault during slot warmup on hybrid Delta Net models.
-        // Aux ctxs + true K-parallel dispatcher = next session.
+        // The dispatcher (forthcoming) splits heap-spec tree paths across these K ctxs in
+        // parallel via std::thread, then reduces by longest-accepted-prefix and syncs the
+        // winning ctx's KV state back to primary via llama_state_seq_get/set_data_ext.
         {
             const int K = params_base.speculative.numa_quarters;
             if (K > 1) {
@@ -959,28 +957,62 @@ private:
                         SRV_WRN("%s", "--spec-numa-quarters: ggml_threadpool_new not available; disabling\n");
                     } else {
                         const int per_quarter = n_threads_total / K;
+                        SRV_INF("Phase 1.1 foundation v5: K=%d, %d threads/quarter — building %d aux ctxs\n",
+                                K, per_quarter, K - 1);
 
-                        cpu_params cp = params_base.cpuparams;
-                        cp.n_threads  = per_quarter;
-                        cp.mask_valid = true;
-                        for (int b = 0; b < GGML_MAX_N_THREADS; b++) {
-                            cp.cpumask[b] = (b < per_quarter);
+                        numa_ctxs.assign(K, nullptr);
+                        numa_threadpools.assign(K, nullptr);
+                        numa_threadpools_batch.assign(K, nullptr);
+                        numa_ctxs[0] = ctx;
+
+                        bool all_ok = true;
+                        for (int q = 0; q < K; q++) {
+                            cpu_params cp = params_base.cpuparams;
+                            cp.n_threads  = per_quarter;
+                            cp.mask_valid = true;
+                            for (int b = 0; b < GGML_MAX_N_THREADS; b++) {
+                                cp.cpumask[b] = (b >= q * per_quarter && b < (q + 1) * per_quarter);
+                            }
+
+                            ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(cp);
+                            ggml_threadpool * tp = tp_new_fn(&tpp);
+                            if (!tp) {
+                                SRV_WRN("--spec-numa-quarters: failed to create threadpool for quarter %d; disabling\n", q);
+                                all_ok = false;
+                                break;
+                            }
+                            numa_threadpools[q] = tp;
+
+                            llama_context * cq = ctx;
+                            if (q > 0) {
+                                llama_context_params cparams = common_context_params_to_llama(params_base);
+                                cq = llama_init_from_model(model, cparams);
+                                if (!cq) {
+                                    SRV_WRN("--spec-numa-quarters: failed to init aux ctx for quarter %d; disabling\n", q);
+                                    all_ok = false;
+                                    break;
+                                }
+                                numa_ctxs[q] = cq;
+                            }
+
+                            llama_attach_threadpool(cq, tp, nullptr);
+                            // Blocker-1 fix: align llama_context's thread count to the
+                            // threadpool's worker count, else OpenMP spawns threads that
+                            // read OOB cpumasks and segfault on hybrid Delta Net models.
+                            llama_set_n_threads(cq, per_quarter, per_quarter);
+
+                            SRV_INF("Phase 1.1: ctx[%d] %s pinned to threads [%d, %d)\n",
+                                    q, q == 0 ? "(primary)" : "(aux)",
+                                    q * per_quarter, (q + 1) * per_quarter);
                         }
 
-                        ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(cp);
-                        ggml_threadpool * tp = tp_new_fn(&tpp);
-                        if (tp) {
-                            numa_threadpools.push_back(tp);
-                            llama_attach_threadpool(ctx, tp, nullptr);
-                            // CRITICAL: align llama_context's thread count to the threadpool's
-                            // worker count, else OpenMP spawns threads that read OOB cpumasks.
-                            llama_set_n_threads(ctx, per_quarter, per_quarter);
+                        if (all_ok) {
                             numa_quarters_active = K;
-                            SRV_WRN("Phase 1.1 foundation v4 active: primary ctx pinned to threads [0, %d) "
-                                    "(K=%d, %d threads/quarter). Aux ctxs + K-parallel dispatcher = next session.\n",
-                                    per_quarter, K, per_quarter);
+                            SRV_WRN("Phase 1.1 foundation v5 active: %d NUMA-pinned target ctxs. "
+                                    "Dispatcher not yet wired — aux ctxs idle until next phase.\n", K);
                         } else {
-                            SRV_WRN("%s", "--spec-numa-quarters: failed to create primary threadpool; disabling\n");
+                            destroy_numa_aux();
+                            numa_quarters_active = 1;
                         }
                     }
                 }
