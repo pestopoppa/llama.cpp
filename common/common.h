@@ -307,6 +307,13 @@ struct common_params_speculative {
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
 
+    // NUMA-parallel candidate verify (Phase 1.1 of slot-promotion handoff)
+    // K=1 disables (single context, current default). K>1 spawns K target llama_context
+    // instances at server load, each pinned to one NUMA quarter via attached threadpool.
+    // Each spec-dec round dispatches K candidate paths from the heap-spec tree to the K
+    // contexts in parallel; longest-accepted-prefix wins.
+    int32_t numa_quarters = 1;
+
     // ngram-based speculative decoding
 
     uint16_t ngram_size_n   = 12; // ngram size for lookup

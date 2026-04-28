@@ -693,6 +693,18 @@ private:
 
     llama_model_ptr model_dft;
 
+    // NUMA-parallel candidate verify (Phase 1.1):
+    //   numa_ctxs[0..K-1]: K target llama_context instances, each pinned to one NUMA quarter.
+    //   numa_threadpools[0..K-1]: corresponding threadpools with quarter-restricted cpumask.
+    //   numa_threadpools_batch[0..K-1]: optional batch threadpools.
+    //   numa_quarters_active = K when --spec-numa-quarters K (K>=2); 1 disables (single-ctx path).
+    //   The dispatcher (next phase) splits the heap-spec tree's K paths across these contexts
+    //   in parallel; longest-accepted-prefix wins and is promoted via seq_cp from winning ctx.
+    int32_t numa_quarters_active = 1;
+    std::vector<llama_context *> numa_ctxs;
+    std::vector<ggml_threadpool *> numa_threadpools;
+    std::vector<ggml_threadpool *> numa_threadpools_batch;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -718,7 +730,32 @@ private:
 
     bool sleeping = false;
 
+    void destroy_numa_aux() {
+        // Free auxiliary NUMA contexts (skip index 0 — that's the primary ctx, freed by llama_init).
+        for (size_t q = 1; q < numa_ctxs.size(); q++) {
+            if (numa_ctxs[q]) llama_free(numa_ctxs[q]);
+        }
+        numa_ctxs.clear();
+
+        if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+            auto * tp_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+            if (tp_free_fn) {
+                for (auto * tp : numa_threadpools) {
+                    if (tp) tp_free_fn(tp);
+                }
+                for (auto * tp : numa_threadpools_batch) {
+                    if (tp) tp_free_fn(tp);
+                }
+            }
+        }
+        numa_threadpools.clear();
+        numa_threadpools_batch.clear();
+    }
+
     void destroy() {
+        destroy_numa_aux();
+
         llama_init.reset();
 
         ctx = nullptr;
@@ -891,6 +928,89 @@ private:
         }
 
         slots.clear();
+
+        // NUMA-parallel candidate verify (Phase 1.1) — initialize K-1 auxiliary target
+        // contexts pinned to NUMA quarters 1..K-1. The primary ctx (already loaded) handles
+        // quarter 0 by default. Dispatcher (forthcoming) splits heap-spec tree paths.
+        // K=1 leaves the single-context path intact; K>=2 allocates extras.
+        // Detection of NUMA quarter cpumasks: divide [0..n_threads) evenly across K quarters.
+        {
+            const int K = params_base.speculative.numa_quarters;
+            if (K > 1) {
+                const int n_threads_total = params_base.cpuparams.n_threads > 0
+                    ? params_base.cpuparams.n_threads
+                    : (int) std::thread::hardware_concurrency();
+                if (n_threads_total < K) {
+                    SRV_WRN("--spec-numa-quarters=%d but only %d threads available; disabling\n", K, n_threads_total);
+                } else {
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    auto * cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+                    auto * tp_new_fn = cpu_reg ?
+                        (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new") : nullptr;
+
+                    if (!tp_new_fn) {
+                        SRV_WRN("%s", "--spec-numa-quarters: ggml_threadpool_new not available; disabling\n");
+                    } else {
+                        const int per_quarter = n_threads_total / K;
+                        SRV_INF("Phase 1.1 NUMA-parallel verify: K=%d quarters, %d threads/quarter\n", K, per_quarter);
+
+                        // Quarter 0 → primary ctx; build & attach its threadpool here too.
+                        // Quarters 1..K-1 → new auxiliary contexts.
+                        numa_ctxs.assign(K, nullptr);
+                        numa_threadpools.assign(K, nullptr);
+                        numa_threadpools_batch.assign(K, nullptr);
+                        numa_ctxs[0] = ctx;
+
+                        bool all_ok = true;
+                        for (int q = 0; q < K; q++) {
+                            cpu_params cp = params_base.cpuparams;
+                            cp.n_threads  = per_quarter;
+                            cp.mask_valid = true;
+                            for (int b = 0; b < GGML_MAX_N_THREADS; b++) {
+                                cp.cpumask[b] = (b >= q * per_quarter && b < (q + 1) * per_quarter);
+                            }
+
+                            ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(cp);
+                            ggml_threadpool * tp = tp_new_fn(&tpp);
+                            if (!tp) {
+                                SRV_WRN("--spec-numa-quarters: failed to create threadpool for quarter %d; disabling\n", q);
+                                all_ok = false;
+                                break;
+                            }
+                            numa_threadpools[q] = tp;
+
+                            if (q > 0) {
+                                // Auxiliary context shares the model; gets its own KV cache.
+                                llama_context_params cparams = common_context_params_to_llama(params_base);
+                                llama_context * cq = llama_init_from_model(model, cparams);
+                                if (!cq) {
+                                    SRV_WRN("--spec-numa-quarters: failed to init auxiliary context for quarter %d; disabling\n", q);
+                                    all_ok = false;
+                                    break;
+                                }
+                                numa_ctxs[q] = cq;
+                                llama_attach_threadpool(cq, tp, nullptr);
+                                SRV_INF("Phase 1.1: auxiliary ctx %d created, pinned to threads [%d, %d)\n",
+                                        q, q * per_quarter, (q + 1) * per_quarter);
+                            } else {
+                                llama_attach_threadpool(ctx, tp, nullptr);
+                                SRV_INF("Phase 1.1: primary ctx pinned to threads [0, %d)\n", per_quarter);
+                            }
+                        }
+
+                        if (all_ok) {
+                            numa_quarters_active = K;
+                            SRV_WRN("Phase 1.1 foundation active: %d NUMA-pinned target contexts. "
+                                    "Dispatcher not yet wired — secondary contexts idle until next phase.\n", K);
+                        } else {
+                            // Roll back: free anything allocated and revert to single-ctx.
+                            destroy_numa_aux();
+                            numa_quarters_active = 1;
+                        }
+                    }
+                }
+            }
+        }
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
