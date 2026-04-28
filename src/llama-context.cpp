@@ -166,6 +166,8 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.kv_hadamard = params.kv_hadamard;
     cparams.moe_n_expert_override = params.moe_n_expert_override;
+    cparams.moe_spec_budget = params.moe_spec_budget;
+    cparams.moe_spec_min_batch = params.moe_spec_min_batch > 0 ? params.moe_spec_min_batch : 4;
     cparams.n_layer_exit = params.n_layer_exit;
 
     // initialized later
@@ -2915,6 +2917,8 @@ llama_context_params llama_context_default_params() {
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.moe_n_expert_override       =*/ 0,
+        /*.moe_spec_budget             =*/ 0,
+        /*.moe_spec_min_batch          =*/ 4,
         /*.n_layer_exit                =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
