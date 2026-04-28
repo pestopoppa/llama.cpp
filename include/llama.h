@@ -356,6 +356,12 @@ extern "C" {
         // Used for MoE self-draft speculation: draft context uses n=1, verify uses full
         int32_t  moe_n_expert_override;
 
+        // MoE-Spec budget (arXiv:2602.16052) — top-B aggregate-routing-score
+        // expert shortlist applied per-batch before per-token argsort_top_k.
+        // 0 = off (default); 1..n_expert-1 = budget. Fires when n_tokens >= moe_spec_min_batch.
+        int32_t  moe_spec_budget;
+        int32_t  moe_spec_min_batch;  // default 4
+
         // TIDE early exit: 0 = all layers, N = exit after N layers
         int32_t  n_layer_exit;
 

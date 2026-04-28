@@ -45,6 +45,12 @@ struct llama_cparams {
     // 0 = use model default, 1+ = force exactly N active experts
     int32_t moe_n_expert_override;
 
+    // MoE-Spec budget (arXiv:2602.16052) for spec-dec verification batches:
+    // top-B aggregate-routing-score expert shortlist, applied per-batch before per-token argsort_top_k.
+    // 0 = off (default); 1..n_expert-1 = budget. Fires only when n_tokens >= moe_spec_min_batch.
+    int32_t moe_spec_budget;
+    int32_t moe_spec_min_batch;  // default 4; minimum batch size to trigger budgeting
+
     // TIDE early exit: number of layers to compute (0 = all layers)
     // When > 0 and < n_layer, the model exits early after this many layers.
     // Used by TIDE router for per-token adaptive layer exit.
