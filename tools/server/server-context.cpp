@@ -16,11 +16,13 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <thread>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -40,45 +42,139 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // Copies seq state (KV cache + recurrent state for hybrid models) from src ctx to dst
 // ctx for a given seq_id. Uses llama_state_seq_get/set_data_ext with PARTIAL_ONLY flag
 // to match the existing checkpoint pattern (server_get_checkpoint).
-// Returns true on success. Caller is responsible for ensuring the seq_id space on dst
-// ctx is clean (call llama_memory_seq_rm beforehand if needed).
-static bool numa_state_sync(llama_context * src, llama_context * dst, int seq_id) {
-    if (src == dst) return true;
+// When sync_us_out is non-null, returns the wall-clock duration of the get+set memcpy
+// pair (excluding the dst seq_rm). The reused thread_local buffer means the first call
+// per thread pays an allocation; subsequent calls reuse the buffer.
+// Returns true on success.
+static bool numa_state_sync(llama_context * src, llama_context * dst, int seq_id, int64_t * sync_us_out = nullptr, size_t * bytes_out = nullptr) {
+    if (src == dst) {
+        if (sync_us_out) *sync_us_out = 0;
+        if (bytes_out) *bytes_out = 0;
+        return true;
+    }
     const size_t sz = llama_state_seq_get_size_ext(src, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    if (sz == 0) return true;  // empty source seq — nothing to copy
+    if (bytes_out) *bytes_out = sz;
+    if (sz == 0) {
+        if (sync_us_out) *sync_us_out = 0;
+        return true;  // empty source seq — nothing to copy
+    }
     static thread_local std::vector<uint8_t> buf;  // reused across calls
     buf.resize(sz);
+    const int64_t t_get0 = ggml_time_us();
     const size_t got = llama_state_seq_get_data_ext(src, buf.data(), sz, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const int64_t t_get1 = ggml_time_us();
     if (got != sz) {
         SRV_WRN("numa_state_sync: get_data_ext returned %zu, expected %zu\n", got, sz);
         return false;
     }
     // Clear dst seq before set, otherwise set_data_ext may fail due to existing state.
     llama_memory_seq_rm(llama_get_memory(dst), seq_id, -1, -1);
+    const int64_t t_set0 = ggml_time_us();
     const size_t set_n = llama_state_seq_set_data_ext(dst, buf.data(), sz, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const int64_t t_set1 = ggml_time_us();
     if (set_n != sz) {
         SRV_WRN("numa_state_sync: set_data_ext consumed %zu, expected %zu\n", set_n, sz);
         return false;
     }
+    if (sync_us_out) *sync_us_out = (t_get1 - t_get0) + (t_set1 - t_set0);
     return true;
 }
 
-// Phase 1.1 dispatcher v0 (PASS-THROUGH): K-parallel verify is wired but not yet
-// parallelized. Currently calls common_sampler_sample_and_accept_n on the primary
-// ctx, identical to the K=1 path. The dispatcher integration point is now in place
-// and aux ctxs are reachable via numa_ctxs[]; the actual parallelism is the next
-// progressive enhancement (build K path-batches → std::thread over llama_decode
-// on K ctxs → reduce by longest accept → sync winner state to primary).
+// Phase 1.1 dispatcher v1 — K-parallel candidate verify reducer.
+//
+// Caller has ALREADY arranged for:
+//   - numa_ctxs[0] (primary) to have decoded the shared batch including
+//     [sampled, slot.spec_draft...] at positions [pos0, pos0+1, ...].
+//   - numa_ctxs[k] (aux, 1..K-1) to have decoded [sampled, alt_paths[k-1]...]
+//     at the same positions, having first synced state from primary.
+//   - aux_decode_ok[k-1] indicates whether aux ctx k's decode succeeded.
+//   - alt_paths[k-1] is the draft sequence that aux ctx k verified.
+//
+// This function:
+//   1. Runs common_sampler_sample_and_accept_n on each ctx (primary uses
+//      slot.spec_i_batch into the shared batch; aux ctxs use [0..N] into
+//      their own per-ctx batch).
+//   2. Picks winner = longest accepted prefix; ties broken by lowest index.
+//   3. If winner != primary, syncs winner state → primary, replaces
+//      slot.spec_draft with winner's path, and moves winner's sampler clone
+//      into slot.smpl.
+//   4. Returns winner's accepted prefix.
+//
+// Falls back to pass-through (primary-only) when no aux is usable
+// (numa_quarters_active == 1, alt_paths empty, or all aux decodes failed).
+struct numa_verify_inputs {
+    const std::vector<llama_context *> * numa_ctxs;
+    int                                  K;            // active K (1..numa_ctxs->size())
+    const std::vector<llama_tokens>    * alt_paths;    // size K-1 (or fewer)
+    const std::vector<int>             * aux_decode_ok;// size K-1
+};
+
+// Forward declaration; full implementation is below the server_slot definition.
+struct server_slot;
 static llama_tokens dispatch_numa_parallel_verify(
-        struct common_sampler * smpl,
-        const std::vector<llama_context *> & numa_ctxs,
-        int seq_id,
-        const std::vector<int32_t> & i_batch,
-        const llama_tokens & spec_draft) {
-    GGML_UNUSED(seq_id);
-    GGML_ASSERT(!numa_ctxs.empty());
-    // v0 pass-through — primary ctx is at index 0
-    return common_sampler_sample_and_accept_n(smpl, numa_ctxs[0], i_batch, spec_draft);
+        server_slot & slot,
+        const numa_verify_inputs & in);
+
+// Phase 1.1 — pick up to K-1 alternative paths from the speculation tree (in
+// addition to the greedy path that is already in slot.spec_draft). Returns
+// each alt path as a flat token sequence (NOT including id_last / sampled).
+//
+// We rank paths by their leaf log_prob (descending), exclude any path whose
+// token sequence matches greedy_tokens, and take the top K-1.  Each path is
+// truncated to n_max_per_path tokens.  Returns an empty vector when:
+//   - the spec impl is not tree-based (no tree exposed),
+//   - the tree has only one leaf (no branching → no alternatives),
+//   - K <= 1.
+static std::vector<llama_tokens> numa_select_top_k_alt_paths(
+        const common_speculative * spec,
+        const llama_tokens & greedy_tokens,
+        int K,
+        int n_max_per_path) {
+    std::vector<llama_tokens> result;
+    if (K <= 1 || spec == nullptr) return result;
+
+    const speculation_tree * tree = common_speculative_get_tree(spec);
+    if (tree == nullptr || tree->n_nodes == 0) return result;
+
+    auto paths_idx = tree->get_paths();   // each path = list of node indices, root → leaf
+    if (paths_idx.size() <= 1) return result;  // only one leaf → no alts
+
+    struct path_score {
+        int leaf_idx;     // index into paths_idx
+        float leaf_log_p;
+    };
+    std::vector<path_score> scores;
+    scores.reserve(paths_idx.size());
+    for (size_t i = 0; i < paths_idx.size(); i++) {
+        const auto & p = paths_idx[i];
+        if (p.empty()) continue;
+        scores.push_back({(int) i, tree->log_probs[p.back()]});
+    }
+
+    std::sort(scores.begin(), scores.end(),
+              [](const path_score & a, const path_score & b) {
+                  return a.leaf_log_p > b.leaf_log_p;
+              });
+
+    result.reserve((size_t) K - 1);
+    for (const auto & s : scores) {
+        if ((int) result.size() >= K - 1) break;
+
+        const auto & node_idxs = paths_idx[s.leaf_idx];
+        llama_tokens path_tokens;
+        path_tokens.reserve(node_idxs.size());
+        for (int32_t ni : node_idxs) {
+            path_tokens.push_back(tree->tokens[ni]);
+        }
+        if ((int) path_tokens.size() > n_max_per_path) {
+            path_tokens.resize(n_max_per_path);
+        }
+        // skip if identical to greedy
+        if (path_tokens == greedy_tokens) continue;
+        if (path_tokens.empty()) continue;
+        result.push_back(std::move(path_tokens));
+    }
+    return result;
 }
 
 static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
@@ -136,6 +232,17 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     server_prompt_checkpoint spec_ckpt;
     common_speculative_ptr spec;
+
+    // Phase 1.1 — K-parallel candidate verify. spec_draft holds path 0 (greedy /
+    // primary path). numa_alt_paths holds up to K-1 alternative paths from the
+    // speculation_tree, ranked by leaf log_prob descending. Each entry is a
+    // sequence of draft tokens (NOT including id_last). Empty when K=1, when
+    // the impl doesn't expose a tree (ngram drafters), or when only one leaf
+    // exists. spec_pos0 is the llama_pos of `sampled` (the just-accepted token
+    // that begins this verify round) — used by the aux-batch builder to place
+    // tokens at the same positions as the shared batch's primary path.
+    std::vector<llama_tokens> numa_alt_paths;
+    llama_pos                 spec_pos0 = -1;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -261,6 +368,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            numa_alt_paths.clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -390,7 +498,7 @@ struct server_slot {
         return n_draft_max;
     }
 
-    void update_batch(llama_batch & batch) {
+    void update_batch(llama_batch & batch, int numa_quarters_active = 1) {
         const int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0) {
             GGML_ASSERT(can_speculate());
@@ -409,6 +517,7 @@ struct server_slot {
                 }
             } else {
                 GGML_ASSERT(spec_i_batch.empty());
+                GGML_ASSERT(numa_alt_paths.empty());
 
                 // generate a new draft
                 spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
@@ -430,6 +539,14 @@ struct server_slot {
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                }
+
+                // Phase 1.1 — populate alt paths for K-parallel verify.
+                if (!spec_draft.empty() && numa_quarters_active > 1) {
+                    numa_alt_paths = numa_select_top_k_alt_paths(
+                            spec.get(), spec_draft, numa_quarters_active, n_draft_max);
+                    SLT_DBG(*this, "numa_select_top_k_alt_paths: K=%d, greedy=%zu tokens, alt=%zu paths\n",
+                            numa_quarters_active, spec_draft.size(), numa_alt_paths.size());
                 }
             }
 
@@ -456,6 +573,7 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+            spec_pos0 = (llama_pos) pos0;  // remember for aux-batch builder
 
             common_batch_add(batch, sampled, pos0++, { this->id }, true);
             for (auto token : spec_draft) {
@@ -623,6 +741,102 @@ struct server_slot {
     }
 };
 
+// Phase 1.1 dispatcher v1 implementation (forward-declared at top of file,
+// after server_slot definition so we can access slot members).
+static llama_tokens dispatch_numa_parallel_verify(
+        server_slot & slot,
+        const numa_verify_inputs & in) {
+    const auto & numa_ctxs    = *in.numa_ctxs;
+    const auto & alt_paths    = *in.alt_paths;
+    const auto & aux_decode_ok= *in.aux_decode_ok;
+
+    GGML_ASSERT(!numa_ctxs.empty());
+
+    const int K = std::min<int>({ in.K, (int) numa_ctxs.size(), 1 + (int) alt_paths.size() });
+
+    // Fast path: no aux usable → primary-only sample-and-accept (the original
+    // single-ctx behavior; identical to the K=1 path).
+    bool any_aux_ok = false;
+    for (int k = 0; k < K - 1; k++) if (aux_decode_ok[k]) { any_aux_ok = true; break; }
+    if (K <= 1 || alt_paths.empty() || !any_aux_ok) {
+        return common_sampler_sample_and_accept_n(slot.smpl.get(), numa_ctxs[0], slot.spec_i_batch, slot.spec_draft);
+    }
+
+    // Per-ctx sample-and-accept. Each ctx gets its own sampler clone since
+    // common_sampler_accept mutates state.
+    struct ctx_result {
+        int               ctx_idx;     // 0 = primary, 1..K-1 = aux
+        llama_tokens      accepted;
+        common_sampler  * smpl;        // owned; freed below if not winner
+        const llama_tokens * draft;    // pointer into spec_draft / alt_paths
+    };
+    std::vector<ctx_result> results;
+    results.reserve(K);
+
+    // Primary ctx. Uses slot.spec_i_batch (indices into shared batch).
+    {
+        common_sampler * primary_smpl = common_sampler_clone(slot.smpl.get());
+        auto acc = common_sampler_sample_and_accept_n(
+                primary_smpl, numa_ctxs[0], slot.spec_i_batch, slot.spec_draft);
+        results.push_back({0, std::move(acc), primary_smpl, &slot.spec_draft});
+    }
+
+    // Aux ctxs. Each aux batch has its alt path at positions [0..N]. The
+    // sample-and-accept idxs are [0, 1, 2, ..., alt.size()].
+    for (int k = 1; k < K; k++) {
+        if (!aux_decode_ok[k - 1]) continue;
+        const auto & alt = alt_paths[k - 1];
+        std::vector<int> idxs(alt.size() + 1);
+        for (size_t i = 0; i < idxs.size(); i++) idxs[i] = (int) i;
+
+        common_sampler * aux_smpl = common_sampler_clone(slot.smpl.get());
+        auto acc = common_sampler_sample_and_accept_n(
+                aux_smpl, numa_ctxs[k], idxs, alt);
+        results.push_back({k, std::move(acc), aux_smpl, &alt});
+    }
+
+    // Pick winner = longest accepted prefix; ties → lowest ctx index.
+    int winner_i = 0;
+    for (size_t i = 1; i < results.size(); i++) {
+        if (results[i].accepted.size() > results[winner_i].accepted.size()) {
+            winner_i = (int) i;
+        }
+    }
+    auto & winner = results[winner_i];
+
+    SLT_DBG(slot, "numa K-parallel verify: K=%d, winner_ctx=%d, accepted=%zu (greedy=%zu)\n",
+            K, winner.ctx_idx, winner.accepted.size(), results[0].accepted.size());
+
+    // If winner is an aux ctx, we must:
+    //   (a) sync winner state → primary so the slot's primary KV reflects the
+    //       winning path,
+    //   (b) replace slot.smpl with winner's sampler clone,
+    //   (c) replace slot.spec_draft with winner's path so the upstream partial-
+    //       acceptance check uses the right reference.
+    if (winner.ctx_idx != 0) {
+        int64_t sync_us = 0;
+        size_t sync_bytes = 0;
+        const bool ok = numa_state_sync(numa_ctxs[winner.ctx_idx], numa_ctxs[0], slot.id, &sync_us, &sync_bytes);
+        if (!ok) {
+            SLT_WRN(slot, "numa: winner-state sync failed (winner_ctx=%d → primary)\n", winner.ctx_idx);
+        }
+        slot.smpl.reset(winner.smpl);
+        winner.smpl = nullptr;
+        slot.spec_draft = *winner.draft;  // replace greedy with winner's path
+    } else {
+        // Primary won — replace slot.smpl with our primary clone (the original
+        // slot.smpl is unchanged in state since we cloned before sample-and-accept).
+        slot.smpl.reset(winner.smpl);
+        winner.smpl = nullptr;
+    }
+
+    // Free non-winner sampler clones.
+    for (auto & r : results) {
+        if (r.smpl != nullptr) common_sampler_free(r.smpl);
+    }
+
+    return std::move(winner.accepted);
+}
 
 
 //
@@ -2431,7 +2645,7 @@ private:
                 continue;
             }
 
-            slot.update_batch(batch);
+            slot.update_batch(batch, numa_quarters_active);
         }
 
         // process in chunks of params.n_batch
@@ -2971,6 +3185,98 @@ private:
 
         int32_t i_next = 0;
 
+        // Phase 1.1 — K-parallel aux decode dispatch.
+        //
+        // We pick ONE spec-dec slot in this batch with non-empty numa_alt_paths
+        // and decode its K-1 alternative paths on aux ctxs in parallel with the
+        // primary's decode. Multiple concurrent spec-dec slots are not yet
+        // supported in K-parallel mode (the others fall back to single-ctx
+        // verify; their alt paths go unused this round).
+        //
+        // Each aux thread:
+        //   1. syncs primary→aux state for slot.id (per-round delta sync; first
+        //      round cost amortizes against the one-shot sync done at
+        //      SLOT_STATE_GENERATING transition).
+        //   2. calls llama_decode(aux_ctx, alt_path_batch).
+        //
+        // After the primary decode chunk loop, we join aux threads. Per-ctx
+        // sample-and-accept then runs in dispatch_numa_parallel_verify.
+        server_slot * numa_active_slot = nullptr;
+        std::vector<llama_batch> numa_aux_batches;
+        std::vector<int>         numa_aux_decode_ok;  // 1 = ok, 0 = failed/skipped
+        std::vector<std::thread> numa_aux_threads;
+        if (numa_quarters_active > 1 && numa_ctxs.size() > 1 && batch.n_tokens > 0) {
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING) continue;
+                if (!slot.can_speculate())               continue;
+                if (slot.spec_draft.empty())             continue;
+                if (slot.numa_alt_paths.empty())         continue;
+                if (slot.spec_pos0 < 0)                  continue;
+                if (slot.ctx != numa_ctxs[0])            continue;  // safety: slot bound to primary
+
+                numa_active_slot = &slot;
+                break;
+            }
+        }
+        if (numa_active_slot != nullptr) {
+            const int K = std::min<int>({ numa_quarters_active,
+                                          (int) numa_ctxs.size(),
+                                          1 + (int) numa_active_slot->numa_alt_paths.size() });
+
+            numa_aux_batches.resize(K - 1);
+            numa_aux_decode_ok.assign(K - 1, 0);
+            numa_aux_threads.reserve(K - 1);
+
+            for (int k = 1; k < K; k++) {
+                const auto & alt = numa_active_slot->numa_alt_paths[k - 1];
+                const int n_tokens_alt = 1 + (int) alt.size();  // sampled + alt path
+                numa_aux_batches[k - 1] = llama_batch_init(n_tokens_alt, 0, 1);
+                llama_batch & b = numa_aux_batches[k - 1];
+                common_batch_add(b, numa_active_slot->sampled, numa_active_slot->spec_pos0, { numa_active_slot->id }, true);
+                llama_pos pos = numa_active_slot->spec_pos0 + 1;
+                for (auto tok : alt) {
+                    common_batch_add(b, tok, pos++, { numa_active_slot->id }, true);
+                }
+            }
+
+            // Per-round state sync runs SEQUENTIALLY on the main thread BEFORE
+            // primary decode begins. We cannot read primary's seq state from
+            // an aux thread while primary is concurrently decoding (would race
+            // on KV-cache mutation; manifests as find_slot non-consecutive
+            // position warnings + n_batch halving + huge slowdown). Cost is
+            // ~5.8 ms per aux ctx on Q8 hybrid (≈17 ms for K=4), absorbed once
+            // per round. Aux decodes still run in parallel with primary decode.
+            int64_t total_sync_us = 0;
+            int sync_failed = 0;
+            for (int k = 1; k < K; k++) {
+                int64_t sync_us = 0;
+                size_t sync_bytes = 0;
+                const bool synced = numa_state_sync(numa_ctxs[0], numa_ctxs[k], numa_active_slot->id, &sync_us, &sync_bytes);
+                if (!synced) {
+                    SRV_WRN("numa: per-round sync primary→aux[%d] FAILED — skipping aux decode\n", k);
+                    sync_failed++;
+                    continue;
+                }
+                total_sync_us += sync_us;
+                numa_aux_decode_ok[k - 1] = 1;  // mark sync-ok; decode result will overwrite below
+            }
+            SLT_DBG(*numa_active_slot, "numa per-round sync: K=%d, %.2f ms, sync_failed=%d\n",
+                    K, (double) total_sync_us / 1000.0, sync_failed);
+
+            for (int k = 1; k < K; k++) {
+                if (!numa_aux_decode_ok[k - 1]) continue;  // sync failed → no decode
+                numa_aux_threads.emplace_back([this, k, &numa_aux_batches, &numa_aux_decode_ok]() {
+                    const int ret = llama_decode(numa_ctxs[k], numa_aux_batches[k - 1]);
+                    if (ret != 0) {
+                        SRV_WRN("numa aux thread k=%d: llama_decode returned %d — aux ctx unusable this round\n", k, ret);
+                        numa_aux_decode_ok[k - 1] = 0;
+                        return;
+                    }
+                    // numa_aux_decode_ok[k - 1] stays 1 from the sync-ok mark.
+                });
+            }
+        }
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3103,6 +3409,32 @@ private:
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
                     }
+
+                    // Phase 1.1 — one-shot state sync from primary ctx to K-1 aux ctxs at
+                    // the prompt→generate transition. The primary ctx has just decoded the
+                    // prompt; aux ctxs need the same KV (+ recurrent state on hybrid models)
+                    // before the first speculative-verify round so all K ctxs start from the
+                    // same starting point. Subsequent rounds may need delta sync; for now we
+                    // only do this once per request.
+                    if (numa_quarters_active > 1 && numa_ctxs.size() > 1 && slot.ctx == numa_ctxs[0]) {
+                        int64_t total_us = 0;
+                        size_t total_bytes = 0;
+                        for (size_t k = 1; k < numa_ctxs.size(); k++) {
+                            int64_t us = 0;
+                            size_t bytes = 0;
+                            const bool ok = numa_state_sync(numa_ctxs[0], numa_ctxs[k], slot.id, &us, &bytes);
+                            if (!ok) {
+                                SLT_WRN(slot, "numa_state_sync(primary→aux[%zu]) FAILED at SLOT_STATE_GENERATING transition\n", k);
+                            }
+                            total_us += us;
+                            if (bytes > total_bytes) total_bytes = bytes;
+                        }
+                        SLT_INF(slot, "numa one-shot state sync: K=%d, %.2f MiB/ctx, total %.2f ms across %d aux ctxs\n",
+                                numa_quarters_active,
+                                (double) total_bytes / (1024.0 * 1024.0),
+                                (double) total_us / 1000.0,
+                                (int) (numa_ctxs.size() - 1));
+                    }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
                 }
@@ -3199,6 +3531,13 @@ private:
                 }
             }
 
+            // Phase 1.1 — wait for K-parallel aux decode threads spawned earlier
+            // in this run_slots call. Aux threads ran in parallel with the
+            // primary's decode chunk loop; by now they should be largely done.
+            for (auto & t : numa_aux_threads) {
+                if (t.joinable()) t.join();
+            }
+
             // speculative decoding - main model sample and accept
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
@@ -3215,9 +3554,20 @@ private:
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = numa_quarters_active > 1
-                        ? dispatch_numa_parallel_verify(slot.smpl.get(), numa_ctxs, slot.id, slot.spec_i_batch, slot.spec_draft)
-                        : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    llama_tokens accepted;
+                    if (numa_quarters_active > 1 && &slot == numa_active_slot) {
+                        numa_verify_inputs vin;
+                        vin.numa_ctxs     = &numa_ctxs;
+                        vin.K             = std::min<int>({ numa_quarters_active,
+                                                            (int) numa_ctxs.size(),
+                                                            1 + (int) slot.numa_alt_paths.size() });
+                        vin.alt_paths     = &slot.numa_alt_paths;
+                        vin.aux_decode_ok = &numa_aux_decode_ok;
+                        accepted = dispatch_numa_parallel_verify(slot, vin);
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(
+                                slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    }
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
@@ -3298,6 +3648,17 @@ private:
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
+        }
+
+        // Phase 1.1 — free K-parallel aux batches allocated this round.
+        for (auto & b : numa_aux_batches) {
+            llama_batch_free(b);
+        }
+
+        // Active slot's alt paths are consumed (or not) by this round; clear so
+        // the next round re-populates from the fresh tree.
+        if (numa_active_slot != nullptr) {
+            numa_active_slot->numa_alt_paths.clear();
         }
 
         SRV_DBG("%s", "run slots completed\n");
