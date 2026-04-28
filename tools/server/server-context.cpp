@@ -929,86 +929,25 @@ private:
 
         slots.clear();
 
-        // NUMA-parallel candidate verify (Phase 1.1) — initialize K-1 auxiliary target
-        // contexts pinned to NUMA quarters 1..K-1. The primary ctx (already loaded) handles
-        // quarter 0 by default. Dispatcher (forthcoming) splits heap-spec tree paths.
-        // K=1 leaves the single-context path intact; K>=2 allocates extras.
-        // Detection of NUMA quarter cpumasks: divide [0..n_threads) evenly across K quarters.
+        // NUMA-parallel candidate verify (Phase 1.1) — foundation v3 (CLI surface only).
+        // Earlier v1/v2 attempts to (a) create K aux contexts or (b) attach a quarter-pinned
+        // threadpool to the primary ctx CRASHED on Qwen3.6-35B-A3B Q8 (hybrid Delta Net):
+        // multiple "warn: failed to set affinity mask : Invalid argument (22)" from threadpool
+        // workers, then segfault during slot init. Same code worked fine on Qwen2.5-0.5B
+        // (dense, non-hybrid). Root cause appears to be an interaction between the spawned
+        // threadpool's sched_setaffinity calls and the recurrent-state allocation path on
+        // hybrid Delta Net models — needs deeper investigation in the dispatcher session.
+        //
+        // For now: K>=2 is parsed but takes NO effect — K-context creation, threadpool
+        // attachment, and parallel dispatcher all deferred to next session. K=1 default
+        // path is unchanged. CLI surface preserved so registry/launcher configs can stage.
         {
             const int K = params_base.speculative.numa_quarters;
             if (K > 1) {
-                const int n_threads_total = params_base.cpuparams.n_threads > 0
-                    ? params_base.cpuparams.n_threads
-                    : (int) std::thread::hardware_concurrency();
-                if (n_threads_total < K) {
-                    SRV_WRN("--spec-numa-quarters=%d but only %d threads available; disabling\n", K, n_threads_total);
-                } else {
-                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                    auto * cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
-                    auto * tp_new_fn = cpu_reg ?
-                        (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new") : nullptr;
-
-                    if (!tp_new_fn) {
-                        SRV_WRN("%s", "--spec-numa-quarters: ggml_threadpool_new not available; disabling\n");
-                    } else {
-                        const int per_quarter = n_threads_total / K;
-                        SRV_INF("Phase 1.1 NUMA-parallel verify: K=%d quarters, %d threads/quarter\n", K, per_quarter);
-
-                        // Quarter 0 → primary ctx; build & attach its threadpool here too.
-                        // Quarters 1..K-1 → new auxiliary contexts.
-                        numa_ctxs.assign(K, nullptr);
-                        numa_threadpools.assign(K, nullptr);
-                        numa_threadpools_batch.assign(K, nullptr);
-                        numa_ctxs[0] = ctx;
-
-                        bool all_ok = true;
-                        for (int q = 0; q < K; q++) {
-                            cpu_params cp = params_base.cpuparams;
-                            cp.n_threads  = per_quarter;
-                            cp.mask_valid = true;
-                            for (int b = 0; b < GGML_MAX_N_THREADS; b++) {
-                                cp.cpumask[b] = (b >= q * per_quarter && b < (q + 1) * per_quarter);
-                            }
-
-                            ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(cp);
-                            ggml_threadpool * tp = tp_new_fn(&tpp);
-                            if (!tp) {
-                                SRV_WRN("--spec-numa-quarters: failed to create threadpool for quarter %d; disabling\n", q);
-                                all_ok = false;
-                                break;
-                            }
-                            numa_threadpools[q] = tp;
-
-                            if (q > 0) {
-                                // Auxiliary context shares the model; gets its own KV cache.
-                                llama_context_params cparams = common_context_params_to_llama(params_base);
-                                llama_context * cq = llama_init_from_model(model, cparams);
-                                if (!cq) {
-                                    SRV_WRN("--spec-numa-quarters: failed to init auxiliary context for quarter %d; disabling\n", q);
-                                    all_ok = false;
-                                    break;
-                                }
-                                numa_ctxs[q] = cq;
-                                llama_attach_threadpool(cq, tp, nullptr);
-                                SRV_INF("Phase 1.1: auxiliary ctx %d created, pinned to threads [%d, %d)\n",
-                                        q, q * per_quarter, (q + 1) * per_quarter);
-                            } else {
-                                llama_attach_threadpool(ctx, tp, nullptr);
-                                SRV_INF("Phase 1.1: primary ctx pinned to threads [0, %d)\n", per_quarter);
-                            }
-                        }
-
-                        if (all_ok) {
-                            numa_quarters_active = K;
-                            SRV_WRN("Phase 1.1 foundation active: %d NUMA-pinned target contexts. "
-                                    "Dispatcher not yet wired — secondary contexts idle until next phase.\n", K);
-                        } else {
-                            // Roll back: free anything allocated and revert to single-ctx.
-                            destroy_numa_aux();
-                            numa_quarters_active = 1;
-                        }
-                    }
-                }
+                SRV_WRN("--spec-numa-quarters=%d parsed but inactive: foundation v2 (threadpool "
+                        "attach to primary ctx) crashes on hybrid Delta Net models. K>=2 path "
+                        "deferred to next session pending investigation.\n", K);
+                numa_quarters_active = 1;
             }
         }
 
