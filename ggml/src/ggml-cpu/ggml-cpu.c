@@ -3727,57 +3727,126 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-#ifndef GGML_USE_OPENMP
-            // Phase 1.4: downgrade the between-op barrier to CCD-local when:
-            //   (a) current op is MUL_MAT/MUL_MAT_ID or a pointwise op — writes
-            //       under the axis-0 partition (thread i writes ne0 range
-            //       [i*ne0/nth, (i+1)*ne0/nth) — both in decode nrows=1 via
-            //       Phase 1.2 and in downstream ops via the axis-0 fallback).
-            //   (b) next op is pointwise (ADD, MUL, SCALE, UNARY) so it reads
-            //       only its own axis-0 range.
-            //   (c) GGML_CCD_WORK_DIST=1 so MUL_MAT uses static (not stealing)
-            //       partitioning.
+            // CPU4 Phase 1 (2026-04-29): op-coalesced barriers. Skip the
+            // between-op barrier when the next op does NOT read the current
+            // op's output, AND both ops are in the deterministic-axis-0-
+            // partition class (so threads agree on work distribution).
             //
-            // Perplexity-verified before shipping. Env gate:
-            // GGML_BARRIER_LOCAL_BETWEEN_OPS=1.
-            static int s_local_between = -1;
-            static int s_wd_on         = -1;
-            if (s_local_between < 0) {
-                const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
-                s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
+            // Phase 0 manual analysis on Qwen3 MoE (Coder-30B + REAP-246B):
+            // 24-29% per-token barrier-count reduction potential. Q/K/V
+            // projections all read normed input but write disjoint Qcur/
+            // Kcur/Vcur — Q→K→V chain coalesces from 3 inter-op barriers
+            // to 1. Q-norm/K-norm and RoPE-Q/RoPE-K similarly.
+            //
+            // Conservative rule:
+            //   (a) next op's src[] does NOT contain cur node (no
+            //       read-after-write dependency)
+            //   (b) cur op is in {MUL_MAT, MUL_MAT_ID, RMS_NORM, NORM,
+            //       ROPE, MUL, ADD, SCALE, UNARY, GLU} — deterministic
+            //       axis-0 partitioning
+            //   (c) next op is in the same set
+            //
+            // MUL_MAT's internal barrier at ggml_compute_forward_mul_mat
+            // (line 1487 area) is PRESERVED — provides per-MUL_MAT thread
+            // coordination, preventing optimistic threads from outpacing
+            // by multiple ops.
+            //
+            // Env gate: GGML_BARRIER_COALESCE=1 (default off). Bit-exact
+            // gate must pass on Coder-30B + REAP-246B Q4_K_M 32-chunk PPL.
+            static int s_barrier_coalesce = -1;
+            if (s_barrier_coalesce < 0) {
+                const char * env = getenv("GGML_BARRIER_COALESCE");
+                s_barrier_coalesce = (env && env[0] && env[0] != '0') ? 1 : 0;
             }
-            if (s_wd_on < 0) {
-                const char * env = getenv("GGML_CCD_WORK_DIST");
-                s_wd_on = (env && env[0] && env[0] != '0') ? 1 : 0;
-            }
-            if (s_local_between && s_wd_on) {
+
+            bool coalesce_next = false;
+            if (s_barrier_coalesce) {
                 enum ggml_op cur_op  = node->op;
-                enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
-                bool cur_partitioned = (cur_op == GGML_OP_MUL_MAT ||
-                                        cur_op == GGML_OP_MUL_MAT_ID ||
-                                        cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
-                                        cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
-                bool next_elementwise = (next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
-                                         next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
-                // Only safe when next op is decode-shape (nrows_dst==1). Check
-                // dst of NEXT op — if outer > 1, fall through to global.
-                if (cur_partitioned && next_elementwise) {
-                    const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
-                    const int64_t next_outer = (next_node->ne[1] * next_node->ne[2] * next_node->ne[3]);
-                    if (next_outer == 1 && next_node->ne[0] > params.nth) {
-                        ggml_barrier_local(state->threadpool);
+                const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
+                enum ggml_op next_op = next_node->op;
+
+                // Allowlist of ops with deterministic axis-0 work distribution
+                // AND no shared-wdata writes. MUL_MAT/MUL_MAT_ID are EXCLUDED
+                // because they quantize src1 → params->wdata (shared mutable
+                // buffer) before the internal barrier — coalescing would let
+                // op N+1 clobber wdata while op N's chunk-loop still reads it.
+                // Discovered via smoke test 2026-04-29: COALESCE=1 with
+                // MUL_MAT in the allowlist produced garbled output (wdata
+                // race), confirming the wdata-shared-buffer hazard.
+#define GGML_OP_COALESCE_OK(op) ( \
+    (op) == GGML_OP_RMS_NORM || (op) == GGML_OP_NORM || \
+    (op) == GGML_OP_ROPE || \
+    (op) == GGML_OP_MUL || (op) == GGML_OP_ADD || \
+    (op) == GGML_OP_SCALE || (op) == GGML_OP_UNARY || \
+    (op) == GGML_OP_GLU)
+
+                if (GGML_OP_COALESCE_OK(cur_op) && GGML_OP_COALESCE_OK(next_op)) {
+                    // Check that next op does not consume cur node as src.
+                    bool depends = false;
+                    for (int i = 0; i < GGML_MAX_SRC; i++) {
+                        if (next_node->src[i] == node) {
+                            depends = true;
+                            break;
+                        }
+                    }
+                    coalesce_next = !depends;
+                }
+#undef GGML_OP_COALESCE_OK
+            }
+
+            if (!coalesce_next) {
+#ifndef GGML_USE_OPENMP
+                // Phase 1.4: downgrade the between-op barrier to CCD-local when:
+                //   (a) current op is MUL_MAT/MUL_MAT_ID or a pointwise op — writes
+                //       under the axis-0 partition (thread i writes ne0 range
+                //       [i*ne0/nth, (i+1)*ne0/nth) — both in decode nrows=1 via
+                //       Phase 1.2 and in downstream ops via the axis-0 fallback).
+                //   (b) next op is pointwise (ADD, MUL, SCALE, UNARY) so it reads
+                //       only its own axis-0 range.
+                //   (c) GGML_CCD_WORK_DIST=1 so MUL_MAT uses static (not stealing)
+                //       partitioning.
+                //
+                // Perplexity-verified before shipping. Env gate:
+                // GGML_BARRIER_LOCAL_BETWEEN_OPS=1.
+                static int s_local_between = -1;
+                static int s_wd_on         = -1;
+                if (s_local_between < 0) {
+                    const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
+                    s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
+                }
+                if (s_wd_on < 0) {
+                    const char * env = getenv("GGML_CCD_WORK_DIST");
+                    s_wd_on = (env && env[0] && env[0] != '0') ? 1 : 0;
+                }
+                if (s_local_between && s_wd_on) {
+                    enum ggml_op cur_op  = node->op;
+                    enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
+                    bool cur_partitioned = (cur_op == GGML_OP_MUL_MAT ||
+                                            cur_op == GGML_OP_MUL_MAT_ID ||
+                                            cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
+                                            cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
+                    bool next_elementwise = (next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
+                                             next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
+                    // Only safe when next op is decode-shape (nrows_dst==1). Check
+                    // dst of NEXT op — if outer > 1, fall through to global.
+                    if (cur_partitioned && next_elementwise) {
+                        const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
+                        const int64_t next_outer = (next_node->ne[1] * next_node->ne[2] * next_node->ne[3]);
+                        if (next_outer == 1 && next_node->ne[0] > params.nth) {
+                            ggml_barrier_local(state->threadpool);
+                        } else {
+                            ggml_barrier(state->threadpool);
+                        }
                     } else {
                         ggml_barrier(state->threadpool);
                     }
                 } else {
                     ggml_barrier(state->threadpool);
                 }
-            } else {
-                ggml_barrier(state->threadpool);
-            }
 #else
-            ggml_barrier(state->threadpool);
+                ggml_barrier(state->threadpool);
 #endif
+            }
         }
     }
 
