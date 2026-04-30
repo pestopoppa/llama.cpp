@@ -27,26 +27,13 @@
 #  endif
 #endif
 
-// ---- Phase 1.4 (Lever A'): per-NUMA-node weight replication ----
-// Globals set by init_mappings when GGML_NUMA_REPLICATE=1.
-// Consumed by ggml_compute_forward_mul_mat (ggml-cpu.c) via the C-linkage
-// accessors below.
-#if defined(__linux__) && defined(LLAMA_LOADER_HAS_NUMAIF)
-#define LLAMA_NUMA_REPLICA_MAX 16
-static int        g_numa_replica_n = 0;
-static void *     g_numa_replica_bases[LLAMA_NUMA_REPLICA_MAX] = {nullptr};
-static void *     g_numa_replica_src_base = nullptr;   // the file mmap base we replicated from
-static size_t     g_numa_replica_size = 0;
-static ptrdiff_t  g_numa_replica_offsets[LLAMA_NUMA_REPLICA_MAX] = {0};
-
-extern "C" {
-    int        ggml_numa_replica_count_(void)            { return g_numa_replica_n; }
-    void *     ggml_numa_replica_src_base_(void)         { return g_numa_replica_src_base; }
-    size_t     ggml_numa_replica_size_(void)             { return g_numa_replica_size; }
-    ptrdiff_t  ggml_numa_replica_offset_for_(int idx)    { return (idx >= 0 && idx < g_numa_replica_n) ? g_numa_replica_offsets[idx] : 0; }
-}
-
-#endif
+// CPU1 Phase 1.4 / Lever A' (per-NUMA-node weight replication, env-gated by
+// GGML_NUMA_REPLICATE) was stripped in v5 cleanup audit 2026-04-30.
+// 4× memory blowup for marginal gain on a single-socket NPS4 host where
+// `numactl --interleave=all` already delivers ~92% of the achievable
+// bandwidth. See `epyc-inference-research/research/numa-weights-deep-dive.md`
+// for the decision rationale and git history pre-v5 for the original
+// implementation.
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1390,322 +1377,23 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         size_data += ggml_nbytes(it.second.tensor);
     }
 
-#if defined(__linux__) && defined(LLAMA_LOADER_HAS_NUMAIF)
-    // Phase 1.4 / Lever A' (CPU1): per-NUMA-node weight replication.
-    // Triggered by GGML_NUMA_REPLICATE=1. Allocates one anonymous region per
-    // NUMA node, mbind'd to that node, and memcpy's the file mapping into
-    // each replica. The Phase 1.2 work-distribution path in ggml-cpu.c then
-    // redirects src0 reads through the replica on the CCD's local node,
-    // eliminating the ~75% cross-node access rate that plain interleave
-    // pays on Infinity Fabric.
-    // CPU1 Lever A' GGML_NUMA_REPLICATE was stripped in v5 cleanup audit
-    // 2026-04-30 (NUMA_WEIGHTS family). 4× memory blowup for marginal gain
-    // alone; default `numactl --interleave=all` invocation prefix achieves
-    // equivalent placement without the replication overhead. The producer
-    // activation is force-disabled here; the implementation remains in tree
-    // for the purposes of this audit — a follow-up will fully delete it.
-    if (false /* GGML_NUMA_REPLICATE producer disabled */) {
-        const char * env_rep = std::getenv("GGML_NUMA_REPLICATE");
-        if (env_rep && *env_rep && env_rep[0] != '0') {
-            if (mappings.size() != 1) {
-                LLAMA_LOG_WARN("numa-replicate: only 1-mapping models supported; have %zu, skipping\n", mappings.size());
-            } else {
-                int n_nodes = 0;
-                if (DIR * d = opendir("/sys/devices/system/node")) {
-                    struct dirent * ent;
-                    while ((ent = readdir(d))) {
-                        if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
-                    }
-                    closedir(d);
-                }
-                if (n_nodes < 2) {
-                    LLAMA_LOG_INFO("numa-replicate: only %d node(s); skipping\n", n_nodes);
-                } else if (n_nodes > LLAMA_NUMA_REPLICA_MAX) {
-                    LLAMA_LOG_WARN("numa-replicate: %d nodes > max %d, skipping\n", n_nodes, LLAMA_NUMA_REPLICA_MAX);
-                } else {
-                    const size_t sz = mappings[0]->size();
-                    void * src = mappings[0]->addr();
-                    LLAMA_LOG_INFO("numa-replicate: allocating %d replicas of %zu MB each (%zu GB total)\n",
-                                   n_nodes, sz >> 20, ((size_t)n_nodes * sz) >> 30);
-                    bool ok = true;
-                    for (int n = 0; n < n_nodes; ++n) {
-                        void * p = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
-                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                        if (p == MAP_FAILED) {
-                            LLAMA_LOG_WARN("numa-replicate: mmap for node %d failed: %s\n", n, strerror(errno));
-                            ok = false; break;
-                        }
-                        // mbind this region to node n. Anonymous mmap's policy governs faults.
-                        const unsigned long maxnode = 64UL;
-                        unsigned long mask = (1UL << n);
-                        long rc = syscall(SYS_mbind, p, sz, MPOL_BIND, &mask, maxnode, 0);
-                        if (rc != 0) {
-                            LLAMA_LOG_WARN("numa-replicate: mbind node %d failed: %s\n", n, strerror(errno));
-                        }
-                        g_numa_replica_bases[n] = p;
-                    }
-                    if (ok) {
-                        // Copy from file mmap into each replica, in parallel. Each copy uses a
-                        // thread pinned to that node's CPUs so first-touch (for the destination
-                        // pages) happens on the intended node.
-                        struct cargs { void * dst; const void * src; size_t sz; int node; };
-                        std::vector<cargs> ca(n_nodes);
-                        std::vector<pthread_t> ctids(n_nodes);
-                        // Determine a CPU for each node (first cpu of the node). Read
-                        // /sys/devices/system/node/nodeN/cpulist for simplicity.
-                        std::vector<int> node_first_cpu(n_nodes, -1);
-                        for (int n = 0; n < n_nodes; ++n) {
-                            char path[128];
-                            snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", n);
-                            FILE * f = fopen(path, "r");
-                            if (f) {
-                                int v = 0;
-                                if (fscanf(f, "%d", &v) == 1) node_first_cpu[n] = v;
-                                fclose(f);
-                            }
-                        }
-                        auto cworker = +[](void * arg) -> void * {
-                            auto * a = (cargs *)arg;
-                            memcpy(a->dst, a->src, a->sz);
-                            return nullptr;
-                        };
-                        for (int n = 0; n < n_nodes; ++n) {
-                            ca[n] = cargs{ g_numa_replica_bases[n], src, sz, n };
-                            pthread_create(&ctids[n], nullptr, cworker, &ca[n]);
-                            // Pin the copy-thread to the node's first CPU.
-                            if (node_first_cpu[n] >= 0) {
-                                cpu_set_t cs;
-                                CPU_ZERO(&cs);
-                                // Pin to all CPUs on this node for memcpy parallelism if we could…
-                                // here just the first CPU to keep it simple. The mbind'd region
-                                // governs placement so any CPU is fine, but local first-touch
-                                // is a belt-and-suspenders.
-                                CPU_SET(node_first_cpu[n], &cs);
-                                pthread_setaffinity_np(ctids[n], sizeof(cs), &cs);
-                            }
-                        }
-                        for (int n = 0; n < n_nodes; ++n) pthread_join(ctids[n], nullptr);
-
-                        g_numa_replica_src_base = src;
-                        g_numa_replica_size = sz;
-                        for (int n = 0; n < n_nodes; ++n) {
-                            g_numa_replica_offsets[n] = (char *)g_numa_replica_bases[n] - (char *)src;
-                        }
-                        g_numa_replica_n = n_nodes;
-                        LLAMA_LOG_INFO("numa-replicate: complete; %d replicas ready\n", n_nodes);
-                    }
-                }
-            }
-        }
-    }
-
-    // CPU1 Phase 1.3 v2 per-CCD warm-up touch pass (gated by
-    // GGML_NUMA_WEIGHTS=local) was stripped in v5 cleanup audit 2026-04-30
-    // (NUMA_WEIGHTS family). The mmap-side env activation in llama-mmap.cpp
-    // was also stripped, so this pass would be unreachable even without the
-    // explicit gate; the gate is force-disabled here as belt-and-suspenders.
-    if (false /* GGML_NUMA_WEIGHTS=local producer disabled */) {
-        const char * env_nw = std::getenv("GGML_NUMA_WEIGHTS");
-        const char * env_pools = std::getenv("GGML_CCD_POOLS");
-        const bool want_warmup = env_nw && strcmp(env_nw, "local") == 0
-                              && env_pools && (env_pools[0] == '1' || env_pools[0] == 'y' || env_pools[0] == 'Y');
-        if (want_warmup) {
-            // Determine CCD count. Default to 12 for EPYC 9655; overridable.
-            int n_ccd = 12;
-            if (const char * env_nc = std::getenv("GGML_NUMA_WARMUP_CCD")) {
-                int v = atoi(env_nc);
-                if (v > 0) n_ccd = v;
-            }
-            int n_phys_per_ccd = 8; // EPYC 9655
-            if (const char * env_pp = std::getenv("GGML_NUMA_WARMUP_PHYS_PER_CCD")) {
-                int v = atoi(env_pp);
-                if (v > 0) n_phys_per_ccd = v;
-            }
-            // Count NUMA nodes (purely diagnostic).
-            int n_nodes = 0;
-            if (DIR * d = opendir("/sys/devices/system/node")) {
-                struct dirent * ent;
-                while ((ent = readdir(d))) {
-                    if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
-                }
-                closedir(d);
-            }
-            if (n_nodes < 2) {
-                LLAMA_LOG_INFO("numa-warmup: only %d NUMA node(s); skipping\n", n_nodes);
-            } else {
-                LLAMA_LOG_INFO("numa-warmup: %d CCDs x %d phys cores, touching weights across %d nodes\n",
-                               n_ccd, n_phys_per_ccd, n_nodes);
-                const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
-
-                // Snapshot weight refs into a flat array for thread workers.
-                struct wentry { void * addr; size_t nbytes; };
-                std::vector<wentry> entries;
-                entries.reserve(weights_map.size());
-                size_t threshold = 0;
-                if (const char * env_thr = std::getenv("GGML_NUMA_WARMUP_MIN_BYTES")) {
-                    threshold = (size_t)atoll(env_thr);
-                }
-                for (const auto & it : weights_map) {
-                    const auto & w = it.second;
-                    if (w.idx >= mappings.size()) continue;
-                    size_t nbytes = ggml_nbytes(w.tensor);
-                    if (nbytes < threshold) continue;
-                    entries.push_back({ (char *)mappings[w.idx]->addr() + w.offs, nbytes });
-                }
-                LLAMA_LOG_INFO("numa-warmup: touching %zu large tensors\n", entries.size());
-
-                struct targs { int ccd_id; int n_ccd; int n_phys_per_ccd; size_t page_size;
-                               const std::vector<wentry> * entries; volatile char dummy; };
-                std::vector<targs> ta(n_ccd);
-                std::vector<pthread_t> tids(n_ccd);
-                auto worker = +[](void * arg) -> void * {
-                    auto * a = (targs *)arg;
-                    // Pin to this CCD's physical cores.
-                    cpu_set_t cs;
-                    CPU_ZERO(&cs);
-                    int core_start = a->ccd_id * a->n_phys_per_ccd;
-                    int core_end   = core_start + a->n_phys_per_ccd;
-                    for (int core = core_start; core < core_end; ++core) CPU_SET(core, &cs);
-                    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
-#if defined(LLAMA_LOADER_HAS_NUMAIF)
-                    // Override inherited MPOL_INTERLEAVE with MPOL_LOCAL so our touches
-                    // place pages on the CPU-local node (not interleaved).
-                    syscall(SYS_set_mempolicy, MPOL_LOCAL, (unsigned long *)nullptr, 0UL);
-#endif
-                    // Touch assigned row-range of each tensor.
-                    volatile char d = 0;
-                    for (const auto & w : *a->entries) {
-                        size_t beg = ((size_t)a->ccd_id * w.nbytes) / (size_t)a->n_ccd;
-                        size_t end = ((size_t)(a->ccd_id + 1) * w.nbytes) / (size_t)a->n_ccd;
-                        beg = (beg / a->page_size) * a->page_size;
-                        char * base = (char *)w.addr;
-                        for (size_t p = beg; p < end; p += a->page_size) {
-                            d ^= base[p];
-                        }
-                    }
-                    a->dummy = d;
-                    return nullptr;
-                };
-                for (int c = 0; c < n_ccd; ++c) {
-                    ta[c] = targs{ c, n_ccd, n_phys_per_ccd, page_size, &entries, 0 };
-                    pthread_create(&tids[c], nullptr, worker, &ta[c]);
-                }
-                for (int c = 0; c < n_ccd; ++c) {
-                    pthread_join(tids[c], nullptr);
-                }
-                LLAMA_LOG_INFO("numa-warmup: complete\n");
-            }
-        }
-    }
-
-    // CPU15 Phase 1b GGML_EXPERT_CCD_LAYOUT was stripped in v5 cleanup audit
-    // 2026-04-30 (superseded by Phase 3.2 inter-process EP). Producer
-    // force-disabled below. Implementation retained in tree pending follow-up
-    // hard strip. Original comment preserved for reader context:
+    // ==== STRIPPED in v5 cleanup audit 2026-04-30 ====
+    // Four NUMA-family producer code paths previously lived here:
+    //   GGML_NUMA_REPLICATE         (CPU1 Phase 1.4 / Lever A' weight replication, ~110 LOC)
+    //   GGML_NUMA_WEIGHTS=local     (CPU1 Phase 1.3 v2 per-CCD warmup pass,        ~95 LOC)
+    //   GGML_EXPERT_CCD_LAYOUT      (CPU15 Phase 1b per-expert mbind,              ~85 LOC)
+    //   GGML_EXPERT_ANON_COPIES     (CPU15 Phase 2 anon-mmap expert copies,        ~210 LOC)
     //
-    // CPU15 Phase 1b: per-expert NUMA pinning for MoE. When GGML_EXPERT_CCD_LAYOUT=1
-    // is set, each MoE expert tensor (`*ffn_*_exps.weight` etc.) is split along its
-    // `ne[2]` axis (the expert dimension) and each expert slice is mbind()'d to a
-    // specific NUMA node = (e % n_ccd) / n_ccd_per_node. Composes with the work-
-    // distribution change in ggml_compute_forward_mul_mat_id (CPU15 Phase 1a) so
-    // that the threads on CCD K work only on experts pinned to CCD K's NUMA node,
-    // converting cross-NUMA reads into local reads.
+    // All four were measured net-neutral or net-negative on single-socket
+    // EPYC 9655 NPS4. The default `numactl --interleave=all` invocation
+    // prefix delivers ~92% of the achievable bandwidth without any of these
+    // mechanisms' overhead. The deployable answer for MoE expert
+    // distribution is Phase 3.2 inter-process Expert Parallelism (search
+    // for GGML_EP_ROLE / GGML_EP_N_INSTANCES / GGML_EP_SHARD).
     //
-    // Default OFF; preserves baseline behavior. Operates on the file mmap pages
-    // directly — no extra RAM allocation (unlike GGML_NUMA_REPLICATE which 4×'s
-    // RAM use).
-    if (false /* GGML_EXPERT_CCD_LAYOUT producer disabled */) {
-        const char * env_layout = std::getenv("GGML_EXPERT_CCD_LAYOUT");
-        if (env_layout && env_layout[0] && env_layout[0] != '0') {
-            // Need at least 2 NUMA nodes
-            int n_nodes = 0;
-            if (DIR * d = opendir("/sys/devices/system/node")) {
-                struct dirent * ent;
-                while ((ent = readdir(d))) {
-                    if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) n_nodes++;
-                }
-                closedir(d);
-            }
-            int n_ccd = 12;
-            if (const char * env_nc = std::getenv("GGML_NUMA_WARMUP_CCD")) {
-                int v = atoi(env_nc);
-                if (v > 0) n_ccd = v;
-            }
-            const int n_ccd_per_node = (n_nodes > 0) ? (n_ccd + n_nodes - 1) / n_nodes : 1;
-            const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
-
-            if (n_nodes < 2) {
-                LLAMA_LOG_INFO("expert-ccd-layout: only %d NUMA node(s); skipping\n", n_nodes);
-            } else {
-                size_t n_tensors_pinned = 0;
-                size_t n_experts_pinned = 0;
-                size_t bytes_pinned = 0;
-                size_t n_unaligned = 0;
-                for (const auto & it : weights_map) {
-                    const auto & w = it.second;
-                    const ggml_tensor * t = w.tensor;
-                    if (w.idx >= mappings.size()) continue;
-                    if (!t) continue;
-                    // Identify MoE expert tensors. Standard llama.cpp naming:
-                    // *ffn_(up|down|gate)_exps.weight* — the expert dim is ne[2].
-                    // We require ne[2] >= n_ccd to make CCD partitioning sensible.
-                    const std::string name = it.first;
-                    const bool is_expert = (name.find("ffn_") != std::string::npos &&
-                                             name.find("_exps") != std::string::npos);
-                    if (!is_expert) continue;
-                    const int64_t n_experts = t->ne[2];
-                    if (n_experts < n_ccd) continue;
-                    const size_t total_bytes = ggml_nbytes(t);
-                    const size_t per_expert_bytes = total_bytes / (size_t)n_experts;
-                    if (per_expert_bytes * (size_t)n_experts != total_bytes) {
-                        // Unexpected layout; skip.
-                        continue;
-                    }
-                    char * base = (char *)mappings[w.idx]->addr() + w.offs;
-                    for (int64_t e = 0; e < n_experts; ++e) {
-                        const int ccd  = (int)(e % n_ccd);
-                        const int node = ccd / n_ccd_per_node;
-                        // mbind operates on full pages. Round start down, end up.
-                        char * exp_addr = base + (size_t)e * per_expert_bytes;
-                        size_t exp_size = per_expert_bytes;
-                        uintptr_t aligned_addr = (uintptr_t)exp_addr & ~(uintptr_t)(page_size - 1);
-                        size_t leading = (uintptr_t)exp_addr - aligned_addr;
-                        size_t aligned_size = leading + exp_size;
-                        aligned_size = (aligned_size + page_size - 1) & ~(page_size - 1);
-                        if (leading != 0) n_unaligned++;
-                        const unsigned long maxnode = 64UL;
-                        unsigned long mask = (1UL << node);
-                        // MPOL_MF_MOVE: move pages that are already faulted in
-                        // on the wrong node. The mmap may have triggered kernel
-                        // readahead before init_mappings runs, so without this
-                        // flag mbind would only affect future page faults.
-                        // 1 = MPOL_MF_MOVE.
-                        long rc = syscall(SYS_mbind, (void *)aligned_addr, aligned_size,
-                                           MPOL_BIND, &mask, maxnode, 1);
-                        if (rc != 0) {
-                            LLAMA_LOG_WARN("expert-ccd-layout: mbind expert %lld of '%s' to node %d failed: %s\n",
-                                           (long long)e, name.c_str(), node, strerror(errno));
-                            continue;
-                        }
-                        n_experts_pinned++;
-                        bytes_pinned += exp_size;
-                    }
-                    n_tensors_pinned++;
-                }
-                LLAMA_LOG_INFO("expert-ccd-layout: pinned %zu experts across %zu tensors = %.1f GiB to %d NUMA nodes (n_ccd=%d, %s%zu page-unaligned slices)\n",
-                               n_experts_pinned, n_tensors_pinned, bytes_pinned / (1024.0*1024.0*1024.0), n_nodes, n_ccd,
-                               n_unaligned ? "" : "no ", n_unaligned);
-            }
-        }
-    }
-
-    // CPU15 Phase 2 anonymous-mmap'd expert-only NUMA copies (env-gated by
-    // GGML_EXPERT_ANON_COPIES) was stripped in v5 cleanup audit 2026-04-30
-    // alongside its consumer in ggml_compute_forward_mul_mat_id (commit
-    // bbe38a683). The intra-process per-node expert copy approach is
-    // superseded by Phase 3.2 inter-process EP. Read git history if you
-    // need the original implementation for reference.
-#endif
+    // See `epyc-inference-research/research/numa-weights-deep-dive.md` for
+    // the decision rationale; consult git history pre-v5 for the original
+    // implementations.
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
