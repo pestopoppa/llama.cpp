@@ -1691,30 +1691,6 @@ static int ggml_ep_master_park(void) {
     return s;
 }
 
-// CPU22 — Dynamic MoE load balancing via global tile-queue work-stealing.
-// Default OFF. When GGML_EP_WORK_STEALING=1, ggml_compute_forward_mul_mat_id
-// switches its expert-loop chunk distribution from per-expert atomic counters
-// (each expert claims chunks via atomic_fetch_add on its own counter; threads
-// iterate experts sequentially) to a single GLOBAL tile array with a single
-// atomic counter (threads pull from a flat queue covering all chunks across
-// all experts). The hypothesis: if expert load imbalance leaves slow threads
-// stuck on a heavy expert while fast threads have already passed it, a global
-// queue lets fast threads pick up other experts' tiles regardless of their
-// own expert-iteration position. Bounded above by CPU24's 15% sync share.
-//
-// Excluded (falls through to existing path) when EP/CCD-sharding is active —
-// the work-stealing path doesn't currently coordinate with master/worker
-// drone or per-CCD partitioning. Compatible only with single-instance,
-// non-CCD-sharded MoE compute.
-static int ggml_ep_work_stealing(void) {
-    static int s = -1;
-    if (s < 0) {
-        const char * env = getenv("GGML_EP_WORK_STEALING");
-        s = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    return s;
-}
-
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -2071,95 +2047,6 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_ep_shard_warm_parallel(src0, ep_my_id, ep_n_inst, ith, nth, params->threadpool);
     }
 
-    // CPU22 work-stealing path — single global tile queue across all experts.
-    // Active when GGML_EP_WORK_STEALING=1 AND no EP/CCD sharding is active.
-    // Falls through to the existing per-expert sequential loop otherwise.
-    const bool ws_active = ggml_ep_work_stealing() && !ep_inter && !ep_active && !master_parker;
-    if (ws_active) {
-        // Stage 1: ith==0 builds the global tile array. Each tile = 1 chunk
-        // of a non-empty expert. Tile encoding: int64 = (cur_a<<32)|(ith1<<16)|ith0.
-        //
-        // Static buffer sized for up to 256 experts × 256 chunks/expert =
-        // 65536 tiles × 8B = 512 KB. Comfortably fits any real MoE config
-        // (Coder-30B 128 experts × ~96 chunks ≈ 12K tiles; REAP-246B
-        // similarly bounded).
-        #define GGML_WS_MAX_TILES (256 * 256)
-        static int64_t s_ws_tiles[GGML_WS_MAX_TILES];
-        int64_t * tiles = s_ws_tiles;
-        const int64_t MAX_TILES = GGML_WS_MAX_TILES;
-        static atomic_int s_ws_next = ATOMIC_VAR_INIT(0);
-        static atomic_int s_ws_total = ATOMIC_VAR_INIT(0);
-        if (ith == 0) {
-            int64_t n_tiles = 0;
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                const int64_t cne1 = matrix_row_counts[cur_a];
-                if (cne1 == 0) continue;
-                const int64_t nr0 = ne01;
-                const int64_t nr1 = cne1;
-                int chunk_size = 16;
-                if (nr0 == 1 || nr1 == 1) chunk_size = 64;
-                int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-                int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-                if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-                    nchunk0 = nr0 > nr1 ? nth : 1;
-                    nchunk1 = nr0 > nr1 ? 1 : nth;
-                }
-                for (int64_t i1 = 0; i1 < nchunk1; ++i1) {
-                    for (int64_t i0 = 0; i0 < nchunk0; ++i0) {
-                        if (n_tiles < MAX_TILES) {
-                            tiles[n_tiles++] = ((int64_t) cur_a << 32) | ((int64_t) i1 << 16) | (int64_t) i0;
-                        }
-                    }
-                }
-            }
-            atomic_store_explicit(&s_ws_total, (int) n_tiles, memory_order_relaxed);
-            atomic_store_explicit(&s_ws_next, 0, memory_order_relaxed);
-        }
-        ggml_barrier(params->threadpool);
-
-        // Stage 2: all threads pull tiles from the global queue.
-        const int n_tiles = atomic_load_explicit(&s_ws_total, memory_order_relaxed);
-        while (true) {
-            int t_idx = atomic_fetch_add_explicit(&s_ws_next, 1, memory_order_relaxed);
-            if (t_idx >= n_tiles) break;
-            const int64_t tile = tiles[t_idx];
-            const int cur_a   = (int) (tile >> 32);
-            const int64_t i1  = (tile >> 16) & 0xFFFF;
-            const int64_t i0  = tile & 0xFFFF;
-            const int64_t cne1 = matrix_row_counts[cur_a];
-
-            const char * src0_cur = (const char *) tensor_data(src0) + (size_t) cur_a * nb02;
-
-            const void * wdata_local = (src1->type == vec_dot_type) ? tensor_data(src1) : params->wdata;
-            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-            const int64_t nr0 = ne01;
-            const int64_t nr1 = cne1;
-            int chunk_size = 16;
-            if (nr0 == 1 || nr1 == 1) chunk_size = 64;
-            int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-            int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-            if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-                nchunk0 = nr0 > nr1 ? nth : 1;
-                nchunk1 = nr0 > nr1 ? 1 : nth;
-            }
-            const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-            const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-            const int64_t ir0_start = dr0 * i0;
-            const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
-            const int64_t ir1_start = dr1 * i1;
-            const int64_t ir1_end   = MIN(ir1_start + dr1, nr1);
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata_local
-            );
-        }
-        // Skip the existing per-expert loop below — work-stealing has handled
-        // the entire compute. Fall through to the close-barrier section after.
-        goto ws_close;
-    }
-
     // Phase 3.2(h): master parker threads skip the entire expert loop. They
     // participate in the close barrier and parallel sum-reduce below, but
     // contribute no compute here so total memory-active threads across all
@@ -2280,7 +2167,6 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-ws_close:;
     // CPU15 Phase 3.2(d.1.b) inter-process EP close.
     //
     // Three-state close:
