@@ -1398,7 +1398,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // redirects src0 reads through the replica on the CCD's local node,
     // eliminating the ~75% cross-node access rate that plain interleave
     // pays on Infinity Fabric.
-    if (use_mmap && g_numa_replica_n == 0) {
+    // CPU1 Lever A' GGML_NUMA_REPLICATE was stripped in v5 cleanup audit
+    // 2026-04-30 (NUMA_WEIGHTS family). 4× memory blowup for marginal gain
+    // alone; default `numactl --interleave=all` invocation prefix achieves
+    // equivalent placement without the replication overhead. The producer
+    // activation is force-disabled here; the implementation remains in tree
+    // for the purposes of this audit — a follow-up will fully delete it.
+    if (false /* GGML_NUMA_REPLICATE producer disabled */) {
         const char * env_rep = std::getenv("GGML_NUMA_REPLICATE");
         if (env_rep && *env_rep && env_rep[0] != '0') {
             if (mappings.size() != 1) {
@@ -1493,15 +1499,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
-    // Phase 1.3 v2 (CPU1): optional per-CCD warm-up touch pass. Triggered by
-    // GGML_NUMA_WEIGHTS=local + GGML_CCD_POOLS=1. Spawns one pthread per CCD,
-    // pinned to that CCD's physical cores. Each thread touches one byte per
-    // page of its assigned row-range of every weight tensor, causing
-    // first-touch to place those pages on that CCD's NUMA node. Partitioning
-    // mirrors Phase 1.2's CCD-block-contiguous work distribution, so threads
-    // later accessing rows [c*N/n_ccd, (c+1)*N/n_ccd) find them on the local
-    // node.
-    if (use_mmap) {
+    // CPU1 Phase 1.3 v2 per-CCD warm-up touch pass (gated by
+    // GGML_NUMA_WEIGHTS=local) was stripped in v5 cleanup audit 2026-04-30
+    // (NUMA_WEIGHTS family). The mmap-side env activation in llama-mmap.cpp
+    // was also stripped, so this pass would be unreachable even without the
+    // explicit gate; the gate is force-disabled here as belt-and-suspenders.
+    if (false /* GGML_NUMA_WEIGHTS=local producer disabled */) {
         const char * env_nw = std::getenv("GGML_NUMA_WEIGHTS");
         const char * env_pools = std::getenv("GGML_CCD_POOLS");
         const bool want_warmup = env_nw && strcmp(env_nw, "local") == 0
@@ -1595,6 +1598,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
+    // CPU15 Phase 1b GGML_EXPERT_CCD_LAYOUT was stripped in v5 cleanup audit
+    // 2026-04-30 (superseded by Phase 3.2 inter-process EP). Producer
+    // force-disabled below. Implementation retained in tree pending follow-up
+    // hard strip. Original comment preserved for reader context:
+    //
     // CPU15 Phase 1b: per-expert NUMA pinning for MoE. When GGML_EXPERT_CCD_LAYOUT=1
     // is set, each MoE expert tensor (`*ffn_*_exps.weight` etc.) is split along its
     // `ne[2]` axis (the expert dimension) and each expert slice is mbind()'d to a
@@ -1606,7 +1614,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // Default OFF; preserves baseline behavior. Operates on the file mmap pages
     // directly — no extra RAM allocation (unlike GGML_NUMA_REPLICATE which 4×'s
     // RAM use).
-    if (use_mmap) {
+    if (false /* GGML_EXPERT_CCD_LAYOUT producer disabled */) {
         const char * env_layout = std::getenv("GGML_EXPERT_CCD_LAYOUT");
         if (env_layout && env_layout[0] && env_layout[0] != '0') {
             // Need at least 2 NUMA nodes
