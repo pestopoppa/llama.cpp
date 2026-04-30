@@ -4,6 +4,8 @@
 #include "ggml.h"
 #include "ggml-cpu-impl.h"  // for ggml_barrier prototype
 
+extern "C" int ggml_ep_verbose(void);  // defined in ggml-ep-bootstrap.cpp
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -160,9 +162,11 @@ extern "C" void * ggml_ep_shard_lookup(const ggml_tensor * src0,
     entry.n_instances      = n_inst;
     entry.ready.store(true, std::memory_order_release);  // single-threaded path: ready immediately
 
-    fprintf(stderr, "ggml-ep-shard: %s sharded (%d/%lld experts, %zu MiB local)\n",
-            src0->name ? src0->name : "(anon)",
-            n_kept, (long long) n_experts, buf_bytes >> 20);
+    if (ggml_ep_verbose()) {
+        fprintf(stderr, "ggml-ep-shard: %s sharded (%d/%lld experts, %zu MiB local)\n",
+                src0->name ? src0->name : "(anon)",
+                n_kept, (long long) n_experts, buf_bytes >> 20);
+    }
     return buf;
 }
 
@@ -229,9 +233,11 @@ extern "C" void * ggml_ep_shard_warm_parallel(const ggml_tensor * src0,
                         n_kept = kept;
                         buf    = b;
                         need_copy = true;
-                        fprintf(stderr, "ggml-ep-shard-warm: %s alloc'd (%d/%lld experts, %zu MiB local)\n",
-                                src0->name ? src0->name : "(anon)",
-                                kept, (long long) n_experts, buf_bytes >> 20);
+                        if (ggml_ep_verbose()) {
+                            fprintf(stderr, "ggml-ep-shard-warm: %s alloc'd (%d/%lld experts, %zu MiB local)\n",
+                                    src0->name ? src0->name : "(anon)",
+                                    kept, (long long) n_experts, buf_bytes >> 20);
+                        }
                     }
                 }
             }

@@ -19,6 +19,17 @@
 static struct ep_session * g_ep_session = nullptr;
 static std::atomic<bool>   g_ep_bootstrapped{false};
 
+// Gate informational stderr output behind GGML_EP_VERBOSE=1 (default off).
+// Error-path fprintf calls are unaffected — they always fire.
+extern "C" int ggml_ep_verbose(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * e = std::getenv("GGML_EP_VERBOSE");
+        s = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return s;
+}
+
 // Add all CPUs in `node_id` (parsed from /sys/devices/system/node/nodeN/cpulist)
 // to `cpuset`. Returns the number of CPUs added, or -1 on parse failure.
 static int ggml_ep_add_node_cpus(int node_id, cpu_set_t * cpuset) {
@@ -83,9 +94,11 @@ static int ggml_ep_pin_to_numa_nodes(const int * nodes, int n) {
         off += snprintf(nodes_str + off, sizeof(nodes_str) - off,
                         i == 0 ? "%d" : ",%d", nodes[i]);
     }
-    fprintf(stderr, "ggml-ep: pinned (pid=%d) to NUMA nodes [%s] (%d cpus, %s)\n",
-            (int) getpid(), nodes_str, total_cpus,
-            (n == 1) ? "MPOL_PREFERRED" : "MPOL_INTERLEAVE");
+    if (ggml_ep_verbose()) {
+        fprintf(stderr, "ggml-ep: pinned (pid=%d) to NUMA nodes [%s] (%d cpus, %s)\n",
+                (int) getpid(), nodes_str, total_cpus,
+                (n == 1) ? "MPOL_PREFERRED" : "MPOL_INTERLEAVE");
+    }
     return 0;
 }
 
@@ -222,9 +235,11 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
         // EOF'ing on /dev/null'd stdin), redirect stdin/stdout to /dev/null.
         // stderr stays attached so worker errors are visible.
         const int wid = ep_session_instance_id(g_ep_session) - 1;
-        fprintf(stderr, "ggml-ep: worker %d (pid=%d) returning to caller (will run llama.cpp normally)\n",
-                wid, (int) getpid());
-        fflush(stderr);
+        if (ggml_ep_verbose()) {
+            fprintf(stderr, "ggml-ep: worker %d (pid=%d) returning to caller (will run llama.cpp normally)\n",
+                    wid, (int) getpid());
+            fflush(stderr);
+        }
 
         // Disconnect stdin/stdout. We open /dev/null fresh and dup2 over the
         // existing fds so the inherited TTY mappings are replaced; freopen
@@ -244,7 +259,9 @@ extern "C" int ggml_ep_bootstrap_if_requested(void) {
     // Master path. Register cleanup so workers are reaped at normal exit.
     atexit(ggml_ep_master_atexit);
 
-    fprintf(stderr, "ggml-ep: master (pid=%d) spawned %d worker process(es), n_instances=%d\n",
-            (int) getpid(), n_workers, n_instances);
+    if (ggml_ep_verbose()) {
+        fprintf(stderr, "ggml-ep: master (pid=%d) spawned %d worker process(es), n_instances=%d\n",
+                (int) getpid(), n_workers, n_instances);
+    }
     return 1;
 }
