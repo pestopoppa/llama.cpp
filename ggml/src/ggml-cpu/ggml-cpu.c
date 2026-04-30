@@ -1945,76 +1945,19 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // CPU15 Phase 2 anon-expert lookup (set once per op, used per-expert below).
-    // Look up this MoE op's expert tensor in the per-node anon registry built
-    // by llama-model-loader.cpp's GGML_EXPERT_ANON_COPIES=1 pass. If found,
-    // the EP path will redirect each expert's read to the local-node copy
-    // instead of reading from the file mmap.
-#ifndef GGML_USE_OPENMP
-    extern int ggml_ep_anon_n_tensors_(void);
-    extern const struct ggml_ep_tensor_info * ggml_ep_anon_lookup_(const void * file_base);
-    struct ggml_ep_tensor_info_local {
-        void * file_base;
-        int    n_experts;
-        int    n_nodes;
-        int    n_ccd;
-        int    n_ccd_per_node;
-        size_t per_expert_bytes;
-        void * per_node_base[16];
-        int    expert_to_node_idx[256];
-    };
-    const struct ggml_ep_tensor_info_local * ep_info_local = NULL;
-    if (ggml_ep_anon_n_tensors_() > 0) {
-        ep_info_local = (const struct ggml_ep_tensor_info_local *) ggml_ep_anon_lookup_(src0->data);
-    }
-#endif
+    // CPU15 Phase 1+2 (intra-process per-CCD expert sharding + anon-mmap
+    // local-node copies) was superseded by Phase 3.2 inter-process EP and
+    // stripped in v5 cleanup audit 2026-04-30. The deployed answer for MoE
+    // expert distribution is `ep_inter` / `ep_slice` / `ep_master_active`
+    // / `ep_worker_active` defined above; the intra-process approach was
+    // measured net-neutral or marginal alone and is recorded in git history
+    // (search for GGML_EXPERT_CCD_SHARDING / GGML_EXPERT_ANON_COPIES on
+    // commits prior to the v5 audit if reading historical context).
 
-    // CPU15 Phase 1: per-CCD expert sharding. When GGML_EXPERT_CCD_SHARDING=1
-    // and CCD pools are configured, expert `cur_a` is computed only by the
-    // ccd_threads threads on CCD(cur_a % n_ccd). Within those threads,
-    // chunking uses ccd_threads as effective parallelism. Default OFF.
-    //
-    // Hypothesis (CPU15 D3): if expert weights are NUMA-interleaved (current
-    // state with GGML_NUMA_WEIGHTS=1), 75% of expert reads under flat work
-    // distribution land on a remote NUMA node. Pinning experts to specific
-    // CCDs converts those into local reads when paired with a future per-
-    // expert mbind pass (GGML_EXPERT_CCD_LAYOUT=1, not yet implemented).
-    // Phase 1 ships work distribution alone to measure the partial effect.
-#ifndef GGML_USE_OPENMP
-    static int s_ep_sharding = -1;
-    if (s_ep_sharding < 0) {
-        const char * env = getenv("GGML_EXPERT_CCD_SHARDING");
-        s_ep_sharding = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    const struct ggml_threadpool * tp = params->threadpool;
-    const struct ggml_compute_state * st = ggml_tls_state;
-    const bool ep_active = s_ep_sharding && tp->ccd_pool_enabled && st != NULL &&
-                            tp->ccd_count > 0 && nth == tp->ccd_count * tp->ccd_threads &&
-                            n_as >= tp->ccd_count;
-    const int my_ccd       = ep_active ? st->ccd_id        : -1;
-    const int my_ccd_local = ep_active ? st->ccd_local_id  : -1;
-    const int n_ccd        = ep_active ? tp->ccd_count     : -1;
-    const int ccd_threads  = ep_active ? tp->ccd_threads   : -1;
-#else
-    const bool ep_active = false;
-    const int my_ccd       = -1;
-    const int my_ccd_local = -1;
-    const int n_ccd        = -1;
-    const int ccd_threads  = -1;
-#endif
-
-    // reset current_chunk: when sharded, only this CCD's threads init this
-    // CCD's experts' counters (to ccd_threads instead of nth). Multiple
-    // threads writing the same value is benign.
-    if (ep_active) {
-        for (int cur_a = my_ccd; cur_a < n_as; cur_a += n_ccd) {
-            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-            *current_chunk_ctr = ccd_threads;
-        }
-    } else {
-        // Phase 3.2(h): use master_moe_nth as effective count when master is
-        // restricted, so the chunk-counter starts at the right value for the
-        // chunk-grabbing loop below. Master parkers don't participate.
+    // reset current_chunk. Phase 3.2(h): use master_moe_nth as effective count
+    // when master is restricted, so the chunk-counter starts at the right
+    // value for the chunk-grabbing loop below. Master parkers don't participate.
+    {
         const int init_nth = (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth : nth;
         if (!master_parker) {
             for (int cur_a = ith; cur_a < n_as; cur_a += init_nth) {
@@ -2065,11 +2008,6 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // Intra-process: skip experts not assigned to my CCD.
-        if (ep_active && (cur_a % n_ccd) != my_ccd) {
-            continue;
-        }
-
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
 
         // CPU15 Phase 3.2(e.1) inter-process expert sharding: when
@@ -2085,25 +2023,6 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-#ifndef GGML_USE_OPENMP
-        // CPU15 Phase 2: redirect to local-node anonymous copy when ep_active
-        // and the tensor was registered by GGML_EXPERT_ANON_COPIES=1. The
-        // copy was first-touched on the target node so reads are local.
-        // (Mutually exclusive with Phase 3.2(e.1) above — only one sharding
-        // mechanism is active at a time.)
-        if (ep_active && ep_info_local && cur_a < ep_info_local->n_experts) {
-            const int my_node = my_ccd / ep_info_local->n_ccd_per_node;
-            if (my_node < ep_info_local->n_nodes &&
-                ep_info_local->per_node_base[my_node] != NULL) {
-                const int e_idx = ep_info_local->expert_to_node_idx[cur_a];
-                if (e_idx >= 0) {
-                    src0_cur = (const char *) ep_info_local->per_node_base[my_node] +
-                               (size_t) e_idx * ep_info_local->per_expert_bytes;
-                }
-            }
-        }
-#endif
-
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -2118,15 +2037,12 @@ static void ggml_compute_forward_mul_mat_id(
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
-        // Effective parallelism: when sharded, only ccd_threads threads work
-        // on this expert; chunking and atomic counter must use that count.
-        // Phase 3.2(h): master in inter-process EP also uses a reduced count
-        // (master_moe_nth = nth / N_instances) so total memory-active threads
-        // across all instances stay at the physical core count.
-        const int eff_nth = ep_active                                       ? ccd_threads
-                          : (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth
-                          :                                                   nth;
-        const int eff_ith = ep_active ? my_ccd_local : ith;
+        // Effective parallelism. Phase 3.2(h): master in inter-process EP uses
+        // a reduced count (master_moe_nth = nth / N_instances) so total
+        // memory-active threads across all instances stay at the physical
+        // core count.
+        const int eff_nth = (ep_master_active && ep_slice && ep_master_park) ? master_moe_nth : nth;
+        const int eff_ith = ith;
 
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
