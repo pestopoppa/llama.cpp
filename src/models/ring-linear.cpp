@@ -124,12 +124,19 @@ llm_build_ring_linear::llm_build_ring_linear(const llama_model & model, const ll
                     ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
                                  kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
-            // Reshape token output to [n_embd, n_seq_tokens, n_seqs] for the post-attn norm + gate.
-            ggml_tensor * o = ggml_reshape_3d(ctx0, o_flat, n_embd, n_seq_tokens, n_seqs);
-
-            // GroupRMSNorm: split the last axis into group_norm_size groups, RMS-normalize each,
-            // then apply the per-channel weight.
-            ggml_tensor * o_normed = ggml_group_norm(ctx0, o, group_norm_size, hparams.f_norm_rms_eps);
+            // Reshape token output for the post-attn GroupRMSNorm + gate.
+            // BailingMoeV2GroupRMSNorm splits the last axis (n_embd) into group_norm_size
+            // groups of size n_embd/group_norm_size each, then RMS-normalizes each group
+            // independently (NO mean subtraction). Implementation: reshape n_embd → (group_size, n_groups),
+            // call ggml_rms_norm (which normalizes along ne[0] = group_size), reshape back.
+            // NOTE: ggml_group_norm is LayerNorm (subtracts mean) and groups along ne[2] —
+            // wrong on both axes; do not use here.
+            const int64_t group_size = n_embd / group_norm_size;
+            ggml_tensor * o_grouped = ggml_reshape_4d(ctx0, o_flat,
+                                                     group_size, (int64_t) group_norm_size,
+                                                     n_seq_tokens, n_seqs);
+            ggml_tensor * o_norm    = ggml_rms_norm(ctx0, o_grouped, hparams.f_norm_rms_eps);
+            ggml_tensor * o_normed  = ggml_reshape_3d(ctx0, o_norm, n_embd, n_seq_tokens, n_seqs);
             o_normed = ggml_mul(ctx0, o_normed, layer.attn_out_norm);
 
             // Sigmoid gate computed from the LAYER INPUT (not the attention output), per the
