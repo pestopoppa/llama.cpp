@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <cstdlib>  // std::getenv, atoi
 
 // ggml_compute_forward_dup
 
@@ -10796,8 +10795,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
     int64_t ir0,
-    int64_t ir1,
-    int64_t k_per_head) {
+    int64_t ir1) {
 
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
@@ -10855,23 +10853,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
-    // Work index ir decodes into (head_seq, j_block) under a partition
-    // strategy that expands the upstream `nr = H * n_seqs` space to
-    // `nr = H * n_seqs * k_per_head`, giving k_per_head sub-chunks per head
-    // along the S_v (j) axis. Each sub-chunk owns a contiguous j-range
-    // [j_start, j_end) and processes all 4 inner phases (scale, delta,
-    // outer product, attn_out) within that range using its own delta[]
-    // scratch. The state matrix is stored transposed (`s_out[j*S_v+i]`)
-    // so a j-range is a contiguous byte range in memory — no strided
-    // access, no false sharing between threads working different j-ranges
-    // of the same head. Delta is per-thread scratch and only the j-range
-    // is written, so no cross-thread reduction is needed.
     for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t hs_idx = ir / k_per_head;   // (head, seq) linear index
-        const int64_t jb_idx = ir % k_per_head;   // j-block index within this head
-
-        const int64_t iv1 = hs_idx % H; // head_index
-        const int64_t iv3 = hs_idx / H; // sequence
+        const int64_t iv1 = ir % H; // head_index
+        const int64_t iv3 = ir / H; // sequence
 
         const int64_t iq1 = iv1 % neq1;
         const int64_t ik1 = iv1 % nek1;
@@ -10879,22 +10863,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        // j-range for this sub-chunk: [jb_idx * S_v / k_per_head, (jb_idx+1) * S_v / k_per_head)
-        const int64_t j_start = (jb_idx * S_v) / k_per_head;
-        const int64_t j_end   = ((jb_idx + 1) * S_v) / k_per_head;
-        if (j_end <= j_start) {
-            continue;
-        }
-        const int64_t j_count = j_end - j_start;
-
         float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy only this sub-chunk's j-slice from input state. Sub-chunks
-        // of the same head partition the S_v rows disjointly, so there's
-        // no overlap — the full head's state is copied once when all
-        // k_per_head sub-chunks have run.
+        // copy input state into output buffer and operate in-place
         const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out + j_start * S_v, s_in + j_start * S_v, j_count * S_v * sizeof(float));
+        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10911,36 +10884,32 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             // so row j of s_out = column j of S (contiguous access)
 
             if (kda) {
-                // precompute exp(g) into delta scratch — each thread fills
-                // the FULL S_v-length delta[] buffer because the scale step
-                // below needs delta[i] for all i even when this thread only
-                // owns a j-range. Redundant across sub-chunks of the same
-                // head but S_v=256 expf per thread per layer is <1% overhead.
+                // precompute exp(g) into delta scratch (reused below)
                 for (int64_t i = 0; i < S_v; ++i) {
                     delta[i] = expf(g_d[i]);
                 }
                 // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
-                for (int64_t j = j_start; j < j_end; ++j) {
+                for (int64_t j = 0; j < S_v; ++j) {
                     ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
                 }
             } else {
-                ggml_vec_scale_f32(j_count * S_v, &s_out[j_start * S_v], expf(g_d[0]));
+                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
             }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = j_start; j < j_end; ++j) {
+            for (int64_t j = 0; j < S_v; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = j_start; j < j_end; ++j) {
+            for (int64_t j = 0; j < S_v; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = j_start; j < j_end; ++j) {
+            for (int64_t j = 0; j < S_v; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
@@ -10957,37 +10926,13 @@ static void ggml_compute_forward_gated_delta_net_f32(
         ggml_tensor * dst) {
 
     ggml_tensor * V = dst->src[2];
-    const int64_t H_times_nseq = V->ne[1] * V->ne[3];
-    const int64_t S_v          = V->ne[0];
+    int64_t nr = V->ne[1] * V->ne[3];
 
     // disable for NUMA
     const bool disable_chunking = ggml_is_numa();
 
     int nth = params->nth;
     int ith = params->ith;
-
-    // Original upstream used nr = H * n_seqs, which at decode (n_seqs=1)
-    // caps at H heads — for Qwen3.6-27B this is 16, so the op plateaus at
-    // 16 effective threads. This refactor lets each head's S_v axis split
-    // across k_per_head sub-chunks (disjoint j-ranges of the transposed
-    // state) so all nth threads can be lit up. Measured 2026-04-24: for
-    // Qwen3.6-27B decode at 96t this partitioning is *net-neutral* —
-    // decode throughput caps at ~4.4 t/s regardless of k_per_head ∈
-    // {1, 6, 16}, indicating the gated_delta_net op is NOT the decode
-    // bottleneck on this model (kept DISABLED by default to avoid the
-    // redundant expf overhead). Env-gated for future investigation on
-    // other models where DeltaNet *does* dominate.
-    int64_t k_per_head = 1;
-    static const int k_per_head_env = []() {
-        const char * env = std::getenv("GGML_GDN_K_PER_HEAD");
-        return (env && *env) ? atoi(env) : -1;
-    }();
-    if (k_per_head_env >= 1) {
-        k_per_head = k_per_head_env;
-        if (k_per_head > S_v) k_per_head = S_v;
-    }
-
-    int64_t nr = H_times_nseq * k_per_head;
 
     // 4x chunks per thread
     int nth_scaled = nth * 4;
@@ -11012,7 +10957,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir0 = dr * current_chunk;
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, k_per_head);
+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
