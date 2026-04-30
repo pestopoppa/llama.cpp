@@ -466,6 +466,12 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
+// mul_mat / mul_mat_id block-tile size. Chosen to match Zen 4/5 AVX-512
+// register pressure (16 fp32 = one ZMM register) and 64 B cache line × 4-way
+// dot-product unroll. Pre-set in the upstream ggml-cpu.c implementation;
+// kept named here so future tuning has a single place to change.
+#define GGML_MUL_MAT_BLOCK 16
+
 // Threadpool def
 // EPYC-9655 CCD topology constants (compile-time for simplicity; see comment below).
 // Runtime topology detection is a future improvement.
@@ -1328,14 +1334,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne13 % ne03 == 0);
 
     // block-tiling attempt
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
+    const int64_t blck_0 = GGML_MUL_MAT_BLOCK;
+    const int64_t blck_1 = GGML_MUL_MAT_BLOCK;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
-    float tmp[32];
+    // GGML_MUL_MAT_BLOCK * 2, accounting for mmla kernels
+    float tmp[GGML_MUL_MAT_BLOCK * 2];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1369,11 +1375,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? GGML_MUL_MAT_BLOCK : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * GGML_MUL_MAT_BLOCK), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
             }
         }
@@ -1723,10 +1729,10 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
+    const int64_t blck_0 = GGML_MUL_MAT_BLOCK;
+    const int64_t blck_1 = GGML_MUL_MAT_BLOCK;
 
-    float tmp[16];
+    float tmp[GGML_MUL_MAT_BLOCK];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
