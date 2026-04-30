@@ -393,6 +393,14 @@ struct llm_build_kimi_linear : public llm_build_delta_net_base {
     const llama_model & model;
 };
 
+// Ant Group Ring-mini-linear-2.0 / Ring-flash-linear-2.0:
+// hybrid Lightning Attention (linear, fixed per-head decay) + softmax MoE.
+struct llm_build_ring_linear : public llm_graph_context {
+    llm_build_ring_linear(const llama_model & model, const llm_graph_params & params);
+
+    const llama_model & model;
+};
+
 template <bool iswa>
 struct llm_build_lfm2 : public llm_graph_context {
     llm_build_lfm2(const llama_model & model, const llm_graph_params & params);

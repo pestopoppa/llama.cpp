@@ -337,6 +337,7 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.rms_norm_1",      # Grok
             "model.layers.{bid}.post_attn_norm",               # grok-2
             "transformer.blocks.{bid}.norm_attn_norm.norm_2",  # dbrx
+            "model.layers.{bid}.attention.g_norm",             # bailingmoe-linear (GroupRMSNorm on Lightning Attention output)
         ),
 
         MODEL_TENSOR.ATTN_POST_NORM: (
@@ -363,6 +364,7 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.gate_proj", # afmoe
             "model.layers.{bid}.linear_attn.in_proj_z",  # qwen3.5
             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
+            "model.layers.{bid}.attention.g_proj",    # bailingmoe-linear (Lightning Attention output gate projection)
         ),
 
         # Feed-forward norm

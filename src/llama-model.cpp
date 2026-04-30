@@ -2505,6 +2505,44 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_BAILINGMOE_LINEAR:
+            {
+                // Ant Group Ring-mini-linear-2.0 / Ring-flash-linear-2.0:
+                // hybrid Lightning Attention (linear, fixed per-head decay) + softmax MoE.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
+                ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,        hparams.n_norm_groups, false);
+
+                // Recurrent-state sizing for the GLA op: each linear-attn layer keeps a per-head
+                // (head_dim x head_dim) state matrix. Reuse the RWKV/wkv-style state-size accessor:
+                //   n_embd_s() = n_embd * wkv_head_size = (n_head*head_dim)*head_dim
+                // No rolling state is needed (Lightning Attention's recurrence is closed-form),
+                // so token_shift_count = 0 keeps n_embd_r() at zero.
+                hparams.wkv_head_size     = hparams.n_embd_head_k();
+                hparams.token_shift_count = 0;
+
+                // Mark linear-attention layers via the existing full-attention-interval pattern.
+                // For Ring-mini (layer_group_size=5, n_layer=20): softmax at indices 4, 9, 14, 19.
+                {
+                    uint32_t full_attn_interval = 5;
+                    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                    }
+                }
+
+                switch (hparams.n_layer) {
+                    case 20: type = LLM_TYPE_16B_A1B;   break;  // Ring-mini-linear-2.0
+                    case 30: type = LLM_TYPE_100B_A6B; break;  // tentative — Ring-flash-linear-2.0 sizing TBD
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_DOTS1:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -6675,6 +6713,71 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
+            case LLM_ARCH_BAILINGMOE_LINEAR:
+                {
+                    // Hybrid Lightning Attention + softmax MoE.
+                    // - Linear layers: full MHA-shaped Q/K/V (num_kv_heads = num_attention_heads),
+                    //   plus ATTN_GATE (g_proj) and ATTN_OUT_NORM (g_norm) for the post-attention
+                    //   gate-and-norm path required by Lightning Attention.
+                    // - Softmax layers: standard GQA-shaped Q/K/V matching n_head_kv from hparams.
+                    const int64_t n_ff_exp        = hparams.n_ff_exp;
+                    const int64_t n_expert_shared = hparams.n_expert_shared;
+                    const int64_t n_embd_softmax  = n_embd + 2 * n_embd_gqa;            // Q + K + V at GQA ratio
+                    const int64_t n_embd_linear   = n_embd + 2 * n_embd_head_k * n_head; // Q + K + V all MHA-shaped
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    GGML_ASSERT(n_expert > 0      && "n_expert must be > 0 for bailingmoe-linear");
+                    GGML_ASSERT(n_expert_used > 0 && "n_expert_used must be > 0 for bailingmoe-linear");
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+                        const bool is_linear_attn = hparams.is_recurrent(i);
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i),
+                                                   {n_embd, is_linear_attn ? n_embd_linear : n_embd_softmax}, 0);
+                        layer.wo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i),
+                                                   {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        if (is_linear_attn) {
+                            // g_proj: per-token gate computed from input → multiplied with sigmoid into the post-attention output.
+                            layer.wqkv_gate     = create_tensor(tn(LLM_TENSOR_ATTN_GATE,     "weight", i),
+                                                               {n_embd, n_embd_head_k * n_head}, 0);
+                            // g_norm (GroupRMSNorm): applied to the GLA output before the gate.
+                            layer.attn_out_norm = create_tensor(tn(LLM_TENSOR_ATTN_OUT_NORM, "weight", i),
+                                                               {n_embd_head_k * n_head}, 0);
+                        }
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+                        if (static_cast<uint32_t>(i) >= hparams.n_layer_dense_lead) { // MoE layer
+                            const int64_t n_ff_shexp = (hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff_exp) * n_expert_shared;
+
+                            layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
+
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+                        } else { // Dense FFN (the leading first_k_dense_replace layers)
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff,   n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        }
+                    }
+                } break;
             case LLM_ARCH_DOTS1:
                 {
                     const int64_t n_ff_exp        = hparams.n_ff_exp;
@@ -9075,6 +9178,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
             } break;
+        case LLM_ARCH_BAILINGMOE_LINEAR:
+            {
+                llm = std::make_unique<llm_build_ring_linear>(*this, params);
+            } break;
         case LLM_ARCH_STEP35:
             {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
@@ -9314,6 +9421,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_BAILINGMOE2:
+        case LLM_ARCH_BAILINGMOE_LINEAR:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_JAIS2:

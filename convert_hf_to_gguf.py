@@ -11230,6 +11230,27 @@ class BailingMoeV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("BailingMoeLinearV2ForCausalLM")
+class BailingMoeLinearV2Model(BailingMoeV2Model):
+    # Ant Group Ring-mini-linear-2.0 / Ring-flash-linear-2.0 — hybrid Lightning Attention + softmax MoE.
+    # Layer pattern: every `layer_group_size`-th layer is full softmax attention, the rest are
+    # Lightning Attention (constant per-head fixed power-law decay; runs through ggml_gated_linear_attn).
+    model_arch = gguf.MODEL_ARCH.BAILINGMOE_LINEAR
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        # Softmax-attention layers occur every `layer_group_size`-th layer (1-indexed): indices
+        # `layer_group_size - 1, 2*layer_group_size - 1, ...`. The C++ loader uses
+        # `((il + 1) % full_attention_interval != 0)` to flag linear-attention layers.
+        if (lgs := hparams.get("layer_group_size")) is not None:
+            self.gguf_writer.add_full_attention_interval(int(lgs))
+        # Lightning Attention's post-attn GroupRMSNorm splits `n_heads*head_dim` into
+        # `group_norm_size` groups for normalization — emit so the runtime can wire it correctly.
+        if (gns := hparams.get("group_norm_size")) is not None:
+            self.gguf_writer.add_group_norm_groups(int(gns))
+
+
 @ModelBase.register("GroveMoeForCausalLM", "modeling_grove_moe.GroveMoeForCausalLM")
 class GroveMoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.GROVEMOE
