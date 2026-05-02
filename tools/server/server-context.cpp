@@ -3461,9 +3461,9 @@ private:
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                     metrics.on_prompt_eval(slot);
 
-                    // TIDE: initialize step size from model layer count
+                    // TIDE: only activate when n_layer_exit is explicitly set (otherwise all models are affected)
                     const int n_layer = llama_model_n_layer(llama_get_model(slot.ctx));
-                    slot.tide_step = std::max(4, n_layer / 8); // exit in steps of ~12.5% of layers
+                    slot.tide_step = params_base.n_layer_exit > 0 ? std::max(4, n_layer / 8) : 0;
                 }
 
                 // TIDE: dynamic early exit adjustment based on sampling confidence
