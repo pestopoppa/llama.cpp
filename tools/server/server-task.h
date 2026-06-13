@@ -55,6 +55,8 @@ struct task_params {
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
+    int32_t kv_streaming_sink   = 0; // min initial tokens to keep during context shift, 0 = disabled
+    int32_t kv_streaming_window = 0; // recent tokens to keep during context shift, 0 = disabled
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt

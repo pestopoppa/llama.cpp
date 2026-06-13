@@ -2591,12 +2591,28 @@ private:
                     n_keep += 1;
                 }
 
+                if (slot.task->params.kv_streaming_sink > 0) {
+                    n_keep = std::max(n_keep, slot.task->params.kv_streaming_sink);
+                }
+
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
-                const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+                int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                if (slot.task->params.kv_streaming_window > 0 && n_left > 1) {
+                    const int n_window = std::min(slot.task->params.kv_streaming_window, n_left - 1);
+                    n_discard = n_left - n_window;
+                }
+
+                n_discard = std::min(std::max(n_discard, 1), n_left);
+
+                if (slot.task->params.kv_streaming_window > 0) {
+                    SLT_WRN(slot, "slot context shift (streaming), n_keep = %d, n_left = %d, n_discard = %d, kv_streaming_sink = %d, kv_streaming_window = %d\n",
+                            n_keep, n_left, n_discard, slot.task->params.kv_streaming_sink, slot.task->params.kv_streaming_window);
+                } else {
+                    SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                }
 
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);

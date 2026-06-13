@@ -68,6 +68,8 @@ struct cli_context {
         defaults.sampling    = params.sampling;
         defaults.speculative = params.speculative;
         defaults.n_keep      = params.n_keep;
+        defaults.kv_streaming_sink   = params.kv_streaming_sink;
+        defaults.kv_streaming_window = params.kv_streaming_window;
         defaults.n_predict   = params.n_predict;
         defaults.antiprompt  = params.antiprompt;
 

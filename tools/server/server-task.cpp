@@ -66,6 +66,8 @@ json task_params::to_json(bool only_metrics) const {
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
+            {"kv_streaming_sink",         kv_streaming_sink},
+            {"kv_streaming_window",       kv_streaming_window},
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
             {"n_probs",                   sampling.n_probs},
@@ -124,6 +126,8 @@ json task_params::to_json(bool only_metrics) const {
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
+        {"kv_streaming_sink",         kv_streaming_sink},
+        {"kv_streaming_window",       kv_streaming_window},
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
@@ -249,6 +253,8 @@ task_params server_task::params_from_json_cmpl(
     defaults.sampling      = params_base.sampling;
     defaults.speculative   = params_base.speculative;
     defaults.n_keep        = params_base.n_keep;
+    defaults.kv_streaming_sink   = params_base.kv_streaming_sink;
+    defaults.kv_streaming_window = params_base.kv_streaming_window;
     defaults.n_predict     = params_base.n_predict;
     defaults.n_cache_reuse = params_base.n_cache_reuse;
     defaults.cache_prompt  = params_base.cache_prompt;
@@ -269,6 +275,8 @@ task_params server_task::params_from_json_cmpl(
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
     params.n_discard        = json_value(data,       "n_discard",          defaults.n_discard);
+    params.kv_streaming_sink   = json_value(data,    "kv_streaming_sink",   defaults.kv_streaming_sink);
+    params.kv_streaming_window = json_value(data,    "kv_streaming_window", defaults.kv_streaming_window);
     params.n_cmpl           = json_value(data,       "n_cmpl",             json_value(data, "n", 1));
     params.n_cache_reuse    = json_value(data,       "n_cache_reuse",      defaults.n_cache_reuse);
     //params.t_max_prompt_ms  = json_value(data,       "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
@@ -347,6 +355,14 @@ task_params server_task::params_from_json_cmpl(
 
     if (params.sampling.dry_penalty_last_n < -1) {
         throw std::runtime_error("Error: dry_penalty_last_n must be >= -1");
+    }
+
+    if (params.kv_streaming_sink < 0) {
+        throw std::runtime_error("Error: kv_streaming_sink must be >= 0");
+    }
+
+    if (params.kv_streaming_window < 0) {
+        throw std::runtime_error("Error: kv_streaming_window must be >= 0");
     }
 
     if (params.sampling.penalty_last_n == -1) {
