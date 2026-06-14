@@ -112,6 +112,21 @@ static bool common_speculative_are_compatible(
     return true;
 }
 
+static bool common_speculative_decode_ok(
+        llama_context * ctx,
+        llama_batch batch,
+        const char * label) {
+    const int ret = llama_decode(ctx, batch);
+    if (ret < 0) {
+        LOG_WRN("%s: %s llama_decode failed, ret = %d\n", __func__, label, ret);
+        return false;
+    }
+    if (ret > 0) {
+        LOG_WRN("%s: %s llama_decode returned %d\n", __func__, label, ret);
+    }
+    return true;
+}
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -443,10 +458,11 @@ struct common_speculative_state_draft : public common_speculative_state {
         if (batch.n_tokens > 0) {
             //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
 
-            int ret = llama_decode(ctx_dft, batch);
-            if (ret != 0 && ret != 1) {
-                LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu\n",
-                        __func__, ret, prompt_cur.size());
+            if (!common_speculative_decode_ok(ctx_dft, batch, "draft prompt batch")) {
+                llama_memory_clear(mem_dft, false);
+                prompt_dft.clear();
+                result.clear();
+                return;
             }
         }
 
@@ -461,10 +477,11 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
 
-        int ret = llama_decode(ctx_dft, batch);
-        if (ret != 0 && ret != 1) {
-            LOG_WRN("%s: llama_decode returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
-                    __func__, ret, prompt_cur.size(), prompt_dft.size());
+        if (!common_speculative_decode_ok(ctx_dft, batch, "draft id_last")) {
+            llama_memory_clear(mem_dft, false);
+            prompt_dft.clear();
+            result.clear();
+            return;
         }
 
         common_sampler_reset(smpl);
@@ -501,10 +518,11 @@ struct common_speculative_state_draft : public common_speculative_state {
             common_batch_add(batch, id, n_past + i + 1, { 0 }, true);
 
             // evaluate the drafted tokens on the draft model
-            ret = llama_decode(ctx_dft, batch);
-            if (ret != 0) {
-                LOG_WRN("%s: llama_decode[%d] returned %d, prompt_cur.size=%zu, prompt_dft.size=%zu\n",
-                        __func__, i, ret, prompt_cur.size(), prompt_dft.size());
+            if (!common_speculative_decode_ok(ctx_dft, batch, "draft generated token")) {
+                llama_memory_clear(mem_dft, false);
+                prompt_dft.clear();
+                result.clear();
+                return;
             }
 
             prompt_dft.push_back(id);
@@ -1139,7 +1157,13 @@ struct common_speculative_state_tree : public common_speculative_state {
             prompt_dft.push_back(prompt_cur[i]);
         }
         if (batch.n_tokens > 0) {
-            llama_decode(ctx_dft, batch);
+            if (!common_speculative_decode_ok(ctx_dft, batch, "tree prompt batch")) {
+                llama_memory_clear(mem_dft, false);
+                prompt_dft.clear();
+                tree = speculation_tree{};
+                result.clear();
+                return;
+            }
         }
 
         const llama_pos n_past = prompt_dft.size();
@@ -1147,7 +1171,13 @@ struct common_speculative_state_tree : public common_speculative_state {
         common_batch_clear(batch);
         common_batch_add(batch, id_last, n_past, { 0 }, true);
         prompt_dft.push_back(id_last);
-        llama_decode(ctx_dft, batch);
+        if (!common_speculative_decode_ok(ctx_dft, batch, "tree id_last")) {
+            llama_memory_clear(mem_dft, false);
+            prompt_dft.clear();
+            tree = speculation_tree{};
+            result.clear();
+            return;
+        }
         common_sampler_reset(smpl);
 
         // --- DySpec: heap-based dynamic tree construction ---
@@ -1238,7 +1268,17 @@ struct common_speculative_state_tree : public common_speculative_state {
                 common_batch_add(batch, tree.tokens[fn.node_idx],
                     n_past + fn.depth + 1, { fn.seq_id }, true);
             }
-            llama_decode(ctx_dft, batch);
+            if (!common_speculative_decode_ok(ctx_dft, batch, "tree wave batch")) {
+                for (auto & fn : wave) {
+                    if (fn.owns_smpl) common_sampler_free(fn.smpl);
+                    if (fn.seq_id != 0) llama_memory_seq_rm(mem_dft, fn.seq_id, 0, -1);
+                }
+                llama_memory_clear(mem_dft, false);
+                prompt_dft.clear();
+                tree = speculation_tree{};
+                result.clear();
+                return;
+            }
 
             for (size_t w = 0; w < wave.size(); w++) {
                 auto & fn = wave[w];
