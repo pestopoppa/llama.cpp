@@ -21,6 +21,8 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+static constexpr uint32_t SPEC_TREE_MAX_SEQS = 32;
+
 const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
@@ -1028,7 +1030,7 @@ struct common_speculative_state_tree : public common_speculative_state {
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
     {
-        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, SPEC_TREE_MAX_SEQS);
         {
             common_params_sampling params;
             params.no_perf = false;
@@ -1322,7 +1324,7 @@ struct common_speculative_state_tree : public common_speculative_state {
                         common_sampler_accept(fn.smpl, child_tok, true);
                         fn.owns_smpl = false;
                     } else {
-                        if (next_seq_id >= 32) break;
+                        if ((uint32_t) next_seq_id >= SPEC_TREE_MAX_SEQS) break;
                         child_seq = next_seq_id++;
                         llama_memory_seq_cp(mem_dft, fn.seq_id, child_seq, 0, -1);
                         child_smpl = common_sampler_clone(fn.smpl);
@@ -1382,6 +1384,9 @@ common_speculative * common_speculative_init(
         llama_context             * ctx_tgt) {
     llama_context * ctx_dft = nullptr;
     if (params.model_dft) {
+        if (!params.mparams_dft.path.empty() && params.p_split > 0.0f) {
+            params.cparams_dft.n_seq_max = std::max(params.cparams_dft.n_seq_max, SPEC_TREE_MAX_SEQS);
+        }
         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s", "failed to create draft context\n");
