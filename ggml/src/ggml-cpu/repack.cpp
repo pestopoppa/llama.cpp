@@ -12,9 +12,17 @@
 #include "arch-fallback.h"
 
 #include <cmath>
+#include <cstdlib>  // for std::getenv
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#if defined(__linux__)
+#include <cctype>    // isdigit
+#include <cerrno>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 #include "repack.h"
 
@@ -1365,6 +1373,53 @@ void ggml_gemv_q8_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+void ggml_gemv_q8_0_8x8_q8_0_generic(int                        n,
+                                     float * GGML_RESTRICT      s,
+                                     size_t                     bs,
+                                     const void * GGML_RESTRICT vx,
+                                     const void * GGML_RESTRICT vy,
+                                     int                        nr,
+                                     int                        nc) {
+    const int qk                = QK8_0;
+    const int nb                = n / qk;
+    const int ncols_interleaved = 8;
+    const int blocklen          = 8;
+
+    assert(nr == 1);
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    float sumf[8];
+    int   sumi;
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q8_0x8 * b_ptr = (const block_q8_0x8 *) vx + (x * nb);
+
+        for (int j = 0; j < ncols_interleaved; j++) {
+            sumf[j] = 0.0;
+        }
+        for (int l = 0; l < nb; l++) {
+            for (int k = 0; k < (qk / blocklen); k++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    sumi = 0;
+                    for (int i = 0; i < blocklen; ++i) {
+                        const int v0 = b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                        sumi += v0 * a_ptr[l].qs[k * blocklen + i];
+                    }
+                    sumf[j] += sumi * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * GGML_CPU_FP16_TO_FP32(a_ptr[l].d);
+                }
+            }
+        }
+        for (int j = 0; j < ncols_interleaved; j++) {
+            s[x * ncols_interleaved + j] = sumf[j];
+        }
+    }
+}
+
 // Only enable these for RISC-V.
 #if defined __riscv_zvfh
 void ggml_gemv_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2383,6 +2438,58 @@ void ggml_gemm_q8_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+void ggml_gemm_q8_0_8x8_q8_0_generic(int                        n,
+                                     float * GGML_RESTRICT      s,
+                                     size_t                     bs,
+                                     const void * GGML_RESTRICT vx,
+                                     const void * GGML_RESTRICT vy,
+                                     int                        nr,
+                                     int                        nc) {
+    const int qk                = QK8_0;
+    const int nb                = n / qk;
+    const int ncols_interleaved = 8;
+    const int blocklen          = 8;
+
+    assert(n % qk == 0);
+    assert(nr % 4 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    float sumf[4][8];
+    int   sumi;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_q8_0x8 * b_ptr = (const block_q8_0x8 *) vx + (x * nb);
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    sumf[m][j] = 0.0;
+                }
+            }
+            for (int l = 0; l < nb; l++) {
+                for (int k = 0; k < (qk / blocklen); k++) {
+                    for (int m = 0; m < 4; m++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            sumi = 0;
+                            for (int i = 0; i < blocklen; ++i) {
+                                const int v0 = b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
+                            }
+                            sumf[m][j] +=
+                                sumi * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * GGML_CPU_FP16_TO_FP32(a_ptr[l].d[m]);
+                        }
+                    }
+                }
+            }
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+                }
+            }
+        }
+    }
+}
+
 // Only enable these for RISC-V.
 #if defined __riscv_zvfh
 void ggml_gemm_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2808,6 +2915,27 @@ static block_q4_0x8 make_block_q4_0x8(block_q4_0 * in, unsigned int blck_size_in
     return out;
 }
 
+// Interleave 8 block_q8_0 into a block_q8_0x8 with stride blck_size_interleave.
+// Layout for blck_size_interleave=8 (the only value we use on Zen 5 8x8):
+//   chunk i stores in[i % 8].qs[((i/8)*8) .. ((i/8)*8)+7], so the first 64
+//   bytes form [R0[0..7], R1[0..7], ..., R7[0..7]] — one ZMM per K-subchunk.
+static block_q8_0x8 make_block_q8_0x8(block_q8_0 * in, unsigned int blck_size_interleave) {
+    block_q8_0x8 out;
+
+    for (int i = 0; i < 8; i++) {
+        out.d[i] = in[i].d;
+    }
+
+    const int end = QK8_0 * 8 / blck_size_interleave;
+    for (int i = 0; i < end; ++i) {
+        int src_id     = i % 8;
+        int src_offset = (i / 8) * blck_size_interleave;
+        int dst_offset = i * blck_size_interleave;
+        memcpy(&out.qs[dst_offset], &in[src_id].qs[src_offset], blck_size_interleave);
+    }
+    return out;
+}
+
 static block_q4_0x16 make_block_q4_0x16(block_q4_0 * in, unsigned int blck_size_interleave) {
     block_q4_0x16 out;
 
@@ -3202,11 +3330,10 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
     GGML_ASSERT(interleave_block == 4 || interleave_block == 8);
     constexpr int nrows_interleaved = 4;
 
-    block_q4_0x4 * dst = (block_q4_0x4 *)t->data;
-    const block_q4_0 * src = (const block_q4_0 *)data;
-    block_q4_0 dst_tmp[4];
-    int nrow = ggml_nrows(t);
-    int nblocks = t->ne[0] / QK4_0;
+    block_q4_0x4 * dst_base = (block_q4_0x4 *)t->data;
+    const block_q4_0 * src_base = (const block_q4_0 *)data;
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK4_0;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_0));
 
@@ -3214,14 +3341,23 @@ static int repack_q4_0_to_q4_0_4_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_q4_0 * src = src_base + b * nblocks;
+        block_q4_0x4 * dst = dst_base + bg * nblocks;
+        block_q4_0 dst_tmp[4];
+
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_q4_0x4(dst_tmp, interleave_block);
+            dst[x] = make_block_q4_0x4(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3233,11 +3369,10 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
     GGML_ASSERT(interleave_block == 8 || interleave_block == 4);
     constexpr int nrows_interleaved = 8;
 
-    block_q4_Kx8 * dst = (block_q4_Kx8*)t->data;
-    const block_q4_K * src = (const block_q4_K*) data;
-    block_q4_K dst_tmp[8];
-    int nrow = ggml_nrows(t);
-    int nblocks = t->ne[0] / QK_K;
+    block_q4_Kx8 * dst_base = (block_q4_Kx8*)t->data;
+    const block_q4_K * src_base = (const block_q4_K*) data;
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_K));
 
@@ -3245,14 +3380,23 @@ static int repack_q4_K_to_q4_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_q4_K * src = src_base + b * nblocks;
+        block_q4_Kx8 * dst = dst_base + bg * nblocks;
+        block_q4_K dst_tmp[8];
+
         for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
+            for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_q4_Kx8(dst_tmp, interleave_block);
+            dst[x] = make_block_q4_Kx8(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3294,11 +3438,10 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
     GGML_ASSERT(interleave_block == 8);
     constexpr int nrows_interleaved = 8;
 
-    block_q2_Kx8 * dst = (block_q2_Kx8*)t->data;
-    const block_q2_K * src = (const block_q2_K*) data;
-    block_q2_K dst_tmp[8];
-    int nrow = ggml_nrows(t);
-    int nblocks = t->ne[0] / QK_K;
+    block_q2_Kx8 * dst_base = (block_q2_Kx8*)t->data;
+    const block_q2_K * src_base = (const block_q2_K*) data;
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q2_K));
 
@@ -3306,14 +3449,23 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_q2_K * src = src_base + b * nblocks;
+        block_q2_Kx8 * dst = dst_base + bg * nblocks;
+        block_q2_K dst_tmp[8];
+
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_q2_Kx8(dst_tmp, interleave_block);
+            dst[x] = make_block_q2_Kx8(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3451,11 +3603,10 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
     GGML_ASSERT(interleave_block == 8);
     constexpr int nrows_interleaved = 8;
 
-    block_q4_0x8 * dst = (block_q4_0x8*)t->data;
-    const block_q4_0 * src = (const block_q4_0*) data;
-    block_q4_0 dst_tmp[8];
-    int nrow = ggml_nrows(t);
-    int nblocks = t->ne[0] / QK4_0;
+    block_q4_0x8 * dst_base = (block_q4_0x8*)t->data;
+    const block_q4_0 * src_base = (const block_q4_0*) data;
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK4_0;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_0));
 
@@ -3463,14 +3614,23 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, int interleave_block
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_q4_0 * src = src_base + b * nblocks;
+        block_q4_0x8 * dst = dst_base + bg * nblocks;
+        block_q4_0 dst_tmp[8];
+
         for (int64_t x = 0; x < nblocks; x++) {
-            for (int i  = 0; i < nrows_interleaved; i++ ) {
+            for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_q4_0x8(dst_tmp, interleave_block);
+            dst[x] = make_block_q4_0x8(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3503,6 +3663,38 @@ static int repack_q8_0_to_q8_0_4_bl(struct ggml_tensor *       t,
                 dst_tmp[i] = src[x + i * nblocks];
             }
             *dst++ = make_block_q8_0x4(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
+
+static int repack_q8_0_to_q8_0_8_bl(struct ggml_tensor *       t,
+                                    int                        interleave_block,
+                                    const void * GGML_RESTRICT data,
+                                    size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(interleave_block == 8);
+    constexpr int nrows_interleaved = 8;
+
+    block_q8_0x8 *     dst = (block_q8_0x8 *) t->data;
+    const block_q8_0 * src = (const block_q8_0 *) data;
+    block_q8_0         dst_tmp[8];
+    int                nrow    = ggml_nrows(t);
+    int                nblocks = t->ne[0] / QK8_0;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q8_0));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_q8_0x8(dst_tmp, interleave_block);
         }
         src += nrows_interleaved * nblocks;
     }
@@ -3602,14 +3794,12 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
     GGML_ASSERT(t->type == GGML_TYPE_IQ4_NL);
     GGML_ASSERT(interleave_block == 4);
 
-    const block_iq4_nl   * src = (const block_iq4_nl   *)data;
-          block_iq4_nlx4 * dst = (      block_iq4_nlx4 *)t->data;
+    const block_iq4_nl * src_base = (const block_iq4_nl *)data;
+    block_iq4_nlx4 * dst_base = (block_iq4_nlx4 *)t->data;
 
-    block_iq4_nl dst_tmp[4];
-
-    int nrow = ggml_nrows(t);
-    int nrows_interleaved = 4;
-    int nblocks = t->ne[0] / QK4_NL;
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 4;
+    const int nblocks = t->ne[0] / QK4_NL;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_nl));
 
@@ -3617,14 +3807,23 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_iq4_nl * src = src_base + b * nblocks;
+        block_iq4_nlx4 * dst = dst_base + bg * nblocks;
+        block_iq4_nl dst_tmp[4];
+
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_iq4_nlx4(dst_tmp, interleave_block);
+            dst[x] = make_block_iq4_nlx4(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3659,14 +3858,12 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_ASSERT(t->type == GGML_TYPE_IQ4_NL);
     GGML_ASSERT(interleave_block == 8);
 
-    const block_iq4_nl   * src = (const block_iq4_nl   *)data;
-          block_iq4_nlx8 * dst = (      block_iq4_nlx8 *)t->data;
+    const block_iq4_nl * src_base = (const block_iq4_nl *)data;
+    block_iq4_nlx8 * dst_base = (block_iq4_nlx8 *)t->data;
 
-    block_iq4_nl dst_tmp[8];
-
-    int nrow = ggml_nrows(t);
-    int nrows_interleaved = 8;
-    int nblocks = t->ne[0] / QK4_NL;
+    const int nrow = ggml_nrows(t);
+    const int nrows_interleaved = 8;
+    const int nblocks = t->ne[0] / QK4_NL;
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_nl));
 
@@ -3674,14 +3871,23 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int n_row_groups = nrow / nrows_interleaved;
+
+#ifdef GGML_USE_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int bg = 0; bg < n_row_groups; bg++) {
+        const int b = bg * nrows_interleaved;
+        const block_iq4_nl * src = src_base + b * nblocks;
+        block_iq4_nlx8 * dst = dst_base + bg * nblocks;
+        block_iq4_nl dst_tmp[8];
+
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
             }
-            *dst++ = make_block_iq4_nlx8(dst_tmp, interleave_block);
+            dst[x] = make_block_iq4_nlx8(dst_tmp, interleave_block);
         }
-        src += nrows_interleaved * nblocks;
     }
     return 0;
 
@@ -3934,6 +4140,10 @@ template <> int repack<block_q8_0, 8, 4>(struct ggml_tensor * t, const void * da
     return repack_q8_0_to_q8_0_4_bl(t, 8, data, data_size);
 }
 
+template <> int repack<block_q8_0, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q8_0_to_q8_0_8_bl(t, 8, data, data_size);
+}
+
 #if defined __riscv_zvfh
 template <> int repack<block_q4_0, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_16_bl(t, 1, data, data_size);
@@ -4031,6 +4241,10 @@ template <> void gemv<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemv_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_q8_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q8_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 #if defined __riscv_zvfh
 template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4126,6 +4340,10 @@ template <> void gemm<block_q8_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 
 template <> void gemm<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_q8_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q8_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 #if defined __riscv_zvfh
@@ -4302,9 +4520,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
+            // Remainder rows: the 4-row-interleaved `ggml_quantize_mat_t` can only
+            // consume full 4-row blocks, so any leftover rows (e.g. ne11=1 during
+            // single-token decode) fall through to a plain `from_float` per row.
+            //
+            // The upstream pattern was `i11 = i11_processed + ith; i11 < ne11; i11 += nth`,
+            // which at ne11=1 has ONLY thread 0 do real work while the other nth-1
+            // threads skip straight to the `ggml_barrier` below — a serial stall
+            // that caps tensor_traits decode throughput regardless of thread count.
+            // The standard `ggml_compute_forward_mul_mat` path (ggml-cpu.c:1466-1475)
+            // solves this by partitioning the K dimension across threads for each
+            // leftover row. Mirror that here.
             const int64_t i11_processed = ne11 - ne11 % 4;
-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+            for (int64_t i11 = i11_processed; i11 < ne11; ++i11) {
+                const size_t bs = ggml_blck_size(PARAM_TYPE);
+                const size_t nbw0 = ggml_type_size(PARAM_TYPE);
+                const int64_t nb_k = ne10 / bs;
+                const int64_t k_block_start = (ith * nb_k) / nth;
+                const int64_t k_block_end   = ((ith + 1) * nb_k) / nth;
+                if (k_block_end > k_block_start) {
+                    from_float(
+                        (float *) (data_ptr + i11 * nb11 + k_block_start * bs * nb10),
+                        (void *) (wdata_ptr + i11 * nbw1 + k_block_start * nbw0),
+                        (k_block_end - k_block_start) * bs);
+                }
             }
         }
 
@@ -4557,6 +4796,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for Q8_0
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 4, GGML_TYPE_Q8_0> q8_0_4x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_q8_0, 8, 8, GGML_TYPE_Q8_0> q8_0_8x8_q8_0;
 
     // instances for RISC-V
     //
@@ -4697,6 +4937,17 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
         }
     } else if (cur->type == GGML_TYPE_Q8_0) {
+        // x86 Zen 5 / AVX-512BW 8x8 repacked GEMV path, env-gated for rollout
+        // (scaffold: falls through to _generic until the SIMD kernel lands).
+        if (ggml_cpu_has_avx512()) {
+            static const bool q8_0_8x8_enabled = []() {
+                const char * env = std::getenv("GGML_Q8_0_8X8");
+                return env != nullptr && env[0] == '1';
+            }();
+            if (q8_0_8x8_enabled && cur->ne[1] % 8 == 0) {
+                return &q8_0_8x8_q8_0;
+            }
+        }
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             if (cur->ne[1] % 4 == 0) {
                 return &q8_0_4x8_q8_0;
@@ -4754,6 +5005,84 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     if (buffer == nullptr) {
         return nullptr;
     }
+
+#if defined(__linux__)
+    // NUMA placement for CPU_REPACK buffers (CPU2 Session 15 follow-up).
+    //
+    // Background: `ggml_aligned_malloc` returns unfaulted anonymous pages
+    // that, on first-touch, get pinned to whichever NUMA node the touching
+    // thread runs on. For a ~26 GB Q8_0 weight buffer on NPS4 EPYC,
+    // first-touch from whatever thread runs `set_tensor` lands every page
+    // on that one node; decode traffic from 96 threads × 4 nodes then
+    // saturates that single node's memory controllers (2.8× regression
+    // vs the mmap+interleave baseline measured 2026-04-24).
+    //
+    // Fix: mbind(MPOL_INTERLEAVE) the whole region across all nodes so
+    // first-touch round-robins pages. This is the allocation-time analog
+    // of the CPU1 Phase 1.3 `set_mempolicy(MPOL_INTERLEAVE)` that the mmap
+    // path applies before mapping GGUF weights, scoped to this buffer
+    // rather than process-wide.
+    //
+    // Kill-switch: `GGML_NUMA_REPACK_INTERLEAVE=0` disables this mbind
+    // and falls back to whatever first-touch NUMA assignment the OS picks.
+    // Default-on for backward compatibility — set 0 only when measuring
+    // the baseline impact of the mbind itself, or when an alternative
+    // NUMA strategy (per-CCD bind, replication) is active.
+    //
+    // Gated `only_numa` (via ggml_is_numa()) so single-node hosts pay nothing.
+    static const bool numa_repack_interleave = []() {
+        const char * env = std::getenv("GGML_NUMA_REPACK_INTERLEAVE");
+        // Default ON: missing var or non-"0" value → enabled.
+        // Explicit "0" → disabled.
+        const bool enabled = (env == nullptr || env[0] != '0');
+        if (!enabled) {
+            GGML_LOG_INFO("cpu-repack: GGML_NUMA_REPACK_INTERLEAVE=0 — "
+                          "skipping mbind(MPOL_INTERLEAVE) on CPU_REPACK buffers; "
+                          "first-touch NUMA placement only\n");
+        }
+        return enabled;
+    }();
+    if (numa_repack_interleave && ggml_is_numa() && buffer->context && buffer->size >= (1ull << 20)) {
+        int n_nodes = 0;
+        if (DIR * d = opendir("/sys/devices/system/node")) {
+            struct dirent * ent;
+            while ((ent = readdir(d))) {
+                if (strncmp(ent->d_name, "node", 4) == 0 && isdigit((unsigned char)ent->d_name[4])) {
+                    n_nodes++;
+                }
+            }
+            closedir(d);
+        }
+        if (n_nodes > 1) {
+            const unsigned long maxnode = 64UL;
+            unsigned long nodemask = 0;
+            for (int n = 0; n < n_nodes && n < 64; ++n) nodemask |= (1UL << n);
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+#ifndef SYS_mbind
+// x86_64 mbind syscall number; avoid pulling in <sys/syscall.h> if it
+// doesn't surface SYS_mbind on this libc.
+#define SYS_mbind 237
+#endif
+            uintptr_t addr = (uintptr_t) buffer->context;
+            size_t    len  = buffer->size;
+            // Page-align the start down and length up for mbind.
+            const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+            uintptr_t aligned_addr = addr & ~(page - 1);
+            size_t    aligned_len  = ((addr - aligned_addr) + len + page - 1) & ~(page - 1);
+            long rc = syscall(SYS_mbind, (void *) aligned_addr, aligned_len,
+                              MPOL_INTERLEAVE, &nodemask, maxnode, 0ul);
+            if (rc != 0) {
+                GGML_LOG_WARN("cpu-repack: mbind(MPOL_INTERLEAVE) failed on %zu-byte buffer: %s\n",
+                              aligned_len, strerror(errno));
+            } else {
+                GGML_LOG_INFO("cpu-repack: mbind(MPOL_INTERLEAVE) on %.1f GiB across %d NUMA nodes\n",
+                              aligned_len / (1024.0 * 1024.0 * 1024.0), n_nodes);
+            }
+        }
+    }
+#endif
 
     buffer->buft              = buft;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
