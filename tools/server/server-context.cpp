@@ -2610,10 +2610,19 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
-                        queue_tasks.defer(std::move(task));
-                        break;
+                        // F6 (ported from v5 55fa088e8 + ffcb1baf4): force-release a processing
+                        // slot for erase instead of deferring, so an external timeout manager can
+                        // cancel in-flight inference nobody is reading. Notify the original
+                        // request's HTTP handler so it doesn't block forever (capture its task id
+                        // before release() clears slot->task), then fall through to clear the KV.
+                        SLT_WRN(*slot, "force-releasing processing slot for erase, id_task = %d\n", task.id);
+                        if (slot->task) {
+                            const int orig_task_id = slot->task->id;
+                            slot->release();
+                            send_error(orig_task_id, "Slot erased while processing (external timeout)");
+                        } else {
+                            slot->release();
+                        }
                     }
 
                     // Erase token cache
