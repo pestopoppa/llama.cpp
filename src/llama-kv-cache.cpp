@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -108,6 +109,36 @@ llama_kv_cache::llama_kv_cache(
         if (kv_size != size_other) {
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             kv_size = size_other;
+        }
+    }
+
+    // Check for paged attention memory reduction
+    // LLAMA_PAGED_ATTN=N sets block size
+    // LLAMA_PAGED_ATTN_MAX_BLOCKS=M limits to M blocks (memory savings)
+    {
+        const char * env_paged      = getenv("LLAMA_PAGED_ATTN");
+        const char * env_max_blocks = getenv("LLAMA_PAGED_ATTN_MAX_BLOCKS");
+        uint32_t paged_block_size = 0;
+        uint32_t paged_max_blocks = 0;
+        if (env_paged) {
+            paged_block_size = (uint32_t) atoi(env_paged);
+        }
+        if (env_max_blocks) {
+            paged_max_blocks = (uint32_t) atoi(env_max_blocks);
+        }
+        // If paged attention with max blocks is configured, reduce kv_size
+        if (paged_block_size > 0 && paged_max_blocks > 0) {
+            uint32_t kv_size_paged = paged_max_blocks * paged_block_size;
+            // Ensure alignment with n_pad
+            if (n_pad > 1 && kv_size_paged % n_pad != 0) {
+                kv_size_paged = ((kv_size_paged + n_pad - 1) / n_pad) * n_pad;
+            }
+            if (kv_size_paged < kv_size) {
+                const float savings = 100.0f * (1.0f - (float)kv_size_paged / kv_size);
+                LLAMA_LOG_INFO("%s: paged attention reducing KV cache from %u to %u tokens (%.1f%% memory savings)\n",
+                               __func__, kv_size, kv_size_paged, savings);
+                kv_size = kv_size_paged;
+            }
         }
     }
 
@@ -374,6 +405,17 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // Enable paged attention block tracking via environment variable
+    // Usage: LLAMA_PAGED_ATTN=64 (block size in tokens)
+    const char * LLAMA_PAGED_ATTN = getenv("LLAMA_PAGED_ATTN");
+    if (LLAMA_PAGED_ATTN) {
+        const uint32_t block_size_env = (uint32_t) atoi(LLAMA_PAGED_ATTN);
+        if (block_size_env > 0) {
+            enable_blocks(block_size_env);
+            LLAMA_LOG_INFO("%s: paged attention enabled with block_size = %u\n", __func__, block_size_env);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -451,6 +493,55 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+        }
+    }
+
+    // Update block tracking after removal
+    if (enable_block_tracking && block_size > 0) {
+        if (seq_id >= 0) {
+            // Check if we removed the entire sequence (all positions)
+            const uint32_t stream_idx = seq_to_stream[seq_id];
+            if (stream_idx < v_block_tables.size() && stream_idx < v_block_pools.size()) {
+                auto & table = v_block_tables[stream_idx];
+                auto & pool = v_block_pools[stream_idx];
+                auto & cells = v_cells[stream_idx];
+                // Check if this sequence still has any cells
+                bool seq_has_cells = false;
+                for (uint32_t i = 0; i < cells.size() && !seq_has_cells; ++i) {
+                    if (cells.seq_has(i, seq_id)) {
+                        seq_has_cells = true;
+                    }
+                }
+                if (!seq_has_cells) {
+                    // Sequence is completely removed, deallocate all its blocks
+                    const auto * blocks = table.get_sequence_blocks(seq_id);
+                    if (blocks) {
+                        for (int32_t physical_block : *blocks) {
+                            if (physical_block >= 0) {
+                                pool.deallocate(physical_block);
+                                LLAMA_LOG_DEBUG("%s: deallocated block %d for seq %d\n",
+                                               __func__, physical_block, seq_id);
+                            }
+                        }
+                    }
+                    table.clear_sequence(seq_id);
+                }
+            }
+        } else {
+            // Removed all sequences - clear all block tracking
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                if (s < v_block_pools.size()) {
+                    v_block_pools[s].clear();
+                }
+                if (s < v_block_tables.size()) {
+                    v_block_tables[s].clear();
+                }
+            }
+            LLAMA_LOG_DEBUG("%s: cleared all block tracking\n", __func__);
+        }
+        // Print stats in debug mode
+        if (debug > 0) {
+            print_block_stats();
         }
     }
 
@@ -1183,6 +1274,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // Update block allocations for paged attention
+    update_block_tokens(sinfo);
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1807,6 +1901,211 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+//
+// llama_kv_cache block tracking for paged attention
+//
+
+void llama_kv_cache::enable_blocks(uint32_t tokens_per_block) {
+    if (tokens_per_block == 0) {
+        return;
+    }
+
+    enable_block_tracking = true;
+    block_size = tokens_per_block;
+
+    // Initialize block pools and tables for each stream
+    const uint32_t kv_size = get_size();
+    const uint32_t n_blocks = (kv_size + block_size - 1) / block_size;
+
+    v_block_pools.resize(n_stream);
+    v_block_tables.resize(n_stream);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_block_pools[s].init(n_blocks);
+    }
+
+    LLAMA_LOG_INFO("%s: enabled block tracking with block_size=%u, n_blocks=%u\n",
+                   __func__, block_size, n_blocks);
+}
+
+bool llama_kv_cache::has_block_tracking() const {
+    return enable_block_tracking;
+}
+
+uint32_t llama_kv_cache::get_block_size() const {
+    return block_size;
+}
+
+ggml_tensor * llama_kv_cache::build_block_table_tensor(
+        ggml_context * ctx,
+        uint32_t n_seqs,
+        uint32_t max_blocks_per_seq) const {
+    // Create I32 tensor [max_blocks_per_seq, n_seqs]
+    ggml_tensor * block_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_blocks_per_seq, n_seqs);
+    ggml_set_input(block_table);
+    ggml_set_name(block_table, "block_table");
+    return block_table;
+}
+
+void llama_kv_cache::set_input_block_table(ggml_tensor * dst, const slot_info & sinfo) const {
+    int32_t * data = (int32_t *) dst->data;
+    const int64_t max_blocks = dst->ne[0];
+    const int64_t n_seqs = dst->ne[1];
+
+    // Initialize all entries to identity mapping (physical = logical)
+    // This ensures correct behavior even when actual block mappings aren't available
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        for (int64_t b = 0; b < max_blocks; ++b) {
+            data[s * max_blocks + b] = (int32_t) b;
+        }
+    }
+
+    // If block tracking is enabled and we have block tables, use actual mappings
+    if (enable_block_tracking && !v_block_tables.empty()) {
+        for (uint32_t s = 0; s < sinfo.n_stream() && s < (uint32_t) n_seqs; ++s) {
+            const uint32_t stream_idx = sinfo.strm[s];
+            if (stream_idx >= v_block_tables.size()) {
+                continue;
+            }
+
+            const auto & block_table = v_block_tables[stream_idx];
+            const auto sequences = block_table.get_sequences();
+
+            for (const auto & seq_id : sequences) {
+                const auto * blocks = block_table.get_sequence_blocks(seq_id);
+                if (!blocks || blocks->empty()) {
+                    continue;
+                }
+
+                // Map this sequence's blocks to the table row
+                const int64_t table_row = s;
+                if (table_row >= n_seqs) {
+                    continue;
+                }
+
+                for (size_t b = 0; b < blocks->size() && (int64_t) b < max_blocks; ++b) {
+                    data[table_row * max_blocks + b] = (*blocks)[b];
+                }
+                break; // Only process first sequence per stream for now
+            }
+        }
+    }
+}
+
+void llama_kv_cache::print_block_stats() const {
+    if (!enable_block_tracking || block_size == 0) {
+        LLAMA_LOG_INFO("%s: block tracking not enabled\n", __func__);
+        return;
+    }
+
+    // Compute bytes per token (K + V per layer)
+    size_t bytes_per_token = 0;
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+        bytes_per_token += n_embd_k_gqa * ggml_type_size(layer.k->type);
+        bytes_per_token += n_embd_v_gqa * ggml_type_size(layer.v->type);
+    }
+
+    LLAMA_LOG_INFO("%s: === Block Pool Statistics ===\n", __func__);
+    LLAMA_LOG_INFO("%s: block_size = %u tokens, bytes_per_token = %zu\n",
+                   __func__, block_size, bytes_per_token);
+
+    for (uint32_t s = 0; s < n_stream && s < v_block_pools.size(); ++s) {
+        const auto & pool = v_block_pools[s];
+        const auto stats = pool.compute_stats(block_size, bytes_per_token);
+
+        LLAMA_LOG_INFO("%s: stream %u: blocks %u/%u (%.1f%% used), tokens %u/%u (%.1f%% util)\n",
+                       __func__, s,
+                       stats.n_blocks_used, stats.n_blocks_total,
+                       stats.n_blocks_total > 0 ? 100.0f * stats.n_blocks_used / stats.n_blocks_total : 0.0f,
+                       stats.n_tokens_used, stats.n_tokens_total,
+                       100.0f * stats.utilization);
+
+        if (stats.n_tokens_wasted > 0) {
+            LLAMA_LOG_INFO("%s:   wasted: %u tokens (%.1f%% fragmentation)\n",
+                           __func__, stats.n_tokens_wasted, 100.0f * stats.fragmentation);
+        }
+
+        if (bytes_per_token > 0 && stats.memory_allocated > 0) {
+            LLAMA_LOG_INFO("%s:   memory: %.2f MiB allocated, %.2f MiB used, %.2f MiB wasted\n",
+                           __func__,
+                           stats.memory_allocated / (1024.0f * 1024.0f),
+                           stats.memory_used / (1024.0f * 1024.0f),
+                           stats.memory_wasted / (1024.0f * 1024.0f));
+        }
+    }
+    LLAMA_LOG_INFO("%s: =============================\n", __func__);
+}
+
+void llama_kv_cache::update_block_tokens(const slot_info & sinfo) {
+    if (!enable_block_tracking || block_size == 0) {
+        return;
+    }
+
+    // For each stream in the slot info, update block allocations
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t stream_idx = sinfo.strm[s];
+        if (stream_idx >= v_block_pools.size() || stream_idx >= v_block_tables.size()) {
+            continue;
+        }
+
+        auto & pool = v_block_pools[stream_idx];
+        auto & table = v_block_tables[stream_idx];
+        const auto & cells = v_cells[stream_idx];
+
+        // Track which logical blocks we've seen for each sequence
+        std::unordered_map<llama_seq_id, std::set<uint32_t>> seq_logical_blocks;
+
+        // Process each cell index in this stream
+        for (uint32_t ii = 0; ii < sinfo.idxs[s].size(); ++ii) {
+            const uint32_t cell_idx = sinfo.idxs[s][ii];
+            const uint32_t logical_block = cell_idx / block_size;
+
+            // Get sequence IDs for this cell
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq_max; ++seq_id) {
+                if (!cells.seq_has(cell_idx, seq_id)) {
+                    continue;
+                }
+
+                // Check if this logical block already has a physical block allocated
+                int32_t physical_block = table.get_physical(seq_id, logical_block);
+
+                if (physical_block < 0) {
+                    // Need to allocate a new physical block
+                    physical_block = pool.allocate();
+
+                    if (physical_block < 0) {
+                        // Pool exhausted - this shouldn't happen with proper sizing
+                        LLAMA_LOG_WARN("%s: block pool exhausted for stream %u\n", __func__, stream_idx);
+                        continue;
+                    }
+
+                    // Update block metadata
+                    auto & block = pool.get(physical_block);
+                    block.seq_id = seq_id;
+                    block.logical_idx = logical_block;
+                    block.n_tokens = 0;
+
+                    // Update block table mapping
+                    table.set_mapping(seq_id, logical_block, physical_block);
+
+                    LLAMA_LOG_DEBUG("%s: allocated block %d for seq %d, logical %u\n",
+                                   __func__, physical_block, seq_id, logical_block);
+                }
+
+                // Increment token count for this block
+                auto & block = pool.get(physical_block);
+                if (seq_logical_blocks[seq_id].insert(logical_block).second) {
+                    // First time seeing this logical block for this sequence in this batch
+                    block.n_tokens++;
+                }
+            }
+        }
+    }
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -2645,4 +2944,24 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+bool llama_kv_cache_context::has_block_tracking() const {
+    return kv->has_block_tracking();
+}
+
+uint32_t llama_kv_cache_context::get_block_size() const {
+    return kv->get_block_size();
+}
+
+ggml_tensor * llama_kv_cache_context::build_block_table_tensor(
+        ggml_context * ctx,
+        uint32_t n_seqs,
+        uint32_t max_blocks_per_seq) const {
+    return kv->build_block_table_tensor(ctx, n_seqs, max_blocks_per_seq);
+}
+
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst) const {
+    GGML_ASSERT(!sinfos.empty() && "set_input_block_table called without slot infos");
+    kv->set_input_block_table(dst, sinfos[i_cur]);
 }
