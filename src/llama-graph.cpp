@@ -601,6 +601,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot_swa) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
+
+    if (self_block_table != nullptr) {
+        mctx->get_base()->set_input_block_table(self_block_table);
+    }
+
+    if (self_block_table_swa != nullptr) {
+        mctx->get_swa()->set_input_block_table(self_block_table_swa);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -2637,7 +2645,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // paged attention: select the block table for this layer's sub-cache (base vs SWA)
+    ggml_tensor * block_table = is_swa ? inp->get_block_table_swa() : inp->get_block_table();
+    int32_t block_size = block_table ? mctx_cur->get_block_size() : 0;
+    GGML_ASSERT(!block_table || block_size > 0);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, block_table, block_size);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -2777,6 +2790,24 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+
+    // Create per-sub-cache block table tensors for paged attention if enabled.
+    // The base and SWA sub-caches track blocks independently, so each gets its own table.
+    if (cparams.flash_attn) {
+        const uint32_t n_seqs = ubatch.n_seqs_unq;
+
+        if (mctx_cur->get_base()->has_block_tracking()) {
+            const uint32_t block_size = mctx_cur->get_base()->get_block_size();
+            const uint32_t max_blocks_per_seq = (mctx_cur->get_base()->get_n_kv() + block_size - 1) / block_size;
+            inp->self_block_table = mctx_cur->get_base()->build_block_table_tensor(ctx0, n_seqs, max_blocks_per_seq);
+        }
+
+        if (mctx_cur->get_swa()->has_block_tracking()) {
+            const uint32_t block_size = mctx_cur->get_swa()->get_block_size();
+            const uint32_t max_blocks_per_seq = (mctx_cur->get_swa()->get_n_kv() + block_size - 1) / block_size;
+            inp->self_block_table_swa = mctx_cur->get_swa()->build_block_table_tensor(ctx0, n_seqs, max_blocks_per_seq);
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

@@ -1389,18 +1389,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
         {"--paged-attn"}, "N",
-        string_format("enable paged attention with block size N tokens (default: %d, 0 = disabled)", params.paged_attn_block_size),
+        string_format("enable paged attention with block size N tokens (default: %u, 0 = disabled)", params.paged_attn_block_size),
         [](common_params & params, int value) {
             params.paged_attn_block_size = value;
         }
-    ).set_env("LLAMA_PAGED_ATTN"));
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_PAGED_ATTN"));
     add_opt(common_arg(
         {"--paged-attn-max-blocks"}, "N",
-        string_format("max blocks for paged attention memory reduction (default: %d, 0 = unlimited)", params.paged_attn_max_blocks),
+        string_format("max blocks for paged attention memory reduction (default: %u, 0 = unlimited)", params.paged_attn_max_blocks),
         [](common_params & params, int value) {
             params.paged_attn_max_blocks = value;
         }
-    ).set_env("LLAMA_PAGED_ATTN_MAX_BLOCKS"));
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_PAGED_ATTN_MAX_BLOCKS"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

@@ -414,6 +414,11 @@ llama_kv_cache::llama_kv_cache(
         if (block_size_env > 0) {
             enable_blocks(block_size_env);
             LLAMA_LOG_INFO("%s: paged attention enabled with block_size = %u\n", __func__, block_size_env);
+        } else {
+            // env is present but did not parse to a positive block size - make this
+            // visible so an operator can tell the read happened vs. a stale binary
+            LLAMA_LOG_WARN("%s: LLAMA_PAGED_ATTN is set to '%s' but did not resolve to a positive block size; paged attention NOT enabled\n",
+                           __func__, LLAMA_PAGED_ATTN);
         }
     }
 }

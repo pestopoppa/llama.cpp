@@ -441,6 +441,9 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    ggml_tensor * get_block_table()     const { return self_block_table; }
+    ggml_tensor * get_block_table_swa() const { return self_block_table_swa; }
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
@@ -456,6 +459,10 @@ public:
 
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
+
+    // paged attention block tables (per sub-cache), I32 [max_blocks, n_seqs]
+    ggml_tensor * self_block_table     = nullptr; // base (non-SWA) sub-cache
+    ggml_tensor * self_block_table_swa = nullptr; // SWA sub-cache
 
     const llama_hparams hparams;
     const llama_cparams cparams;
