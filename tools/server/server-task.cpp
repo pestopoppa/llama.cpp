@@ -1563,6 +1563,19 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_slot_compact
+//
+json server_task_result_slot_compact::to_json() {
+    return json {
+        { "id_slot",       id_slot },
+        { "scorer",        "expected_attention" },
+        { "n_evicted",     n_evicted },
+        { "keep_ratio",    keep_ratio },
+        { "pos_max_after", pos_max_after },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 

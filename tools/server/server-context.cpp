@@ -10,6 +10,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-kv-compress.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2636,6 +2637,53 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_COMPACT:
+                {
+                    // Expected Attention KV cache compression (forward-ported from v5 894e048e3).
+                    // The scorer reads raw KV tensor data without locks and evicts low-importance
+                    // entries in-place via llama_memory_seq_rm. THREAD SAFETY: the slot MUST be
+                    // idle (not processing inference) to avoid concurrent read/write on KV buffers.
+                    // We defer (like SLOT_SAVE/RESTORE) if the slot is busy — never force-release,
+                    // because EA must observe a quiescent KV cache.
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // defer until the slot is idle, so EA reads a quiescent KV cache
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    llama_kv_compress_params ea_params;
+                    ea_params.compression_ratio = 1.0f - task.slot_action.keep_ratio; // keep_ratio=0.5 → remove 50%
+                    ea_params.n_sink            = task.slot_action.keep_first;
+                    ea_params.n_future          = task.slot_action.n_future;
+                    ea_params.use_covariance    = task.slot_action.use_covariance;
+                    ea_params.layer_weights     = task.slot_action.layer_weights;
+
+                    const int n_evicted = llama_kv_compress_evict(ctx_tgt, id_slot, ea_params);
+                    if (n_evicted < 0) {
+                        send_error(task, "Expected Attention compression failed", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    const llama_pos new_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot);
+
+                    auto res = std::make_unique<server_task_result_slot_compact>();
+                    res->id            = task.id;
+                    res->id_slot       = id_slot;
+                    res->n_evicted     = n_evicted;
+                    res->keep_ratio    = task.slot_action.keep_ratio;
+                    res->pos_max_after = new_pos_max;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4579,6 +4627,9 @@ void server_routes::init_routes() {
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
+        if (action == "compact") {
+            return handle_slots_compact(req, id_slot);
+        }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -5254,6 +5305,58 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const server_http_req & req, int id_slot) {
+    // Expected Attention KV cache compaction (forward-ported from v5 894e048e3).
+    // POST /slots/{id}?action=compact
+    // Body (all optional): keep_ratio (0.0-1.0, default 0.5), keep_first (sink tokens, default 8),
+    //                      n_future (RoPE window, default 128), use_covariance (bool, default true),
+    //                      layer_weights (float[], per-attention-layer weights, default uniform).
+    // The legacy "knorm" scorer is not ported to v6: it depended on the v5 Attention-Matching
+    // state-serialization format (per-stream flags + always-written cell ext), which is not
+    // present in v6's upstream KV state layout. Expected Attention is the production default and
+    // operates in-place on raw KV tensors, so it needs no state-buffer surgery.
+    auto res = create_response();
+
+    auto body = json::parse(req.body, nullptr, false);
+
+    server_task task(SERVER_TASK_TYPE_SLOT_COMPACT);
+    task.slot_action.id_slot        = id_slot;
+    task.slot_action.keep_ratio     = body.is_object() && body.contains("keep_ratio")     ? body["keep_ratio"].get<float>()    : 0.5f;
+    task.slot_action.keep_first     = body.is_object() && body.contains("keep_first")     ? body["keep_first"].get<int>()      : 8;
+    task.slot_action.n_future       = body.is_object() && body.contains("n_future")       ? body["n_future"].get<int>()        : 128;
+    task.slot_action.use_covariance = body.is_object() && body.contains("use_covariance") ? body["use_covariance"].get<bool>() : true;
+
+    // Layer-adaptive weights for autopilot tuning. Pass "layer_weights": [..] to emphasize
+    // specific attention layers. If omitted, uniform weighting across all attention layers.
+    if (body.is_object() && body.contains("layer_weights") && body["layer_weights"].is_array()) {
+        for (const auto & w : body["layer_weights"]) {
+            task.slot_action.layer_weights.push_back(w.get<float>());
+        }
+    }
+
+    auto & rd = res->rd;
+    {
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_compact*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

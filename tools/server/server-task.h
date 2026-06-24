@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -25,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_COMPACT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -158,11 +160,19 @@ struct server_task {
 
     server_task_type type;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE,
+    // SERVER_TASK_TYPE_SLOT_COMPACT
     struct slot_action {
         int id_slot;
         std::string filename;
         std::string filepath;
+
+        // used by SERVER_TASK_TYPE_SLOT_COMPACT (Expected Attention KV compaction)
+        float keep_ratio       = 0.5f;  // fraction of KV entries to KEEP
+        int   keep_first       = 8;     // sink tokens protected from eviction
+        int   n_future         = 128;   // RoPE averaging window
+        bool  use_covariance   = true;  // include covariance term (more accurate)
+        std::vector<float> layer_weights; // per-attention-layer scoring weights (empty = uniform)
     };
     slot_action slot_action;
 
@@ -548,6 +558,15 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_compact : server_task_result {
+    int        id_slot       = -1;
+    int        n_evicted     = 0;
+    float      keep_ratio    = 0.5f;
+    llama_pos  pos_max_after = 0;
 
     virtual json to_json() override;
 };

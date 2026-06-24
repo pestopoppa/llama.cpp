@@ -161,6 +161,11 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // raw tensor access for KV compression scorers (Expected Attention, etc.)
+    ggml_tensor * get_k_layer_raw(int32_t il) const;
+    ggml_tensor * get_v_layer_raw(int32_t il) const;
+    bool has_layer(int32_t il) const;
+
     //
     // graph_build API
     //
