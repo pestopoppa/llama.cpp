@@ -467,22 +467,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-// mul_mat / mul_mat_id block-tile size. Chosen to match Zen 4/5 AVX-512
-// register pressure (16 fp32 = one ZMM register) and 64 B cache line × 4-way
-// dot-product unroll. Pre-set in the upstream ggml-cpu.c implementation;
-// kept named here so future tuning has a single place to change.
-#define GGML_MUL_MAT_BLOCK 16
-
 // Threadpool def
-// EPYC-9655 CCD topology constants (compile-time for simplicity; see comment below).
-// Runtime topology detection is a future improvement.
-#define GGML_TP_MAX_CCD 16
-struct ggml_ccd_sync {
-    atomic_int n_arrived;   // threads on this CCD that have reached barrier
-    atomic_int sense;       // sense bit (0/1), flipped each barrier release
-    char _pad[64 - 2*sizeof(atomic_int)]; // pad to cacheline to prevent false sharing
-};
-
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -495,20 +480,6 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
-
-    // Per-CCD 2-level barrier state (enabled when ccd_pool_enabled).
-    // Design: non-last threads on a CCD spin on the CCD's local sense line (stays in local L3).
-    // The last thread on each CCD promotes to a global phase; the global-last thread flips the
-    // global sense. Awakened CCD-leads then flip their CCD-local sense to release their neighbors.
-    // Hot-path contention: N/CCD atomic increments on local counter (cacheline stays local) plus
-    // CCD count increments on global counter — instead of flat N-way contention on n_barrier.
-    bool ccd_pool_enabled;
-    int  ccd_count;                 // number of CCDs in use (0 if disabled)
-    int  ccd_threads;               // threads per CCD
-    int  ccd_core_base;             // first physical core of this process's cpuset (0 if unrestricted)
-    struct ggml_ccd_sync GGML_CACHE_ALIGN ccd[GGML_TP_MAX_CCD];
-    atomic_int GGML_CACHE_ALIGN ccd_global_arrived;
-    atomic_int GGML_CACHE_ALIGN ccd_global_sense;
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -533,11 +504,6 @@ struct ggml_compute_state {
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;
-    // Per-CCD barrier bookkeeping (valid only when threadpool->ccd_pool_enabled)
-    int  ccd_id;        // which CCD this thread belongs to (0..ccd_count-1), or -1 if flat
-    int  ccd_local_id;  // index within its CCD (0..ccd_threads-1)
-    int  local_sense;   // sense bit this thread observed last barrier (0/1)
-    int  global_sense;  // global sense last observed (for CCD-leaders only)
 };
 
 // Helpers for polling loops
@@ -597,46 +563,6 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
-#ifndef GGML_USE_OPENMP
-// Thread-local pointer to this thread's ggml_compute_state. Set at worker/main entry;
-// consulted O(1) by ggml_barrier when ccd_pool_enabled. Avoids O(N) pthread_equal lookup.
-static __thread struct ggml_compute_state * ggml_tls_state = NULL;
-#endif
-
-// Lever B: CCD-local-only variant of ggml_barrier. Syncs threads within one
-// CCD (8-way) without the cross-CCD portion. Safe ONLY when all threads in
-// the same CCD consume data written by their same-CCD peers (e.g., a chain
-// of matmuls with CCD-block-contiguous partitioning). UNSAFE before ops that
-// need cross-CCD data (reductions, attention). Caller must verify safety.
-void ggml_barrier_local(struct ggml_threadpool * tp) {
-    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
-    if (n_threads == 1) {
-        return;
-    }
-#ifdef GGML_USE_OPENMP
-    #pragma omp barrier
-#else
-    if (tp->ccd_pool_enabled && n_threads == tp->ccd_count * tp->ccd_threads && ggml_tls_state != NULL) {
-        struct ggml_compute_state * st = ggml_tls_state;
-        int ccd_id = st->ccd_id;
-        struct ggml_ccd_sync * csync = &tp->ccd[ccd_id];
-        int my_local = st->local_sense ^ 1;
-        st->local_sense = my_local;
-        int local_n = atomic_fetch_add_explicit(&csync->n_arrived, 1, memory_order_acq_rel);
-        if (local_n == (tp->ccd_threads - 1)) {
-            atomic_store_explicit(&csync->n_arrived, 0, memory_order_relaxed);
-            atomic_store_explicit(&csync->sense, my_local, memory_order_release);
-        } else {
-            while (atomic_load_explicit(&csync->sense, memory_order_acquire) != my_local) {
-                ggml_thread_cpu_relax();
-            }
-        }
-        return;
-    }
-    ggml_barrier(tp);
-#endif
-}
-
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -646,77 +572,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #ifdef GGML_USE_OPENMP
     #pragma omp barrier
 #else
-    // ---- Per-CCD 2-level barrier (Phase 1.0 CPU1 prototype + Lever A tightening) ----
-    // Perf (2026-04-24) showed ggml_barrier = 43% of decode cycles at 96 threads.
-    // Lever A tightens memory-order: the sense-flip store uses release, and the
-    // matching acquire on the sense-load handshake (line 633/642) provides the
-    // ordering for post-barrier reads. The trailing seq_cst thread fence is
-    // redundant on x86 when all downstream reads are through atomic loads with
-    // acquire ordering. GGML_BARRIER_STRICT=1 restores the old seq_cst fence
-    // for paranoid testing.
-    if (tp->ccd_pool_enabled && n_threads == tp->ccd_count * tp->ccd_threads && ggml_tls_state != NULL) {
-        struct ggml_compute_state * st = ggml_tls_state;
-        int ccd_id = st->ccd_id;
-        struct ggml_ccd_sync * csync = &tp->ccd[ccd_id];
-
-        // EVERY thread flips its own view of local+global sense every barrier call.
-        // This keeps sense values consistent across threads regardless of which thread
-        // happens to be the leader on any given barrier (leader-turnover tolerant).
-        int my_local  = st->local_sense  ^ 1;
-        int my_global = st->global_sense ^ 1;
-        st->local_sense  = my_local;
-        st->global_sense = my_global;
-
-        // Arrive at local CCD barrier. acq_rel on x86 compiles to the same lock xadd
-        // as seq_cst without paying for mfence semantics we don't actually need here.
-        int local_n = atomic_fetch_add_explicit(&csync->n_arrived, 1, memory_order_acq_rel);
-
-        if (local_n == (tp->ccd_threads - 1)) {
-            // Last thread on this CCD — reset local counter (for next use), promote to global.
-            atomic_store_explicit(&csync->n_arrived, 0, memory_order_relaxed);
-
-            int global_n = atomic_fetch_add_explicit(&tp->ccd_global_arrived, 1, memory_order_acq_rel);
-
-            if (global_n == (tp->ccd_count - 1)) {
-                // Last CCD-leader globally — reset global counter, flip global sense.
-                atomic_store_explicit(&tp->ccd_global_arrived, 0, memory_order_relaxed);
-                atomic_store_explicit(&tp->ccd_global_sense, my_global, memory_order_release);
-            } else {
-                // Wait for global sense to flip
-                while (atomic_load_explicit(&tp->ccd_global_sense, memory_order_acquire) != my_global) {
-                    ggml_thread_cpu_relax();
-                }
-            }
-
-            // Release the neighbors on my CCD by publishing the new local sense.
-            atomic_store_explicit(&csync->sense, my_local, memory_order_release);
-        } else {
-            // Non-leader on this CCD — spin on LOCAL sense (cacheline stays local to CCD).
-            while (atomic_load_explicit(&csync->sense, memory_order_acquire) != my_local) {
-                ggml_thread_cpu_relax();
-            }
-        }
-
-        #ifdef GGML_TSAN_ENABLED
-        atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
-        #else
-        {
-            // Optional strict mode for paranoia — skip the mfence by default because
-            // the release/acquire pair above already establishes happens-before.
-            static int s_strict = -1;
-            if (s_strict < 0) {
-                const char * env = getenv("GGML_BARRIER_STRICT");
-                s_strict = (env && env[0] && env[0] != '0') ? 1 : 0;
-            }
-            if (s_strict) {
-                atomic_thread_fence(memory_order_seq_cst);
-            }
-        }
-        #endif
-        return;
-    }
-
-    // ---- Original flat barrier (fallback) ----
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -1335,14 +1190,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne13 % ne03 == 0);
 
     // block-tiling attempt
-    const int64_t blck_0 = GGML_MUL_MAT_BLOCK;
-    const int64_t blck_1 = GGML_MUL_MAT_BLOCK;
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // GGML_MUL_MAT_BLOCK * 2, accounting for mmla kernels
-    float tmp[GGML_MUL_MAT_BLOCK * 2];
+    // 16 * 2, accounting for mmla kernels
+    float tmp[32];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1376,11 +1231,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? GGML_MUL_MAT_BLOCK : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * GGML_MUL_MAT_BLOCK), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
             }
         }
@@ -1528,62 +1383,6 @@ UseGgmlGemm2:;
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
-
-    // Phase 1.2 (CPU1): CCD-block-contiguous work distribution, env-gated.
-    // When GGML_CCD_WORK_DIST=1 AND CCD pools are enabled AND the big dim is
-    // large enough to divide cleanly, each CCD's threads process a contiguous
-    // block of output rows (or output cols, whichever dim we're splitting).
-    // Bit-exact with default when env unset. The Lever A' src0-replica path
-    // that previously composed with this work distribution was stripped in
-    // v5 cleanup audit 2026-04-30 (NUMA_WEIGHTS family, see git history).
-    {
-#ifndef GGML_USE_OPENMP
-        static int s_ccd_wd_env = -1;
-        if (s_ccd_wd_env < 0) {
-            const char * env = getenv("GGML_CCD_WORK_DIST");
-            s_ccd_wd_env = (env && *env && env[0] != '0') ? 1 : 0;
-        }
-        struct ggml_threadpool * tp = params->threadpool;
-        if (s_ccd_wd_env && tp->ccd_pool_enabled && tp->ccd_count > 0 &&
-                nth == tp->ccd_count * tp->ccd_threads) {
-            const int ccd_id       = ith / tp->ccd_threads;
-            const int ccd_local_id = ith % tp->ccd_threads;
-            const int n_ccd        = tp->ccd_count;
-            const int n_ccd_local  = tp->ccd_threads;
-
-            // Split the larger dim (same choice as default path below).
-            const bool split_nr0 = (nr0 > nr1);
-            const int64_t big = split_nr0 ? nr0 : nr1;
-
-            if (big >= (int64_t)n_ccd) {
-                // Partition big dim: CCD block → thread sub-slice.
-                const int64_t ccd_beg = (ccd_id * big) / n_ccd;
-                const int64_t ccd_end = ((ccd_id + 1) * big) / n_ccd;
-                const int64_t my_beg  = ccd_beg + ((ccd_local_id * (ccd_end - ccd_beg)) / n_ccd_local);
-                const int64_t my_end  = ccd_beg + (((ccd_local_id + 1) * (ccd_end - ccd_beg)) / n_ccd_local);
-
-                if (my_end > my_beg) {
-                    int64_t ir0_start, ir0_end, ir1_start, ir1_end;
-                    if (split_nr0) {
-                        ir0_start = my_beg; ir0_end = my_end;
-                        ir1_start = 0;      ir1_end = nr1;
-                    } else {
-                        ir0_start = 0;      ir0_end = nr0;
-                        ir1_start = my_beg; ir1_end = my_end;
-                    }
-                    int64_t num_rows_per_vec_dot = vec_dot_num_rows;
-                    if ((nr0 % 2 != 0) || (ne11 % 2 != 0) ||
-                        ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
-                        num_rows_per_vec_dot = 1;
-                    }
-                    ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type,
-                            num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
-                }
-                return;
-            }
-        }
-#endif
-    }
 
     // Now select a reasonable chunk size.
     int chunk_size = 16;
@@ -3220,11 +3019,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
-#ifndef GGML_USE_OPENMP
-    // Establish TLS pointer so ggml_barrier can locate our compute_state in O(1)
-    ggml_tls_state = state;
-#endif
-
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
@@ -3277,126 +3071,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            // CPU4 Phase 1 (2026-04-29): op-coalesced barriers. Skip the
-            // between-op barrier when the next op does NOT read the current
-            // op's output, AND both ops are in the deterministic-axis-0-
-            // partition class (so threads agree on work distribution).
-            //
-            // Phase 0 manual analysis on Qwen3 MoE (Coder-30B + REAP-246B):
-            // 24-29% per-token barrier-count reduction potential. Q/K/V
-            // projections all read normed input but write disjoint Qcur/
-            // Kcur/Vcur — Q→K→V chain coalesces from 3 inter-op barriers
-            // to 1. Q-norm/K-norm and RoPE-Q/RoPE-K similarly.
-            //
-            // Conservative rule:
-            //   (a) next op's src[] does NOT contain cur node (no
-            //       read-after-write dependency)
-            //   (b) cur op is in {MUL_MAT, MUL_MAT_ID, RMS_NORM, NORM,
-            //       ROPE, MUL, ADD, SCALE, UNARY, GLU} — deterministic
-            //       axis-0 partitioning
-            //   (c) next op is in the same set
-            //
-            // MUL_MAT's internal barrier at ggml_compute_forward_mul_mat
-            // (line 1487 area) is PRESERVED — provides per-MUL_MAT thread
-            // coordination, preventing optimistic threads from outpacing
-            // by multiple ops.
-            //
-            // Env gate: GGML_BARRIER_COALESCE=1 (default off). Bit-exact
-            // gate must pass on Coder-30B + REAP-246B Q4_K_M 32-chunk PPL.
-            static int s_barrier_coalesce = -1;
-            if (s_barrier_coalesce < 0) {
-                const char * env = getenv("GGML_BARRIER_COALESCE");
-                s_barrier_coalesce = (env && env[0] && env[0] != '0') ? 1 : 0;
-            }
-
-            bool coalesce_next = false;
-            if (s_barrier_coalesce) {
-                enum ggml_op cur_op  = node->op;
-                const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
-                enum ggml_op next_op = next_node->op;
-
-                // Allowlist of ops with deterministic axis-0 work distribution
-                // AND no shared-wdata writes. MUL_MAT/MUL_MAT_ID are EXCLUDED
-                // because they quantize src1 → params->wdata (shared mutable
-                // buffer) before the internal barrier — coalescing would let
-                // op N+1 clobber wdata while op N's chunk-loop still reads it.
-                // Discovered via smoke test 2026-04-29: COALESCE=1 with
-                // MUL_MAT in the allowlist produced garbled output (wdata
-                // race), confirming the wdata-shared-buffer hazard.
-#define GGML_OP_COALESCE_OK(op) ( \
-    (op) == GGML_OP_RMS_NORM || (op) == GGML_OP_NORM || \
-    (op) == GGML_OP_ROPE || \
-    (op) == GGML_OP_MUL || (op) == GGML_OP_ADD || \
-    (op) == GGML_OP_SCALE || (op) == GGML_OP_UNARY || \
-    (op) == GGML_OP_GLU)
-
-                if (GGML_OP_COALESCE_OK(cur_op) && GGML_OP_COALESCE_OK(next_op)) {
-                    // Check that next op does not consume cur node as src.
-                    bool depends = false;
-                    for (int i = 0; i < GGML_MAX_SRC; i++) {
-                        if (next_node->src[i] == node) {
-                            depends = true;
-                            break;
-                        }
-                    }
-                    coalesce_next = !depends;
-                }
-#undef GGML_OP_COALESCE_OK
-            }
-
-            if (!coalesce_next) {
-#ifndef GGML_USE_OPENMP
-                // Phase 1.4: downgrade the between-op barrier to CCD-local when:
-                //   (a) current op is MUL_MAT/MUL_MAT_ID or a pointwise op — writes
-                //       under the axis-0 partition (thread i writes ne0 range
-                //       [i*ne0/nth, (i+1)*ne0/nth) — both in decode nrows=1 via
-                //       Phase 1.2 and in downstream ops via the axis-0 fallback).
-                //   (b) next op is pointwise (ADD, MUL, SCALE, UNARY) so it reads
-                //       only its own axis-0 range.
-                //   (c) GGML_CCD_WORK_DIST=1 so MUL_MAT uses static (not stealing)
-                //       partitioning.
-                //
-                // Perplexity-verified before shipping. Env gate:
-                // GGML_BARRIER_LOCAL_BETWEEN_OPS=1.
-                static int s_local_between = -1;
-                static int s_wd_on         = -1;
-                if (s_local_between < 0) {
-                    const char * env = getenv("GGML_BARRIER_LOCAL_BETWEEN_OPS");
-                    s_local_between = (env && env[0] && env[0] != '0') ? 1 : 0;
-                }
-                if (s_wd_on < 0) {
-                    const char * env = getenv("GGML_CCD_WORK_DIST");
-                    s_wd_on = (env && env[0] && env[0] != '0') ? 1 : 0;
-                }
-                if (s_local_between && s_wd_on) {
-                    enum ggml_op cur_op  = node->op;
-                    enum ggml_op next_op = cgraph->nodes[node_n + 1]->op;
-                    bool cur_partitioned = (cur_op == GGML_OP_MUL_MAT ||
-                                            cur_op == GGML_OP_MUL_MAT_ID ||
-                                            cur_op == GGML_OP_MUL || cur_op == GGML_OP_ADD ||
-                                            cur_op == GGML_OP_SCALE || cur_op == GGML_OP_UNARY);
-                    bool next_elementwise = (next_op == GGML_OP_MUL || next_op == GGML_OP_ADD ||
-                                             next_op == GGML_OP_SCALE || next_op == GGML_OP_UNARY);
-                    // Only safe when next op is decode-shape (nrows_dst==1). Check
-                    // dst of NEXT op — if outer > 1, fall through to global.
-                    if (cur_partitioned && next_elementwise) {
-                        const struct ggml_tensor * next_node = cgraph->nodes[node_n + 1];
-                        const int64_t next_outer = (next_node->ne[1] * next_node->ne[2] * next_node->ne[3]);
-                        if (next_outer == 1 && next_node->ne[0] > params.nth) {
-                            ggml_barrier_local(state->threadpool);
-                        } else {
-                            ggml_barrier(state->threadpool);
-                        }
-                    } else {
-                        ggml_barrier(state->threadpool);
-                    }
-                } else {
-                    ggml_barrier(state->threadpool);
-                }
-#else
-                ggml_barrier(state->threadpool);
-#endif
-            }
+            ggml_barrier(state->threadpool);
         }
     }
 
@@ -3575,128 +3250,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
-
-        // Initialize per-CCD barrier state (disabled by default).
-        threadpool->ccd_pool_enabled = false;
-        threadpool->ccd_count        = 0;
-        threadpool->ccd_threads      = 0;
-        threadpool->ccd_core_base    = 0;
-        for (int c = 0; c < GGML_TP_MAX_CCD; ++c) {
-            atomic_init(&threadpool->ccd[c].n_arrived, 0);
-            atomic_init(&threadpool->ccd[c].sense, 0);
-        }
-        atomic_init(&threadpool->ccd_global_arrived, 0);
-        atomic_init(&threadpool->ccd_global_sense, 0);
-
-#ifndef GGML_USE_OPENMP
-        // Opt-in CCD pool via env var — only when thread count is a whole multiple of 8
-        // (EPYC CCD size) and >= 16 (to have sensible sub-pools).
-        const char * env_ccd = getenv("GGML_CCD_POOLS");
-        int env_ccd_on = (env_ccd && (env_ccd[0] == '1' || env_ccd[0] == 'y' || env_ccd[0] == 'Y'));
-        if (env_ccd_on) {
-            // On EPYC 9655: 12 CCDs × 16 logical threads (8 phys + 8 HT) = 192.
-            // Accept thread counts that evenly divide into <= GGML_TP_MAX_CCD sub-pools of >= 8 threads.
-            int nt = tpp->n_threads;
-            int ccds = 0;
-            int tpcc = 0;
-            // Prefer 12-CCD split when nt % 12 == 0; else try 6, 4, 2, fall back to disable.
-            for (int cand = 12; cand >= 2; cand /= 2) {
-                if (cand <= GGML_TP_MAX_CCD && nt % cand == 0 && (nt / cand) >= 8) {
-                    ccds = cand;
-                    tpcc = nt / cand;
-                    break;
-                }
-            }
-            // Allow 12,6,4,3,2 explicitly (12 is the natural EPYC fit)
-            int opts[] = {12, 6, 4, 3, 2};
-            for (size_t i = 0; i < sizeof(opts)/sizeof(opts[0]); ++i) {
-                int cand = opts[i];
-                if (nt % cand == 0 && (nt / cand) >= 4) {
-                    ccds = cand;
-                    tpcc = nt / cand;
-                    break;
-                }
-            }
-            if (ccds > 0 && ccds <= GGML_TP_MAX_CCD) {
-                // Respect any external cpuset (taskset / cgroup). Without this, CCD pinning
-                // assumes cores 0..95 are all available and silently mis-pins under
-                // taskset quarters — leading to concurrent instances all piling onto
-                // core 0 (deadlock-like stalls observed 2026-04-24).
-                //
-                // Read the process's current allowed CPU set, verify it forms a
-                // contiguous aligned range of exactly ccds*tpcc cores matching our
-                // CCD geometry, and compute ccd_core_base as the first allowed core.
-                // If the cpuset doesn't fit cleanly, disable CCD pinning (barrier
-                // can still work, but we won't force specific cores).
-                int base_core   = 0;
-                int fit_cpuset  = 1;
-                int need_cores  = ccds * tpcc;
-                cpu_set_t allowed;
-                CPU_ZERO(&allowed);
-                if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-                    int count = 0, first = -1, last = -1;
-                    for (int c = 0; c < (int)(sizeof(allowed)*8) && c < GGML_MAX_N_THREADS; ++c) {
-                        if (CPU_ISSET(c, &allowed)) {
-                            if (first < 0) first = c;
-                            last = c;
-                            count++;
-                        }
-                    }
-                    if (first < 0) {
-                        fit_cpuset = 0;
-                    } else {
-                        base_core = first;
-                        // Compute the exact set of pin targets we'd emit below and
-                        // verify every one is in the process's cpuset. If not, disable
-                        // pinning — the 2-level barrier still runs, kernel schedules
-                        // threads within the inherited cpuset.
-                        for (int c = 0; c < ccds && fit_cpuset; ++c) {
-                            for (int l = 0; l < tpcc; ++l) {
-                                int core;
-                                if (tpcc == 8) {
-                                    core = base_core + c * 8 + l;
-                                } else if (tpcc == 16) {
-                                    int phys_start = base_core + c * 8;
-                                    core = (l < 8) ? (phys_start + l)
-                                                   : (96 + phys_start + (l - 8));
-                                } else {
-                                    core = base_core + c * tpcc + l;
-                                }
-                                if (core < 0 || core >= (int)(sizeof(allowed)*8)
-                                    || !CPU_ISSET(core, &allowed)) {
-                                    fit_cpuset = 0;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    fit_cpuset = 0;
-                }
-
-                if (!fit_cpuset) {
-                    GGML_LOG_INFO("[GGML_CCD_POOLS] requested but cpuset doesn't fit "
-                                  "%d CCDs x %d threads (base=%d, need=%d cores); "
-                                  "disabling CCD pinning — barrier still uses 2-level form\n",
-                                  ccds, tpcc, base_core, need_cores);
-                    // Keep the 2-level barrier but don't force core pinning.
-                    threadpool->ccd_pool_enabled = true;
-                    threadpool->ccd_count        = ccds;
-                    threadpool->ccd_threads      = tpcc;
-                    threadpool->ccd_core_base    = -1;   // sentinel: do not pin cores
-                } else {
-                    threadpool->ccd_pool_enabled = true;
-                    threadpool->ccd_count        = ccds;
-                    threadpool->ccd_threads      = tpcc;
-                    threadpool->ccd_core_base    = base_core;
-                    GGML_LOG_INFO("[GGML_CCD_POOLS] enabled: %d CCDs x %d threads/CCD "
-                                  "(total %d, core_base=%d)\n", ccds, tpcc, nt, base_core);
-                }
-            } else {
-                GGML_LOG_INFO("[GGML_CCD_POOLS] requested but n_threads=%d doesn't fit; disabling\n", nt);
-            }
-        }
-#endif
     }
 
     // Allocate and init workers state
@@ -3707,17 +3260,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         workers[j].threadpool = threadpool;
         workers[j].ith        = j;
-        // CCD assignment is contiguous-block: thread j belongs to CCD j/ccd_threads.
-        // Only meaningful when ccd_pool_enabled; harmless to init otherwise.
-        if (threadpool->ccd_pool_enabled) {
-            workers[j].ccd_id       = j / threadpool->ccd_threads;
-            workers[j].ccd_local_id = j % threadpool->ccd_threads;
-        } else {
-            workers[j].ccd_id       = -1;
-            workers[j].ccd_local_id = -1;
-        }
-        workers[j].local_sense  = 0;
-        workers[j].global_sense = 0;
     }
 
     threadpool->workers = workers;
@@ -3739,56 +3281,13 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        if (threadpool->ccd_pool_enabled && threadpool->ccd_core_base >= 0) {
-            // CCD-aware per-worker cpumask: worker j pinned to a specific core on its CCD.
-            // EPYC 9655 layout: 12 CCDs × 8 physical cores + HT siblings at core+96.
-            // ccd_core_base is the first core of this process's cpuset (respects taskset).
-            memset(workers[j].cpumask, 0, GGML_MAX_N_THREADS);
-            int ccd_id = workers[j].ccd_id;
-            int local_id = workers[j].ccd_local_id;
-            int base = threadpool->ccd_core_base;
-            int core;
-            if (threadpool->ccd_threads == 8) {
-                core = base + ccd_id * 8 + local_id;        // physical cores only
-            } else if (threadpool->ccd_threads == 16) {
-                int phys_start = base + ccd_id * 8;
-                if (local_id < 8) {
-                    core = phys_start + local_id;            // physical core
-                } else {
-                    core = 96 + phys_start + (local_id - 8); // HT sibling of the same CCD
-                }
-            } else {
-                // Fallback for other ccd_threads values: contiguous range from base
-                core = base + ccd_id * threadpool->ccd_threads + local_id;
-            }
-            if (core >= 0 && core < GGML_MAX_N_THREADS) {
-                workers[j].cpumask[core] = 1;
-            }
-        } else if (threadpool->ccd_pool_enabled) {
-            // CCD pool active but core pinning disabled due to cpuset mismatch.
-            // Do not set a cpumask — let the kernel schedule threads within the
-            // inherited process cpuset.
-            memset(workers[j].cpumask, 0, GGML_MAX_N_THREADS);
-        } else {
-            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
-        }
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
 
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
 
-    if (threadpool->ccd_pool_enabled) {
-        // Main thread (worker[0]): intentionally do NOT pin to a single core.
-        // Pinning main to one core would restrict its cpuset, and any thread
-        // pool it later creates (e.g., a second pool for batch/eval) would
-        // inherit the restricted cpuset — all workers of that second pool
-        // would then pile onto the single inherited core. Leave main on the
-        // inherited (task-wide) cpuset. Secondary workers are already pinned
-        // above and will do the actual compute work.
-        memset(workers[0].cpumask, 0, GGML_MAX_N_THREADS);
-    } else {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
-    }
+    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
