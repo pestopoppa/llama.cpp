@@ -253,12 +253,12 @@ struct MulMat {
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? q8_k_type : type;
-            // iqk port: dequant/repack path heap-corrupts in this v6 integration
-            // (intermittent OOB in iqk_convert_*_r8 / mul_mat_NxM). Force the direct
-            // (correct, byte-identical) GEMM for all Ny. Repack-path = perf follow-up.
-            case GGML_TYPE_Q4_K   : return type;
-            case GGML_TYPE_Q5_K   : return type;
-            case GGML_TYPE_Q6_K   : return type;
+            // iqk port: dequant/repack path RE-ENABLED — the crash was an OOB type_traits[]
+            // read from passing these ik-only dequant targets to v6's ggml_row_size; fixed
+            // by routing the dequant row-size through iqk_row_size() (see call sites below).
+            case GGML_TYPE_Q4_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q5_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q6_K   : return nrc_y >= 64 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_IQ2_KS : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ2_K  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ2_KL : return nrc_y >= 32 ? q8_k_type : type;
@@ -288,12 +288,12 @@ struct MulMat {
         switch (type) {
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
-            // iqk port: dequant/repack path heap-corrupts in this v6 integration
-            // (intermittent OOB in iqk_convert_*_r8 / mul_mat_NxM). Force the direct
-            // (correct, byte-identical) GEMM for all Ny. Repack-path = perf follow-up.
-            case GGML_TYPE_Q4_K   : return type;
-            case GGML_TYPE_Q5_K   : return type;
-            case GGML_TYPE_Q6_K   : return type;
+            // iqk port: dequant/repack path RE-ENABLED — the crash was an OOB type_traits[]
+            // read from passing these ik-only dequant targets to v6's ggml_row_size; fixed
+            // by routing the dequant row-size through iqk_row_size() (see call sites below).
+            case GGML_TYPE_Q4_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q5_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q6_K   : return nrc_y >= 64 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_IQ2_XXS: return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
@@ -408,6 +408,24 @@ struct MulMat {
 static std::vector<char> & thread_local_work_buffer() {
     thread_local std::vector<char> f;
     return f;
+}
+
+// iqk port: row size for ik-only repacked dequant types (Q8_0_R8=208 / Q8_K_R8=399 /
+// Q8_K_R16=397) that v6's ggml_row_size() CANNOT handle — they are out-of-enum #defines
+// that index far past v6's 42-entry type_traits[] (the dequant-path crash root cause;
+// ASAN: global-buffer-overflow READ at ggml.c:1309 via ggml_type_size). Mirrors
+// ik_llama's type_traits {blck_size, type_size} for these IDs; defers to v6's
+// ggml_row_size() for any in-enum type (incl. Q8_1=9). Aborts loudly on an unknown
+// out-of-enum type instead of silently reading OOB.
+static inline size_t iqk_row_size(int t, int64_t ne) {
+    switch (t) {
+        case GGML_TYPE_Q8_0_R8:  return (size_t)(ne / QK8_0) *  sizeof(block_q8_0);            // ik: blck=QK8_0, type=sizeof(block_q8_0)
+        case GGML_TYPE_Q8_K_R8:  return (size_t)(ne / QK_K)  * (sizeof(block_q8_k_r8)  / 8);   // ik: blck=QK_K, type=sizeof(block_q8_k_r8)/8
+        case GGML_TYPE_Q8_K_R16: return (size_t)(ne / QK_K)  * (sizeof(block_q8_k_r16) / 16);  // ik: blck=QK_K, type=sizeof(block_q8_k_r16)/16
+        default:
+            if (t >= 0 && t < GGML_TYPE_COUNT) return ggml_row_size((ggml_type) t, ne);
+            GGML_ABORT("iqk_row_size: unhandled ik-only quant type %d (add its ik row-size here)", t);
+    }
 }
 
 bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
@@ -552,7 +570,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         first_x *= num_rows;
         nrc_x   *= num_rows;
 
-        size_t row_size_qx = ggml_row_size(dequant_type, ne00);
+        size_t row_size_qx = iqk_row_size(dequant_type, ne00); // iqk port: ik-only-type-safe row size (was ggml_row_size -> OOB)
         size_t row_size_qy = strideB;
 
         DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
@@ -744,7 +762,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         first_x *= num_rows;
         nrc_x   *= num_rows;
 
-        size_t row_size_qx = ggml_row_size(dequant_type, ne00);
+        size_t row_size_qx = iqk_row_size(dequant_type, ne00); // iqk port: ik-only-type-safe row size (was ggml_row_size -> OOB)
         size_t row_size_qy = strideB;
 
         DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
@@ -811,7 +829,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
             first_x *= num_rows;
             nrc_x   *= num_rows;
 
-            size_t row_size_qx = ggml_row_size(dequant_type, ne00);
+            size_t row_size_qx = iqk_row_size(dequant_type, ne00); // iqk port: ik-only-type-safe row size (was ggml_row_size -> OOB)
             size_t row_size_qy = strideB;
 
             DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
