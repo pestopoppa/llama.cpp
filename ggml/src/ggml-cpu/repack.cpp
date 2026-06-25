@@ -1,5 +1,6 @@
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
+#include <cstdlib>
 #include "ggml-common.h"
 #include "ggml-backend-impl.h"
 
@@ -4526,6 +4527,29 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+#if defined(GGML_USE_IQK_MULMAT)
+    // iqk port: when GGML_IQK=1, do NOT divert iqk-supported quant types into the
+    // CPU_REPACK extra-buffer. Otherwise ggml_cpu_extra_compute_forward (ggml-cpu.c:~1719)
+    // intercepts these matmuls on the generic-C repack kernel BEFORE the iqk hook in
+    // ggml_compute_forward_mul_mat (ggml-cpu.c:~1289) can claim them — which starved iqk
+    // of the dominant FFN/attn Q4_K GEMMs (capping prefill at +16% vs ik's +62%).
+    // Returning nullptr keeps them as plain GGML_OP_MUL_MAT so iqk's AVX-512 kernels run.
+    // Mirrors ik_llama (which has no CPU_REPACK). Type list MUST match iqk_typeA_supported
+    // (iqk_dispatch.cpp). Decided once at load (ggml_backend_cpu_repack_buffer_init_tensor).
+    {
+        static const bool iqk_on = []() { const char * s = getenv("GGML_IQK"); return s && atoi(s) != 0; }();
+        if (iqk_on) {
+            switch (cur->type) {
+                case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+                case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:
+                    return nullptr;
+                default: break;
+            }
+        }
+    }
+#endif
     // instance for Q4
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 4, GGML_TYPE_Q8_0> q4_0_4x8_q8_0;
