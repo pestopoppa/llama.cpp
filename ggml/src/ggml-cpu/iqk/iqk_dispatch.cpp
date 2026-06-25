@@ -17,6 +17,25 @@
 #include "iqk_mul_mat.h"
 #include <cstdlib>
 #include <cstdio>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+
+// iqk port DEBUG: SIGSEGV backtrace handler (no gdb on host). Installed once when
+// GGML_IQK_DEBUG_SEGV=1. Prints the crashing call stack to stderr.
+namespace {
+void iqk_segv_handler(int sig) {
+    void * bt[64];
+    int n = backtrace(bt, 64);
+    fprintf(stderr, "\n[iqk] SIGSEGV (%d) — backtrace (%d frames):\n", sig, n);
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    _exit(139);
+}
+struct IqkSegvInstaller {
+    IqkSegvInstaller() { if (const char * s = getenv("GGML_IQK_DEBUG_SEGV"); s && atoi(s)) signal(SIGSEGV, iqk_segv_handler); }
+};
+IqkSegvInstaller iqk_segv_installer_;
+} // namespace
 
 // activation quantizer (iqk_quantize_min.cpp)
 extern "C" void quantize_row_q8_2_x4(const float * x, void * vy, int64_t k);

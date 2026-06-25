@@ -253,13 +253,12 @@ struct MulMat {
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? q8_k_type : type;
-            // iqk port: the large-Ny dequant/repack optimization (Q4_K/Q5_K->Q8_1,
-            // Q6_K->Q8_0_R8) segfaults in this v6 integration (repacked-buffer path).
-            // Force the direct Q4_K/Q5_K/Q6_K x Q8_2_X4 GEMM for all Ny — verified
-            // correct (decode byte-identical to v6). Repack-path prefill = perf follow-up.
-            case GGML_TYPE_Q4_K   : return type; // was: nrc_y >= 32 ? GGML_TYPE_Q8_1 : type;
-            case GGML_TYPE_Q5_K   : return type; // was: nrc_y >= 32 ? GGML_TYPE_Q8_1 : type;
-            case GGML_TYPE_Q6_K   : return type; // was: nrc_y >= 64 ? GGML_TYPE_Q8_0_R8 : type;
+            // iqk port: dequant/repack path heap-corrupts in this v6 integration
+            // (intermittent OOB in iqk_convert_*_r8 / mul_mat_NxM). Force the direct
+            // (correct, byte-identical) GEMM for all Ny. Repack-path = perf follow-up.
+            case GGML_TYPE_Q4_K   : return type;
+            case GGML_TYPE_Q5_K   : return type;
+            case GGML_TYPE_Q6_K   : return type;
             case GGML_TYPE_IQ2_KS : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ2_K  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ2_KL : return nrc_y >= 32 ? q8_k_type : type;
@@ -289,13 +288,12 @@ struct MulMat {
         switch (type) {
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
-            // iqk port: the large-Ny dequant/repack optimization (Q4_K/Q5_K->Q8_1,
-            // Q6_K->Q8_0_R8) segfaults in this v6 integration (repacked-buffer path).
-            // Force the direct Q4_K/Q5_K/Q6_K x Q8_2_X4 GEMM for all Ny — verified
-            // correct (decode byte-identical to v6). Repack-path prefill = perf follow-up.
-            case GGML_TYPE_Q4_K   : return type; // was: nrc_y >= 32 ? GGML_TYPE_Q8_1 : type;
-            case GGML_TYPE_Q5_K   : return type; // was: nrc_y >= 32 ? GGML_TYPE_Q8_1 : type;
-            case GGML_TYPE_Q6_K   : return type; // was: nrc_y >= 64 ? GGML_TYPE_Q8_0_R8 : type;
+            // iqk port: dequant/repack path heap-corrupts in this v6 integration
+            // (intermittent OOB in iqk_convert_*_r8 / mul_mat_NxM). Force the direct
+            // (correct, byte-identical) GEMM for all Ny. Repack-path = perf follow-up.
+            case GGML_TYPE_Q4_K   : return type;
+            case GGML_TYPE_Q5_K   : return type;
+            case GGML_TYPE_Q6_K   : return type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_IQ2_XXS: return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
