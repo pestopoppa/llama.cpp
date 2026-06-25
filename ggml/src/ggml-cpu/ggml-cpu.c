@@ -1282,6 +1282,15 @@ void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#if defined(GGML_USE_IQK_MULMAT)
+    // iqk port: fast quantized GEMM (ik_llama kernels) for supported quant types.
+    // Runtime-gated by env GGML_IQK=1; returns false (falls through) otherwise or
+    // for unsupported types/dims. Handles its own src1 quantization + barrier.
+    if (ggml_iqk_try_mul_mat(params, dst)) {
+        return;
+    }
+#endif
+
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
     // broadcast factors

@@ -52,10 +52,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        # iqk port (Stage 1): ik_llama quantized-GEMM kernels (Q4_K + Q8_0), flag-gated
+        ggml-cpu/iqk/iqk_mul_mat.cpp
+        ggml-cpu/iqk/iqk_gemm_kquants.cpp
+        ggml-cpu/iqk/iqk_gemm_legacy_quants.cpp
+        ggml-cpu/iqk/iqk_quantize_min.cpp
+        ggml-cpu/iqk/iqk_stubs.cpp
+        ggml-cpu/iqk/iqk_dispatch.cpp
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu ggml-cpu/iqk)
+    # iqk port: kernels compiled in; runtime gate is env GGML_IQK (see iqk_dispatch.cpp)
+    target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_IQK_MULMAT)
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)

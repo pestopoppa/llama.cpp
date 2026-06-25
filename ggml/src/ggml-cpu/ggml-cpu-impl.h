@@ -531,6 +531,12 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
+#if defined(GGML_USE_IQK_MULMAT)
+// iqk port: dense quantized-GEMM fast path (ik_llama kernels); returns true if it
+// handled the mul_mat (env GGML_IQK=1 + supported type/dims), false to fall through.
+bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+#endif
+
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 

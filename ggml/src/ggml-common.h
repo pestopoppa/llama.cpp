@@ -258,6 +258,21 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
 
+// iqk port: Q8_2 activation type (ik_llama). Internal-only (never an on-disk tensor type).
+// Required as the typeB activation format for iqk's Q4_K/Q8_0 GEMM kernels.
+#define QK8_2 32
+typedef struct {
+    uint16_t d;        // delta  (bf16-ish packing)
+    uint16_t s;        // sum scale
+    int8_t qs[QK8_2];  // quants
+} block_q8_2;
+static_assert(sizeof(block_q8_2) == sizeof(ggml_half) + sizeof(int16_t) + QK8_2, "wrong q8_2 block size/padding");
+typedef struct {
+    uint16_t d[8];
+    int8_t qs[4*QK8_2];
+} block_q8_2_x4;
+static_assert(sizeof(block_q8_2_x4) == 4*sizeof(block_q8_2), "wrong q8_2_x4 block size/padding");
+
 //
 // Ternary quantization
 //
