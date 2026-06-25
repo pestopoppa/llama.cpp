@@ -1561,6 +1561,15 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
+#if defined(GGML_USE_IQK_MULMAT)
+    // iqk port (Stage 2): MoE expert GEMM fast path (ik_llama kernels). Runtime-gated by
+    // env GGML_IQK=1; owns its own Q8_2_X4 src1 quantization + row-mapping + per-expert
+    // iqk_mul_mat_moe. Returns true if handled (then we're done), false to fall through.
+    if (ggml_iqk_try_mul_mat_id(params, dst)) {
+        return;
+    }
+#endif
+
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert

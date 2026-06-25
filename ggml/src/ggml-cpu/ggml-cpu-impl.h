@@ -535,6 +535,8 @@ void ggml_barrier(struct ggml_threadpool * tp);
 // iqk port: dense quantized-GEMM fast path (ik_llama kernels); returns true if it
 // handled the mul_mat (env GGML_IQK=1 + supported type/dims), false to fall through.
 bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// iqk port (Stage 2): MoE expert GEMM fast path for GGML_OP_MUL_MAT_ID.
+bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #endif
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
