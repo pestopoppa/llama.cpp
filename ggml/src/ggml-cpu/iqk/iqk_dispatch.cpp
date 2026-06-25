@@ -132,8 +132,9 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const struct ggml_tensor * ids  = dst->src[2];
     if (dst->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) return false;
     const int tA = (int) src0->type;
-    if (!(tA == GGML_TYPE_Q4_K || tA == GGML_TYPE_Q5_K || tA == GGML_TYPE_Q6_K ||
-          tA == GGML_TYPE_Q2_K || tA == GGML_TYPE_Q3_K)) return false; // kquants (Q8_2_X4 path)
+    // Same families as the dense hook (kquants + legacy Q8_0/Q4_0/...); all use the
+    // Q8_2_X4 activation. iqk_mul_mat_moe returns false for any it can't handle -> native.
+    if (!iqk_typeA_supported(tA)) return false;
 
     const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
