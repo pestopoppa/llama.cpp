@@ -317,6 +317,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= 3;
             case GGML_TYPE_Q6_K:
                 return ne11 <= 5;
+            // MMVQ->MMQ campaign (mmvq experiment): force MMQ for Q8_0 at ne11>=2 so
+            // MTP verify blocks (4-col batch) use batched mul_mat_q instead of per-column mul_mat_vec_q.
+            case GGML_TYPE_Q8_0:
+                return ne11 <= 1;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
