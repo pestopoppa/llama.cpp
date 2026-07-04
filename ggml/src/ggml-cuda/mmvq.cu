@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -485,6 +486,166 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// ============================================================================================
+// CDNA2 (gfx90a) batch-1 Q8_0 GEMV: async weight-prefetch / LDS double-buffering.
+//   Experimental — mi210-q8-dequant handoff, converged do-first lever. All numbers OBSERVATIONS.
+//   Premise: the Q8_0 GEMV is already int8-native (dp4a); the 47->62% roofline gap is a batch-1
+//   memory-level-parallelism wall, not a dequant-compute gap. Lever: software-pipeline the next
+//   weight tile's global->LDS DMA under the current tile's dp4a to keep more HBM requests in
+//   flight (Little's law). Uses the MUBUF direct-to-LDS path (llvm.amdgcn.raw.buffer.load.lds,
+//   supported on gfx9/CDNA2) — NOT __builtin_amdgcn_global_load_lds (gfx940-gated, mis-encodes
+//   on gfx90a). CP_ASYNC_AVAILABLE is CUDA-only, so there is no cp.async on the AMD path today.
+//   Gated to Q8_0 + ncols_dst==1 + dense(ids==null) + no-fusion + CDNA2; every other path is
+//   byte-identical. Runtime-selected by GGML_CUDA_Q8_PREFETCH (0=off, 1=on cached, 2=on SLC).
+// ============================================================================================
+#if defined(GGML_USE_HIP)
+#define Q8_LDS_PREFETCH_COMPILED 1
+
+typedef int __attribute__((ext_vector_type(4))) q8pf_i32x4_t;
+
+// gfx9 raw buffer resource (V#): [base:64][num_records:32][cfg:32].
+// cfg = 0x00020000 for __gfx9__/CDNA per CK ck.hpp:76-77 (CK_BUFFER_RESOURCE_3RD_DWORD).
+static __device__ __forceinline__ q8pf_i32x4_t q8pf_make_rsrc(const void * base, uint32_t num_bytes) {
+    union { q8pf_i32x4_t v; struct { const void * p; uint32_t range; uint32_t cfg; } s; } u;
+    u.s.p     = base;
+    u.s.range = num_bytes;
+    u.s.cfg   = 0x00020000u;
+    return u.v;
+}
+
+// LLVM intrinsic: global->LDS DMA, one DWORD per lane, bypasses VGPRs.
+// args: (rsrc, lds_ptr[addrspace 3], size, voffset, soffset, imm_offset, aux/cachepolicy)
+__device__ void q8pf_raw_buffer_load_lds(
+    q8pf_i32x4_t rsrc, __attribute__((address_space(3))) uint32_t * lds_ptr,
+    int size, int voffset, int soffset, int offset, int aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+// One CUDA block = one output row (rows_per_cuda_block == 1). nwarps warps * 64 lanes.
+// WAUX: cachepolicy for the weight DMA (0 = default-cached, 2 = SLC/streaming-nontemporal).
+template <int nwarps, int WAUX>
+__launch_bounds__(nwarps*64, 1)
+static __global__ void mul_mat_vec_q8_0_prefetch(
+        const void * __restrict__ vx_ptr, const void * __restrict__ vy_ptr, float * __restrict__ dst_ptr,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    constexpr int warp_size    = 64;
+    constexpr int qk           = QK8_0;                        // 32
+    constexpr int qi           = QI8_0;                        // 8
+    constexpr int vdr          = VDR_Q8_0_Q8_1_MMVQ;           // 2
+    constexpr int nthreads     = nwarps*warp_size;             // 256 for nwarps=4
+    constexpr int blk_per_iter = vdr*nthreads/qi;              // 64
+    constexpr int tile_bytes   = blk_per_iter*(int)sizeof(block_q8_0);  // 64*34 = 2176
+    constexpr int tile_dwords  = tile_bytes/4;                 // 544
+    constexpr int n_passes     = (tile_dwords + nthreads - 1)/nthreads; // 3
+    constexpr int grp          = qi/vdr;                       // 4
+
+    const int tid  = warp_size*threadIdx.y + threadIdx.x;      // 0..nthreads-1
+    const int row0 = blockIdx.x;                               // rows_per_cuda_block == 1
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y   = channel_dst;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y    = sample_dst;
+
+    ggml_cuda_pdl_sync();
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const int n_iter = (blocks_per_row_x + blk_per_iter - 1) / blk_per_iter;
+
+    // weight row base; buffer resource bounded to this row's byte extent so a partial last tile
+    // reads 0 for out-of-range dwords (they are never consumed — guarded below).
+    const block_q8_0 * x_row = (const block_q8_0 *) vx_ptr
+        + sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    // block_q8_0 is 34 B (not DWORD-aligned): round the buffer num_records UP to a DWORD so the
+    // last block's final straddling DWORD is in-bounds (else HW zeroes it -> qs[30..31] corrupt).
+    // The extra <=3 B are read into LDS but never consumed (guard: gblock < blocks_per_row_x).
+    const uint32_t row_bytes = (uint32_t) blocks_per_row_x * (uint32_t) sizeof(block_q8_0);
+    const q8pf_i32x4_t rsrc = q8pf_make_rsrc(x_row, (row_bytes + 3u) & ~3u);
+
+    // activation vector base (block_q8_1); default-cached (temporal reuse across rows).
+    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_y*stride_sample_y + channel_y*stride_channel_y;
+
+    __shared__ uint32_t lds_w[2][tile_dwords];
+
+    auto dma_tile = [&](int it, int buf) {
+        __attribute__((address_space(3))) uint32_t * lds_base =
+            (__attribute__((address_space(3))) uint32_t *) &lds_w[buf][0];
+        const uint32_t byte_base = (uint32_t) it * (uint32_t) tile_bytes;
+#pragma unroll
+        for (int p = 0; p < n_passes; ++p) {
+            const int d = p*nthreads + tid;
+            if (d < tile_dwords) {
+                q8pf_raw_buffer_load_lds(rsrc, lds_base + d, 4, (int)(byte_base + (uint32_t) d * 4u), 0, 0, WAUX);
+            }
+        }
+    };
+
+    dma_tile(0, 0); // prologue: issue tile 0
+
+    const int g0  = tid / grp;              // local block index within tile
+    const int kqs = vdr * (tid % grp);      // 0,2,4,6
+
+    float acc = 0.0f;
+    for (int it = 0; it < n_iter; ++it) {
+        // drain this lane's outstanding vmem (current tile DMA + prev consume's y-loads),
+        // then a scheduling barrier (MANDATORY — else the compiler hoists the LDS consumer
+        // above the wait) and a block barrier so all lanes see the whole tile in LDS.
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
+        __syncthreads();
+
+        // issue the next tile so its DMA overlaps the current tile's compute below.
+        if (it + 1 < n_iter) {
+            dma_tile(it + 1, (it + 1) & 1);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+        const int gblock = it*blk_per_iter + g0;
+        if (gblock < blocks_per_row_x) {
+            const block_q8_0 * wb =
+                (const block_q8_0 *) ((const char *) &lds_w[it & 1][0] + g0*(int) sizeof(block_q8_0));
+            int v[vdr];
+            int u[vdr];
+#pragma unroll
+            for (int i = 0; i < vdr; ++i) {
+                v[i] = get_int_b2(wb->qs, kqs + i);       // weights from LDS
+                u[i] = get_int_b4(y[gblock].qs, kqs + i); // activation from global (cached)
+            }
+            acc += vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, wb->d, __low2half(y[gblock].ds));
+        }
+    }
+
+    // cross-warp reduction (rows_per_cuda_block == 1), identical structure to mul_mat_vec_q.
+    __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][warp_size];
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y-1][threadIdx.x] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int l = 0; l < nwarps-1; ++l) {
+        acc += tmp_shared[l][threadIdx.x];
+    }
+    acc = warp_reduce_sum<warp_size>(acc);
+
+    if (threadIdx.x == 0) {
+        dst_ptr[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0] = acc;
+    }
+#else
+    GGML_UNUSED_VARS(vx_ptr, vy_ptr, dst_ptr, ncols_x, stride_row_x, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio,
+        stride_sample_x, stride_sample_y, stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // __HIP_DEVICE_COMPILE__ && CDNA2
+}
+#endif // GGML_USE_HIP
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -769,6 +930,37 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
+#ifdef Q8_LDS_PREFETCH_COMPILED
+// GGML_CUDA_Q8_PREFETCH: 0=off (default), 1=on default-cached weight DMA, 2=on SLC/streaming.
+static int q8pf_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_Q8_PREFETCH");
+        return e ? atoi(e) : 0;
+    }();
+    return mode;
+}
+
+static void mul_mat_vec_q8_0_prefetch_launch(
+        const void * vx, const void * vy, float * dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const dim3 & block_nums, const dim3 & block_dims, cudaStream_t stream, int mode) {
+    // nwarps == 4 matches calc_nwarps(Q8_0, ncols_dst=1, GCN table) for CDNA2.
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    if (mode == 2) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q8_0_prefetch<4, 2>, lp,
+            vx, vy, dst, ncols_x, stride_row_x, stride_col_dst, channel_ratio, stride_channel_x,
+            stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q8_0_prefetch<4, 0>, lp,
+            vx, vy, dst, ncols_x, stride_row_x, stride_col_dst, channel_ratio, stride_channel_x,
+            stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
+}
+#endif // Q8_LDS_PREFETCH_COMPILED
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -902,6 +1094,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
     switch (ncols_dst) {
         case 1: {
             constexpr int c_ncols_dst = 1;
+
+#ifdef Q8_LDS_PREFETCH_COMPILED
+            // Experimental CDNA2 async weight-prefetch specialization (dense Q8_0 batch-1 GEMV).
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                if (!has_ids && !has_fusion && GGML_CUDA_CC_IS_CDNA(cc) && warp_size == 64 && q8pf_mode() != 0) {
+                    std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                            nsamples_dst, warp_size, table_id);
+                    mul_mat_vec_q8_0_prefetch_launch(
+                        vx, vy, dst, ncols_x, stride_row_x, stride_col_dst, channel_ratio_fd, stride_channel_x,
+                        stride_channel_y, stride_channel_dst, sample_ratio_fd, stride_sample_x, stride_sample_y,
+                        stride_sample_dst, dims.first, dims.second, stream, q8pf_mode());
+                    return;
+                }
+            }
+#endif // Q8_LDS_PREFETCH_COMPILED
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
