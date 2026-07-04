@@ -1658,6 +1658,12 @@ extern "C" {
     // b I32 [n_rows, ne2, ne3, 1]
     //
     // return [n_embd, n_rows, ne2, ne3]
+    // [TAG_GDN_STATE_BF16] like ggml_get_rows but preserves a non-quantized src dtype (F16/BF16/F32)
+    GGML_API struct ggml_tensor * ggml_get_rows_keep_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // data
+            struct ggml_tensor  * b);  // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
