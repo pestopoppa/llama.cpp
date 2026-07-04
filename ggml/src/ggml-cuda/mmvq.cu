@@ -367,6 +367,15 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
+        // CDNA2 single-stream experiment (mi210-q8-dequant handoff, lever 2/3): batch-1 Q8_0 GEMV is
+        // achieved-BW/occupancy-limited at nwarps=2 (128 thr/block). Raise warps-per-block to put more
+        // weight-load requests in flight (Little's law). RDNA4 already uses nwarps=8 for Q8_0. Same
+        // dp4a math, but the fp cross-warp reduction is split more ways, so numerically-valid-not-
+        // bit-exact (test-backend-ops MUL_MAT 1103/1103 pass). Measured +4.6% (28.99->30.32 t/s, 27B
+        // Q8) single-stream tg128; nwarps=4 beat 2 (baseline) and 8 (reduction-overhead-bound).
+        if (ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
+            return 4;
+        }
         switch (ncols_dst) {
             case 1:
             case 2:
