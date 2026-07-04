@@ -2773,7 +2773,14 @@ ggml_tensor * llm_graph_context::build_rs(
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    if (state_zero->type == GGML_TYPE_F32) {
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    } else {
+        // [TAG_GDN_STATE_BF16] ggml_scale is F32-only; zero a non-F32 (e.g. BF16) recurrent state
+        // slot via an F32 cast round-trip so the clear works for the bf16 SSM-state cache.
+        ggml_tensor * zeroed = ggml_scale(ctx0, ggml_cast(ctx0, state_zero, GGML_TYPE_F32), 0.0f);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, zeroed, state_zero));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

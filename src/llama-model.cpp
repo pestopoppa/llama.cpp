@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -2000,6 +2001,15 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// [TAG_GDN_STATE_BF16] recurrent SSM-state cache precision, runtime-gated (default F32).
+// GGML_CUDA_GDN_STATE_BF16=1 stores the gated-delta-net recurrent state as BF16, halving the
+// ~192 MB/dispatch state read+write that dominates GDN decode (and ~2x the GDN-state VRAM).
+// Default OFF => F32 => byte-identical to upstream. Requires the fused GDN path (the default).
+static ggml_type gdn_recurrent_state_type() {
+    const char * e = getenv("GGML_CUDA_GDN_STATE_BF16");
+    return (e && atoi(e) != 0) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2054,7 +2064,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
-                            GGML_TYPE_F32,
+                            gdn_recurrent_state_type(), // [TAG_GDN_STATE_BF16] recurrent SSM state
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
@@ -2114,8 +2124,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_r  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ gdn_recurrent_state_type(), // [TAG_GDN_STATE_BF16]
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

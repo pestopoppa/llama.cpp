@@ -3872,6 +3872,33 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+// [TAG_GDN_STATE_BF16] Like ggml_get_rows but preserves a non-quantized source dtype (F16/BF16/F32)
+// in the output instead of forcing F32. Used to gather the recurrent SSM state without a bf16->f32
+// expansion, so the BF16 state reaches the gated-delta-net op at bf16 (halving its HBM traffic).
+struct ggml_tensor * ggml_get_rows_keep_type(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    enum ggml_type type = GGML_TYPE_F32;
+    if (a->type == GGML_TYPE_I32) {
+        type = a->type;
+    } else if (!ggml_is_quantized(a->type)) {
+        type = a->type; // preserve F16/BF16/F32
+    }
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    result->op     = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(
@@ -6234,7 +6261,8 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    // [TAG_GDN_STATE_BF16] recurrent state may be F32 (default) or BF16 (traffic-halving variant).
+    GGML_ASSERT(state->type == GGML_TYPE_F32 || state->type == GGML_TYPE_BF16);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
@@ -6253,7 +6281,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(K >= 1);
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    // [TAG_GDN_STATE_BF16] result carries [attn | state]; match the state dtype so the state
+    // region (the dominant HBM traffic) is written at the state's precision (F32 or BF16).
+    struct ggml_tensor * result = ggml_new_tensor(ctx, state->type, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
 

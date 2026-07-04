@@ -557,6 +557,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
+        // [TAG_GDN_STATE_BF16] when the recurrent state is BF16, result (and thus the attn view)
+        // is BF16; the gated norm downstream needs F32, so narrow-cast the tiny attn output back.
+        if (output->type != GGML_TYPE_F32) {
+            output = ggml_cast(ctx0, output, GGML_TYPE_F32);
+        }
+
         return output;
     }
 
@@ -601,6 +607,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+    // [TAG_GDN_STATE_BF16] see above: narrow-cast the attn output back to F32 for the gated norm.
+    if (output->type != GGML_TYPE_F32) {
+        output = ggml_cast(ctx0, output, GGML_TYPE_F32);
+    }
 
     return output;
 }
