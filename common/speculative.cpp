@@ -13,9 +13,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <queue>
 #include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -30,7 +32,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"draft-tree",    COMMON_SPECULATIVE_TYPE_DRAFT_TREE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -378,6 +381,384 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+};
+
+
+// ---------------------------------------------------------------------------
+// DySpec tree speculative decoding — Phase 1a
+//
+// Ported from feature/tree-speculation @ 8b59e1708 and re-expressed against the
+// v6 common_speculative_impl begin/process/draft/accept lifecycle (the old
+// common_speculative_state / config-vector API this was written for is gone).
+//
+// This is an EXTERNAL-drafter implementation (uses ctx_dft), the closest analog
+// being common_speculative_impl_draft_simple above.
+//
+// It builds a DySpec draft tree on the draft model — heap/wave frontier
+// expansion keyed by cumulative log-probability, a depth-decreasing branching
+// schedule, and per-node draft-KV forks via llama_memory_seq_cp — but draft()
+// returns ONLY the greedy path (get_greedy_path(): the top-1 child at each
+// depth). That greedy path is exactly what a linear draft would produce, so
+// v6's existing LINEAR verify path consumes it unchanged and acceptance is
+// never worse than linear ("guarantees >= linear"). Alternative branches are
+// built to exercise/validate the tree machinery but are discarded here; using
+// them requires multi-path target verification, which is Phase 1b.
+//
+// Draft-side seq_id budget (why this is safe with no server surgery):
+//   The primary (greedy) chain stays on the sequence's OWN draft seq_id.
+//   Alternative branches fork KV into SCRATCH seq_ids drawn from the range
+//   [n_seq, llama_n_seq_max(ctx_dft)). Under the Phase-1a server, ctx_dft is
+//   created with seq_max == n_seq (== n_parallel), so that range is EMPTY: no
+//   fork happens, the tree degenerates to the greedy chain (== a linear draft),
+//   which is safe and correct. When a future server enlarges the draft seq_max
+//   (Phase 1b sets 9*n_parallel), the identical code branches for real.
+//
+// Draft-KV cleanup: like draft-simple, the sequence's own draft KV is left for
+// the server to reconcile (it restores from a checkpoint / truncates right
+// after common_speculative_draft()). Only the scratch seq_ids that this impl
+// itself allocated are removed here.
+// ---------------------------------------------------------------------------
+
+// tree topology built during a single draft() call for one sequence.
+// kept internal to this .cpp for Phase 1a (no header change).
+struct common_speculative_tree {
+    std::vector<int32_t>     parent;    // parent[i] = -1 for a root node
+    std::vector<llama_token> tokens;    // token at each node
+    std::vector<float>       log_probs; // cumulative log-probability to reach node i
+    int32_t n_nodes = 0;
+
+    // greedy path: follow the first-added (top-1 / primary) child at each depth.
+    // primary children are always recorded before their siblings, so array order
+    // encodes the greedy chain. returns node 0's token first, i.e. the drafted
+    // tokens (id_last is NOT included), matching draft-simple's result semantics.
+    llama_tokens get_greedy_path() const {
+        if (n_nodes == 0) {
+            return {};
+        }
+
+        llama_tokens result;
+        int32_t cur = 0;
+        result.push_back(tokens[cur]);
+
+        while (true) {
+            int32_t first_child = -1;
+            for (int32_t i = cur + 1; i < n_nodes; ++i) {
+                if (parent[i] == cur) {
+                    first_child = i;
+                    break;
+                }
+            }
+            if (first_child < 0) {
+                break;
+            }
+            result.push_back(tokens[first_child]);
+            cur = first_child;
+        }
+
+        return result;
+    }
+};
+
+struct common_speculative_impl_draft_tree : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    llama_batch batch;
+
+    std::vector<common_sampler_ptr> smpls; // one primary sampler per sequence
+
+    // DySpec fan-out schedule
+    static constexpr int MAX_BRANCHES_PER_NODE = 7;
+    static constexpr int WAVE_BATCH_SIZE       = 8;
+
+    common_speculative_impl_draft_tree(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_TREE, n_seq)
+        , params(params.draft)
+    {
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * ctx_tgt = this->params.ctx_tgt;
+
+        LOG_INF("%s: adding speculative implementation 'draft-tree'\n", __func__);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%f, p_split=%f\n", __func__,
+                this->params.n_max, this->params.n_min, this->params.p_min, this->params.p_split);
+
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+
+        smpls.resize(n_seq);
+        for (auto & smpl : smpls) {
+            common_params_sampling sparams;
+            sparams.no_perf = false;
+            sparams.top_k = 10;
+            sparams.samplers = {
+                COMMON_SAMPLER_TYPE_TOP_K,
+            };
+
+            smpl.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        const bool vocab_cmpt = common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
+        LOG_DBG("%s: vocab_cmpt = %d\n", __func__, vocab_cmpt);
+
+        if (!vocab_cmpt) {
+            LOG_ERR("%s: the target and draft vocabs are not compatible\n", __func__);
+
+            throw std::runtime_error("draft model vocab type must match target model to use speculation");
+        }
+
+        // real sequences occupy [0, n_seq); tree branches fork into scratch
+        // seq_ids in [n_seq, seq_max). require seq_max >= n_seq so the real slots
+        // stay valid. seq_max == n_seq is fine: no scratch -> greedy chain only.
+        if (llama_n_seq_max(ctx_dft) < n_seq) {
+            LOG_ERR("%s: draft n_seq_max (%d) < n_seq (%d)\n", __func__, llama_n_seq_max(ctx_dft), n_seq);
+
+            throw std::runtime_error("the draft model number of sequences is incompatible with the speculative n_seq");
+        }
+    }
+
+    ~common_speculative_impl_draft_tree() override {
+        llama_batch_free(batch);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        // noop
+    }
+
+    bool process(const llama_batch & batch) override {
+        auto * ctx_dft = params.ctx_dft;
+
+        const int ret = llama_decode(ctx_dft, batch);
+
+        if (ret != 0) {
+            LOG_ERR("%s: failed to decode draft batch, ret = %d\n", __func__, ret);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto * ctx_dft = params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            build_tree_seq(ctx_dft, mem_dft, seq_id, dp);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+
+    // build a DySpec tree for one sequence and write its greedy path to dp.result
+    void build_tree_seq(
+            llama_context   * ctx_dft,
+            llama_memory_t    mem_dft,
+            llama_seq_id      seq_id,
+            common_speculative_draft_params & dp) {
+        auto & result = *dp.result;
+        result.clear();
+
+        const int budget    = std::max(1, params.n_max); // max tree nodes (== max greedy length in 1a)
+        const int max_depth = budget;                    // depth cap
+
+        // scratch seq_ids for alternative branches: [n_seq, seq_max)
+        const llama_seq_id scratch_base = (llama_seq_id) n_seq;
+        const llama_seq_id scratch_max  = (llama_seq_id) llama_n_seq_max(ctx_dft);
+        llama_seq_id next_scratch = scratch_base;
+
+        common_sampler * root_smpl = smpls[seq_id].get();
+        common_sampler_reset(root_smpl);
+
+        // seed: decode id_last at n_past on the sequence's own draft seq
+        // (the draft KV for [0, n_past) was populated by process()).
+        common_batch_clear(batch);
+        common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+        if (llama_decode(ctx_dft, batch) != 0) {
+            LOG_WRN("%s: seed llama_decode failed for seq %d\n", __func__, seq_id);
+            return;
+        }
+
+        common_speculative_tree tree;
+
+        // cloned samplers created for alternative branches; freed at the end.
+        std::vector<common_sampler *> clones;
+
+        // DySpec: fan-out decreases with depth
+        auto branching_factor = [&](int depth) -> int {
+            if (depth == 0) return MAX_BRANCHES_PER_NODE; // 7 at root
+            if (depth <= 2) return 5;
+            if (depth <= 4) return 3;
+            return 2;
+        };
+
+        // max-heap frontier keyed by cumulative log-probability
+        struct frontier_node {
+            float            cum_log_prob;
+            int32_t          node_idx;
+            int32_t          depth;
+            llama_seq_id     seq;
+            common_sampler * smpl;
+
+            bool operator<(const frontier_node & other) const {
+                return cum_log_prob < other.cum_log_prob;
+            }
+        };
+        std::priority_queue<frontier_node> heap;
+
+        // sample root candidates from id_last's logits (batch index 0)
+        common_sampler_sample(root_smpl, ctx_dft, 0, true);
+        const auto * cur_p = common_sampler_get_candidates(root_smpl, true);
+        if (cur_p->size == 0) {
+            return;
+        }
+
+        // seed the tree with root candidates. primary (k==0) is recorded first so
+        // that array order encodes the greedy chain.
+        const int n_root = std::min(branching_factor(0), (int) cur_p->size);
+        for (int k = 0; k < n_root && tree.n_nodes < budget; ++k) {
+            if (k == 0 && cur_p->data[0].p < params.p_min) break; // low-confidence -> no draft (== linear)
+            if (k > 0  && cur_p->data[k].p < params.p_split) break;
+            if (k > 0  && next_scratch >= scratch_max) break;     // no scratch -> greedy chain only
+
+            const llama_token tok   = cur_p->data[k].id;
+            const float       log_p = std::log(std::max(cur_p->data[k].p, 1e-10f));
+
+            const int32_t node = tree.n_nodes;
+            tree.parent.push_back(-1);
+            tree.tokens.push_back(tok);
+            tree.log_probs.push_back(log_p);
+            tree.n_nodes++;
+
+            llama_seq_id     seq;
+            common_sampler * node_smpl;
+            if (k == 0) {
+                // primary root: keep on the real seq + the primary sampler
+                seq       = seq_id;
+                node_smpl = root_smpl;
+                common_sampler_accept(root_smpl, tok, true);
+            } else {
+                // alternative root: fork the draft KV into a scratch seq + clone
+                seq = next_scratch++;
+                llama_memory_seq_cp(mem_dft, seq_id, seq, 0, -1);
+                node_smpl = common_sampler_clone(root_smpl);
+                clones.push_back(node_smpl);
+                common_sampler_accept(node_smpl, tok, true);
+            }
+
+            heap.push({ log_p, node, 0, seq, node_smpl });
+        }
+
+        // wave-based expansion: pop up to WAVE_BATCH_SIZE highest-probability
+        // frontier nodes, decode them in one batch, then expand their children.
+        while (tree.n_nodes < budget && !heap.empty()) {
+            std::vector<frontier_node> wave;
+            while ((int) wave.size() < WAVE_BATCH_SIZE && !heap.empty()) {
+                frontier_node fn = heap.top();
+                heap.pop();
+                if (fn.depth >= max_depth - 1) {
+                    continue; // depth cap reached: leave as a leaf
+                }
+                wave.push_back(fn);
+            }
+            if (wave.empty()) {
+                break;
+            }
+
+            // one forward pass for all wave nodes (decodes each node's own token,
+            // producing the logits used to sample its children)
+            common_batch_clear(batch);
+            for (size_t w = 0; w < wave.size(); ++w) {
+                const auto & fn = wave[w];
+                common_batch_add(batch, tree.tokens[fn.node_idx], dp.n_past + fn.depth + 1, { fn.seq }, true);
+            }
+            if (batch.n_tokens == 0) {
+                break;
+            }
+            if (llama_decode(ctx_dft, batch) != 0) {
+                LOG_WRN("%s: wave llama_decode failed for seq %d\n", __func__, seq_id);
+                break;
+            }
+
+            for (size_t w = 0; w < wave.size() && tree.n_nodes < budget; ++w) {
+                frontier_node & fn = wave[w];
+
+                common_sampler_sample(fn.smpl, ctx_dft, (int) w, true);
+                const auto * cands = common_sampler_get_candidates(fn.smpl, true);
+                if (cands->size == 0) {
+                    continue;
+                }
+
+                const int n_children = std::min(branching_factor(fn.depth + 1), (int) cands->size);
+                for (int k = 0; k < n_children && tree.n_nodes < budget; ++k) {
+                    if (k == 0 && cands->data[0].p < params.p_min) break;   // greedy stop (== linear)
+                    if (k > 0  && cands->data[k].p < params.p_split) break;
+                    if (k > 0  && next_scratch >= scratch_max) break;       // no scratch -> greedy chain only
+
+                    const llama_token child_tok   = cands->data[k].id;
+                    const float       child_log_p = fn.cum_log_prob + std::log(std::max(cands->data[k].p, 1e-10f));
+
+                    const int32_t child_node = tree.n_nodes;
+                    tree.parent.push_back(fn.node_idx);
+                    tree.tokens.push_back(child_tok);
+                    tree.log_probs.push_back(child_log_p);
+                    tree.n_nodes++;
+
+                    llama_seq_id     child_seq;
+                    common_sampler * child_smpl;
+                    if (k == 0) {
+                        // primary child: inherit the parent's seq + sampler
+                        child_seq  = fn.seq;
+                        child_smpl = fn.smpl;
+                        // note: sampler is top-k only, so accepting the primary token
+                        // before cloning alternatives below does not perturb them.
+                        common_sampler_accept(fn.smpl, child_tok, true);
+                    } else {
+                        // alternative child: fork the parent's KV + clone its sampler
+                        child_seq = next_scratch++;
+                        llama_memory_seq_cp(mem_dft, fn.seq, child_seq, 0, -1);
+                        child_smpl = common_sampler_clone(fn.smpl);
+                        clones.push_back(child_smpl);
+                        common_sampler_accept(child_smpl, child_tok, true);
+                    }
+
+                    heap.push({ child_log_p, child_node, fn.depth + 1, child_seq, child_smpl });
+                }
+            }
+        }
+
+        // return the greedy path (top-1 at each depth == linear draft output)
+        result = tree.get_greedy_path();
+        if ((int) result.size() > budget) {
+            result.resize(budget);
+        }
+        if ((int) result.size() < params.n_min) {
+            result.clear();
+        }
+
+        LOG_DBG("%s: seq %d built tree with %d nodes, returning %zu greedy tokens\n",
+                __func__, seq_id, tree.n_nodes, result.size());
+
+        // free cloned samplers
+        for (auto * s : clones) {
+            common_sampler_free(s);
+        }
+
+        // remove only the scratch seq_ids we allocated; the server reconciles the
+        // sequence's own draft KV right after common_speculative_draft().
+        for (llama_seq_id s = scratch_base; s < next_scratch; ++s) {
+            llama_memory_seq_rm(mem_dft, s, 0, -1);
+        }
     }
 };
 
@@ -1841,6 +2222,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_TREE:    return "draft-tree";
         default:                                    return "unknown";
     }
 }
@@ -1888,6 +2270,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_TREE:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -1925,6 +2308,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
         bool has_draft_mtp    = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP))    && params.draft.ctx_dft != nullptr;
+        bool has_draft_tree   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_TREE))   && params.draft.ctx_dft != nullptr;
 
 
 
@@ -1935,7 +2319,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1965,6 +2349,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_draft_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
+        if (has_draft_tree) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_TREE, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -1983,6 +2370,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_TREE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_tree>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
