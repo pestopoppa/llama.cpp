@@ -371,6 +371,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
+    int gqa_ratio_eff = 1;
+    while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+        gqa_ratio_eff *= 2;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -390,6 +395,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (gqa_ratio % 8 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (GGML_CUDA_CC_IS_AMD(cc) && Q->ne[1] * int64_t(gqa_ratio_eff) > 256) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -451,7 +459,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel =
+        Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        !(GGML_CUDA_CC_IS_AMD(cc) && (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16));
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -478,12 +488,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
-    int gqa_ratio_eff = 1;
-    while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
-        gqa_ratio_eff *= 2;
-    }
-
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -495,11 +499,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 320 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_WMMA_F16;
+    }
+
+    if (amd_mfma_available(cc) && Q->ne[0] == 320 && gqa_opt_applies) {
+        if (Q->ne[1] <= 3) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
@@ -511,6 +522,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_MMA_F16;
         }
         if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+            if (Q->ne[0] == 256 && K->ne[1] % FATTN_KQ_STRIDE != 0) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }

@@ -1766,7 +1766,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || (DKQ > 256 && !(DKQ == 320 && DV == 256 && ncols2 == 32))) {
         NO_DEVICE_CODE;
         return;
     }
