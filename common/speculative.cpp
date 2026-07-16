@@ -2629,6 +2629,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
+    if (std::find(params.speculative.types.begin(),
+                  params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_TREE) != params.speculative.types.end()) {
+        result.n_outputs_max = std::max(result.n_outputs_max, (int32_t) SPEC_TREE_MAX_SEQS);
+    }
 
     return result;
 }
@@ -2664,6 +2669,7 @@ common_speculative_init_result::common_speculative_init_result(
                   params.speculative.types.end(),
                   COMMON_SPECULATIVE_TYPE_DRAFT_TREE) != params.speculative.types.end()) {
         cparams.n_seq_max = std::max(cparams.n_seq_max, SPEC_TREE_MAX_SEQS);
+        cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
