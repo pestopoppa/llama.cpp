@@ -19,7 +19,6 @@ def _git(root: Path, args: list[str]) -> str:
 
 def render(root: Path, base: str) -> str:
     changed = _git(root, ["diff", "--name-only", base, "--"])
-    recent = _git(root, ["log", "--oneline", "-10", "--", "scripts", "docs", "tools"])
     lines = [
         "# EPYC llama Replay Analysis",
         "",
@@ -43,11 +42,6 @@ def render(root: Path, base: str) -> str:
         lines.extend(f"- `{line}`" for line in changed.splitlines())
     else:
         lines.append("- No tracked changes against base.")
-    lines.extend(["", "## Recent Analysis-Relevant Commits", ""])
-    if recent:
-        lines.extend(f"- `{line}`" for line in recent.splitlines())
-    else:
-        lines.append("- No recent matching commits.")
     lines.append("")
     return "\n".join(lines)
 
