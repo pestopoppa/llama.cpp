@@ -1,3 +1,4 @@
+#include "common.h"
 #include "ggml.h"
 #include "llama.h"
 
@@ -192,6 +193,14 @@ static void test_top_n_sigma(const std::vector<float> & probs, const std::vector
     tester.check();
 }
 
+static void test_grammar_prefill_policy() {
+    common_grammar none;
+    GGML_ASSERT(!common_grammar_needs_prefill(none));
+    GGML_ASSERT(!common_grammar_needs_prefill({COMMON_GRAMMAR_TYPE_USER, "root ::= \"x\""}));
+    GGML_ASSERT(!common_grammar_needs_prefill({COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, "root ::= \"{}\""}));
+    GGML_ASSERT( common_grammar_needs_prefill({COMMON_GRAMMAR_TYPE_TOOL_CALLS, "root ::= \"<tool>\""}));
+}
+
 static void test_sampler_queue(const size_t n_vocab, const std::string & samplers_sequence, const int top_k, const float top_p, const float min_p
 ) {
     sampler_tester tester(n_vocab);
@@ -307,6 +316,8 @@ static void test_perf() {
 
 int main(void) {
     ggml_time_init();
+
+    test_grammar_prefill_policy();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

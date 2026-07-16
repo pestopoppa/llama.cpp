@@ -281,7 +281,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
-    // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
+    // Only chat-template/tool-call grammars include the generation prompt in their grammar root.
+    // Plain output-format and user-supplied grammars constrain generated content only.
     if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
         try {
             for (const auto & token : prefill_tokens) {

@@ -212,10 +212,10 @@ inline const std::string & common_grammar_value(const common_grammar & g) {
 }
 
 // Returns true when the generation_prompt should be prefilled into the grammar sampler.
-// Only output-format and tool-call grammars need prefill; user-supplied grammars must not be prefilled.
+// Only chat-template grammars include the generation prompt prefix in their root rule.
+// Plain output-format grammars constrain generated content only and must not be prefilled.
 inline bool common_grammar_needs_prefill(const common_grammar & g) {
-    return g.type == COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT
-        || g.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
+    return g.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
 }
 
 // sampling parameters
@@ -279,7 +279,7 @@ struct common_params_sampling {
     // The assistant generation prompt already prefilled into the prompt.
     // Fed to the grammar sampler (to advance past pre-existing tokens) and used
     // to determine the reasoning budget sampler's initial state.
-    // Only applied when the grammar is of output-format or tool-calls type.
+    // Only applied when the grammar root already includes the chat-template generation prompt.
     std::string generation_prompt;
 
     // reasoning budget sampler parameters
