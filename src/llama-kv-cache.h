@@ -166,6 +166,9 @@ public:
     ggml_tensor * get_v_layer_raw(int32_t il) const;
     bool has_layer(int32_t il) const;
 
+    std::vector<uint32_t> get_layer_ids() const;
+    ggml_tensor * get_k_storage(int32_t il) const;
+
     //
     // graph_build API
     //

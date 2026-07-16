@@ -87,6 +87,11 @@ static __device__ __forceinline__ float op_log(float x) {
 }
 
 static __device__ __forceinline__ float op_expm1(float x) {
+    // ROCm's device expm1f returns NaN for some positive overflow inputs; the CPU
+    // reference returns +inf via expf(x) - 1.0f, which is also the IEEE result.
+    if (x > 88.722839f) {
+        return INFINITY;
+    }
     return expm1f(x);
 }
 
