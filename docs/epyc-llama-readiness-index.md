@@ -13,29 +13,34 @@ the repository ready for downstream use.
 
 ## Prioritized Tasks
 
-- [ ] P0 - Keep the repo-local guidance aligned with the current tree and policy.
+- [x] P0 - Add incremental validation surfaces for readiness scoring.
+  - Key files: [`scripts/gitnexus-analyze.sh`](../scripts/gitnexus-analyze.sh), [`scripts/validate/check_numeric_literals.py`](../scripts/validate/check_numeric_literals.py)
+  - Done when: changed-file validation can run without invoking model inference or kernel builds.
+
+- [x] P1 - Add generated-docs and analysis-report refresh surfaces.
+  - Key files: [`scripts/docs/generate_readiness_docs_index.py`](../scripts/docs/generate_readiness_docs_index.py), [`scripts/analysis/generate_analysis_reports_index.py`](../scripts/analysis/generate_analysis_reports_index.py)
+  - Done when: generated docs can be refreshed and checked deterministically.
+
+- [x] P2 - Add health, security-audit, and replay-analysis workflow surfaces.
+  - Key files: [`scripts/session/health_check.sh`](../scripts/session/health_check.sh), [`scripts/security_audit.py`](../scripts/security_audit.py), [`scripts/analysis/replay_analysis.py`](../scripts/analysis/replay_analysis.py)
+  - Done when: the L4 health, security, and replay criteria have repo-local commands and report artifacts.
+
+- [ ] P3 - Keep the repo-local guidance aligned with the current tree and policy.
   - Key files: [`AGENTS.md`](../AGENTS.md), [`CLAUDE.md`](../CLAUDE.md), [`README.md`](../README.md)
   - Done when: path names, repo scope, and contributor guidance match the live repository layout.
-
-- [ ] P1 - Keep the readiness entrypoint stable and discoverable.
-  - Key files: [`docs/epyc-llama-readiness-index.md`](./epyc-llama-readiness-index.md)
-  - Done when: this file remains the single task-index surface for repo-readiness coordination.
-
-- [ ] P2 - Record any future docs-only readiness gaps here before broader repo work starts.
-  - Key files: `docs/`
-  - Done when: new readiness items are added here as bounded checklist entries with owners and target paths.
 
 ## Dependency Graph
 
 ```mermaid
 graph TD
-  R1[P0: guidance alignment] --> R2[P1: stable readiness entrypoint]
-  R2 --> R3[P2: future readiness gaps]
+  R1[P0: incremental validation] --> R2[P1: generated docs and reports]
+  R2 --> R3[P2: health security replay surfaces]
+  R3 --> R4[P3: guidance alignment]
 ```
 
 ## Cross-Cutting Concerns
 
-- Keep the repo-readiness surface docs-only; do not pull source, build, or generated artifacts into this index.
+- Keep the repo-readiness surface scripts/docs-only; do not touch kernel source for readiness-only work.
 - Treat path names as canonical for this tree: `/mnt/raid0/llm/llama.cpp` is the working repo root used by the current session.
 - Re-check the guidance files if the repository layout or repo naming changes, because this index depends on those names staying current.
 
@@ -51,4 +56,8 @@ graph TD
 - `CLAUDE.md`
 - `README.md`
 - `docs/`
+- `scripts/analysis/`
+- `scripts/docs/`
+- `scripts/session/`
+- `scripts/validate/`
 - `tools/server/README.md`
