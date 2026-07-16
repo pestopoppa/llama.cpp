@@ -30,6 +30,16 @@ struct seq_draft {
     struct common_sampler * smpl = nullptr;
 };
 
+static bool decode_or_fail(llama_context * ctx, llama_batch batch, const char * label) {
+    const int ret = llama_decode(ctx, batch);
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode failed at %s, ret = %d\n", __func__, label, ret);
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -182,9 +192,11 @@ int main(int argc, char ** argv) {
     const auto t_enc_start = ggml_time_us();
 
     // eval the prompt with both models
-    llama_decode(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1));
-    llama_decode(ctx_tgt, llama_batch_get_one(&inp.back(),           1));
-    llama_decode(ctx_dft, llama_batch_get_one( inp.data(), n_input));
+    if (!decode_or_fail(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1), "target prompt prefix") ||
+        !decode_or_fail(ctx_tgt, llama_batch_get_one(&inp.back(),           1), "target prompt last token") ||
+        !decode_or_fail(ctx_dft, llama_batch_get_one( inp.data(), n_input),     "draft prompt")) {
+        return 1;
+    }
 
     const auto t_enc_end = ggml_time_us();
 
@@ -462,7 +474,9 @@ int main(int argc, char ** argv) {
 
             llama_memory_seq_rm(mem_dft, 0, n_past_dft, -1);
             // LOG_DBG("dft batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_dft, batch_dft).c_str());
-            llama_decode(ctx_dft, batch_dft);
+            if (!decode_or_fail(ctx_dft, batch_dft, "draft sampled token")) {
+                return 1;
+            }
 
             ++n_past_dft;
         }
@@ -590,7 +604,9 @@ int main(int argc, char ** argv) {
             }
 
             // evaluate the drafted tokens on the draft model
-            llama_decode(ctx_dft, batch_dft);
+            if (!decode_or_fail(ctx_dft, batch_dft, "draft continuation")) {
+                return 1;
+            }
             ++n_past_cur;
             ++n_drafted;
 
@@ -607,7 +623,9 @@ int main(int argc, char ** argv) {
             }
 
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
-            llama_decode(ctx_tgt, batch_tgt);
+            if (!decode_or_fail(ctx_tgt, batch_tgt, "target verification")) {
+                return 1;
+            }
             ++n_past_tgt;
         }
 

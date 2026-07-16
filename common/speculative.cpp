@@ -29,6 +29,7 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+static constexpr uint32_t SPEC_TREE_MAX_SEQS = 32;
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -2657,6 +2658,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+
+    if (std::find(params.speculative.types.begin(),
+                  params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_TREE) != params.speculative.types.end()) {
+        cparams.n_seq_max = std::max(cparams.n_seq_max, SPEC_TREE_MAX_SEQS);
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
