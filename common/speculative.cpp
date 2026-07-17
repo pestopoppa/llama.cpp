@@ -835,6 +835,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
     std::vector<float> g_embd_buf;
+    std::vector<llama_token> batch_tokens;
 
     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq)
@@ -864,8 +865,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; eagle3 decoder needs both.
-        // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        batch_tokens.resize(n_b);
+        batch.token = batch_tokens.data();
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -922,10 +923,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
         backend_chains.clear();
 
-        if (batch.token != nullptr) {
-            free(batch.token);
-            batch.token = nullptr;
-        }
+        batch.token = nullptr;
         llama_batch_free(batch);
     }
 
@@ -1618,6 +1616,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+    std::vector<llama_token>        batch_tokens;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1645,8 +1644,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
-        // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        batch_tokens.resize(n_b);
+        batch.token = batch_tokens.data();
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1711,10 +1710,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         backend_chains.clear();
 
-        if (batch.token != nullptr) {
-            free(batch.token);
-            batch.token = nullptr;
-        }
+        batch.token = nullptr;
         llama_batch_free(batch);
     }
 
