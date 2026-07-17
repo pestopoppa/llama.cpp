@@ -1808,6 +1808,40 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_log_mmvq_route_enabled() {
+    static const bool enabled = []() {
+        const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_log_mul_mat_route(
+        const char * route,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int cc,
+        int64_t ne11) {
+    if (!ggml_cuda_log_mmvq_route_enabled() || src0->type != GGML_TYPE_Q8_0) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "GGML_CUDA_MUL_MAT_ROUTE route=%s src0=%s src1=%s dst=%s type=%s cc=%d "
+        "src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] ne11=%" PRId64 "\n",
+        route,
+        src0->name, src1->name, dst->name,
+        ggml_type_name(src0->type),
+        cc,
+        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+        dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+        ne11);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1821,32 +1855,38 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        ggml_cuda_log_mul_mat_route("CUBLAS_PRECHECK", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
 
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        ggml_cuda_log_mul_mat_route("MMVF", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        ggml_cuda_log_mul_mat_route("MMF", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        ggml_cuda_log_mul_mat_route("MMVQ", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        ggml_cuda_log_mul_mat_route("MMQ", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    ggml_cuda_log_mul_mat_route("CUBLAS", src0, src1, dst, cc, ne11);
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 

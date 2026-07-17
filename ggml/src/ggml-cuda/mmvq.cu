@@ -4,9 +4,18 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cinttypes>
 #include <cstdlib>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+static bool ggml_cuda_log_mmvq_route_enabled() {
+    static const bool enabled = []() {
+        const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
@@ -279,57 +288,65 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+    const auto log_decision = [type, cc, ne11](bool decision) {
+        if (ggml_cuda_log_mmvq_route_enabled() && type == GGML_TYPE_Q8_0) {
+            GGML_LOG_INFO("GGML_CUDA_MMVQ_ROUTE_DECISION type=%s cc=%d ne11=%" PRId64 " use_mmvq=%d\n",
+                ggml_type_name(type), cc, ne11, decision ? 1 : 0);
+        }
+        return decision;
+    };
+
     if (!ggml_is_quantized(type)) {
-        return false;
+        return log_decision(false);
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
-                    return ne11 <= 7;
+                    return log_decision(ne11 <= 7);
                 case GGML_TYPE_Q5_1:
-                    return ne11 <= 7;
+                    return log_decision(ne11 <= 7);
                 case GGML_TYPE_Q8_0:
-                    return ne11 <= 6;
+                    return log_decision(ne11 <= 6);
                 case GGML_TYPE_Q2_K:
-                    return ne11 <= 4;
+                    return log_decision(ne11 <= 4);
                 case GGML_TYPE_Q3_K:
-                    return ne11 <= 3;
+                    return log_decision(ne11 <= 3);
                 case GGML_TYPE_Q4_K:
-                    return ne11 <= 2;
+                    return log_decision(ne11 <= 2);
                 case GGML_TYPE_Q5_K:
-                    return ne11 <= 3;
+                    return log_decision(ne11 <= 3);
                 case GGML_TYPE_Q6_K:
-                    return ne11 <= 4;
+                    return log_decision(ne11 <= 4);
                 case GGML_TYPE_IQ1_S:
-                    return ne11 <= 5;
+                    return log_decision(ne11 <= 5);
                 case GGML_TYPE_IQ2_XXS:
                 case GGML_TYPE_IQ3_S:
                 case GGML_TYPE_IQ4_XS:
-                    return ne11 <= 6;
+                    return log_decision(ne11 <= 6);
                 default:
-                    return ne11 <= MMVQ_MAX_BATCH_SIZE;
+                    return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
             }
         }
         switch (type) { // tuned for CDNA2
             case GGML_TYPE_Q2_K:
-                return ne11 <= 5;
+                return log_decision(ne11 <= 5);
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
-                return ne11 <= 3;
+                return log_decision(ne11 <= 3);
             case GGML_TYPE_Q6_K:
-                return ne11 <= 5;
+                return log_decision(ne11 <= 5);
             // MMVQ->MMQ campaign (mmvq experiment): force MMQ for Q8_0 at ne11>=2 so
             // MTP verify blocks (4-col batch) use batched mul_mat_q instead of per-column mul_mat_vec_q.
             case GGML_TYPE_Q8_0:
-                return ne11 <= 1;
+                return log_decision(ne11 <= 1);
             default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+                return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
         }
     }
-    return ne11 <= MMVQ_MAX_BATCH_SIZE;
+    return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
