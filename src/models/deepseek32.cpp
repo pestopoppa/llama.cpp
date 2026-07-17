@@ -204,6 +204,13 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
+        GGML_ASSERT(model.layers[il].attn_norm);
+        GGML_ASSERT(model.layers[il].wq_a);
+        GGML_ASSERT(model.layers[il].attn_q_a_norm);
+        GGML_ASSERT(model.layers[il].indexer_attn_q_b);
+        GGML_ASSERT(model.layers[il].indexer_attn_k);
+        GGML_ASSERT(model.layers[il].indexer_k_norm);
+        GGML_ASSERT(model.layers[il].indexer_proj);
 
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
@@ -279,6 +286,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 cb(indexer_k, "indexer_k", il);
 
                 // perform Hadamard transform on indexer q and k
+                GGML_ASSERT(inp_attn_dsa->self_k_rot_lid);
                 indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
                 cb(indexer_q, "indexer_q", il);
                 indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
