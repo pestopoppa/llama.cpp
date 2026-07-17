@@ -2658,7 +2658,6 @@ common_speculative_init_result::common_speculative_init_result(
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
-    auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -2670,6 +2669,7 @@ common_speculative_init_result::common_speculative_init_result(
                   COMMON_SPECULATIVE_TYPE_DRAFT_TREE) != params.speculative.types.end()) {
         cparams.n_seq_max = std::max(cparams.n_seq_max, SPEC_TREE_MAX_SEQS);
         cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
+        cparams.kv_unified = true;
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -2682,7 +2682,18 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_TRC("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        auto params_dft = params;
+        params_dft.devices               = params.speculative.draft.devices;
+        params_dft.model                 = params.speculative.draft.mparams;
+        params_dft.n_gpu_layers          = params.speculative.draft.n_gpu_layers;
+        params_dft.tensor_buft_overrides = params.speculative.draft.tensor_buft_overrides;
+        if (params.speculative.draft.cpuparams.n_threads > 0) {
+            params_dft.cpuparams.n_threads       = params.speculative.draft.cpuparams.n_threads;
+            params_dft.cpuparams_batch.n_threads = params.speculative.draft.cpuparams_batch.n_threads;
+        }
+
+        auto mparams_dft = common_model_params_to_llama(params_dft);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams_dft);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
