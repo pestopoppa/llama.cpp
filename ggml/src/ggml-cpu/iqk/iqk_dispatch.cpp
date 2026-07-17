@@ -48,6 +48,13 @@ inline bool iqk_enabled() {
     static const bool e = []() { const char * s = getenv("GGML_IQK"); return s && atoi(s) != 0; }();
     return e;
 }
+inline bool iqk_q8_0_enabled() {
+    static const bool e = []() {
+        const char * s = getenv("GGML_IQK_Q8_0");
+        return s && atoi(s) != 0;
+    }();
+    return e;
+}
 inline bool iqk_typeA_supported(int t) {
     switch (t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
@@ -69,6 +76,7 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
     if (dst->type  != GGML_TYPE_F32) return false;
     if (src1->type != GGML_TYPE_F32) return false;          // Stage 1: F32 activations only
     if (!iqk_typeA_supported((int) src0->type)) return false;
+    if (src0->type == GGML_TYPE_Q8_0 && !iqk_q8_0_enabled()) return false;
 
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
@@ -135,6 +143,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     // Same families as the dense hook (kquants + legacy Q8_0/Q4_0/...); all use the
     // Q8_2_X4 activation. iqk_mul_mat_moe returns false for any it can't handle -> native.
     if (!iqk_typeA_supported(tA)) return false;
+    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_enabled()) return false;
 
     const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
