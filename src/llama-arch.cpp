@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -860,7 +861,17 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    const auto kv_it = LLM_KV_NAMES.find(kv);
+    if (kv_it == LLM_KV_NAMES.end()) {
+        throw std::runtime_error(format("unknown GGUF metadata key id: %d", static_cast<int>(kv)));
+    }
+
+    const auto arch_it = LLM_ARCH_NAMES.find(arch);
+    if (arch_it == LLM_ARCH_NAMES.end()) {
+        throw std::runtime_error(format("unknown GGUF architecture id: %d", static_cast<int>(arch)));
+    }
+
+    std::string name = ::format(kv_it->second, arch_it->second);
 
     if (suffix != nullptr) {
         name += ".";
@@ -915,7 +926,12 @@ llm_arch llm_arch_from_string(const std::string & name) {
 }
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
-    return LLM_TENSOR_INFOS.at(tensor);
+    const auto it = LLM_TENSOR_INFOS.find(tensor);
+    if (it == LLM_TENSOR_INFOS.end()) {
+        throw std::runtime_error(format("missing tensor info mapping for tensor id: %d", static_cast<int>(tensor)));
+    }
+
+    return it->second;
 }
 
 bool llm_arch_is_recurrent(const llm_arch & arch) {

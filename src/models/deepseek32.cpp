@@ -501,6 +501,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
+    if (hparams.n_layer_nextn > 0) {
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

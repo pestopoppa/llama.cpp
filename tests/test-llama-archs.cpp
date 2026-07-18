@@ -22,6 +22,11 @@
 #include <utility>
 #include <vector>
 
+static std::runtime_error phase_error(const char * phase, llm_arch arch, bool moe, const std::exception & err) {
+    return std::runtime_error(std::string(phase) + " failed for " + llm_arch_name(arch) +
+        (moe ? " MoE: " : " Dense: ") + err.what());
+}
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
@@ -469,8 +474,19 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+            gguf_context_ptr gguf_ctx;
+            try {
+                gguf_ctx = get_gguf_ctx(arch, moe);
+            } catch (const std::exception & err) {
+                throw phase_error("get_gguf_ctx", arch, moe, err);
+            }
+
+            std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx;
+            try {
+                model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+            } catch (const std::exception & err) {
+                throw phase_error("get_model_and_ctx", arch, moe, err);
+            }
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
@@ -574,7 +590,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 continue;
             }
             const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx;
+            try {
+                gguf_ctx = get_gguf_ctx(arch, moe);
+            } catch (const std::exception & err) {
+                throw phase_error("get_gguf_ctx", arch, moe, err);
+            }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
@@ -594,12 +615,20 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 #endif // GGML_USE_WEBGPU
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        try {
+                            model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                            logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        } catch (const std::exception & err) {
+                            throw phase_error("cpu logits", arch, moe, err);
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        try {
+                            model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                            logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        } catch (const std::exception & err) {
+                            throw phase_error("device logits", arch, moe, err);
+                        }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -620,9 +649,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
-                        const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                        std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_roundtrip;
+                        std::vector<float> logits_roundtrip;
+                        try {
+                            model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                            logits_roundtrip = get_logits(
+                                model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                        } catch (const std::exception & err) {
+                            throw phase_error("roundtrip logits", arch, moe, err);
+                        }
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {

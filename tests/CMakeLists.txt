@@ -16,6 +16,22 @@ function(llama_build source)
     endif()
 endfunction()
 
+function(llama_set_test_library_path test_name test_target)
+    if (NOT WIN32)
+        set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "LD_LIBRARY_PATH=path_list_prepend:$<TARGET_FILE_DIR:${test_target}>"
+        )
+    endif()
+endfunction()
+
+function(llama_set_test_runtime_library_path test_name)
+    if (NOT WIN32)
+        set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "LD_LIBRARY_PATH=path_list_prepend:${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+        )
+    endif()
+endfunction()
+
 function(llama_test target)
     include(CMakeParseArguments)
     set(options)
@@ -44,6 +60,7 @@ function(llama_test target)
         ${LLAMA_TEST_ARGS})
 
     set_property(TEST ${TEST_NAME} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    llama_set_test_library_path(${TEST_NAME} ${TEST_TARGET})
 endfunction()
 
 function(llama_test_cmd target)
@@ -72,6 +89,7 @@ function(llama_test_cmd target)
         ${LLAMA_TEST_ARGS})
 
     set_property(TEST ${TEST_NAME} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    llama_set_test_runtime_library_path(${TEST_NAME})
 endfunction()
 
 # Builds and runs a test source file.
@@ -114,6 +132,7 @@ function(llama_build_and_test source)
         ${LLAMA_TEST_ARGS})
 
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    llama_set_test_library_path(${TEST_TARGET} ${TEST_TARGET})
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
