@@ -100,6 +100,36 @@ def test_slot_erase():
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
 
+def test_slot_compact_stays_eviction_only():
+    global server
+    server.server_slots = True
+    server.n_slots = 2
+    server.slot_save_path = "./tmp"
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=compact", data={
+        "keep_ratio": 0.5,
+        "keep_first": 8,
+        "n_future": 128,
+        "use_covariance": True,
+    })
+    assert res.status_code == 200
+    # The server keeps the compact action available, but it still only reports
+    # the evict-only Expected Attention result shape here.
+    assert res.body["id_slot"] == 1
+    assert res.body["scorer"] == "expected_attention"
+    assert res.body["keep_ratio"] == 0.5
+    assert res.body["n_evicted"] >= 0
+    assert res.body["pos_max_after"] >= 0
+
+
 #
 # Multimodal server (mmproj loaded) slot save/restore.
 #

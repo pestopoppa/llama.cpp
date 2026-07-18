@@ -40,6 +40,8 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static llama_kv_compress_params make_server_expected_attention_params(const server_task & task);
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -2653,15 +2655,7 @@ private:
                         break;
                     }
 
-                    llama_kv_compress_params ea_params;
-                    ea_params.compression_ratio = 1.0f - task.slot_action.keep_ratio; // keep_ratio=0.5 → remove 50%
-                    ea_params.n_sink            = task.slot_action.keep_first;
-                    ea_params.n_future          = task.slot_action.n_future;
-                    ea_params.use_covariance    = task.slot_action.use_covariance;
-                    ea_params.layer_weights     = task.slot_action.layer_weights;
-                    // Server slot prompt/checkpoint state tracks logical positions independently.
-                    // Keep Expected Attention in gapped-eviction mode unless that state is also compacted.
-                    ea_params.compact_positions = false;
+                    llama_kv_compress_params ea_params = make_server_expected_attention_params(task);
 
                     const int n_evicted = llama_kv_compress_evict(ctx_tgt, id_slot, ea_params);
                     if (n_evicted < 0) {
@@ -5252,6 +5246,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
+}
+
+static llama_kv_compress_params make_server_expected_attention_params(const server_task & task) {
+    llama_kv_compress_params ea_params;
+    ea_params.compression_ratio = 1.0f - task.slot_action.keep_ratio; // keep_ratio=0.5 → remove 50%
+    ea_params.n_sink            = task.slot_action.keep_first;
+    ea_params.n_future          = task.slot_action.n_future;
+    ea_params.use_covariance    = task.slot_action.use_covariance;
+    ea_params.layer_weights     = task.slot_action.layer_weights;
+
+    // Server slot prompt/checkpoint state tracks logical positions independently.
+    // Keep Expected Attention in gapped-eviction mode until the server can compact
+    // that logical state in lockstep with the KV cells.
+    ea_params.compact_positions = false;
+    GGML_ASSERT(!ea_params.compact_positions);
+
+    return ea_params;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const server_http_req & req, int id_slot) {
