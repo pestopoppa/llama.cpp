@@ -2922,15 +2922,30 @@ private:
                     n_keep += 1;
                 }
 
+                if (slot.task->params.kv_streaming_sink > 0) {
+                    n_keep = std::max(n_keep, slot.task->params.kv_streaming_sink);
+                }
+
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 int       n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
+                if (slot.task->params.kv_streaming_window > 0 && n_left > 1) {
+                    const int n_window = std::min(slot.task->params.kv_streaming_window, n_left - 1);
+                    n_discard = n_left - n_window;
+                }
+
                 // ref: https://github.com/ggml-org/llama.cpp/pull/24786
                 n_discard = std::clamp(n_discard, 0, std::max(0, n_left - 1));
 
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                if (slot.task->params.kv_streaming_sink > 0 || slot.task->params.kv_streaming_window > 0) {
+                    SLT_WRN(slot,
+                            "slot context shift (streaming), n_keep = %d, n_left = %d, n_discard = %d, kv_streaming_sink = %d, kv_streaming_window = %d\n",
+                            n_keep, n_left, n_discard, slot.task->params.kv_streaming_sink, slot.task->params.kv_streaming_window);
+                } else {
+                    SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                }
 
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
@@ -4582,6 +4597,8 @@ void server_routes::init_routes() {
 
         task_params tparams;
         tparams.sampling = params.sampling;
+        tparams.kv_streaming_sink   = params.kv_streaming_sink;
+        tparams.kv_streaming_window = params.kv_streaming_window;
         json default_generation_settings_for_props = json {
             { "params", tparams.to_json(true) },
             { "n_ctx",  meta->slot_n_ctx },

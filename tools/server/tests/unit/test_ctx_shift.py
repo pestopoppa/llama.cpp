@@ -43,6 +43,38 @@ def test_ctx_shift_enabled():
     assert res.body["truncated"] is True
 
 
+def test_ctx_shift_streaming_kv_request_settings():
+    global server
+    server.enable_ctx_shift = True
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "n_predict": 96,
+        "prompt": SHORT_TEXT,
+        "kv_streaming_sink": 16,
+        "kv_streaming_window": 32,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["predicted_n"] == 96
+    assert res.body["generation_settings"]["kv_streaming_sink"] == 16
+    assert res.body["generation_settings"]["kv_streaming_window"] == 32
+
+
+@pytest.mark.parametrize("field", [
+    "kv_streaming_sink",
+    "kv_streaming_window",
+])
+def test_ctx_shift_streaming_kv_rejects_negative(field: str):
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "n_predict": 1,
+        "prompt": "Hi",
+        field: -1,
+    })
+    assert res.status_code == 400
+    assert field in res.body["error"]["message"]
+
+
 @pytest.mark.parametrize("n_predict,n_token_output,truncated", [
     (64, 64, False),
     (-1, 248, True), # 8 tokens prompt + 248 tokens generated = 256 tokens total

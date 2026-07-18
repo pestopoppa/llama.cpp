@@ -67,6 +67,8 @@ json task_params::to_json(bool only_metrics) const {
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
+            {"kv_streaming_sink",         kv_streaming_sink},
+            {"kv_streaming_window",       kv_streaming_window},
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
             {"n_probs",                   sampling.n_probs},
@@ -119,6 +121,8 @@ json task_params::to_json(bool only_metrics) const {
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
+        {"kv_streaming_sink",         kv_streaming_sink},
+        {"kv_streaming_window",       kv_streaming_window},
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},

@@ -358,6 +358,12 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
     if (!client.model.empty()) {
         body["model"] = client.model;
     }
+    if (params.kv_streaming_sink > 0) {
+        body["kv_streaming_sink"] = params.kv_streaming_sink;
+    }
+    if (params.kv_streaming_window > 0) {
+        body["kv_streaming_window"] = params.kv_streaming_window;
+    }
 
     bool stream_error = false;
 

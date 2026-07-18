@@ -1489,6 +1489,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--kv-streaming-sink"}, "N",
+        string_format("minimum number of initial tokens to keep during context shift (default: %d, 0 = disabled)", params.kv_streaming_sink),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-streaming-sink must be non-negative");
+            }
+            params.kv_streaming_sink = value;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAMING_SINK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-streaming-window"}, "N",
+        string_format("number of recent tokens to keep during context shift (default: %d, 0 = disabled)", params.kv_streaming_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-streaming-window must be non-negative");
+            }
+            params.kv_streaming_window = value;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAMING_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--swa-full"},
         string_format("use full-size SWA cache (default: %s)\n"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),

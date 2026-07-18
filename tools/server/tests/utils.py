@@ -95,6 +95,8 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
+    kv_streaming_sink: int | None = None
+    kv_streaming_window: int | None = None
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
@@ -227,6 +229,10 @@ class ServerProcess:
                 server_args.extend(["--lora", lora_file])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
+        if self.kv_streaming_sink is not None:
+            server_args.extend(["--kv-streaming-sink", self.kv_streaming_sink])
+        if self.kv_streaming_window is not None:
+            server_args.extend(["--kv-streaming-window", self.kv_streaming_window])
         if self.spec_type:
             server_args.extend(["--spec-type", self.spec_type])
         if self.api_key:

@@ -59,6 +59,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Number of tokens after n_keep that may be discarded when shifting context (0 = half context)"));
 
+    add((new field_num("kv_streaming_sink", params.kv_streaming_sink))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Minimum number of initial tokens to retain when context shifting (0 = disabled)"));
+
+    add((new field_num("kv_streaming_window", params.kv_streaming_window))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Number of recent tokens to retain when context shifting (0 = disabled)"));
+
     add((new field_num("n_cmpl", params.n_cmpl))
         ->set_hard_limits(1, params_base.n_parallel)
         ->add_alias("n") // alias "n" as fallback (OpenAI completions API)
@@ -504,6 +512,8 @@ task_params eval_llama_cmpl_schema(
     params.sampling      = params_base.sampling;
     params.speculative   = params_base.speculative;
     params.n_keep        = params_base.n_keep;
+    params.kv_streaming_sink   = params_base.kv_streaming_sink;
+    params.kv_streaming_window = params_base.kv_streaming_window;
     params.n_predict     = params_base.n_predict;
     params.n_cache_reuse = params_base.n_cache_reuse;
     params.cache_prompt  = params_base.cache_prompt;
