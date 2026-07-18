@@ -1497,7 +1497,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_streaming_sink = value;
         }
-    ).set_env("LLAMA_ARG_KV_STREAMING_SINK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_STREAMING_SINK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--kv-streaming-window"}, "N",
         string_format("number of recent tokens to keep during context shift (default: %d, 0 = disabled)", params.kv_streaming_window),
@@ -1507,7 +1507,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_streaming_window = value;
         }
-    ).set_env("LLAMA_ARG_KV_STREAMING_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_STREAMING_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"--swa-full"},
         string_format("use full-size SWA cache (default: %s)\n"
