@@ -571,6 +571,8 @@ struct server_task_result_slot_compact : server_task_result {
     int        n_evicted     = 0;
     float      keep_ratio    = 0.5f;
     llama_pos  pos_max_after = 0;
+    bool       compact_positions = false;
+    bool       logical_context_reclaimed = false;
 
     virtual json to_json() override;
 };

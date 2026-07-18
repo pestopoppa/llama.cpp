@@ -2659,6 +2659,9 @@ private:
                     ea_params.n_future          = task.slot_action.n_future;
                     ea_params.use_covariance    = task.slot_action.use_covariance;
                     ea_params.layer_weights     = task.slot_action.layer_weights;
+                    // Server slot prompt/checkpoint state tracks logical positions independently.
+                    // Keep Expected Attention in gapped-eviction mode unless that state is also compacted.
+                    ea_params.compact_positions = false;
 
                     const int n_evicted = llama_kv_compress_evict(ctx_tgt, id_slot, ea_params);
                     if (n_evicted < 0) {
@@ -2674,6 +2677,8 @@ private:
                     res->n_evicted     = n_evicted;
                     res->keep_ratio    = task.slot_action.keep_ratio;
                     res->pos_max_after = new_pos_max;
+                    res->compact_positions = ea_params.compact_positions;
+                    res->logical_context_reclaimed = false;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:

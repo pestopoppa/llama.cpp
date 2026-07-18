@@ -1602,11 +1602,14 @@ json server_task_result_slot_erase::to_json() {
 //
 json server_task_result_slot_compact::to_json() {
     return json {
-        { "id_slot",       id_slot },
-        { "scorer",        "expected_attention" },
-        { "n_evicted",     n_evicted },
-        { "keep_ratio",    keep_ratio },
-        { "pos_max_after", pos_max_after },
+        { "id_slot",                    id_slot },
+        { "scorer",                     "expected_attention" },
+        { "n_evicted",                  n_evicted },
+        { "keep_ratio",                 keep_ratio },
+        { "pos_max_after",              pos_max_after },
+        { "compact_positions",          compact_positions },
+        { "logical_context_reclaimed",  logical_context_reclaimed },
+        { "reclaim_mode",               compact_positions ? "position_compaction" : "evict_only_gapped" },
     };
 }
 
