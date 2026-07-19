@@ -438,7 +438,9 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                         Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        const bool nextn_unmasked = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
+        if (il == n_layer - 1 && inp_out_ids && !nextn_unmasked) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -504,6 +506,10 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     if (hparams.n_layer_nextn > 0) {
         cb(cur, "h_nextn", -1);
         res->t_h_nextn = cur;
+    }
+
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cb(cur, "result_norm", -1);

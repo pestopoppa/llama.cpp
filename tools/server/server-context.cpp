@@ -444,10 +444,9 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
+        i_batch = batch.size();
         if (spec_draft.empty()) {
             // no speculative decoding
-            i_batch = batch.size();
-
             add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -4253,7 +4252,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // to be sent immediately
         json first_result_json = first_result->to_json();
         if (first_result_json == nullptr) {
-            res->data = ""; // simply send HTTP headers and status code
+            // Keep the SSE body observable while the first real token/error is pending.
+            // A zero-byte initial chunk can be treated as an empty stream by clients.
+            res->data = ":\n\n";
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
