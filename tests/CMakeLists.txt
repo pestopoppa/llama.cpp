@@ -135,6 +135,16 @@ function(llama_build_and_test source)
     llama_set_test_library_path(${TEST_TARGET} ${TEST_TARGET})
 endfunction()
 
+option(LLAMA_GLM_DSA_ORACLE_TESTS "llama: build GLM DSA oracle scaffold tests" OFF)
+
+if (LLAMA_GLM_DSA_ORACLE_TESTS)
+    add_executable(test-glm-dsa-top-k-mask test-glm-dsa-top-k-mask.cpp)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-glm-dsa-top-k-mask RUNTIME)
+    endif()
+    llama_test(test-glm-dsa-top-k-mask)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
