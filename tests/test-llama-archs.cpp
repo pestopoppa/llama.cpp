@@ -7,8 +7,8 @@
 #include "llama.h"
 #include "llama-cpp.h"
 
-// TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -84,7 +84,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_nextn = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -129,6 +129,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (n_layer_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_layer_nextn);
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -324,6 +327,38 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void assert_glm_dsa_nextn_unmasked_keeps_all_target_rows(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_GLM_DSA, true, 1);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false);
+    llama_context * lctx = model_and_ctx.second.get();
+
+    llama_set_embeddings_nextn(lctx, true, false);
+    ggml_cgraph * gf = llama_graph_reserve(lctx, 4, 1, 1);
+    llama_set_embeddings_nextn(lctx, false, false);
+
+    if (gf == nullptr) {
+        throw std::runtime_error("failed to reserve nextn row-selection graph");
+    }
+
+    ggml_tensor * h_nextn = ggml_graph_get_tensor(gf, "h_nextn");
+    ggml_tensor * result_norm = ggml_graph_get_tensor(gf, "result_norm");
+    if (h_nextn == nullptr) {
+        throw std::runtime_error("missing h_nextn node");
+    }
+    if (result_norm == nullptr) {
+        throw std::runtime_error("missing result_norm node");
+    }
+    if (h_nextn->ne[1] != 4) {
+        throw std::runtime_error("h_nextn did not retain all unmasked token rows");
+    }
+    if (result_norm->op != GGML_OP_GET_ROWS) {
+        throw std::runtime_error("result_norm did not apply output-row selection after h_nextn");
+    }
+    if (result_norm->src[0] != h_nextn || result_norm->src[0]->ne[1] != 4 || result_norm->ne[1] != 1) {
+        throw std::runtime_error("nextn row-selection graph has the wrong source/output shape");
+    }
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -680,6 +715,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    if (all_ok && (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_GLM_DSA)) {
+        try {
+            assert_glm_dsa_nextn_unmasked_keeps_all_target_rows(seed);
+        } catch (const std::exception & err) {
+            throw phase_error("glm-dsa nextn row-selection graph", LLM_ARCH_GLM_DSA, true, err);
+        }
+    }
     return all_ok ? 0 : 1;
 }
 
