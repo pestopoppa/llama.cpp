@@ -1,6 +1,28 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+static bool gdn_timing_requested() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GDN_TIMING");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool gdn_timing_enabled() {
+    static const bool graphs_disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_GRAPHS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static bool warned = false;
+    if (gdn_timing_requested() && !graphs_disabled && !warned) {
+        GGML_LOG_WARN("%s: GGML_CUDA_GDN_TIMING requires GGML_CUDA_DISABLE_GRAPHS=1; timing disabled to avoid graph-capture synchronization\n",
+                __func__);
+        warned = true;
+    }
+    return gdn_timing_requested() && graphs_disabled;
+}
+
 // [TAG_GDN_STATE_BF16] recurrent-state precision helpers.
 // The recurrent SSM state (curr_state / dst state region) may be stored as F32 (default,
 // byte-identical to upstream) or BF16 (runtime-gated by GGML_CUDA_GDN_STATE_BF16 at cache
@@ -326,6 +348,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
 
+    const bool timing = gdn_timing_enabled();
+    cudaEvent_t timing_start = nullptr;
+    cudaEvent_t timing_stop  = nullptr;
+    if (timing) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&timing_start, 0));
+        CUDA_CHECK(cudaEventCreateWithFlags(&timing_stop,  0));
+        CUDA_CHECK(cudaEventRecord(timing_start, stream));
+    }
+
     if (dst->type == GGML_TYPE_F32) {
         float * dst_d             = (float *) dst->data;
         float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
@@ -347,6 +378,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
         gdn_dispatch<nv_bfloat16>(kda, keep_rs, q_d, k_d, v_d, g_d, b_d,
             (const nv_bfloat16 *) src_state->data, dst_d, state_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+    }
+
+    if (timing) {
+        CUDA_CHECK(cudaEventRecord(timing_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(timing_stop));
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, timing_start, timing_stop));
+        CUDA_CHECK(cudaEventDestroy(timing_start));
+        CUDA_CHECK(cudaEventDestroy(timing_stop));
+        GGML_LOG_INFO("GGML_CUDA_GDN_TIMING: ms=%.6f S_v=%lld H=%lld n_tokens=%lld n_seqs=%lld kda=%d keep_rs=%d K=%d dtype=%s fused_cache=%d\n",
+                elapsed_ms, (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs,
+                kda ? 1 : 0, keep_rs ? 1 : 0, K, dst->type == GGML_TYPE_F32 ? "f32" : "bf16", cache != nullptr ? 1 : 0);
     }
 }
 

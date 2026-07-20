@@ -54,6 +54,7 @@
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventElapsedTime musaEventElapsedTime
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
 #define cudaGetDevice musaGetDevice
