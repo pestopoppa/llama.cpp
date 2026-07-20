@@ -5616,6 +5616,50 @@ struct test_concat : public test_case {
     }
 };
 
+struct test_concat_transpose_dim0 : public test_case {
+    const ggml_type type;
+    const int64_t n_seq;
+    const int transposed;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, n_seq, transposed);
+    }
+
+    test_concat_transpose_dim0(ggml_type type = GGML_TYPE_F32, int64_t n_seq = 1, int transposed = 1)
+        : type(type), n_seq(n_seq), transposed(transposed) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr;
+        if (transposed & 1) {
+            ggml_tensor * a_base = ggml_new_tensor_3d(ctx, type, 5, 3, n_seq);
+            ggml_set_name(a_base, "a_base");
+
+            a = ggml_transpose(ctx, a_base);
+            ggml_set_name(a, "a_transposed");
+        } else {
+            a = ggml_new_tensor_3d(ctx, type, 3, 5, n_seq);
+            ggml_set_name(a, "a");
+        }
+
+        ggml_tensor * b = nullptr;
+        if (transposed & 2) {
+            ggml_tensor * b_base = ggml_new_tensor_3d(ctx, type, 5, 7, n_seq);
+            ggml_set_name(b_base, "b_base");
+
+            b = ggml_transpose(ctx, b_base);
+            ggml_set_name(b, "b_transposed");
+        } else {
+            b = ggml_new_tensor_3d(ctx, type, 7, 5, n_seq);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -9124,6 +9168,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int dim : { 0, 1, 2, 3, }) {
                 test_cases.emplace_back(new test_concat(type_a, {128, 12, 13, 14}, dim == 0 ? 256 : 7, dim, v));
             }
+        }
+    }
+
+    for (int64_t n_seq : {1, 2}) {
+        for (int transposed : {1, 2, 3}) {
+            test_cases.emplace_back(new test_concat_transpose_dim0(GGML_TYPE_F32,  n_seq, transposed));
+            test_cases.emplace_back(new test_concat_transpose_dim0(GGML_TYPE_F16,  n_seq, transposed));
+            test_cases.emplace_back(new test_concat_transpose_dim0(GGML_TYPE_BF16, n_seq, transposed));
         }
     }
 
