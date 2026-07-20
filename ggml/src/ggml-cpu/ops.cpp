@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -1897,6 +1898,91 @@ void ggml_compute_forward_repeat_back(
 
 // ggml_compute_forward_concat
 
+static bool ggml_cpu_concat_dim0_rows_enabled(void) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CPU_CONCAT_DIM0_ROWS");
+        return env && atoi(env) != 0;
+    }();
+
+    return enabled;
+}
+
+static bool ggml_compute_forward_concat_dim0_rows_supported(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (!ggml_cpu_concat_dim0_rows_enabled() || ggml_get_op_params_i32(dst, 0) != 0) {
+        return false;
+    }
+
+    if (src1->type != src0->type || dst->type != src0->type) {
+        return false;
+    }
+
+    const int64_t bs = ggml_blck_size(src0->type);
+
+    return src0->ne[0] % bs == 0 &&
+           src1->ne[0] % bs == 0 &&
+           dst->ne[0]  % bs == 0;
+}
+
+static void ggml_compute_forward_concat_dim0_rows(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const size_t len = ggml_type_size(src0->type);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int32_t dim = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(dim == 0);
+
+    const int64_t bs = ggml_blck_size(src0->type);
+    GGML_ASSERT(src1->type == src0->type);
+    GGML_ASSERT(dst->type == src0->type);
+    GGML_ASSERT(ne0  % bs == 0);
+    GGML_ASSERT(ne00 % bs == 0);
+    GGML_ASSERT(ne10 % bs == 0);
+
+    const int64_t ne0b  = ne0  / bs;
+    const int64_t ne00b = ne00 / bs;
+    const int64_t ne10b = ne10 / bs;
+    GGML_ASSERT(ne0b == ne00b + ne10b);
+
+    // Shard complete logical rows across workers. The default concat kernels
+    // shard dim2, which serializes dim0 concat when dim2 is small.
+    const int64_t n_rows = ne1 * ne2 * ne3;
+    const int64_t dr     = (n_rows + nth - 1) / nth;
+    const int64_t r0     = dr * ith;
+    const int64_t r1     = std::min(r0 + dr, n_rows);
+
+    const char * x;
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i1 = r % ne1;
+        const int64_t i2 = (r / ne1) % ne2;
+        const int64_t i3 = r / (ne1 * ne2);
+
+        for (int64_t i0 = 0; i0 < ne0b; ++i0) {
+            if (i0 < ne00b) {
+                x = (const char *) src0->data + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03;
+            } else {
+                x = (const char *) src1->data + (i0 - ne00b)*nb10 + i1*nb11 + i2*nb12 + i3*nb13;
+            }
+
+            char * y = (char *) dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3;
+
+            memcpy(y, x, len);
+        }
+    }
+}
+
 static void ggml_compute_forward_concat_any(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -2085,6 +2171,11 @@ void ggml_compute_forward_concat(
         GGML_ASSERT(ggml_is_contiguous_rows(src1));
         GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
         GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+    }
+
+    if (ggml_compute_forward_concat_dim0_rows_supported(dst)) {
+        ggml_compute_forward_concat_dim0_rows(params, dst);
+        return;
     }
 
     switch (src0->type) {
