@@ -55,6 +55,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # iqk port (Stage 1): ik_llama quantized-GEMM kernels (Q4_K + Q8_0), flag-gated
         ggml-cpu/iqk/iqk_mul_mat.cpp
         ggml-cpu/iqk/iqk_gemm_kquants.cpp
+        ggml-cpu/iqk/iqk_gemm_iquants.cpp
         ggml-cpu/iqk/iqk_gemm_legacy_quants.cpp
         ggml-cpu/iqk/iqk_quantize_min.cpp
         ggml-cpu/iqk/iqk_stubs.cpp

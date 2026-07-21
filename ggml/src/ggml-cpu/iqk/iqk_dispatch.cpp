@@ -61,6 +61,12 @@ inline bool iqk_typeA_supported(int t) {
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:   // note: Q6_0 is ik-only, not in v6
+        // IQ-quants enabled 2026-07-21: GLM-5.2 UD-IQ2_M carries 148 IQ2_XXS +
+        // 71 IQ3_XXS + 2 IQ2_S routed-expert tensors that dominate its decode
+        // bandwidth and prefill FLOPs; without these cases GGML_IQK=1 skipped
+        // them entirely. IQ4_XS is deliberately NOT listed — iqk_gemm_iquants.cpp
+        // has no kernel for it, and GLM-5.2 uses it for only 4 tensors.
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ2_S:
             return true;
         default: return false;
     }
