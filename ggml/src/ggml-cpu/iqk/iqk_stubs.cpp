@@ -23,12 +23,12 @@
 #include "iqk_gemm_1bit.h"
 
 bool iqk_set_kernels_float(int, int, int, std::array<mul_mat_t, IQK_MAX_NY>&) { return false; }
-bool iqk_set_kernels_iquants(int, int, int, std::array<mul_mat_t, IQK_MAX_NY>&, mul_mat_t&) { return false; }
+// iqk_set_kernels_iquants: real kernel compiled in (iqk_gemm_iquants.cpp) — stub removed 2026-07-21
 bool iqk_set_kernels_iqk_quants(int, int, int, std::array<mul_mat_t, IQK_MAX_NY>&, mul_mat_t&) { return false; }
 bool iqk_set_kernels_ktquants(int, int, int, std::array<mul_mat_t, IQK_MAX_NY>&, mul_mat_t&) { return false; }
 bool iqk_set_kernels_1bit(int, int, int, std::array<mul_mat_t, IQK_MAX_NY>&, mul_mat_t&) { return false; }
 
-bool iqk_convert_iquants_q80_r8(int, int, const void *, size_t, void *, int) { return false; }
+// iqk_convert_iquants_q80_r8: real converter compiled in (iqk_gemm_iquants.cpp) — stub removed 2026-07-21
 bool iqk_convert_iqk_quants_q80_r8(int, int, const void *, size_t, void *, int) { return false; }
 bool iqk_convert_1bit_q80_r8(int, int, const void *, size_t, void *, int) { return false; }
 

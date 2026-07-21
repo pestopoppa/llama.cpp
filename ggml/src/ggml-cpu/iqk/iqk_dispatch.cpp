@@ -61,6 +61,16 @@ inline bool iqk_typeA_supported(int t) {
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:   // note: Q6_0 is ik-only, not in v6
+        // IQ-quants enabled 2026-07-21. iqk_gemm_iquants.cpp implements exactly
+        // these five native types in BOTH iqk_set_kernels_iquants (:2760-2775)
+        // and iqk_convert_iquants_q80_r8 (:2810-2814); the *_R4 repacked
+        // variants are ik-only and unreachable from our GGUFs. Without these
+        // cases GGML_IQK=1 silently skipped the routed-expert tensors that
+        // dominate decode bandwidth and prefill FLOPs on every IQ-quant model
+        // we deploy. NOT listed: IQ4_XS and IQ1_M — no kernel exists for them
+        // here (IQ1_M needs the still-stubbed 1bit family).
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
             return true;
         default: return false;
     }
