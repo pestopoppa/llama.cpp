@@ -294,6 +294,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    llama_build(test-iqk-ser.cpp)
+    llama_test(test-iqk-ser NAME test-iqk-ser)
+    llama_test(test-iqk-ser NAME test-iqk-valid-control ARGS --control)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

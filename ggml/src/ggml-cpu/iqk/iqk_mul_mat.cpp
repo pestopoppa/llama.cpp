@@ -243,12 +243,16 @@ struct MulMat {
         auto q8_k_type = GGML_TYPE_Q8_K_R8;
 #endif
         switch (type) {
-            case GGML_TYPE_IQ2_XXS: return nrc_y >= 32 ? q8_k_type : type;
-            case GGML_TYPE_IQ2_XS : return nrc_y >= 32 ? q8_k_type : type;
-            case GGML_TYPE_IQ2_S  : return nrc_y >= 16 ? q8_k_type : type;
-            case GGML_TYPE_IQ3_XXS: return nrc_y >= 32 ? q8_k_type : type;
+            // The native iquant-to-repacked-Q8 converters produce incorrect
+            // results for some large-Ny dense and MoE shapes on Zen 4. Keep
+            // these five newly enabled families on their direct IQK kernels.
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+                return type;
             case GGML_TYPE_IQ4_XS : return nrc_y >= 32 ? q8_k_type : type;
-            case GGML_TYPE_IQ3_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? q8_k_type : type;
@@ -758,6 +762,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         GGML_ASSERT(Nx%num_rows == 0);
         auto nrc_x = (Nx/num_rows + nth - 1)/nth;
         auto first_x = ith*nrc_x;
+        if (first_x >= Nx/num_rows) return true;
         if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
         first_x *= num_rows;
         nrc_x   *= num_rows;
@@ -793,6 +798,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     GGML_ASSERT(Nx%num_rows == 0);
     auto nrc_x = (Nx/num_rows + nth - 1)/nth;
     auto first_x = ith*nrc_x;
+    if (first_x >= Nx/num_rows) return true;
     if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
     first_x *= num_rows;
     nrc_x *= num_rows;

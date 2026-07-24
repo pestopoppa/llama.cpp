@@ -7,6 +7,8 @@
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 
+#include <cstring>
+
 #ifdef __x86_64__
 
 namespace {
@@ -68,21 +70,14 @@ struct SimpleBits {
 
 struct EvenSignHelper {
 #if defined HAVE_FANCY_SIMD && defined __AVX512VPOPCNTDQ__
-    union sbits_t {
-        __m128i vec;
-        __mmask32 mask[4];
-    };
     IQK_ALWAYS_INLINE void sign_2_values(__m256i aux, __m256i * values) const {
         aux = _mm256_and_si256(_mm256_srlv_epi32(aux, shifts), mask);
         auto pcnt = _mm256_popcnt_epi32(aux);
-        sbits_t sbits;
-        sbits.vec = _mm256_cvtepi32_epi8(_mm256_or_si256(aux, _mm256_slli_epi32(_mm256_and_si256(pcnt, mone), 7)));
-        values[0] = _mm256_mask_sub_epi8(values[0], sbits.mask[0], _mm256_setzero_si256(), values[0]);
-        values[1] = _mm256_mask_sub_epi8(values[1], sbits.mask[1], _mm256_setzero_si256(), values[1]);
-        //auto sign_bits = _mm256_cvtepi32_epi8(_mm256_or_si256(aux, _mm256_slli_epi32(_mm256_and_si256(pcnt, mone), 7)));
-        //const __mmask32 * m32 = (const __mmask32 *)&sign_bits;
-        //values[0] = _mm256_mask_sub_epi8(values[0], m32[0], _mm256_setzero_si256(), values[0]);
-        //values[1] = _mm256_mask_sub_epi8(values[1], m32[1], _mm256_setzero_si256(), values[1]);
+        auto sign_bits = _mm256_cvtepi32_epi8(_mm256_or_si256(aux, _mm256_slli_epi32(_mm256_and_si256(pcnt, mone), 7)));
+        __mmask32 masks[4];
+        std::memcpy(masks, &sign_bits, sizeof(masks));
+        values[0] = _mm256_mask_sub_epi8(values[0], masks[0], _mm256_setzero_si256(), values[0]);
+        values[1] = _mm256_mask_sub_epi8(values[1], masks[1], _mm256_setzero_si256(), values[1]);
     }
     const __m256i shifts = _mm256_set_epi32(21, 14, 7, 0, 21, 14, 7, 0);
     const __m256i mask   = _mm256_set1_epi32(127);
@@ -101,25 +96,19 @@ struct SignHelper {
         aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
         return _mm256_or_si256(_mm256_cmpeq_epi8(aux256, mask2), mone);
     }
-//    inline __m256i make_signs(const uint16_t * sign_bits) const {
-//#ifdef HAVE_FANCY_SIMD
-//#else
-//        return make_signs(sign_bits[0] | (sign_bits[1] << 16));
-//#endif
-//    }
     inline __m256i sign_value(const uint16_t * sign_bits, const __m256i& value) const {
 #ifdef HAVE_FANCY_SIMD
-        const __mmask32 * mask = (const __mmask32 *)sign_bits;
-        return _mm256_mask_sub_epi8(value, mask[0], _mm256_setzero_si256(), value);
+        const uint32_t mask = (uint32_t) sign_bits[0] | ((uint32_t) sign_bits[1] << 16);
+        return _mm256_mask_sub_epi8(value, (__mmask32) mask, _mm256_setzero_si256(), value);
 #else
-        return _mm256_sign_epi8(value, make_signs(sign_bits[0] | (sign_bits[1] << 16)));
+        return _mm256_sign_epi8(value, make_signs((uint32_t) sign_bits[0] | ((uint32_t) sign_bits[1] << 16)));
 #endif
     }
     IQK_ALWAYS_INLINE void sign_4_values(const uint16_t * sign_bits, __m256i * values) const {
         // Somehow the FANCY_SIMD version has become 50% slower for TG???
 #ifdef z_HAVE_FANCY_SIMD
-        //__mmask32 mask[4]; std::memcpy(mask, sign_bits, 4*sizeof(__mmask32));
-        const __mmask32 * mask = (const __mmask32 *)sign_bits;
+        __mmask32 mask[4];
+        std::memcpy(mask, sign_bits, sizeof(mask));
         values[0] = _mm256_mask_sub_epi8(values[0], mask[0], _mm256_setzero_si256(), values[0]);
         values[1] = _mm256_mask_sub_epi8(values[1], mask[1], _mm256_setzero_si256(), values[1]);
         values[2] = _mm256_mask_sub_epi8(values[2], mask[2], _mm256_setzero_si256(), values[2]);
@@ -283,7 +272,7 @@ struct DequantizerIQ2XS final : public BaseDequantizer<block_iq2_xs> {
 
     union index_t {
         __m256i vec;
-        uint16_t val[8];
+        uint16_t val[16];
     };
 
     inline static void make4(const __m256i& data, const __m256i& mask, __m256i * values) {
@@ -305,7 +294,8 @@ struct DequantizerIQ2XS final : public BaseDequantizer<block_iq2_xs> {
         auto partial_bits = _mm256_cvtepi16_epi8(_mm256_srli_epi16(data,  9));
         auto pcnt = _mm_popcnt_epi8(partial_bits);
         auto full_bits = _mm_or_si128(partial_bits, _mm_slli_epi16(_mm_and_si128(pcnt, _mm_set1_epi8(1)), 7));
-        const __mmask32 * m32 = (const __mmask32 *)&full_bits;
+        __mmask32 m32[4];
+        std::memcpy(m32, &full_bits, sizeof(m32));
         auto zero = _mm256_setzero_si256();
         values[0] = _mm256_mask_sub_epi8(values[0], m32[0], zero, values[0]);
         values[1] = _mm256_mask_sub_epi8(values[1], m32[1], zero, values[1]);
@@ -443,20 +433,20 @@ struct DequantizerIQ2S final : public BaseDequantizer<block_iq2_s> {
         const uint16_t * signs = (const uint16_t *)(x[i].qs + QK_K/8) + 8*j;
         make2(qs+0, qh+0, idx_shift, idx_mask, bits.values+0);
         make2(qs+8, qh+2, idx_shift, idx_mask, bits.values+2);
-        q8_quants[0] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+0), sh.make_signs(signs[0] | (signs[1] << 16)));
-        q8_quants[1] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+1), sh.make_signs(signs[2] | (signs[3] << 16)));
-        q8_quants[2] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+2), sh.make_signs(signs[4] | (signs[5] << 16)));
-        q8_quants[3] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+3), sh.make_signs(signs[6] | (signs[7] << 16)));
+        q8_quants[0] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+0), sh.make_signs((uint32_t) signs[0] | ((uint32_t) signs[1] << 16)));
+        q8_quants[1] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+1), sh.make_signs((uint32_t) signs[2] | ((uint32_t) signs[3] << 16)));
+        q8_quants[2] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+2), sh.make_signs((uint32_t) signs[4] | ((uint32_t) signs[5] << 16)));
+        q8_quants[3] = _mm256_sign_epi8(q8.load_quants(0, i, 4*j+3), sh.make_signs((uint32_t) signs[6] | ((uint32_t) signs[7] << 16)));
     }
     static inline void prepare(const uint8_t * qs, const uint8_t * qh, const uint16_t * signs, const SignHelper& sh, __m256i * values) {
         auto idx_shift = _mm256_set_epi32(2, 4, 6, 8, 2, 4, 6, 8);
         auto idx_mask  = _mm256_set1_epi32(0x300);
         make2(qs+0, qh+0, idx_shift, idx_mask, values+0);
         make2(qs+8, qh+2, idx_shift, idx_mask, values+2);
-        values[0] = _mm256_sign_epi8(values[0], sh.make_signs(signs[0] | (signs[1] << 16)));
-        values[1] = _mm256_sign_epi8(values[1], sh.make_signs(signs[2] | (signs[3] << 16)));
-        values[2] = _mm256_sign_epi8(values[2], sh.make_signs(signs[4] | (signs[5] << 16)));
-        values[3] = _mm256_sign_epi8(values[3], sh.make_signs(signs[6] | (signs[7] << 16)));
+        values[0] = _mm256_sign_epi8(values[0], sh.make_signs((uint32_t) signs[0] | ((uint32_t) signs[1] << 16)));
+        values[1] = _mm256_sign_epi8(values[1], sh.make_signs((uint32_t) signs[2] | ((uint32_t) signs[3] << 16)));
+        values[2] = _mm256_sign_epi8(values[2], sh.make_signs((uint32_t) signs[4] | ((uint32_t) signs[5] << 16)));
+        values[3] = _mm256_sign_epi8(values[3], sh.make_signs((uint32_t) signs[6] | ((uint32_t) signs[7] << 16)));
     }
     inline void prepare_signed(int i, int j, __m256i * us, __m256i * s) {
         auto qs = x[i].qs + 16*j;
@@ -464,10 +454,10 @@ struct DequantizerIQ2S final : public BaseDequantizer<block_iq2_s> {
         const uint16_t * signs = (const uint16_t *)(x[i].qs + QK_K/8) + 8*j;
         make2(qs+0, qh+0, idx_shift, idx_mask, us+0);
         make2(qs+8, qh+2, idx_shift, idx_mask, us+2);
-        s[0] = _mm256_sign_epi8(s[0], sh.make_signs(signs[0] | (signs[1] << 16)));
-        s[1] = _mm256_sign_epi8(s[1], sh.make_signs(signs[2] | (signs[3] << 16)));
-        s[2] = _mm256_sign_epi8(s[2], sh.make_signs(signs[4] | (signs[5] << 16)));
-        s[3] = _mm256_sign_epi8(s[3], sh.make_signs(signs[6] | (signs[7] << 16)));
+        s[0] = _mm256_sign_epi8(s[0], sh.make_signs((uint32_t) signs[0] | ((uint32_t) signs[1] << 16)));
+        s[1] = _mm256_sign_epi8(s[1], sh.make_signs((uint32_t) signs[2] | ((uint32_t) signs[3] << 16)));
+        s[2] = _mm256_sign_epi8(s[2], sh.make_signs((uint32_t) signs[4] | ((uint32_t) signs[5] << 16)));
+        s[3] = _mm256_sign_epi8(s[3], sh.make_signs((uint32_t) signs[6] | ((uint32_t) signs[7] << 16)));
     }
     inline void prepare_signed(int i, int j, __m256i * us) {
         auto qs = x[i].qs + 16*j;
@@ -475,10 +465,10 @@ struct DequantizerIQ2S final : public BaseDequantizer<block_iq2_s> {
         const uint16_t * signs = (const uint16_t *)(x[i].qs + QK_K/8) + 8*j;
         make2(qs+0, qh+0, idx_shift, idx_mask, us+0);
         make2(qs+8, qh+2, idx_shift, idx_mask, us+2);
-        bits.values[0] = _mm256_sign_epi8(us[0], sh.make_signs(signs[0] | (signs[1] << 16)));
-        bits.values[1] = _mm256_sign_epi8(us[1], sh.make_signs(signs[2] | (signs[3] << 16)));
-        bits.values[2] = _mm256_sign_epi8(us[2], sh.make_signs(signs[4] | (signs[5] << 16)));
-        bits.values[3] = _mm256_sign_epi8(us[3], sh.make_signs(signs[6] | (signs[7] << 16)));
+        bits.values[0] = _mm256_sign_epi8(us[0], sh.make_signs((uint32_t) signs[0] | ((uint32_t) signs[1] << 16)));
+        bits.values[1] = _mm256_sign_epi8(us[1], sh.make_signs((uint32_t) signs[2] | ((uint32_t) signs[3] << 16)));
+        bits.values[2] = _mm256_sign_epi8(us[2], sh.make_signs((uint32_t) signs[4] | ((uint32_t) signs[5] << 16)));
+        bits.values[3] = _mm256_sign_epi8(us[3], sh.make_signs((uint32_t) signs[6] | ((uint32_t) signs[7] << 16)));
     }
 
     constexpr static int minv = 43;
@@ -537,10 +527,11 @@ struct DequantizerIQ3XXS final : public BaseDequantizer<block_iq3_xxs> {
 
     IQK_ALWAYS_INLINE void sign_2_values(const uint16_t * signs, __m256i * values) const {
 #if defined HAVE_FANCY_SIMD && defined __AVX512VPOPCNTDQ__
-        esh.sign_2_values(MM256_SET_M128I(_mm_set1_epi32(signs[2] | (signs[3] << 16)), _mm_set1_epi32(signs[0] | (signs[1] << 16))), values);
+        esh.sign_2_values(MM256_SET_M128I(_mm_set1_epi32((uint32_t) signs[2] | ((uint32_t) signs[3] << 16)),
+                                         _mm_set1_epi32((uint32_t) signs[0] | ((uint32_t) signs[1] << 16))), values);
 #else
-        esh.sign_value(signs[0] | (signs[1] << 16), values[0]);
-        esh.sign_value(signs[2] | (signs[3] << 16), values[1]);
+        esh.sign_value((uint32_t) signs[0] | ((uint32_t) signs[1] << 16), values[0]);
+        esh.sign_value((uint32_t) signs[2] | ((uint32_t) signs[3] << 16), values[1]);
 #endif
     }
 
@@ -1060,7 +1051,8 @@ static void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
                 auto signs128 = _mm_and_si128(sas, _mm_set1_epi8(-2)); // 0xfe = -2 as signed. Needed to shutup compiler warning.
                 signs128 = _mm_xor_si128(signs128, _mm_srli_epi16(signs128, 1));
 #ifdef HAVE_FANCY_SIMD
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     auto y = _mm256_loadu_si256((const __m256i *)q8.y[iy][ibl].qs + ib);
                     auto sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qx[0], _mm256_mask_sub_epi8(y, mask[0], _mm256_setzero_si256(), y));
@@ -1160,7 +1152,8 @@ static void mul_mat_iq2_xs_r4_q8_k(int n, const void * vx, size_t bx, const Data
                 auto scales16 = _mm256_cvtepi8_epi16(scales);  // 0...7, 0...7
 #ifdef HAVE_FANCY_SIMD
                 __m256i scs[2] = { _mm256_shuffle_epi8(scales16, shuffles[0]), _mm256_shuffle_epi8(scales16, shuffles[1]) };
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     auto y = _mm256_loadu_si256((const __m256i *)q8.y[iy][ibl].qs + ib);
                     auto sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qx[0], _mm256_mask_sub_epi8(y, mask[0], _mm256_setzero_si256(), y)); // blocks: 0,0,0,0,  1,1,1,1, row 0
@@ -1318,7 +1311,8 @@ static void mul_mat_iq2_xs_r4_q8_k_16(int n, const void * vx, size_t bx, const D
                 auto scales16 = _mm256_cvtepi8_epi16(scales);  // 0...7, 0...7
 #ifdef HAVE_FANCY_SIMD
                 __m256i scs[2] = { _mm256_shuffle_epi8(scales16, shuffles[0]), _mm256_shuffle_epi8(scales16, shuffles[1]) };
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 qx[0] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[0], mask[0], _mm256_setzero_si256(), qx[0]));
                 qx[1] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[1], mask[1], _mm256_setzero_si256(), qx[1]));
                 qx[2] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[2], mask[2], _mm256_setzero_si256(), qx[2]));
@@ -1441,7 +1435,8 @@ static void mul_mat_iq2_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
                 auto scales16 = _mm256_cvtepi8_epi16(scales);  // 0...7, 0...7
 #ifdef HAVE_FANCY_SIMD
                 __m256i scs[2] = { _mm256_shuffle_epi8(scales16, shuffles[0]), _mm256_shuffle_epi8(scales16, shuffles[1]) };
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     auto y = _mm256_loadu_si256((const __m256i *)q8.y[iy][ibl].qs + ib);
                     auto sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qx[0], _mm256_mask_sub_epi8(y, mask[0], _mm256_setzero_si256(), y)); // blocks: 0,0,0,0,  1,1,1,1, row 0
@@ -1596,7 +1591,8 @@ static void mul_mat_iq2_s_r4_q8_k_16(int n, const void * vx, size_t bx, const Da
                 auto scales16 = _mm256_cvtepi8_epi16(scales);  // 0...7, 0...7
 #ifdef HAVE_FANCY_SIMD
                 __m256i scs[2] = { _mm256_shuffle_epi8(scales16, shuffles[0]), _mm256_shuffle_epi8(scales16, shuffles[1]) };
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 qx[0] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[0], mask[0], _mm256_setzero_si256(), qx[0]));
                 qx[1] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[1], mask[1], _mm256_setzero_si256(), qx[1]));
                 qx[2] = _mm256_add_epi8(_mm256_set1_epi8(64), _mm256_mask_sub_epi8(qx[2], mask[2], _mm256_setzero_si256(), qx[2]));
@@ -1707,7 +1703,8 @@ static void mul_mat_iq3_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
                 auto signs128 = _mm_and_si128(sas, _mm_set1_epi8(-2)); // 0xfe = -2 as signed. Needed to shutup compiler warning.
                 signs128 = _mm_xor_si128(signs128, _mm_srli_epi16(signs128, 1));
 #ifdef HAVE_FANCY_SIMD
-                auto mask = (const __mmask32 *)&signs128;
+                __mmask32 mask[4];
+                std::memcpy(mask, &signs128, sizeof(mask));
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     auto y = _mm256_loadu_si256((const __m256i *)q8.y[iy][ibl].qs + ib);
                     auto sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qx[0], _mm256_mask_sub_epi8(y, mask[0], _mm256_setzero_si256(), y));

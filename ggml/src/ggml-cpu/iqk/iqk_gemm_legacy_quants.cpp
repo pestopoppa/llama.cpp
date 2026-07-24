@@ -670,7 +670,7 @@ struct HBitDequantizer {
         // => we can cast to uint16_t and use or on two consecutive entries
         // which is faster than memcpy
         const uint16_t * aux16 = (const uint16_t *)bits;
-        const uint32_t aux32 = aux16[0] | (aux16[1] << 16);
+        const uint32_t aux32 = (uint32_t) aux16[0] | ((uint32_t) aux16[1] << 16);
         //uint32_t aux32; memcpy(&aux32, bits, sizeof(uint32_t));
         __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(aux32), shuffle);
         bytes = _mm256_or_si256(bytes, mask);

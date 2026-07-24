@@ -8630,6 +8630,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
         }
     }
+    // Exercise the native IQ-quant IQK paths at production-sized row counts.
+    for (ggml_type type_a : {
+            GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 32, 256, {1, 1}, {1, 1}));
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -8846,6 +8852,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    for (ggml_type type_a : {
+            GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        for (int n : {15, 16, 31, 33}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 512, n, 256));
+        }
+        // With the production 96-thread CPU configuration, m=32 leaves most
+        // IQK workers idle and exercises their no-row partition handling.
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 32, 33, 256));
     }
 
     for (int bs : {1, 4, 512}) {

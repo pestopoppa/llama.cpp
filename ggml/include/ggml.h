@@ -2251,7 +2251,10 @@ extern "C" {
         GGML_SCALE_MODE_BILINEAR = 1,
         GGML_SCALE_MODE_BICUBIC  = 2,
 
-        GGML_SCALE_MODE_COUNT
+        GGML_SCALE_MODE_COUNT,
+
+        // Keep mode-and-flag values within the enum's declared range.
+        GGML_SCALE_MODE_FLAGGED_MAX = GGML_SCALE_MODE_BICUBIC | (1 << 8) | (1 << 9),
     };
 
     enum ggml_scale_flag {

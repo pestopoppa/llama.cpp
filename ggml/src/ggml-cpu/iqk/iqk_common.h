@@ -185,9 +185,9 @@ typedef void (*mul_mat_t)(int n, const void * vx, size_t bx, const DataInfo& inf
 
 static inline void make_q4_scales(const uint8_t * scales8, uint32_t * aux32) {
     const uint16_t * scales = (const uint16_t *)scales8;
-    const uint32_t a0 = scales[0] | (scales[1] << 16);
-    const uint32_t a1 = scales[2] | (scales[3] << 16);
-    const uint32_t a2 = scales[4] | (scales[5] << 16);
+    const uint32_t a0 = (uint32_t) scales[0] | ((uint32_t) scales[1] << 16);
+    const uint32_t a1 = (uint32_t) scales[2] | ((uint32_t) scales[3] << 16);
+    const uint32_t a2 = (uint32_t) scales[4] | ((uint32_t) scales[5] << 16);
     aux32[3] = ((a2 >> 4) & 0x0f0f0f0f) | ((a1 >> 2) & 0x30303030);
     aux32[1] = ((a2 >> 0) & 0x0f0f0f0f) | ((a0 >> 2) & 0x30303030);
     aux32[2] = a1 & 0x3f3f3f3f;
@@ -967,4 +967,3 @@ constexpr int popcount(uint16_t x) { return __builtin_popcount(x); }
 constexpr int popcount(uint32_t x) { return __builtin_popcount(x); }
 constexpr int popcount(uint64_t x) { return __builtin_popcountll(x); }
 #endif
-

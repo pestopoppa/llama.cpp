@@ -66,9 +66,9 @@ inline void prepare_scales_16(const __m256i& all_scales, __m256i * scales) {
 struct ScaleQ3 {
     inline __m128i make_scales(const uint16_t * s8) const {
         const uint16_t * scales16 = (const uint16_t *)s8;
-        uint32_t aux0 = scales16[0] | (scales16[1] << 16);
-        uint32_t aux1 = scales16[2] | (scales16[3] << 16);
-        uint32_t aux2 = scales16[4] | (scales16[5] << 16);
+        uint32_t aux0 = (uint32_t) scales16[0] | ((uint32_t) scales16[1] << 16);
+        uint32_t aux1 = (uint32_t) scales16[2] | ((uint32_t) scales16[3] << 16);
+        uint32_t aux2 = (uint32_t) scales16[4] | ((uint32_t) scales16[5] << 16);
         __m128i scales128 = _mm_set_epi32(
             ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030),
             ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030),
@@ -3013,9 +3013,9 @@ struct DequantizerQ3K final : public BaseDequantizer<block_q3_K> {
         h.bits = vld1q_u8_x2(x[i].hmask);
         mask = vdupq_n_u8(0x01);
         const uint16_t * sc16 = (const uint16_t *)x[i].scales;
-        uint32_t aux0 = sc16[0] | (sc16[1] << 16);
-        uint32_t aux1 = sc16[2] | (sc16[3] << 16);
-        uint32_t aux2 = sc16[4] | (sc16[5] << 16);
+        uint32_t aux0 = (uint32_t) sc16[0] | ((uint32_t) sc16[1] << 16);
+        uint32_t aux1 = (uint32_t) sc16[2] | ((uint32_t) sc16[3] << 16);
+        uint32_t aux2 = (uint32_t) sc16[4] | ((uint32_t) sc16[5] << 16);
         aux32[0] =  (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030);
         aux32[1] =  (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030);
         aux32[2] = ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030);
@@ -3153,7 +3153,7 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
         d = GGML_FP16_TO_FP32(x[i].d);
         const uint16_t scales_h = x[i].scales_h;
         const uint16_t * scales_l = (const uint16_t *)x[i].scales_l;
-        aux32[0] = scales_l[0] | (scales_l[1] << 16);
+        aux32[0] = (uint32_t) scales_l[0] | ((uint32_t) scales_l[1] << 16);
         aux32[1] = aux32[0] >> 4;
         // scl is ordered as 0, 2, 4, 6, 1, 3, 5, 7
         uint8x8_t scl8 = vand_u8(vld1_u8((const uint8_t *)aux32), vdup_n_u8(0xf));
@@ -3932,9 +3932,9 @@ void iqk_convert_q3_k_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int 
             for (int k = 0; k < 8; ++k) {
                 float d = GGML_FP16_TO_FP32(x8[k][i].d);
                 auto sc16 = (const uint16_t *)x8[k][i].scales;
-                uint32_t aux0 = sc16[0] | (sc16[1] << 16);
-                uint32_t aux1 = sc16[2] | (sc16[3] << 16);
-                uint32_t aux2 = sc16[4] | (sc16[5] << 16);
+                uint32_t aux0 = (uint32_t) sc16[0] | ((uint32_t) sc16[1] << 16);
+                uint32_t aux1 = (uint32_t) sc16[2] | ((uint32_t) sc16[3] << 16);
+                uint32_t aux2 = (uint32_t) sc16[4] | ((uint32_t) sc16[5] << 16);
                 aux32[0] =  (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030);
                 aux32[1] =  (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030);
                 aux32[2] = ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030);

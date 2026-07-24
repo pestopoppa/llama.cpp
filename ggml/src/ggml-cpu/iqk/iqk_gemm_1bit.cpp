@@ -7,6 +7,8 @@
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 
+#include <cstring>
+
 namespace {
 
 static const uint64_t iq1s_grid_us[2048] = {
@@ -1470,7 +1472,8 @@ static void mul_mat_q1_0_g128_q8_0(int n, const void * vx, size_t bx, const Data
             float d = GGML_FP16_TO_FP32(x[ib].d);
             auto vd = _mm256_set1_ps(d);
 #ifdef HAVE_FANCY_SIMD
-            auto m32 = (const __mmask32 *)x[ib].qs;
+            __mmask32 m32[4];
+            std::memcpy(m32, x[ib].qs, sizeof(m32));
             for (int k = 0; k < 4; ++k) {
                 qx[k] = _mm256_mask_blend_epi8(m32[k], _mm256_setzero_si256(), mp2);
             }
@@ -1828,7 +1831,8 @@ void iqk_convert_iq1_m_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int
                                               iq1s_grid[qs[1] | ((qh[0] << 4) & 0x700)], iq1s_grid[qs[0] | ((qh[0] << 8) & 0x700)]);
                     value = _mm256_slli_epi16(_mm256_add_epi8(value, _mm256_set1_epi8(1)), 3);
 
-                    auto delta_mask = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(qh[0] | qh[1] << 16), mask), mask);
+                    auto delta_mask = _mm256_cmpeq_epi32(
+                            _mm256_and_si256(_mm256_set1_epi32((uint32_t) qh[0] | ((uint32_t) qh[1] << 16)), mask), mask);
                     auto delta = _mm256_add_epi8(_mm256_set1_epi8(7), _mm256_and_si256(delta_mask, _mm256_set1_epi8(2)));
                     qx[ib32] = _mm256_sub_epi8(value, delta);
 
@@ -2874,7 +2878,7 @@ void iqk_convert_iq1_m_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int
                     value.val[0] = vshlq_n_s8(vaddq_s8(value.val[0], vdupq_n_s8(1)), 3);
                     value.val[1] = vshlq_n_s8(vaddq_s8(value.val[1], vdupq_n_s8(1)), 3);
 
-                    auto aux = vdupq_n_u32(qh[0] | qh[1] << 16);
+                    auto aux = vdupq_n_u32((uint32_t) qh[0] | ((uint32_t) qh[1] << 16));
                     uint32x4x2_t delta_mask{ vceqq_u32(vandq_u32(aux, mask.val[0]), mask.val[0]), vceqq_u32(vandq_u32(aux, mask.val[1]), mask.val[1]) };
                     uint8x16x2_t delta{ vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[0]))),
                                         vaddq_s8(vdupq_n_s8(7), vandq_s8(vdupq_n_s8(2), vreinterpretq_s8_u32(delta_mask.val[1]))) };

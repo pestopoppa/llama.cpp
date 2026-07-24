@@ -3130,12 +3130,12 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                                    iq2s_grid[qs[4] | ((qh[ib32+1] << 8) & 0x300)]);
             qs += 8;
 
-            __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t) signs[1] << 16));
+            __m256i aux256 = _mm256_set1_epi32((uint32_t) signs[0] | ((uint32_t) signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
 
-            aux256 = _mm256_set1_epi32(signs[2] | ((uint32_t) signs[3] << 16));
+            aux256 = _mm256_set1_epi32((uint32_t) signs[2] | ((uint32_t) signs[3] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
@@ -3208,7 +3208,7 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                                                   iq2s_grid[qs[6] | ((qh[ib32+1] << 4) & 0x300)]);
             qs += 8;
 
-            __m128i aux128_0 = _mm_set1_epi32(signs[0] | ((uint32_t) signs[1] << 16));
+            __m128i aux128_0 = _mm_set1_epi32((uint32_t) signs[0] | ((uint32_t) signs[1] << 16));
             __m128i aux128_1 = aux128_0;
             aux128_0 = _mm_and_si128(_mm_shuffle_epi8(aux128_0,mask1_0), mask2_0);
             aux128_1 = _mm_and_si128(_mm_shuffle_epi8(aux128_1,mask1_1), mask2_1);
@@ -3217,7 +3217,7 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i q8s_1_0 = _mm_sub_epi8(_mm_xor_si128(s2_1_0, q8_1_0), s2_1_0);
             const __m128i q8s_1_1 = _mm_sub_epi8(_mm_xor_si128(s2_1_1, q8_1_1), s2_1_1);
 
-            aux128_0 = _mm_set1_epi32(signs[2] | ((uint32_t) signs[3] << 16));
+            aux128_0 = _mm_set1_epi32((uint32_t) signs[2] | ((uint32_t) signs[3] << 16));
             aux128_1 = aux128_0;
             aux128_0 = _mm_and_si128(_mm_shuffle_epi8(aux128_0,mask1_0), mask2_0);
             aux128_1 = _mm_and_si128(_mm_shuffle_epi8(aux128_1,mask1_1), mask2_1);
@@ -3449,12 +3449,12 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]
             );
 
-            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            __m256i aux256 = _mm256_set1_epi32((uint32_t) signs[0] | ((uint32_t) signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
 
-            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_set1_epi32((uint32_t) signs[2] | ((uint32_t) signs[3] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
@@ -3541,7 +3541,7 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i q2_2_0 = _mm_set_epi32(iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[9]], iq3s_grid[idx.index[8]]);
             const __m128i q2_2_1 = _mm_set_epi32(iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]]);
 
-            __m128i aux128_0 = _mm_set1_epi32(signs[0] | (signs[1] << 16));
+            __m128i aux128_0 = _mm_set1_epi32((uint32_t) signs[0] | ((uint32_t) signs[1] << 16));
             __m128i aux128_1 = aux128_0;
             aux128_0 = _mm_and_si128(_mm_shuffle_epi8(aux128_0,mask1_0), mask2_0);
             aux128_1 = _mm_and_si128(_mm_shuffle_epi8(aux128_1,mask1_1), mask2_1);
@@ -3550,7 +3550,7 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m128i q8s_1_0 = _mm_sub_epi8(_mm_xor_si128(s2_1_0, q8_1_0), s2_1_0);
             const __m128i q8s_1_1 = _mm_sub_epi8(_mm_xor_si128(s2_1_1, q8_1_1), s2_1_1);
 
-            aux128_0 = _mm_set1_epi32(signs[2] | (signs[3] << 16));
+            aux128_0 = _mm_set1_epi32((uint32_t) signs[2] | ((uint32_t) signs[3] << 16));
             aux128_1 = aux128_0;
             aux128_0 = _mm_and_si128(_mm_shuffle_epi8(aux128_0,mask1_0), mask2_0);
             aux128_1 = _mm_and_si128(_mm_shuffle_epi8(aux128_1,mask1_1), mask2_1);

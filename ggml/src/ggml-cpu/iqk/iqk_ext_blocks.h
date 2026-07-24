@@ -9,6 +9,60 @@
 #define QK6_0 32
 #endif
 
+#ifndef IQK_HAVE_BLOCK_IQ2_XXS_R4
+#define IQK_HAVE_BLOCK_IQ2_XXS_R4
+typedef struct {
+    ggml_half d[4];
+    uint8_t   sas[QK_K/2];
+    uint8_t   qs[QK_K/2];
+} block_iq2_xxs_r4;
+static_assert(sizeof(block_iq2_xxs_r4) == 4*sizeof(block_iq2_xxs), "wrong iq2_xxs_r4 block size/padding");
+#endif
+
+#ifndef IQK_HAVE_BLOCK_IQ2_XS_R4
+#define IQK_HAVE_BLOCK_IQ2_XS_R4
+typedef struct {
+    ggml_half d[4];
+    uint16_t qs[QK_K/2];
+    uint8_t  scales[QK_K/8];
+} block_iq2_xs_r4;
+static_assert(sizeof(block_iq2_xs_r4) == 4*sizeof(block_iq2_xs), "wrong iq2_xs_r4 block size/padding");
+#endif
+
+#ifndef IQK_HAVE_BLOCK_IQ2_S_R4
+#define IQK_HAVE_BLOCK_IQ2_S_R4
+typedef struct {
+    ggml_half d[4];
+    uint8_t qs[QK_K/2];
+    uint8_t qh[QK_K/8];
+    uint8_t signs[QK_K/2];
+    uint8_t scales[QK_K/8];
+} block_iq2_s_r4;
+static_assert(sizeof(block_iq2_s_r4) == 4*sizeof(block_iq2_s), "wrong iq2_s_r4 block size/padding");
+#endif
+
+#ifndef IQK_HAVE_BLOCK_IQ3_XXS_R4
+#define IQK_HAVE_BLOCK_IQ3_XXS_R4
+typedef struct {
+    ggml_half d[4];
+    uint8_t   sas[QK_K/2];
+    uint8_t   qs[QK_K];
+} block_iq3_xxs_r4;
+static_assert(sizeof(block_iq3_xxs_r4) == 4*sizeof(block_iq3_xxs), "wrong iq3_xxs_r4 block size/padding");
+#endif
+
+#ifndef IQK_HAVE_BLOCK_IQ3_S_R4
+#define IQK_HAVE_BLOCK_IQ3_S_R4
+typedef struct {
+    ggml_half d[4];
+    uint8_t qs[QK_K];
+    uint8_t qh[QK_K/8];
+    uint8_t signs[QK_K/2];
+    uint8_t scales[4*IQ3S_N_SCALE];
+} block_iq3_s_r4;
+static_assert(sizeof(block_iq3_s_r4) == 4*sizeof(block_iq3_s), "wrong iq3_s_r4 block size/padding");
+#endif
+
 #ifndef IQK_HAVE_BLOCK_IQ4_NL_R4
 #define IQK_HAVE_BLOCK_IQ4_NL_R4
 typedef struct {

@@ -111,7 +111,7 @@ struct DequantizerIQ2KS final : public BaseDequantizer<block_iq2_ks, true, true>
     }
     inline __m128i make_scales(const uint8_t * scales_l, uint8_t scales_h) const {
         const uint16_t * scales = (const uint16_t *)scales_l;
-        uint32_t aux32 = scales[0] | (uint32_t(scales[1]) << 16);
+        uint32_t aux32 = uint32_t(scales[0]) | (uint32_t(scales[1]) << 16);
         auto scl = _mm_srlv_epi32(_mm_set1_epi32(aux32), shift);
         scl = _mm_and_si128(_mm_shuffle_epi8(scl, shuffle), _mm_set1_epi8(0xf));
         auto sch = _mm_set1_epi8(scales_h);
@@ -523,7 +523,7 @@ struct DequantizerIQ4K final : public BaseDequantizer<block_iq4_k> {
         uint64_t aux64;
         memcpy(&aux64, scales_l, 8);
         auto scl = _mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), maskl);
-        const uint32_t aux32 = scales_h[0] | (scales_h[1] << 16);
+        const uint32_t aux32 = (uint32_t) scales_h[0] | ((uint32_t) scales_h[1] << 16);
         auto aux = _mm_and_si128(_mm_set_epi32(aux32 >> 2, aux32, aux32 << 2, aux32 << 4), maskh);
         auto sch = _mm_shuffle_epi8(aux, iqxk.scale_shuffle);
         return _mm_add_epi8(_mm_or_si128(scl, sch), m32);
@@ -659,7 +659,7 @@ struct DequantizerIQ5K final : public BaseDequantizer<block_iq5_k> {
         uint64_t aux64;
         memcpy(&aux64, scales_l, 8);
         auto scl = _mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), maskl);
-        const uint32_t aux32 = scales_h[0] | (scales_h[1] << 16);
+        const uint32_t aux32 = (uint32_t) scales_h[0] | ((uint32_t) scales_h[1] << 16);
         auto aux = _mm_and_si128(_mm_set_epi32(aux32 >> 2, aux32, aux32 << 2, aux32 << 4), maskh);
         auto sch = _mm_shuffle_epi8(aux, iqxk.scale_shuffle);
         return _mm_add_epi8(_mm_or_si128(scl, sch), m32);
@@ -980,7 +980,7 @@ struct DequantizerIQ2KS final : public BaseDequantizer<block_iq2_ks, true, true>
     }
     inline __m128i make_scales(const uint8_t * scales_l, uint8_t scales_h) const {
         const uint16_t * scales = (const uint16_t *)scales_l;
-        uint32_t aux32 = scales[0] | (uint32_t(scales[1]) << 16);
+        uint32_t aux32 = uint32_t(scales[0]) | (uint32_t(scales[1]) << 16);
         auto scl = _mm_srlv_epi32(_mm_set1_epi32(aux32), shift);
         scl = _mm_and_si128(_mm_shuffle_epi8(scl, shuffle), _mm_set1_epi8(0xf));
         auto sch = _mm_set1_epi8(scales_h);
@@ -1270,7 +1270,7 @@ struct DequantizerIQ4K final : public BaseDequantizer<block_iq4_k> {
         uint64_t aux64;
         memcpy(&aux64, scales_l, 8);
         auto scl = _mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), maskl);
-        const uint32_t aux32 = scales_h[0] | (scales_h[1] << 16);
+        const uint32_t aux32 = (uint32_t) scales_h[0] | ((uint32_t) scales_h[1] << 16);
         auto aux = _mm_and_si128(_mm_set_epi32(aux32 >> 2, aux32, aux32 << 2, aux32 << 4), maskh);
         auto sch = _mm_shuffle_epi8(aux, hshuff);
         return _mm_add_epi8(_mm_or_si128(scl, sch), m32);
@@ -1361,7 +1361,7 @@ struct DequantizerIQ5K final : public BaseDequantizer<block_iq5_k> {
         uint64_t aux64;
         memcpy(&aux64, scales_l, 8);
         auto scl = _mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), maskl);
-        const uint32_t aux32 = scales_h[0] | (scales_h[1] << 16);
+        const uint32_t aux32 = (uint32_t) scales_h[0] | ((uint32_t) scales_h[1] << 16);
         auto aux = _mm_and_si128(_mm_set_epi32(aux32 >> 2, aux32, aux32 << 2, aux32 << 4), maskh);
         auto sch = _mm_shuffle_epi8(aux, iqxk.hshuff);
         return _mm_add_epi8(_mm_or_si128(scl, sch), m32);
@@ -3866,7 +3866,7 @@ struct DequantizerIQ2KS final : public BaseDequantizer<block_iq2_ks, true, true>
     template <typename Q8>
     inline int32x4x2_t new_block(int i, [[maybe_unused]] const Q8& q8, [[maybe_unused]] float32x4_t * acc) {
         const uint16_t * sc16 = (const uint16_t *)x[i].scales;
-        uint32_t aux32 = sc16[0] | (sc16[1] << 16);
+        uint32_t aux32 = (uint32_t) sc16[0] | ((uint32_t) sc16[1] << 16);
         uint8x8_t scales8 = vreinterpret_u8_u32(vdup_n_u32(aux32));
         scales8 = vand_u8(vzip1_u8(scales8, vshr_n_u8(scales8, 4)), vdup_n_u8(0xf));
         uint8x8_t sh = vand_u8(vceq_u8(vand_u8(vdup_n_u8(x[i].extra >> 8), hmask), vdup_n_u8(0)), vdup_n_u8(16));
