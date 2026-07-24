@@ -69,9 +69,10 @@ inline bool iqk_typeA_supported(int t) {
     }
 }
 
-inline bool iqk_weight_uses_q8_k(int t) {
+constexpr bool iqk_weight_uses_q8_k(int t) {
+    // Keep Q2_K/Q3_K on the v7 Q8_2_X4 route. Reclassifying them as Q8_K
+    // corrupted Hy3 output; Q8_K is enabled only for the validated IQ families.
     switch (t) {
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
             return true;
@@ -79,6 +80,10 @@ inline bool iqk_weight_uses_q8_k(int t) {
             return false;
     }
 }
+static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_Q2_K));
+static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_Q3_K));
+static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ2_XXS));
+static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ3_XXS));
 
 inline bool iqk_shape_supported(int weight_type, int64_t n_rows) {
     // The imported IQ3_XXS kernel exceeds the backend NMSE limit for some tiny
