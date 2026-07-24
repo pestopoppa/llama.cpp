@@ -1294,6 +1294,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
+    int32_t n_layer_tgt = 0; // target model transformer block count
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -1322,6 +1323,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
+        n_layer_tgt   = llama_model_n_layer(model_tgt);
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -1357,13 +1359,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // GGUF stores HF hidden-state indices: an index below n_layer is the
+        // input to that block, while n_layer is the final block output.
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            const int32_t target_layer_id = target_layer_ids[k];
+            if (target_layer_id <= 0 || target_layer_id > n_layer_tgt) {
+                throw std::runtime_error(
+                        "DFlash target layer " + std::to_string(target_layer_id) +
+                        " is outside [1, " + std::to_string(n_layer_tgt) + "]");
+            }
+            if (target_layer_id == n_layer_tgt) {
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            } else {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_id, true);
+            }
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-        llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // Generic DFlash uses a non-causal noise block; Laguna is trained causal.
+        bool causal = false;
+        {
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
+                causal = strcmp(buf, "laguna") == 0;
+            }
+        }
+        llama_set_causal_attn(ctx_dft, causal);
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1432,14 +1454,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const int32_t target_layer_id = target_layer_ids[k];
+                    const float * layer = target_layer_id == n_layer_tgt
+                        ? llama_get_embeddings_nextn(ctx_tgt)
+                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_id);
                     if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        GGML_ABORT("DFlash: target hidden state %d not extracted.", target_layer_id);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+
+                // Metal can expose non-finite target features when massive
+                // activations overflow the f16 staging path. Keep the trained
+                // feature fusion finite without changing ordinary values.
+                size_t n_bad = 0;
+                for (auto & value : features_buf) {
+                    if (!std::isfinite(value)) {
+                        value = value != value ? 0.0f : (value > 0.0f ? 65504.0f : -65504.0f);
+                        ++n_bad;
+                    }
+                }
+                if (n_bad > 0) {
+                    static bool warned = false;
+                    if (!warned) {
+                        LOG_WRN(
+                                "%s: sanitized %zu non-finite target feature values; "
+                                "draft quality may degrade slightly on affected rows\n",
+                                __func__, n_bad);
+                        warned = true;
                     }
                 }
 
