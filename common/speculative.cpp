@@ -12,6 +12,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1479,13 +1480,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
                 if (n_bad > 0) {
-                    static bool warned = false;
-                    if (!warned) {
+                    static std::atomic_bool warned = false;
+                    if (!warned.exchange(true, std::memory_order_relaxed)) {
                         LOG_WRN(
                                 "%s: sanitized %zu non-finite target feature values; "
                                 "draft quality may degrade slightly on affected rows\n",
                                 __func__, n_bad);
-                        warned = true;
                     }
                 }
 
