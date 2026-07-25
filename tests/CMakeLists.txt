@@ -295,9 +295,22 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    llama_test(test-backend-ops NAME test-backend-ops-iqk
+        ARGS test -o MUL_MAT,MUL_MAT_ID -b CPU
+             -p "type_a=(iq2_xxs|iq2_xs|iq2_s|iq3_xxs|iq3_s|iq4_xs)" -j 4)
+    set_tests_properties(test-backend-ops-iqk PROPERTIES
+        ENVIRONMENT "GGML_IQK=1"
+        PASS_REGULAR_EXPRESSION "\\[iqk\\] ACTIVE:")
+
     llama_build(test-iqk-ser.cpp)
-    llama_test(test-iqk-ser NAME test-iqk-ser)
-    llama_test(test-iqk-ser NAME test-iqk-valid-control ARGS --control)
+    llama_test(test-iqk-ser NAME test-iqk-ser ARGS --invalid-iqk)
+    set_tests_properties(test-iqk-ser PROPERTIES
+        PASS_REGULAR_EXPRESSION "\\[iqk\\] ACTIVE: MoE mul_mat_id via ik kernels")
+    llama_test(test-iqk-ser NAME test-iqk-numerical)
+    set_tests_properties(test-iqk-numerical PROPERTIES
+        PASS_REGULAR_EXPRESSION "\\[iqk\\] ACTIVE: MoE mul_mat_id via ik kernels")
+    llama_test(test-iqk-ser NAME test-iqk-invalid-native ARGS --invalid-native)
+    llama_test(test-iqk-ser NAME test-iqk-invalid-reference ARGS --invalid-reference)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

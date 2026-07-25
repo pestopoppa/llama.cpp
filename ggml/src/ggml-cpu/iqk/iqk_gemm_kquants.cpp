@@ -445,12 +445,24 @@ static void mul_mat_iqX_k_q8_K_AVX512(int n, const void * vx, size_t bx, const D
             deq.new_block(i, q8, accm, scales);
 
             for (int iy = 0; iy < nrc_y; ++iy) {
-                const __m512i p1 = _mm512_maddubs_epi16(deq.bits.values[0], q8.load_quants64(iy, i, 0));
-                const __m512i p2 = _mm512_maddubs_epi16(deq.bits.values[1], q8.load_quants64(iy, i, 1));
-                const __m512i p3 = _mm512_maddubs_epi16(deq.bits.values[2], q8.load_quants64(iy, i, 2));
-                const __m512i p4 = _mm512_maddubs_epi16(deq.bits.values[3], q8.load_quants64(iy, i, 3));
-                auto sumi = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(),
-                                    p1, scales[0]), p2, scales[1]), p3, scales[2]), p4, scales[3]);
+                // IQ4_XS spans the full uint8 range, so maddubs can saturate
+                // before scale application. Accumulate exact 4-byte dots in
+                // int32 and apply the duplicated signed int16 scale once.
+                const __m512i p1 = _mm512_dpbusd_epi32(
+                        _mm512_setzero_si512(), deq.bits.values[0], q8.load_quants64(iy, i, 0));
+                const __m512i p2 = _mm512_dpbusd_epi32(
+                        _mm512_setzero_si512(), deq.bits.values[1], q8.load_quants64(iy, i, 1));
+                const __m512i p3 = _mm512_dpbusd_epi32(
+                        _mm512_setzero_si512(), deq.bits.values[2], q8.load_quants64(iy, i, 2));
+                const __m512i p4 = _mm512_dpbusd_epi32(
+                        _mm512_setzero_si512(), deq.bits.values[3], q8.load_quants64(iy, i, 3));
+                const __m512i sumi = _mm512_add_epi32(
+                        _mm512_add_epi32(
+                            _mm512_mullo_epi32(p1, _mm512_srai_epi32(scales[0], 16)),
+                            _mm512_mullo_epi32(p2, _mm512_srai_epi32(scales[1], 16))),
+                        _mm512_add_epi32(
+                            _mm512_mullo_epi32(p3, _mm512_srai_epi32(scales[2], 16)),
+                            _mm512_mullo_epi32(p4, _mm512_srai_epi32(scales[3], 16))));
                 accd[iy] = _mm512_fmadd_ps(_mm512_set1_ps(deq.d*q8.scale(iy, i)), _mm512_cvtepi32_ps(sumi), accd[iy]);
             }
 

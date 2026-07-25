@@ -2,8 +2,8 @@
 // iqk port (Stage 1): dispatch hook. Routes dense GGML_OP_MUL_MAT for the quant
 // families iqk really implements to ik's iqk_mul_mat_4d. Activations use the
 // format required by each weight family: Q8_2_X4 for Q4_K/Q5_K/Q6_K and legacy
-// quants, Q8_K for Q2_K/Q3_K and IQ quants. Falls through to the native kernel
-// for everything else. Runtime gate: env GGML_IQK=1.
+// quants, Q8_K for IQ quants. Q2_K/Q3_K deliberately fall through before
+// activation quantization. Runtime gate: env GGML_IQK=1.
 //
 #include "iqk_config.h"
 
@@ -56,25 +56,30 @@ inline bool iqk_q8_0_enabled() {
     }();
     return e;
 }
-inline bool iqk_typeA_supported(int t) {
+constexpr bool iqk_typeA_supported(int t) {
     switch (t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:   // note: Q6_0 is ik-only, not in v6
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS:
             return true;
         default: return false;
     }
 }
 
+// Keep rejected types out of both dense and MoE hooks: eligibility is checked
+// before iqk_activation_type() and iqk_quantize_activation() in each path.
+static_assert(!iqk_typeA_supported(GGML_TYPE_Q2_K));
+static_assert(!iqk_typeA_supported(GGML_TYPE_Q3_K));
+static_assert(iqk_typeA_supported(GGML_TYPE_IQ4_XS));
+
 constexpr bool iqk_weight_uses_q8_k(int t) {
-    // Keep Q2_K/Q3_K on the v7 Q8_2_X4 route. Reclassifying them as Q8_K
-    // corrupted Hy3 output; Q8_K is enabled only for the validated IQ families.
+    // Q8_K is enabled only for the validated IQ families. Q2_K/Q3_K are
+    // rejected by iqk_typeA_supported() before this helper is reached.
     switch (t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS:
             return true;
         default:
             return false;
@@ -84,6 +89,7 @@ static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_Q2_K));
 static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_Q3_K));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ2_XXS));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ3_XXS));
+static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ4_XS));
 
 inline bool iqk_shape_supported(int weight_type, int64_t n_rows) {
     // The imported IQ3_XXS kernel exceeds the backend NMSE limit for some tiny
