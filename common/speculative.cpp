@@ -1319,12 +1319,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
-        GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
+        if (target_layer_ids_n == 0) {
+            throw std::runtime_error("DFlash model has no target_layer_ids");
+        }
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
-        n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
         n_layer_tgt   = llama_model_n_layer(model_tgt);
+
+        int32_t n_embd_tgt_expected = n_embd_dec;
+        char target_hidden_size_buf[32] = {};
+        if (llama_model_meta_val_str(model_dft, "dflash.target_hidden_size",
+                target_hidden_size_buf, sizeof(target_hidden_size_buf)) >= 0) {
+            char * end = nullptr;
+            const long n_embd_tgt_declared = std::strtol(target_hidden_size_buf, &end, 10);
+            if (end == target_hidden_size_buf || *end != '\0' || n_embd_tgt_declared <= 0 ||
+                    n_embd_tgt_declared > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error("DFlash has an invalid dflash.target_hidden_size metadata value");
+            }
+            n_embd_tgt_expected = (int32_t) n_embd_tgt_declared;
+        } else {
+            LOG_WRN(
+                    "%s: missing dflash.target_hidden_size; using legacy draft hidden size %d and "
+                    "requiring it to match the target model\n",
+                    __func__, n_embd_tgt_expected);
+        }
+        if (n_embd_tgt_expected != n_embd_tgt) {
+            throw std::runtime_error(
+                    "DFlash expected target hidden size " + std::to_string(n_embd_tgt_expected) +
+                    " does not match target model hidden size " + std::to_string(n_embd_tgt));
+        }
+        if (target_layer_ids_n > (uint32_t) std::numeric_limits<int32_t>::max() / n_embd_tgt) {
+            throw std::runtime_error("DFlash target feature width overflows int32_t");
+        }
+        n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -1469,9 +1497,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // Metal can expose non-finite target features when massive
-                // activations overflow the f16 staging path. Keep the trained
-                // feature fusion finite without changing ordinary values.
+                // A small number of f16 staging overflows can occur on some
+                // backends. Preserve that workaround for isolated values, but
+                // reject a corrupted batch rather than masking a recurring
+                // backend/model failure.
                 size_t n_bad = 0;
                 for (auto & value : features_buf) {
                     if (!std::isfinite(value)) {
@@ -1480,13 +1509,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
                 if (n_bad > 0) {
-                    static std::atomic_bool warned = false;
-                    if (!warned.exchange(true, std::memory_order_relaxed)) {
-                        LOG_WRN(
-                                "%s: sanitized %zu non-finite target feature values; "
-                                "draft quality may degrade slightly on affected rows\n",
-                                __func__, n_bad);
+                    static std::atomic<uint64_t> n_bad_total = 0;
+                    const uint64_t total = n_bad_total.fetch_add(n_bad, std::memory_order_relaxed) + n_bad;
+                    const size_t n_bad_limit = std::min<size_t>(16, std::max<size_t>(1, features_buf.size() / 100));
+                    if (n_bad > n_bad_limit) {
+                        LOG_ERR(
+                                "%s: rejecting DFlash batch after %zu/%zu non-finite target features "
+                                "(limit=%zu, cumulative=%llu)\n",
+                                __func__, n_bad, features_buf.size(), n_bad_limit,
+                                (unsigned long long) total);
+                        return false;
                     }
+                    LOG_WRN(
+                            "%s: sanitized %zu isolated non-finite target features "
+                            "(limit=%zu, cumulative=%llu)\n",
+                            __func__, n_bad, n_bad_limit, (unsigned long long) total);
                 }
 
                 // fuse extracted features through DFlash encoder

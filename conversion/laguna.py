@@ -84,9 +84,21 @@ class LagunaModel(TextModel):
         self._attn_gate_types()
 
         # SWA window size (M.1 has none -> key omitted, swa_type stays NONE).
+        # Hybrid Laguna checkpoints must carry an explicit per-layer pattern:
+        # inferring the historical 1-full/3-SWA cadence is not safe for a
+        # converted checkpoint whose config declares a different layout.
         sliding_window = hparams.get("sliding_window") or 0
         if sliding_window > 0:
+            layer_types = hparams.get("layer_types")
+            if not isinstance(layer_types, list) or len(layer_types) != hparams["num_hidden_layers"]:
+                raise ValueError(
+                    "Laguna with sliding_window requires layer_types with one entry per hidden layer")
+            is_swa = [layer_type == "sliding_attention" for layer_type in layer_types]
+            if not any(is_swa):
+                raise ValueError(
+                    "Laguna sliding_window is set but layer_types contains no sliding_attention layers")
             self.gguf_writer.add_sliding_window(sliding_window)
+            self.gguf_writer.add_sliding_window_pattern(is_swa)
 
         # MoE (expert_count / expert_used_count come from super().set_gguf_parameters())
         self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
@@ -112,7 +124,11 @@ class LagunaModel(TextModel):
         self.gguf_writer.add_rope_dimension_count(
             int(head_dim * float(full_rope.get("partial_rotary_factor", 1.0))))
         swa_rope = self.rope_parameters.get("sliding_attention")
-        if swa_rope is not None:
+        if sliding_window > 0:
+            if not isinstance(swa_rope, dict) or swa_rope.get("rope_theta") is None:
+                raise ValueError(
+                    "Laguna with sliding_window requires rope_parameters.sliding_attention.rope_theta")
+            self.gguf_writer.add_rope_freq_base_swa(float(swa_rope["rope_theta"]))
             self.gguf_writer.add_rope_dimension_count_swa(
                 int(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0))))
 

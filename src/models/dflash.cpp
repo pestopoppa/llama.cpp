@@ -11,14 +11,33 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
+    if (target_layer_ids.empty()) {
+        throw std::runtime_error("DFlash model requires at least one target layer");
+    }
 
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+    uint32_t n_embd_tgt = hparams.n_embd;
+    const bool has_target_hidden_size = ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt, false);
+    if (n_embd_tgt == 0) {
+        throw std::runtime_error("DFlash target_hidden_size must be positive");
+    }
+    if (!has_target_hidden_size) {
+        LLAMA_LOG_WARN(
+                "%s: missing target_hidden_size; using legacy draft hidden size %u and requiring "
+                "the runtime target model to match\n",
+                __func__, n_embd_tgt);
+    }
+    if (target_layer_ids.size() > std::numeric_limits<uint32_t>::max() / n_embd_tgt) {
+        throw std::runtime_error("DFlash target feature width overflows uint32_t");
+    }
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);
     for (size_t i = 0; i < target_layer_ids.size(); ++i) {
         LLAMA_LOG_INFO("%d%s", target_layer_ids[i], i + 1 < target_layer_ids.size() ? ", " : "");
     }
     LLAMA_LOG_INFO("]\n");
+    LLAMA_LOG_INFO("%s: DFlash target_hidden_size = %u (draft hidden_size = %u)\n",
+            __func__, n_embd_tgt, hparams.n_embd);
 
     // optional interleaved sliding-window attention with per-layer pattern array.
     // DFlash has a single rope, so the SWA rope == main rope.
@@ -125,6 +144,9 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 
     if (model_df.aux_norm != nullptr) {
         const int64_t n_aux  = model_df.aux_norm->ne[1];
+        if (n_aux <= 0 || hparams.n_embd_inp_enc() % n_aux != 0) {
+            throw std::runtime_error("DFlash aux_norm count must divide the encoder input width");
+        }
         const int64_t n_feat = hparams.n_embd_inp_enc() / n_aux;
 
         cur = ggml_reshape_3d(ctx0, cur, n_feat, n_aux, n_tokens);

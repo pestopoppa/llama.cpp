@@ -27,27 +27,55 @@ void llama_model_laguna::load_arch_hparams(llama_model_loader & ml) {
         hparams.n_ff_shexp = hparams.n_ff_exp * hparams.n_expert_shared;
     }
 
-    // Sliding-window attention is OPTIONAL. XS.2 is hybrid (full / SWA / SWA /
-    // SWA repeating, period 4 starting with full); M.1 has no sliding window
-    // (all layers full attention). When sliding_window is absent or zero we
-    // leave swa_type = NONE and skip the SWA-specific per-layer-type RoPE.
+    // Sliding-window attention is OPTIONAL. When present, its layer layout and
+    // RoPE base are required GGUF contract data. Do not infer the historical
+    // XS.2 cadence or inherit the full-attention YaRN base: either would load
+    // a differently trained hybrid model with silently wrong attention.
     hparams.n_swa = 0;
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
     if (hparams.n_swa > 0) {
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
 
-        uint32_t swa_period = 4;
-        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
-        hparams.set_swa_pattern(swa_period, /*dense_first=*/true);  // XS.2: FULL at il%4==0
+        const bool has_swa_pattern = ml.get_key_or_arr(
+                LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer(), false);
 
         // Per-layer-type RoPE: full layers use YaRN θ=500000 over 64 dims;
         // SWA layers use default RoPE θ=10000 over 128 dims. Base load_hparams
         // already reads ROPE_FREQ_BASE and ROPE_DIMENSION_COUNT into the
         // non-SWA fields; we explicitly pull the SWA mirrors here.
-        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = 1.0f;  // SWA uses plain RoPE (no YaRN scaling); do NOT inherit full layers 1/factor
-        ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
-        ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
+        ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa);
+        ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa);
+
+        if (!has_swa_pattern) {
+            // Pre-contract Laguna-S.2 conversions omitted the pattern. This
+            // fallback is deliberately tied to its entire trained layout so a
+            // future hybrid model cannot silently inherit its 1-full/3-SWA
+            // cadence just by sharing a broad size/window profile.
+            bool is_legacy_s2 =
+                    hparams.n_layer() == 48 &&
+                    hparams.n_swa == 512 &&
+                    hparams.n_embd == 3072 &&
+                    hparams.n_expert == 256 &&
+                    hparams.n_expert_used == 10 &&
+                    hparams.n_ff_exp == 1024 &&
+                    hparams.rope_freq_base_train_swa == 10000.0f &&
+                    hparams.n_rot_swa == 128 &&
+                    hparams.n_rot_full == 64;
+            for (uint32_t il = 0; is_legacy_s2 && il < hparams.n_layer(); ++il) {
+                is_legacy_s2 = hparams.n_head_kv(il) == 8 &&
+                        hparams.n_head(il) == (il % 4 == 0 ? 48 : 72);
+            }
+            if (!is_legacy_s2) {
+                throw std::runtime_error(
+                        "Laguna SWA model requires attention.sliding_window_pattern metadata");
+            }
+            LLAMA_LOG_WARN(
+                    "%s: missing sliding_window_pattern; using verified legacy Laguna-S.2 "
+                    "period-4 dense-first fallback\n",
+                    __func__);
+            hparams.set_swa_pattern(4, /*dense_first=*/true);
+        }
     }
 
     // Default the expert gating function to SIGMOID when the key is absent

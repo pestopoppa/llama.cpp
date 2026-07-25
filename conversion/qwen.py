@@ -665,6 +665,18 @@ class DFlashModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
+        if self.target_model_dir is None:
+            raise ValueError("DFlash draft model requires --target-model-dir to determine target_hidden_size")
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            target_config = json.load(f)
+        if "text_config" in target_config:
+            target_config = {**target_config, **target_config["text_config"]}
+        target_hidden_size = target_config.get("hidden_size")
+        if not isinstance(target_hidden_size, int) or target_hidden_size <= 0:
+            raise ValueError("DFlash target model config requires a positive hidden_size")
+        logger.info(f"DFlash: target_hidden_size = {target_hidden_size} (from target model config)")
+        self.gguf_writer.add_target_hidden_size(target_hidden_size)
+
         block_size = self.hparams.get("block_size", 16)
         self.gguf_writer.add_block_size(block_size)
         dflash_config = self.hparams.get("dflash_config", {})
