@@ -432,6 +432,10 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
+        // The request may reduce the launch-time speculative budget, including
+        // setting it to zero to disable speculation for this request.
+        n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }

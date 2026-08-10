@@ -202,13 +202,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
         ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
+        ->set_desc("Per-request cap on the number of tokens to draft during speculative decoding (0 disables speculation for the request)"));
 
+    // TODO: to keep things simple, disable speculative parameter adjustments that are not wired per request
+#if 0
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Minimum number of draft tokens to use for speculative decoding");
@@ -540,6 +539,13 @@ task_params eval_llama_cmpl_schema(
 
     // post-processing
     {
+        // Per-request speculation may only reduce the launch-time budget. The
+        // server sizes its output buffers from the launch parameters, so report
+        // the clamped value that will actually be used by the slot.
+        params.speculative.draft.n_max = std::min(
+                params.speculative.draft.n_max,
+                params_base.speculative.draft.n_max);
+
         if (params.sampling.penalty_last_n == -1) {
             // note: should be the slot's context and not the full context, but it's ok
             params.sampling.penalty_last_n = n_ctx_slot;

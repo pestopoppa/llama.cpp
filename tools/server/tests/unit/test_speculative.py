@@ -81,6 +81,59 @@ def test_different_draft_min_draft_max():
         last_content = res.body["content"]
 
 
+def test_per_request_draft_max_and_isolation():
+    global server
+    server.start()
+
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    }
+    request_cap = server.spec_draft_n_min
+    assert 0 < request_cap < server.spec_draft_n_max
+
+    # A zero request cap disables speculation and is reported as effective.
+    res_disabled = server.make_request("POST", "/completion", data={
+        **request,
+        "speculative.n_max": 0,
+    })
+    assert res_disabled.status_code == 200
+    assert res_disabled.body["generation_settings"]["speculative.n_max"] == 0
+    assert "draft_n" not in res_disabled.body["timings"]
+
+    # A non-zero request cap is plumbed independently of the launch default.
+    res_capped = server.make_request("POST", "/completion", data={
+        **request,
+        "speculative.n_max": request_cap,
+    })
+    assert res_capped.status_code == 200
+    assert res_capped.body["generation_settings"]["speculative.n_max"] == request_cap
+    assert res_capped.body["timings"]["draft_n"] > 0
+
+    # Requests cannot exceed the launch-time capacity; reporting reflects the
+    # effective clamped value, not the unfulfillable requested value.
+    res_clamped = server.make_request("POST", "/completion", data={
+        **request,
+        "speculative.n_max": server.spec_draft_n_max + 4,
+    })
+    assert res_clamped.status_code == 200
+    assert res_clamped.body["generation_settings"]["speculative.n_max"] == server.spec_draft_n_max
+    assert res_clamped.body["timings"]["draft_n"] > 0
+
+    # Omitting the field on the next request restores the launch default; the
+    # zero cap from the first request must not leak through the reused slot.
+    res_default = server.make_request("POST", "/completion", data=request)
+    assert res_default.status_code == 200
+    assert res_default.body["generation_settings"]["speculative.n_max"] == server.spec_draft_n_max
+    assert res_default.body["timings"]["draft_n"] > 0
+
+    assert res_disabled.body["content"] == res_capped.body["content"]
+    assert res_capped.body["content"] == res_clamped.body["content"]
+    assert res_clamped.body["content"] == res_default.body["content"]
+
+
 def test_slot_ctx_not_exceeded():
     global server
     server.n_ctx = 256
