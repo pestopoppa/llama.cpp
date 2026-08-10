@@ -446,7 +446,7 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    void handle_last_sampled_token(server_batch & batch, bool serial_speculative_verify) {
         bool add_ok = true;
         i_batch = batch.size();
         if (spec_draft.empty()) {
@@ -462,15 +462,19 @@ struct server_slot {
             GGML_ASSERT(spec_i_batch.empty());
 
             spec_i_batch.push_back(batch.size());
-            for (size_t i = 0; i < spec_draft.size(); i++) {
-                spec_i_batch.push_back(batch.size() + i + 1);
+            if (!serial_speculative_verify) {
+                for (size_t i = 0; i < spec_draft.size(); i++) {
+                    spec_i_batch.push_back(batch.size() + i + 1);
+                }
             }
 
             auto pos0 = prompt.tokens.pos_next();
 
             add_ok &= batch.add(id, sampled, pos0++, true);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+            if (!serial_speculative_verify) {
+                for (auto token : spec_draft) {
+                    add_ok &= batch.add(this->id, token, pos0++, true);
+                }
             }
         }
 
@@ -2893,6 +2897,18 @@ private:
         }
     }
 
+    bool use_serial_speculative_verify(const server_slot & slot) const {
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                slot.task->params.sampling.temp > 0.0f) {
+            return false;
+        }
+
+        return std::find(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+    }
+
     void pre_decode() {
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -3100,7 +3116,7 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, use_serial_speculative_verify(slot));
         });
 
         // process in chunks of params.n_batch
@@ -3748,6 +3764,67 @@ private:
         return true;
     }
 
+    // Quantized recurrent targets are not currently batch-invariant: verifying
+    // several draft tokens in one target decode can change greedy argmax versus
+    // decoding the same tokens one at a time (llama.cpp issue #25618).  DSpark
+    // therefore verifies greedy recurrent requests serially until the kernels
+    // can prove the stronger batch-invariance property.  Only accepted draft
+    // tokens are decoded, so rejected tokens never enter recurrent state.
+    llama_tokens sample_and_accept_dspark_serial(server_slot & slot, int32_t off) {
+        GGML_ASSERT(use_serial_speculative_verify(slot));
+        GGML_ASSERT(!slot.spec_draft.empty());
+        GGML_ASSERT(slot.spec_i_batch.size() == 1);
+
+        const llama_tokens draft = slot.spec_draft;
+        const llama_pos pos_first = slot.prompt.tokens.pos_next() - (llama_pos) draft.size() - 1;
+
+        llama_tokens accepted;
+        accepted.reserve(draft.size() + 1);
+
+        server_batch serial_batch;
+        serial_batch.init(1);
+
+        int32_t tok_idx = slot.spec_i_batch.front() - off;
+        for (size_t i = 0; i <= draft.size(); ++i) {
+            llama_token id;
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            }
+
+            common_sampler_accept(slot.smpl.get(), id, true);
+            accepted.push_back(id);
+
+            if (i == draft.size() || id != draft[i]) {
+                break;
+            }
+
+            // The sampled token matched draft[i]. Decode it alone to obtain the
+            // logits for the next verification step with vanilla reduction order.
+            serial_batch.clear();
+            const bool add_ok = serial_batch.add(slot.id, draft[i], pos_first + (llama_pos) i + 1, true);
+            GGML_ASSERT(add_ok);
+            serial_batch.render();
+
+            const int ret = llama_decode(slot.ctx_tgt, serial_batch.batch);
+            metrics.on_decoded(slots);
+            if (ret != 0) {
+                throw std::runtime_error(string_format(
+                        "serial DSpark target verification failed at draft token %zu: llama_decode returned %d",
+                        i, ret));
+            }
+
+            if (!common_speculative_process(spec.get(), serial_batch.batch)) {
+                throw std::runtime_error("failed to process serial DSpark target verification token");
+            }
+
+            tok_idx = 0;
+        }
+
+        slot.spec_i_batch.clear();
+        return accepted;
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -3877,20 +3954,31 @@ private:
 
             // verify and try to accept the draft
             {
-                // save the sampler sampler state in case we need to restore it
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const bool serial_verify = use_serial_speculative_verify(slot);
+                llama_tokens accepted;
 
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-                slot.spec_i_batch.clear();
+                // save the sampler state only for the parallel path, where a
+                // checkpoint restore may need to replay verification.
+                common_sampler_ptr smpl_save;
+                if (serial_verify) {
+                    accepted = sample_and_accept_dspark_serial(slot, off);
+                } else {
+                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+
+                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    accepted = common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    slot.spec_i_batch.clear();
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    !serial_verify && (
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)));
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

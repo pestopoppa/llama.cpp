@@ -149,6 +149,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        const bool spec_dspark = std::find(
+                params.speculative.types.begin(),
+                params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+        if (spec_dspark && params.n_parallel != 1) {
+            SRV_ERR("%s", "draft-dspark currently requires --parallel 1; multi-slot mode is disabled pending resolution of llama.cpp issue #26741\n");
+            return 1;
+        }
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
