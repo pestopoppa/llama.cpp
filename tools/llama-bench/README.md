@@ -34,6 +34,7 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --autokernel-harden <seed>                unique input/context addresses per repetition with an untimed output-invariance replicate
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -97,6 +98,22 @@ For a description of the other options, see the [completion example](../completi
 
 > [!NOTE]
 > The measurements with `llama-bench` do not include the times for tokenization and for sampling.
+
+### AutoKernel hardened repetitions
+
+`--autokernel-harden <seed>` is an experimental reward-integrity mode. For each
+reported sample it constructs content not used by any other sample, runs the timed
+execution through one context/input allocation, then repeats the same content outside
+the timing bracket through a second simultaneously-live allocation. The command fails
+unless the two logits buffers are bitwise identical and every input, context, and output
+address is unique across the invocation. Distinct per-context warm-up content makes a
+stale pointer-keyed cache disagree across the pair instead of accidentally validating
+itself.
+
+JSON/JSONL results include the input/output hashes, paired input/context addresses,
+the live rotated working-set size, and the two boolean hardening attestations. This mode
+allocates two contexts per repetition and is intended for trusted AutoKernel T1 runs,
+not ordinary benchmarking.
 
 ## Examples
 

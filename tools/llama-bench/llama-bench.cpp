@@ -10,7 +10,9 @@
 #include <cstring>
 #include <ctime>
 #include <iterator>
+#include <iomanip>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -359,6 +361,8 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             autokernel_harden;
+    uint64_t                         autokernel_seed;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -404,6 +408,8 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* autokernel_harden    */ false,
+    /* autokernel_seed      */ 0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -423,6 +429,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --autokernel-harden <seed>                 trusted T1 mode: unique content and context/buffer addresses per repetition, with an untimed output-invariance replicate\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -969,6 +976,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.reps = std::stoi(argv[i]);
+            } else if (arg == "--autokernel-harden") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.autokernel_harden = true;
+                params.autokernel_seed = std::stoull(argv[i]);
             } else if (arg == "--prio") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1442,6 +1456,13 @@ struct test {
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
+    bool                     autokernel_hardened = false;
+    bool                     autokernel_output_invariant = false;
+    uint64_t                 autokernel_input_working_set_bytes = 0;
+    std::string              autokernel_input_hashes;
+    std::string              autokernel_input_addresses;
+    std::string              autokernel_context_addresses;
+    std::string              autokernel_output_hashes;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
@@ -1537,7 +1558,10 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "n_prompt",       "n_gen",          "n_depth",       "autokernel_hardened",
+            "autokernel_output_invariant",       "autokernel_input_working_set_bytes",
+            "autokernel_input_hashes",           "autokernel_input_addresses",
+            "autokernel_context_addresses",      "autokernel_output_hashes",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1550,11 +1574,13 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "autokernel_input_working_set_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "autokernel_hardened" || field == "autokernel_output_invariant") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1636,6 +1662,13 @@ struct test {
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
+                                            std::to_string(autokernel_hardened),
+                                            std::to_string(autokernel_output_invariant),
+                                            std::to_string(autokernel_input_working_set_bytes),
+                                            autokernel_input_hashes,
+                                            autokernel_input_addresses,
+                                            autokernel_context_addresses,
+                                            autokernel_output_hashes,
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -2090,7 +2123,63 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+static uint64_t autokernel_mix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static std::vector<llama_token> autokernel_tokens(
+        const llama_model * model, int n_depth, int n_prompt, int n_gen, uint64_t seed) {
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+    const int           count   = std::max(1, n_depth + n_prompt + n_gen);
+    std::vector<llama_token> tokens(count);
+    uint64_t state = seed;
+    for (int i = 0; i < count; ++i) {
+        state = autokernel_mix64(state + (uint64_t) i);
+        tokens[i] = (llama_token) (state % (uint64_t) n_vocab);
+    }
+    if (llama_vocab_get_add_bos(vocab)) {
+        if (n_depth > 0) {
+            tokens[0] = llama_vocab_bos(vocab);
+        }
+        if (n_prompt > 0) {
+            tokens[n_depth] = llama_vocab_bos(vocab);
+        }
+        if (n_gen > 0) {
+            tokens[n_depth + n_prompt] = llama_vocab_bos(vocab);
+        }
+    }
+    return tokens;
+}
+
+static uint64_t autokernel_hash_bytes(const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static std::string autokernel_hex(uint64_t value) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << value;
+    return out.str();
+}
+
+static std::string autokernel_address(const void * ptr) {
+    std::ostringstream out;
+    out << "0x" << std::hex << reinterpret_cast<uintptr_t>(ptr);
+    return out.str();
+}
+
+static bool test_prompt(
+        llama_context * ctx, int n_prompt, int n_batch, int n_threads,
+        llama_token * fixed_tokens = nullptr) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2103,11 +2192,16 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
-        for (int i = 1; i < n_tokens; i++) {
-            tokens[i] = std::rand() % n_vocab;
+        llama_token * batch_tokens = tokens.data();
+        if (fixed_tokens != nullptr) {
+            batch_tokens = fixed_tokens + n_processed;
+        } else {
+            tokens[0] = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+            for (int i = 1; i < n_tokens; i++) {
+                tokens[i] = std::rand() % n_vocab;
+            }
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        int res = llama_decode(ctx, llama_batch_get_one(batch_tokens, n_tokens));
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
@@ -2119,7 +2213,9 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
+static bool test_gen(
+        llama_context * ctx, int n_gen, int n_threads,
+        llama_token * fixed_tokens = nullptr) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2129,15 +2225,38 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
     for (int i = 0; i < n_gen; i++) {
-        int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        llama_token * input = fixed_tokens != nullptr ? fixed_tokens + i : &token;
+        int res = llama_decode(ctx, llama_batch_get_one(input, 1));
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
         }
         llama_synchronize(ctx);
-        token = std::rand() % n_vocab;
+        if (fixed_tokens == nullptr) {
+            token = std::rand() % n_vocab;
+        }
     }
     return true;
+}
+
+static bool autokernel_capture_output(
+        llama_context * ctx, const llama_model * model, std::vector<float> & output,
+        std::string & hash, std::string & address) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    if (logits == nullptr || n_vocab <= 0) {
+        return false;
+    }
+    output.assign(logits, logits + n_vocab);
+    hash = autokernel_hex(autokernel_hash_bytes(output.data(), output.size() * sizeof(float)));
+    address = autokernel_address(logits);
+    return true;
+}
+
+static bool autokernel_outputs_equal(
+        const std::vector<float> & measured, const std::vector<float> & replicate) {
+    return measured.size() == replicate.size() &&
+        std::memcmp(measured.data(), replicate.data(), measured.size() * sizeof(float)) == 0;
 }
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
@@ -2327,6 +2446,246 @@ int llama_bench(int argc, char ** argv) {
 
         llama_attach_threadpool(ctx, threadpool, NULL);
 
+        std::vector<llama_context *> contexts = { ctx };
+
+        if (params.autokernel_harden) {
+            if (t.embeddings || params.reps < 1) {
+                fprintf(stderr,
+                        "%s: --autokernel-harden requires embeddings=off and repetitions >= 1\n",
+                        __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                ggml_threadpool_free_fn(threadpool);
+                return 1;
+            }
+
+            const int context_count = 2 * params.reps;
+            for (int i = 1; i < context_count; ++i) {
+                llama_context * rotated = llama_init_from_model(lmodel, cparams);
+                if (rotated == nullptr) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden failed to allocate context %d/%d\n",
+                            __func__, i + 1, context_count);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+                llama_attach_threadpool(rotated, threadpool, NULL);
+                contexts.push_back(rotated);
+            }
+
+            std::vector<std::vector<llama_token>> warmup_inputs;
+            std::vector<std::vector<llama_token>> measured_inputs;
+            warmup_inputs.reserve(context_count);
+            measured_inputs.reserve(context_count);
+            for (int i = 0; i < context_count; ++i) {
+                warmup_inputs.push_back(autokernel_tokens(
+                    lmodel, t.n_depth, t.n_prompt, t.n_gen,
+                    autokernel_mix64(params.autokernel_seed ^ 0xa11ce00000000000ULL ^ (uint64_t) i)));
+                measured_inputs.push_back(autokernel_tokens(
+                    lmodel, t.n_depth, t.n_prompt, t.n_gen,
+                    autokernel_mix64(params.autokernel_seed ^ 0xc0ffee0000000000ULL ^ (uint64_t) (i / 2))));
+            }
+
+            std::unordered_set<uintptr_t> input_addresses;
+            std::unordered_set<uintptr_t> context_addresses;
+            for (int i = 0; i < context_count; ++i) {
+                input_addresses.insert(reinterpret_cast<uintptr_t>(measured_inputs[i].data()));
+                context_addresses.insert(reinterpret_cast<uintptr_t>(contexts[i]));
+                t.autokernel_input_working_set_bytes +=
+                    warmup_inputs[i].capacity() * sizeof(llama_token) +
+                    measured_inputs[i].capacity() * sizeof(llama_token) +
+                    llama_state_get_size(contexts[i]);
+            }
+            if ((int) input_addresses.size() != context_count ||
+                (int) context_addresses.size() != context_count) {
+                fprintf(stderr,
+                        "%s: --autokernel-harden could not establish unique live input/context addresses\n",
+                        __func__);
+                for (llama_context * item : contexts) {
+                    llama_free(item);
+                }
+                llama_model_free(lmodel);
+                ggml_threadpool_free_fn(threadpool);
+                return 1;
+            }
+
+            // Every context gets different warmup content. A pointer-keyed cache that
+            // survives into the timed run therefore returns DIFFERENT stale outputs on
+            // the measured and replicate contexts, and the invariant below catches it.
+            for (int i = 0; i < context_count; ++i) {
+                llama_memory_clear(llama_get_memory(contexts[i]), false);
+                llama_token * tokens = warmup_inputs[i].data();
+                bool ok = true;
+                if (t.n_depth > 0) {
+                    ok = test_prompt(contexts[i], t.n_depth, t.n_batch, t.n_threads, tokens);
+                }
+                if (t.n_prompt > 0) {
+                    ok = ok && test_prompt(
+                        contexts[i], t.n_prompt, t.n_batch, t.n_threads, tokens + t.n_depth);
+                }
+                if (ok && t.n_gen > 0) {
+                    ok = test_gen(
+                        contexts[i], t.n_gen, t.n_threads, tokens + t.n_depth + t.n_prompt);
+                }
+                if (!ok) {
+                    fprintf(stderr, "%s: --autokernel-harden failed distinct warmup %d/%d\n",
+                            __func__, i + 1, context_count);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+            }
+
+            std::vector<std::string> input_hashes;
+            std::vector<std::string> input_address_pairs;
+            std::vector<std::string> context_address_pairs;
+            std::vector<std::string> output_hash_pairs;
+            std::unordered_set<uintptr_t> output_addresses;
+
+            for (int i = 0; i < params.reps; ++i) {
+                llama_context * measured_ctx = contexts[2 * i];
+                llama_context * replicate_ctx = contexts[2 * i + 1];
+                auto & measured_tokens = measured_inputs[2 * i];
+                auto & replicate_tokens = measured_inputs[2 * i + 1];
+                if (measured_tokens != replicate_tokens) {
+                    fprintf(stderr, "%s: --autokernel-harden internal input-pair mismatch\n", __func__);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+
+                llama_memory_clear(llama_get_memory(measured_ctx), false);
+                bool measured_ok = true;
+                if (t.n_depth > 0) {
+                    measured_ok = test_prompt(
+                        measured_ctx, t.n_depth, t.n_batch, t.n_threads, measured_tokens.data());
+                }
+                uint64_t t_start = get_time_ns();
+                if (t.n_prompt > 0) {
+                    measured_ok = measured_ok && test_prompt(
+                        measured_ctx, t.n_prompt, t.n_batch, t.n_threads,
+                        measured_tokens.data() + t.n_depth);
+                }
+                if (measured_ok && t.n_gen > 0) {
+                    measured_ok = test_gen(
+                        measured_ctx, t.n_gen, t.n_threads,
+                        measured_tokens.data() + t.n_depth + t.n_prompt);
+                }
+                uint64_t t_ns = get_time_ns() - t_start;
+                if (!measured_ok) {
+                    fprintf(stderr, "%s: --autokernel-harden measured run %d/%d failed\n",
+                            __func__, i + 1, params.reps);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+
+                std::vector<float> measured_output;
+                std::string measured_hash;
+                std::string measured_output_address;
+                if (!autokernel_capture_output(
+                        measured_ctx, lmodel, measured_output,
+                        measured_hash, measured_output_address)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not capture measured logits\n", __func__);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+
+                // This replicate is deliberately outside the timing bracket. It uses
+                // identical content through a second simultaneously-live context and
+                // token allocation, then demands bitwise-identical logits.
+                llama_memory_clear(llama_get_memory(replicate_ctx), false);
+                bool replicate_ok = true;
+                if (t.n_depth > 0) {
+                    replicate_ok = test_prompt(
+                        replicate_ctx, t.n_depth, t.n_batch, t.n_threads, replicate_tokens.data());
+                }
+                if (t.n_prompt > 0) {
+                    replicate_ok = replicate_ok && test_prompt(
+                        replicate_ctx, t.n_prompt, t.n_batch, t.n_threads,
+                        replicate_tokens.data() + t.n_depth);
+                }
+                if (replicate_ok && t.n_gen > 0) {
+                    replicate_ok = test_gen(
+                        replicate_ctx, t.n_gen, t.n_threads,
+                        replicate_tokens.data() + t.n_depth + t.n_prompt);
+                }
+                std::vector<float> replicate_output;
+                std::string replicate_hash;
+                std::string replicate_output_address;
+                if (!replicate_ok || !autokernel_capture_output(
+                        replicate_ctx, lmodel, replicate_output,
+                        replicate_hash, replicate_output_address)) {
+                    fprintf(stderr, "%s: --autokernel-harden replicate run %d/%d failed\n",
+                            __func__, i + 1, params.reps);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+                if (!autokernel_outputs_equal(measured_output, replicate_output)) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden output invariance failed at repetition %d/%d (%s != %s)\n",
+                            __func__, i + 1, params.reps,
+                            measured_hash.c_str(), replicate_hash.c_str());
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
+
+                output_addresses.insert(reinterpret_cast<uintptr_t>(llama_get_logits_ith(measured_ctx, -1)));
+                output_addresses.insert(reinterpret_cast<uintptr_t>(llama_get_logits_ith(replicate_ctx, -1)));
+                input_hashes.push_back(autokernel_hex(autokernel_hash_bytes(
+                    measured_tokens.data(), measured_tokens.size() * sizeof(llama_token))));
+                input_address_pairs.push_back(
+                    autokernel_address(measured_tokens.data()) + "/" +
+                    autokernel_address(replicate_tokens.data()));
+                context_address_pairs.push_back(
+                    autokernel_address(measured_ctx) + "/" + autokernel_address(replicate_ctx));
+                output_hash_pairs.push_back(measured_hash + "/" + replicate_hash);
+                t.samples_ns.push_back(t_ns);
+            }
+
+            if ((int) output_addresses.size() != context_count) {
+                fprintf(stderr,
+                        "%s: --autokernel-harden did not rotate the context-owned output buffers\n",
+                        __func__);
+                for (llama_context * item : contexts) {
+                    llama_free(item);
+                }
+                llama_model_free(lmodel);
+                ggml_threadpool_free_fn(threadpool);
+                return 1;
+            }
+            t.autokernel_hardened = true;
+            t.autokernel_output_invariant = true;
+            t.autokernel_input_hashes = join(input_hashes, ",");
+            t.autokernel_input_addresses = join(input_address_pairs, ",");
+            t.autokernel_context_addresses = join(context_address_pairs, ",");
+            t.autokernel_output_hashes = join(output_hash_pairs, ",");
+        } else {
         // warmup run
         if (!params.no_warmup) {
             if (t.n_prompt > 0) {
@@ -2428,6 +2787,7 @@ int llama_bench(int argc, char ** argv) {
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
         }
+        }
 
         if (p) {
             p->print_test(t);
@@ -2441,7 +2801,9 @@ int llama_bench(int argc, char ** argv) {
 
         llama_perf_context_print(ctx);
 
-        llama_free(ctx);
+        for (llama_context * item : contexts) {
+            llama_free(item);
+        }
 
         ggml_threadpool_free_fn(threadpool);
     }
