@@ -2,6 +2,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cerrno>
 #include <cinttypes>
 #include <clocale>
 #include <cmath>
@@ -9,12 +10,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#if defined(__linux__)
+#include <dirent.h>
+#include <dlfcn.h>
+#endif
 #include <iterator>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -429,7 +435,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
-    printf("  --autokernel-harden <seed>                 trusted T1 mode: unique content and context/buffer addresses per repetition, with an untimed output-invariance replicate\n");
+    printf("  --autokernel-harden <seed>                 trusted T1 mode: unique content/addresses plus an ordinary/full-device-sync hybrid pair per repetition\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -1458,11 +1464,17 @@ struct test {
     int                      n_depth;
     bool                     autokernel_hardened = false;
     bool                     autokernel_output_invariant = false;
+    bool                     autokernel_hybrid_ab_complete = false;
+    bool                     autokernel_thread_set_stable = false;
+    bool                     autokernel_escape_checks_complete = false;
     uint64_t                 autokernel_input_working_set_bytes = 0;
     std::string              autokernel_input_hashes;
     std::string              autokernel_input_addresses;
     std::string              autokernel_context_addresses;
     std::string              autokernel_output_hashes;
+    std::string              autokernel_unsynchronized_samples_ns;
+    std::string              autokernel_thread_set_hashes;
+    std::string              autokernel_device_sync_mode;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
@@ -1559,9 +1571,13 @@ struct test {
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",       "autokernel_hardened",
-            "autokernel_output_invariant",       "autokernel_input_working_set_bytes",
+            "autokernel_output_invariant",       "autokernel_hybrid_ab_complete",
+            "autokernel_input_working_set_bytes",
+            "autokernel_thread_set_stable",      "autokernel_escape_checks_complete",
             "autokernel_input_hashes",           "autokernel_input_addresses",
             "autokernel_context_addresses",      "autokernel_output_hashes",
+            "autokernel_unsynchronized_samples_ns",
+            "autokernel_thread_set_hashes",      "autokernel_device_sync_mode",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1580,7 +1596,9 @@ struct test {
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
-            field == "autokernel_hardened" || field == "autokernel_output_invariant") {
+            field == "autokernel_hardened" || field == "autokernel_output_invariant" ||
+            field == "autokernel_hybrid_ab_complete" ||
+            field == "autokernel_thread_set_stable" || field == "autokernel_escape_checks_complete") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1664,11 +1682,17 @@ struct test {
                                             std::to_string(n_depth),
                                             std::to_string(autokernel_hardened),
                                             std::to_string(autokernel_output_invariant),
+                                            std::to_string(autokernel_hybrid_ab_complete),
                                             std::to_string(autokernel_input_working_set_bytes),
+                                            std::to_string(autokernel_thread_set_stable),
+                                            std::to_string(autokernel_escape_checks_complete),
                                             autokernel_input_hashes,
                                             autokernel_input_addresses,
                                             autokernel_context_addresses,
                                             autokernel_output_hashes,
+                                            autokernel_unsynchronized_samples_ns,
+                                            autokernel_thread_set_hashes,
+                                            autokernel_device_sync_mode,
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -2177,6 +2201,61 @@ static std::string autokernel_address(const void * ptr) {
     return out.str();
 }
 
+static bool autokernel_thread_set(std::set<uint64_t> & tids, std::string & hash) {
+#if defined(__linux__)
+    DIR * task_dir = opendir("/proc/self/task");
+    if (task_dir == nullptr) {
+        return false;
+    }
+    tids.clear();
+    while (dirent * entry = readdir(task_dir)) {
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long value = std::strtoull(entry->d_name, &end, 10);
+        if (errno == 0 && end != entry->d_name && *end == '\0') {
+            tids.insert((uint64_t) value);
+        }
+    }
+    const int close_status = closedir(task_dir);
+    if (close_status != 0 || tids.empty()) {
+        return false;
+    }
+    uint64_t digest = 1469598103934665603ULL;
+    for (uint64_t tid : tids) {
+        digest ^= tid;
+        digest *= 1099511628211ULL;
+    }
+    hash = autokernel_hex(digest);
+    return true;
+#else
+    (void) tids;
+    (void) hash;
+    return false;
+#endif
+}
+
+static bool autokernel_full_device_synchronize(bool required, std::string & mode) {
+    if (!required) {
+        mode = "cpu_not_applicable";
+        return true;
+    }
+#if defined(__linux__)
+    using hip_device_synchronize_fn = int (*)();
+    auto * synchronize = reinterpret_cast<hip_device_synchronize_fn>(
+        dlsym(RTLD_DEFAULT, "hipDeviceSynchronize"));
+    if (synchronize == nullptr) {
+        mode = "hip_symbol_missing";
+        return false;
+    }
+    const int status = synchronize();
+    mode = status == 0 ? "hip_full_device" : "hip_full_device_failed";
+    return status == 0;
+#else
+    mode = "unsupported_platform";
+    return false;
+#endif
+}
+
 static bool test_prompt(
         llama_context * ctx, int n_prompt, int n_batch, int n_threads,
         llama_token * fixed_tokens = nullptr) {
@@ -2547,6 +2626,9 @@ int llama_bench(int argc, char ** argv) {
             std::vector<std::string> input_address_pairs;
             std::vector<std::string> context_address_pairs;
             std::vector<std::string> output_hash_pairs;
+            std::vector<std::string> unsynchronized_samples_ns;
+            std::vector<std::string> thread_set_hash_pairs;
+            std::set<std::string> device_sync_modes;
             std::unordered_set<uintptr_t> output_addresses;
 
             for (int i = 0; i < params.reps; ++i) {
@@ -2570,6 +2652,18 @@ int llama_bench(int argc, char ** argv) {
                     measured_ok = test_prompt(
                         measured_ctx, t.n_depth, t.n_batch, t.n_threads, measured_tokens.data());
                 }
+                std::set<uint64_t> thread_set_before_ids;
+                std::string thread_set_before;
+                if (!autokernel_thread_set(thread_set_before_ids, thread_set_before)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not snapshot /proc/self/task before repetition %d/%d\n",
+                            __func__, i + 1, params.reps);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
+                }
                 uint64_t t_start = get_time_ns();
                 if (t.n_prompt > 0) {
                     measured_ok = measured_ok && test_prompt(
@@ -2581,7 +2675,22 @@ int llama_bench(int argc, char ** argv) {
                         measured_ctx, t.n_gen, t.n_threads,
                         measured_tokens.data() + t.n_depth + t.n_prompt);
                 }
-                uint64_t t_ns = get_time_ns() - t_start;
+                std::set<uint64_t> measured_thread_set_after_ids;
+                std::string measured_thread_set_after;
+                if (measured_ok && !autokernel_thread_set(
+                        measured_thread_set_after_ids, measured_thread_set_after)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not snapshot /proc/self/task after repetition %d/%d\n",
+                            __func__, i + 1, params.reps);
+                    measured_ok = false;
+                }
+                const uint64_t unsynchronized_ns = get_time_ns() - t_start;
+                if (measured_ok && thread_set_before_ids != measured_thread_set_after_ids) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden thread set escaped the timed region at repetition %d/%d (%s != %s)\n",
+                            __func__, i + 1, params.reps,
+                            thread_set_before.c_str(), measured_thread_set_after.c_str());
+                    measured_ok = false;
+                }
                 if (!measured_ok) {
                     fprintf(stderr, "%s: --autokernel-harden measured run %d/%d failed\n",
                             __func__, i + 1, params.reps);
@@ -2593,30 +2702,25 @@ int llama_bench(int argc, char ** argv) {
                     return 1;
                 }
 
-                std::vector<float> measured_output;
-                std::string measured_hash;
-                std::string measured_output_address;
-                if (!autokernel_capture_output(
-                        measured_ctx, lmodel, measured_output,
-                        measured_hash, measured_output_address)) {
-                    fprintf(stderr, "%s: --autokernel-harden could not capture measured logits\n", __func__);
-                    for (llama_context * item : contexts) {
-                        llama_free(item);
-                    }
-                    llama_model_free(lmodel);
-                    ggml_threadpool_free_fn(threadpool);
-                    return 1;
-                }
-
-                // This replicate is deliberately outside the timing bracket. It uses
-                // identical content through a second simultaneously-live context and
-                // token allocation, then demands bitwise-identical logits.
+                // The second member of the pair is the ranked measurement. It repeats
+                // the same content behind a full-device barrier before the stop time.
+                // The first member remains diagnostic only; a large A/B divergence is
+                // an integrity flag, never a faster performance result.
                 llama_memory_clear(llama_get_memory(replicate_ctx), false);
                 bool replicate_ok = true;
                 if (t.n_depth > 0) {
                     replicate_ok = test_prompt(
                         replicate_ctx, t.n_depth, t.n_batch, t.n_threads, replicate_tokens.data());
                 }
+                std::set<uint64_t> replicate_thread_set_before_ids;
+                std::string replicate_thread_set_before;
+                if (replicate_ok && !autokernel_thread_set(
+                        replicate_thread_set_before_ids, replicate_thread_set_before)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not snapshot /proc/self/task before synchronized repetition %d/%d\n",
+                            __func__, i + 1, params.reps);
+                    replicate_ok = false;
+                }
+                const uint64_t synchronized_start = get_time_ns();
                 if (t.n_prompt > 0) {
                     replicate_ok = replicate_ok && test_prompt(
                         replicate_ctx, t.n_prompt, t.n_batch, t.n_threads,
@@ -2626,6 +2730,53 @@ int llama_bench(int argc, char ** argv) {
                     replicate_ok = test_gen(
                         replicate_ctx, t.n_gen, t.n_threads,
                         replicate_tokens.data() + t.n_depth + t.n_prompt);
+                }
+                std::string device_sync_mode;
+                if (replicate_ok && !autokernel_full_device_synchronize(
+                        t.n_gpu_layers > 0, device_sync_mode)) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden full-device synchronization failed at repetition %d/%d (%s)\n",
+                            __func__, i + 1, params.reps, device_sync_mode.c_str());
+                    replicate_ok = false;
+                }
+                std::set<uint64_t> replicate_thread_set_after_ids;
+                std::string replicate_thread_set_after;
+                if (replicate_ok && !autokernel_thread_set(
+                        replicate_thread_set_after_ids, replicate_thread_set_after)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not snapshot /proc/self/task after synchronized repetition %d/%d\n",
+                            __func__, i + 1, params.reps);
+                    replicate_ok = false;
+                }
+                const uint64_t synchronized_ns = get_time_ns() - synchronized_start;
+                if (replicate_ok &&
+                        replicate_thread_set_before_ids != replicate_thread_set_after_ids) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden thread set escaped the synchronized region at repetition %d/%d (%s != %s)\n",
+                            __func__, i + 1, params.reps,
+                            replicate_thread_set_before.c_str(), replicate_thread_set_after.c_str());
+                    replicate_ok = false;
+                }
+                if (replicate_ok &&
+                        (thread_set_before_ids != replicate_thread_set_before_ids ||
+                         thread_set_before_ids != replicate_thread_set_after_ids)) {
+                    fprintf(stderr,
+                            "%s: --autokernel-harden thread set changed between ordinary and synchronized repetitions at %d/%d\n",
+                            __func__, i + 1, params.reps);
+                    replicate_ok = false;
+                }
+                std::vector<float> measured_output;
+                std::string measured_hash;
+                std::string measured_output_address;
+                if (!replicate_ok || !autokernel_capture_output(
+                        measured_ctx, lmodel, measured_output,
+                        measured_hash, measured_output_address)) {
+                    fprintf(stderr, "%s: --autokernel-harden could not capture measured logits\n", __func__);
+                    for (llama_context * item : contexts) {
+                        llama_free(item);
+                    }
+                    llama_model_free(lmodel);
+                    ggml_threadpool_free_fn(threadpool);
+                    return 1;
                 }
                 std::vector<float> replicate_output;
                 std::string replicate_hash;
@@ -2665,7 +2816,12 @@ int llama_bench(int argc, char ** argv) {
                 context_address_pairs.push_back(
                     autokernel_address(measured_ctx) + "/" + autokernel_address(replicate_ctx));
                 output_hash_pairs.push_back(measured_hash + "/" + replicate_hash);
-                t.samples_ns.push_back(t_ns);
+                unsynchronized_samples_ns.push_back(std::to_string(unsynchronized_ns));
+                thread_set_hash_pairs.push_back(
+                    thread_set_before + "/" + measured_thread_set_after + "/" +
+                    replicate_thread_set_before + "/" + replicate_thread_set_after);
+                device_sync_modes.insert(device_sync_mode);
+                t.samples_ns.push_back(synchronized_ns);
             }
 
             if ((int) output_addresses.size() != context_count) {
@@ -2681,10 +2837,17 @@ int llama_bench(int argc, char ** argv) {
             }
             t.autokernel_hardened = true;
             t.autokernel_output_invariant = true;
+            t.autokernel_hybrid_ab_complete = true;
+            t.autokernel_thread_set_stable = true;
+            t.autokernel_escape_checks_complete = device_sync_modes.size() == 1;
             t.autokernel_input_hashes = join(input_hashes, ",");
             t.autokernel_input_addresses = join(input_address_pairs, ",");
             t.autokernel_context_addresses = join(context_address_pairs, ",");
             t.autokernel_output_hashes = join(output_hash_pairs, ",");
+            t.autokernel_unsynchronized_samples_ns = join(unsynchronized_samples_ns, ",");
+            t.autokernel_thread_set_hashes = join(thread_set_hash_pairs, ",");
+            t.autokernel_device_sync_mode = device_sync_modes.empty() ?
+                "unobserved" : *device_sync_modes.begin();
         } else {
         // warmup run
         if (!params.no_warmup) {
