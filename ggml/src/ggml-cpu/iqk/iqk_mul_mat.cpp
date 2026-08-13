@@ -242,7 +242,7 @@ struct MulMat {
 #else
         auto q8_k_type = GGML_TYPE_Q8_K_R8;
 #endif
-        switch (type) {
+        switch (int(type)) {
             // The native iquant-to-repacked-Q8 converters produce incorrect
             // results for some large-Ny dense and MoE shapes on Zen 4. Keep
             // these five newly enabled families on their direct IQK kernels.
@@ -289,7 +289,7 @@ struct MulMat {
             default: break;
         }
 #else
-        switch (type) {
+        switch (int(type)) {
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_K_R8 : type;
             // iqk port: dequant/repack path RE-ENABLED — the crash was an OOB type_traits[]
@@ -336,7 +336,7 @@ struct MulMat {
     }
     static inline int num_rows([[maybe_unused]] ggml_type type) {
 #ifdef HAVE_FANCY_SIMD
-        switch (type) {
+        switch (int(type)) {
             case GGML_TYPE_Q2_K_R4:
             case GGML_TYPE_Q3_K_R4:
             case GGML_TYPE_Q6_K_R4:
@@ -371,7 +371,7 @@ struct MulMat {
             default: return 1;
         }
 #else
-        switch (type) {
+        switch (int(type)) {
             case GGML_TYPE_Q2_K_R4:
             case GGML_TYPE_Q3_K_R4:
             case GGML_TYPE_Q4_K_R4:

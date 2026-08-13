@@ -91,12 +91,29 @@ static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ2_XXS));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ3_XXS));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ4_XS));
 
-inline bool iqk_shape_supported(int weight_type, int64_t n_rows) {
+constexpr bool iqk_shape_supported(int weight_type, int64_t n_rows) {
     // The imported IQ3_XXS kernel exceeds the backend NMSE limit for some tiny
     // output matrices. Production model matrices are much larger; retain the
     // native fallback for narrow utility/test shapes.
-    return weight_type != GGML_TYPE_IQ3_XXS || n_rows >= 32;
+    //
+    // Q4_K and Q4_0 use the same Q8_2_X4 activation path.  Deterministic
+    // AutoKernel holdouts showed that their approximate fast paths can exceed
+    // the independent host-double error-ratio bound for 16-row utility/test
+    // shapes even when the generic comparison's broad tolerance accepts them.
+    // Do not make correctness-sensitive narrow shapes depend on that path:
+    // fall through to the native CPU kernel.  The 32-row cutoff retains the
+    // intended model-matrix dispatch while making the boundary deterministic.
+    if (weight_type == GGML_TYPE_IQ3_XXS || weight_type == GGML_TYPE_Q4_K ||
+            weight_type == GGML_TYPE_Q4_0) {
+        return n_rows >= 32;
+    }
+    return true;
 }
+
+static_assert(!iqk_shape_supported(GGML_TYPE_Q4_0, 16));
+static_assert(iqk_shape_supported(GGML_TYPE_Q4_0, 32));
+static_assert(!iqk_shape_supported(GGML_TYPE_Q4_K, 16));
+static_assert(iqk_shape_supported(GGML_TYPE_Q4_K, 32));
 
 inline int iqk_activation_type(int weight_type) {
     return iqk_weight_uses_q8_k(weight_type) ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_2_X4;
