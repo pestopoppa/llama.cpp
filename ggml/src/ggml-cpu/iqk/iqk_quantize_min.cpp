@@ -12,6 +12,7 @@
 #include "ggml-impl.h"
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
+#include "iqk_quantize.h"
 
 #include <cassert>
 #include <cstdint>

@@ -34,6 +34,7 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --autokernel-harden <seed>                unique input/context addresses with ordinary/synchronized output-invariance twins
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -97,6 +98,30 @@ For a description of the other options, see the [completion example](../completi
 
 > [!NOTE]
 > The measurements with `llama-bench` do not include the times for tokenization and for sampling.
+
+### AutoKernel hardened repetitions
+
+`--autokernel-harden <seed>` is an experimental reward-integrity mode. For each
+reported sample it constructs content not used by any other sample and runs a timed
+hybrid pair through two simultaneously-live context/input allocations. The first run
+uses the ordinary host-return bracket and is diagnostic only. The second repeats the
+same content and, for GPU rows, executes `hipDeviceSynchronize` before the stop
+timestamp; only this synchronized twin enters the reported throughput vector. The
+command fails
+unless the two logits buffers are bitwise identical and every input, context, and output
+address is unique across the invocation. Distinct per-context warm-up content makes a
+stale pointer-keyed cache disagree across the pair instead of accidentally validating
+itself. It also snapshots the process thread set immediately before and inside the end
+of both timed brackets and rejects any outliving thread. Work submitted to a
+candidate-created secondary stream is therefore charged to the ranked twin, and the
+ordinary/synchronized timing divergence remains an integrity diagnostic rather than a
+corrected speed claim. CPU rows record that device synchronization is not applicable.
+
+JSON/JSONL results include the input/output hashes, paired input/context addresses,
+ordinary timing vector, hashed thread sets across both brackets, device-sync mode, the
+live rotated working-set size, and the hardening attestations. This mode allocates two
+contexts per repetition and is intended for trusted AutoKernel T1 runs, not ordinary
+benchmarking.
 
 ## Examples
 
