@@ -20,10 +20,7 @@
 #include "ggml-common.h"
 
 #ifdef __cplusplus
-#define GGML_RESTRICT
 extern "C" {
-#else
-#define GGML_RESTRICT restrict
 #endif
 
 struct quantize_user_data;
