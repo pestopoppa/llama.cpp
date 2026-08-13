@@ -75,6 +75,7 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
+    MMVQ_PARAMETERS_CDNA2,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4
@@ -87,6 +88,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA3_0;
 #elif defined(RDNA2) || defined(RDNA3_5)
     return MMVQ_PARAMETERS_RDNA2;
+#elif defined(CDNA2)
+    return MMVQ_PARAMETERS_CDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
@@ -105,6 +108,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         return MMVQ_PARAMETERS_RDNA2;
+    }
+    if (GGML_CUDA_CC_IS_CDNA2(cc)) {
+        return MMVQ_PARAMETERS_CDNA2;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
@@ -387,7 +393,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             default:
                 return 1;
         }
-    } else if (table_id == MMVQ_PARAMETERS_GCN) {
+    } else if (table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_CDNA2) {
         // CDNA2 single-stream experiment (mi210-q8-dequant handoff, lever 2/3): batch-1 Q8_0 GEMV is
         // achieved-BW/occupancy-limited at nwarps=2 (128 thr/block). Raise warps-per-block to put more
         // weight-load requests in flight (Little's law). RDNA4 already uses nwarps=8 for Q8_0. Same
@@ -396,6 +402,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // Q8) single-stream tg128; nwarps=4 beat 2 (baseline) and 8 (reduction-overhead-bound).
         if (ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
             return 4;
+        }
+        // CDNA2 batch-1 Q5_0 experiment: use one wave and one output row per block.
+        if (table_id == MMVQ_PARAMETERS_CDNA2 && ncols_dst == 1 && type == GGML_TYPE_Q5_0) {
+            return 1;
         }
         switch (ncols_dst) {
             case 1:
@@ -487,7 +497,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN ||
+        table_id == MMVQ_PARAMETERS_CDNA2 || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
