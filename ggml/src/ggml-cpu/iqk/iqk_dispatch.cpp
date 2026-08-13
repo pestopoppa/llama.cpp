@@ -117,6 +117,20 @@ static_assert(iqk_shape_supported(GGML_TYPE_Q4_K, 32));
 static_assert(!iqk_shape_supported(GGML_TYPE_Q6_K, 16));
 static_assert(iqk_shape_supported(GGML_TYPE_Q6_K, 32));
 
+constexpr bool iqk_mmid_shape_supported(int weight_type, int64_t n_tokens) {
+    // IQ3_XXS MoE is seed-sensitive near the independent NMSE boundary when
+    // more than one token is routed in a call.  The deterministic holdout found
+    // n=15 above the bound and n=16 only 2.7% below it, while all measured n=1
+    // decode cases were effectively exact.  Preserve that proven decode path;
+    // route wider IQ3_XXS MMID calls through the native CPU implementation.
+    return weight_type != GGML_TYPE_IQ3_XXS || n_tokens == 1;
+}
+
+static_assert(iqk_mmid_shape_supported(GGML_TYPE_IQ3_XXS, 1));
+static_assert(!iqk_mmid_shape_supported(GGML_TYPE_IQ3_XXS, 15));
+static_assert(!iqk_mmid_shape_supported(GGML_TYPE_IQ3_XXS, 16));
+static_assert(iqk_mmid_shape_supported(GGML_TYPE_IQ3_S, 16));
+
 inline int iqk_activation_type(int weight_type) {
     return iqk_weight_uses_q8_k(weight_type) ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_2_X4;
 }
@@ -226,6 +240,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     // cannot handle, in which case the native path reruns the operation.
     if (!iqk_typeA_supported(tA)) return false;
     if (!iqk_shape_supported(tA, src0->ne[1])) return false;
+    if (!iqk_mmid_shape_supported(tA, ids->ne[1])) return false;
     if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_enabled()) return false;
 
     const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2];

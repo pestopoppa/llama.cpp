@@ -302,6 +302,28 @@ if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         ENVIRONMENT "GGML_IQK=1"
         PASS_REGULAR_EXPRESSION "\\[iqk\\] ACTIVE:")
 
+    # IQ3_XXS MMID is retained for single-token decode only.  Wider token axes
+    # use the native kernel: n=15 crossed the independent NMSE boundary, and
+    # n=16 was too close to claim a safe cutoff between them.
+    foreach(n_tokens IN ITEMS 15 16)
+        llama_test(test-backend-ops NAME test-backend-ops-iqk-iq3-xxs-mmid-fallback-n${n_tokens}
+            ARGS test
+                 -o "MUL_MAT_ID(type_a=iq3_xxs,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=${n_tokens},k=256)"
+                 -b CPU --suite-seed 12980815022573307335 --autokernel-properties)
+        set_tests_properties(test-backend-ops-iqk-iq3-xxs-mmid-fallback-n${n_tokens} PROPERTIES
+            ENVIRONMENT "GGML_IQK=1"
+            PASS_REGULAR_EXPRESSION "1/1 tests passed"
+            FAIL_REGULAR_EXPRESSION "MoE mul_mat_id via ik kernels|0/1 tests passed|0/1 backends passed|FAIL")
+    endforeach()
+    llama_test(test-backend-ops NAME test-backend-ops-iqk-iq3-xxs-mmid-decode-n1
+        ARGS test
+             -o "MUL_MAT_ID(type_a=iq3_xxs,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=1,k=256)"
+             -b CPU --suite-seed 12980815022573307335 --autokernel-properties)
+    set_tests_properties(test-backend-ops-iqk-iq3-xxs-mmid-decode-n1 PROPERTIES
+        ENVIRONMENT "GGML_IQK=1"
+        PASS_REGULAR_EXPRESSION "MoE mul_mat_id via ik kernels"
+        FAIL_REGULAR_EXPRESSION "0/1 tests passed|0/1 backends passed|FAIL")
+
     llama_build(test-iqk-ser.cpp)
     llama_test(test-iqk-ser NAME test-iqk-ser ARGS --invalid-iqk)
     set_tests_properties(test-iqk-ser PROPERTIES
