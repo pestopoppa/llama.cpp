@@ -96,20 +96,22 @@ constexpr bool iqk_shape_supported(int weight_type, int64_t n_rows) {
     // output matrices. Production model matrices are much larger; retain the
     // native fallback for narrow utility/test shapes.
     //
-    // Q4_K uses the same Q8_2_X4 activation path.  The deterministic
-    // AutoKernel holdout (`MUL_MAT q4_K/f32 m=16 n=1 k=256`, suite seed
-    // 7922646026297897649) showed its result can exceed the independent
-    // host-double error-ratio bound even though the generic comparison's broad
-    // tolerance accepts it.  Do not make a correctness-sensitive 16-row
-    // utility/test shape depend on that approximate fast path: fall through to
-    // the native CPU kernel.  The 32-row cutoff retains the intended model
-    // matrix dispatch while making the held-out boundary deterministic.
-    if (weight_type == GGML_TYPE_IQ3_XXS || weight_type == GGML_TYPE_Q4_K) {
+    // Q4_K and Q4_0 use the same Q8_2_X4 activation path.  Deterministic
+    // AutoKernel holdouts showed that their approximate fast paths can exceed
+    // the independent host-double error-ratio bound for 16-row utility/test
+    // shapes even when the generic comparison's broad tolerance accepts them.
+    // Do not make correctness-sensitive narrow shapes depend on that path:
+    // fall through to the native CPU kernel.  The 32-row cutoff retains the
+    // intended model-matrix dispatch while making the boundary deterministic.
+    if (weight_type == GGML_TYPE_IQ3_XXS || weight_type == GGML_TYPE_Q4_K ||
+            weight_type == GGML_TYPE_Q4_0) {
         return n_rows >= 32;
     }
     return true;
 }
 
+static_assert(!iqk_shape_supported(GGML_TYPE_Q4_0, 16));
+static_assert(iqk_shape_supported(GGML_TYPE_Q4_0, 32));
 static_assert(!iqk_shape_supported(GGML_TYPE_Q4_K, 16));
 static_assert(iqk_shape_supported(GGML_TYPE_Q4_K, 32));
 
