@@ -18,13 +18,16 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cfloat>
+#include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -51,18 +54,133 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+#if defined(GGML_USE_HIP)
+static constexpr int autokernel_checker_tu_use_hip = 1;
+#else
+static constexpr int autokernel_checker_tu_use_hip = 0;
+#endif
+#if defined(__HIP_DEVICE_COMPILE__)
+static constexpr int autokernel_checker_tu_device_code = 1;
+#else
+static constexpr int autokernel_checker_tu_device_code = 0;
+#endif
+#if defined(GGML_CUDA_FORCE_MMQ)
+static constexpr int autokernel_checker_tu_force_mmq = 1;
+#else
+static constexpr int autokernel_checker_tu_force_mmq = 0;
+#endif
+#if defined(GGML_CUDA_FA)
+static constexpr int autokernel_checker_tu_cuda_fa = 1;
+#else
+static constexpr int autokernel_checker_tu_cuda_fa = 0;
+#endif
+#if defined(GGML_HIP_ROCWMMA_FATTN)
+static constexpr int autokernel_checker_tu_rocwmma_fattn = 1;
+#else
+static constexpr int autokernel_checker_tu_rocwmma_fattn = 0;
+#endif
+
+struct suite_seed_context {
+    bool        enabled      = false;
+    uint64_t    suite_seed   = 0;
+    size_t      case_index   = 0;
+    uint64_t    tensor_index = 0;
+    std::string op;
+};
+
+static thread_local suite_seed_context g_suite_seed_context;
+
+static uint64_t suite_seed_mix(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static uint64_t suite_seed_hash_string(const std::string & value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static uint64_t autokernel_fnv_update(uint64_t hash, const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static std::string autokernel_hex_u64(uint64_t value) {
+    char text[17];
+    const int n = snprintf(text, sizeof(text), "%016" PRIx64, value);
+    GGML_ASSERT(n == 16);
+    return text;
+}
+
+static void suite_seed_begin(uint64_t suite_seed, size_t case_index, const std::string & op) {
+    g_suite_seed_context.enabled      = true;
+    g_suite_seed_context.suite_seed   = suite_seed;
+    g_suite_seed_context.case_index   = case_index;
+    g_suite_seed_context.tensor_index = 0;
+    g_suite_seed_context.op           = op;
+}
+
+struct autokernel_tensor_seed {
+    bool     deterministic;
+    uint64_t value;
+};
+
+static autokernel_tensor_seed suite_seed_next_tensor() {
+    if (!g_suite_seed_context.enabled) {
+        return { false, 0 };
+    }
+    uint64_t value = suite_seed_mix(g_suite_seed_context.suite_seed);
+    value ^= suite_seed_mix(suite_seed_hash_string(g_suite_seed_context.op));
+    value ^= suite_seed_mix(g_suite_seed_context.case_index);
+    value ^= suite_seed_mix(g_suite_seed_context.tensor_index++);
+    return { true, suite_seed_mix(value) };
+}
+
+static std::mt19937 suite_seed_rng() {
+    const autokernel_tensor_seed seed = suite_seed_next_tensor();
+    if (!seed.deterministic) {
+        std::random_device rd;
+        return std::mt19937(rd());
+    }
+    std::seed_seq sequence {
+        static_cast<uint32_t>(seed.value),
+        static_cast<uint32_t>(seed.value >> 32),
+    };
+    return std::mt19937(sequence);
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
         // parallel initialization
         static const size_t n_threads = N_THREADS;
+        const autokernel_tensor_seed seed = suite_seed_next_tensor();
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
-            std::uniform_real_distribution<float> distribution(min, max);
-            for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+            if (seed.deterministic) {
+                const double scale = static_cast<double>(max) - static_cast<double>(min);
+                for (size_t i = start; i < end; i++) {
+                    const uint64_t bits = suite_seed_mix(seed.value ^ suite_seed_mix(i));
+                    const double unit = static_cast<double>(bits >> 11) * 0x1.0p-53;
+                    data[i] = static_cast<float>(static_cast<double>(min) + scale * unit);
+                }
+            } else {
+                thread_local std::default_random_engine gen(std::random_device{}());
+                std::uniform_real_distribution<float> distribution(min, max);
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(gen);
+                }
             }
         };
 
@@ -152,8 +270,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = suite_seed_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -168,12 +285,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -199,8 +316,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = suite_seed_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
@@ -267,19 +383,969 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     return tv;
 }
 
+struct host_property_result {
+    bool        checked = false;
+    bool        passed  = true;
+    const char * metric_id = nullptr;
+    double      residual = 0.0;
+    double      tolerance = 0.0;
+    std::string detail;
+    std::string transform = "identity";
+};
+
+static host_property_result host_property_fail(const char * metric_id, double residual,
+                                               double tolerance, const std::string & detail) {
+    return { true, false, metric_id, residual, tolerance, detail };
+}
+
+static bool host_property_packed(const ggml_tensor * tensor, size_t element_size) {
+    size_t stride = element_size;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (tensor->nb[dim] != stride) {
+            return false;
+        }
+        stride *= static_cast<size_t>(tensor->ne[dim]);
+    }
+    return ggml_nbytes(tensor) == stride;
+}
+
+static double host_property_decode_f16(uint16_t bits) {
+    const bool negative = (bits & 0x8000U) != 0;
+    const uint16_t exponent = (bits >> 10) & 0x1fU;
+    const uint16_t fraction = bits & 0x03ffU;
+    double value;
+    if (exponent == 0) {
+        value = std::ldexp(static_cast<double>(fraction), -24);
+    } else if (exponent == 0x1fU) {
+        value = fraction == 0 ? INFINITY : NAN;
+    } else {
+        value = std::ldexp(static_cast<double>(1024U + fraction), exponent - 25);
+    }
+    return negative ? -value : value;
+}
+
+static bool host_property_raw_float(const ggml_tensor * tensor, std::vector<double> & values,
+                                    std::string & detail) {
+    if (tensor == nullptr || (tensor->type != GGML_TYPE_F32 &&
+            tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16)) {
+        detail = "property oracle requires a raw F32, F16, or BF16 tensor";
+        return false;
+    }
+    const size_t element_size = tensor->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    if (!host_property_packed(tensor, element_size)) {
+        detail = "property oracle refuses a non-packed floating tensor";
+        return false;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    values.resize(ggml_nelements(tensor));
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (tensor->type == GGML_TYPE_F32) {
+            float value;
+            memcpy(&value, bytes.data() + i * sizeof(value), sizeof(value));
+            values[i] = static_cast<double>(value);
+        } else {
+            uint16_t bits;
+            memcpy(&bits, bytes.data() + i * sizeof(bits), sizeof(bits));
+            if (tensor->type == GGML_TYPE_F16) {
+                values[i] = host_property_decode_f16(bits);
+            } else {
+                const uint32_t f32_bits = static_cast<uint32_t>(bits) << 16;
+                float value;
+                memcpy(&value, &f32_bits, sizeof(value));
+                values[i] = static_cast<double>(value);
+            }
+        }
+    }
+    return true;
+}
+
+static bool autokernel_read_float_fp64(const ggml_tensor * tensor,
+                                       std::vector<double> & values,
+                                       std::string & detail) {
+    if (tensor == nullptr || (tensor->type != GGML_TYPE_F32 &&
+            tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16)) {
+        detail = "fp64 oracle requires an F32, F16, or BF16 tensor";
+        return false;
+    }
+    const size_t element_size = tensor->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    if (tensor->nb[0] != element_size) {
+        detail = "fp64 oracle requires a scalar-contiguous floating source";
+        return false;
+    }
+    values.clear();
+    values.reserve(ggml_nelements(tensor));
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                const size_t row_offset = static_cast<size_t>(i1) * tensor->nb[1] +
+                    static_cast<size_t>(i2) * tensor->nb[2] +
+                    static_cast<size_t>(i3) * tensor->nb[3];
+                std::vector<uint8_t> row(static_cast<size_t>(tensor->ne[0]) * element_size);
+                ggml_backend_tensor_get(tensor, row.data(), row_offset, row.size());
+                for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0) {
+                    const uint8_t * element = row.data() + static_cast<size_t>(i0) * element_size;
+                    if (tensor->type == GGML_TYPE_F32) {
+                        float value;
+                        memcpy(&value, element, sizeof(value));
+                        values.push_back(static_cast<double>(value));
+                    } else {
+                        uint16_t bits;
+                        memcpy(&bits, element, sizeof(bits));
+                        if (tensor->type == GGML_TYPE_F16) {
+                            values.push_back(host_property_decode_f16(bits));
+                        } else {
+                            const uint32_t f32_bits = static_cast<uint32_t>(bits) << 16;
+                            float value;
+                            memcpy(&value, &f32_bits, sizeof(value));
+                            values.push_back(static_cast<double>(value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return values.size() == static_cast<size_t>(ggml_nelements(tensor));
+}
+
+static uint16_t autokernel_read_u16_le(const uint8_t * data) {
+    return static_cast<uint16_t>(data[0]) |
+           (static_cast<uint16_t>(data[1]) << 8);
+}
+
+static bool autokernel_decode_quant_fp64(const ggml_tensor * tensor,
+                                         std::vector<double> & values,
+                                         std::string & detail) {
+    // Independent oracle: these are literal GGUF tensor wire layouts (block
+    // sizes, little-endian fp16 scales, and packed quant bits).  This path does
+    // not call ggml type traits, ggml-quants.c, IQK, or any backend dequantizer.
+    // Keeping the bit unpack here is what prevents a shared dequant defect from
+    // agreeing with itself on both candidate and sibling arms.
+    if (tensor == nullptr) {
+        detail = "fp64 oracle requires a quantized source";
+        return false;
+    }
+    size_t block_elements = 0;
+    size_t block_bytes = 0;
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_0: block_elements = 32;  block_bytes = 18;  break;
+        case GGML_TYPE_Q8_0: block_elements = 32;  block_bytes = 34;  break;
+        case GGML_TYPE_Q4_K: block_elements = 256; block_bytes = 144; break;
+        case GGML_TYPE_Q6_K: block_elements = 256; block_bytes = 210; break;
+        default:
+            return false;
+    }
+    if (tensor->ne[0] % static_cast<int64_t>(block_elements) != 0 ||
+            tensor->nb[0] != block_bytes) {
+        detail = "fp64 oracle quant row disagrees with the GGUF wire layout";
+        return false;
+    }
+
+    values.clear();
+    values.reserve(ggml_nelements(tensor));
+    const size_t blocks_per_row = static_cast<size_t>(tensor->ne[0]) / block_elements;
+    const size_t row_bytes = blocks_per_row * block_bytes;
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                const size_t row_offset = static_cast<size_t>(i1) * tensor->nb[1] +
+                    static_cast<size_t>(i2) * tensor->nb[2] +
+                    static_cast<size_t>(i3) * tensor->nb[3];
+                std::vector<uint8_t> bytes(row_bytes);
+                ggml_backend_tensor_get(tensor, bytes.data(), row_offset, bytes.size());
+                for (size_t block_offset = 0; block_offset < bytes.size();
+                        block_offset += block_bytes) {
+                    const uint8_t * block = bytes.data() + block_offset;
+                    if (tensor->type == GGML_TYPE_Q4_0) {
+                        const double d = host_property_decode_f16(autokernel_read_u16_le(block));
+                        for (size_t index = 0; index < 16; ++index) {
+                            values.push_back(d * (static_cast<int>(block[2 + index] & 0x0f) - 8));
+                        }
+                        for (size_t index = 0; index < 16; ++index) {
+                            values.push_back(d * (static_cast<int>(block[2 + index] >> 4) - 8));
+                        }
+                    } else if (tensor->type == GGML_TYPE_Q8_0) {
+                        const double d = host_property_decode_f16(autokernel_read_u16_le(block));
+                        for (size_t index = 0; index < 32; ++index) {
+                            values.push_back(d * static_cast<int8_t>(block[2 + index]));
+                        }
+                    } else if (tensor->type == GGML_TYPE_Q4_K) {
+                        const double d = host_property_decode_f16(autokernel_read_u16_le(block));
+                        const double dmin = host_property_decode_f16(autokernel_read_u16_le(block + 2));
+                        const uint8_t * scales = block + 4;
+                        const uint8_t * quants = block + 16;
+                        auto scale_min = [scales](size_t group) -> std::array<uint8_t, 2> {
+                            if (group < 4) {
+                                return { static_cast<uint8_t>(scales[group] & 0x3f),
+                                         static_cast<uint8_t>(scales[group + 4] & 0x3f) };
+                            }
+                            return {
+                                static_cast<uint8_t>((scales[group + 4] & 0x0f) |
+                                                     ((scales[group - 4] >> 6) << 4)),
+                                static_cast<uint8_t>((scales[group + 4] >> 4) |
+                                                     ((scales[group] >> 6) << 4)),
+                            };
+                        };
+                        for (size_t chunk = 0; chunk < 4; ++chunk) {
+                            const auto first = scale_min(2 * chunk);
+                            const auto second = scale_min(2 * chunk + 1);
+                            for (size_t index = 0; index < 32; ++index) {
+                                values.push_back(d * first[0] * (quants[32 * chunk + index] & 0x0f)
+                                                 - dmin * first[1]);
+                            }
+                            for (size_t index = 0; index < 32; ++index) {
+                                values.push_back(d * second[0] * (quants[32 * chunk + index] >> 4)
+                                                 - dmin * second[1]);
+                            }
+                        }
+                    } else {
+                        const uint8_t * ql = block;
+                        const uint8_t * qh = block + 128;
+                        const int8_t * scales = reinterpret_cast<const int8_t *>(block + 192);
+                        const double d = host_property_decode_f16(autokernel_read_u16_le(block + 208));
+                        for (size_t half = 0; half < 2; ++half) {
+                            const size_t ql_base = 64 * half;
+                            const size_t qh_base = 32 * half;
+                            const size_t scale_base = 8 * half;
+                            std::array<double, 128> decoded {};
+                            for (size_t index = 0; index < 32; ++index) {
+                                const size_t scale_lane = index / 16;
+                                const int q1 = (ql[ql_base + index] & 0x0f) |
+                                               (((qh[qh_base + index] >> 0) & 0x03) << 4);
+                                const int q2 = (ql[ql_base + index + 32] & 0x0f) |
+                                               (((qh[qh_base + index] >> 2) & 0x03) << 4);
+                                const int q3 = (ql[ql_base + index] >> 4) |
+                                               (((qh[qh_base + index] >> 4) & 0x03) << 4);
+                                const int q4 = (ql[ql_base + index + 32] >> 4) |
+                                               (((qh[qh_base + index] >> 6) & 0x03) << 4);
+                                decoded[index] = d * scales[scale_base + scale_lane] * (q1 - 32);
+                                decoded[index + 32] = d * scales[scale_base + scale_lane + 2] * (q2 - 32);
+                                decoded[index + 64] = d * scales[scale_base + scale_lane + 4] * (q3 - 32);
+                                decoded[index + 96] = d * scales[scale_base + scale_lane + 6] * (q4 - 32);
+                            }
+                            values.insert(values.end(), decoded.begin(), decoded.end());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (values.size() != static_cast<size_t>(ggml_nelements(tensor)) ||
+            block_elements == 0) {
+        detail = "fp64 oracle decoded the wrong number of quantized elements";
+        return false;
+    }
+    return true;
+}
+
+static double autokernel_fp64_relative_error(const std::vector<double> & observed,
+                                             const std::vector<double> & expected) {
+    if (observed.size() != expected.size() || observed.empty()) {
+        return INFINITY;
+    }
+    double squared_error = 0.0;
+    double squared_expected = 0.0;
+    for (size_t index = 0; index < observed.size(); ++index) {
+        const double difference = observed[index] - expected[index];
+        squared_error += difference * difference;
+        squared_expected += expected[index] * expected[index];
+    }
+    return std::sqrt(squared_error / std::max(squared_expected, 1e-24));
+}
+
+static bool host_property_fp64_ratio_values(double candidate_error,
+                                            double sibling_error,
+                                            double floor = 1e-12,
+                                            double kappa = 1.5) {
+    return std::isfinite(candidate_error) && std::isfinite(sibling_error) &&
+           candidate_error <= kappa * std::max(sibling_error, floor);
+}
+
+static host_property_result check_fp64_mul_mat_ratio(const ggml_tensor * candidate,
+                                                     const ggml_tensor * sibling) {
+    if (candidate->op != GGML_OP_MUL_MAT || sibling->op != GGML_OP_MUL_MAT ||
+            candidate->src[0] == nullptr || candidate->src[1] == nullptr ||
+            !ggml_is_quantized(candidate->src[0]->type) ||
+            (candidate->src[1]->type != GGML_TYPE_F32 &&
+             candidate->src[1]->type != GGML_TYPE_F16 &&
+             candidate->src[1]->type != GGML_TYPE_BF16)) {
+        return {};
+    }
+    switch (candidate->src[0]->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return {};
+    }
+
+    std::string detail;
+    std::vector<double> weights;
+    std::vector<double> activations;
+    std::vector<double> candidate_output;
+    std::vector<double> sibling_output;
+    if (!autokernel_decode_quant_fp64(candidate->src[0], weights, detail) ||
+            !autokernel_read_float_fp64(candidate->src[1], activations, detail) ||
+            !autokernel_read_float_fp64(candidate, candidate_output, detail) ||
+            !autokernel_read_float_fp64(sibling, sibling_output, detail)) {
+        return host_property_fail("fp64_error_ratio/host-double-gguf-wire/v1",
+                                  INFINITY, 0.0, detail);
+    }
+
+    const ggml_tensor * a = candidate->src[0];
+    const ggml_tensor * b = candidate->src[1];
+    const size_t k = static_cast<size_t>(a->ne[0]);
+    const size_t m = static_cast<size_t>(a->ne[1]);
+    const size_t n = static_cast<size_t>(b->ne[1]);
+    const size_t b2 = static_cast<size_t>(b->ne[2]);
+    const size_t b3 = static_cast<size_t>(b->ne[3]);
+    if (k != static_cast<size_t>(b->ne[0]) ||
+            candidate->ne[0] != a->ne[1] || candidate->ne[1] != b->ne[1] ||
+            candidate->ne[2] != b->ne[2] || candidate->ne[3] != b->ne[3] ||
+            a->ne[2] <= 0 || a->ne[3] <= 0 ||
+            b->ne[2] % a->ne[2] != 0 || b->ne[3] % a->ne[3] != 0) {
+        return host_property_fail("fp64_error_ratio/host-double-gguf-wire/v1",
+                                  INFINITY, 0.0,
+                                  "fp64 MUL_MAT oracle received incompatible shapes");
+    }
+
+    std::vector<double> expected(m * n * b2 * b3);
+    const size_t repeat2 = b2 / static_cast<size_t>(a->ne[2]);
+    const size_t repeat3 = b3 / static_cast<size_t>(a->ne[3]);
+    for (size_t i3 = 0; i3 < b3; ++i3) {
+        const size_t a3 = i3 / repeat3;
+        for (size_t i2 = 0; i2 < b2; ++i2) {
+            const size_t a2 = i2 / repeat2;
+            for (size_t i1 = 0; i1 < n; ++i1) {
+                for (size_t i0 = 0; i0 < m; ++i0) {
+                    double sum = 0.0;
+                    const size_t a_base = k * (i0 + m * (a2 +
+                        static_cast<size_t>(a->ne[2]) * a3));
+                    const size_t b_base = k * (i1 + n * (i2 + b2 * i3));
+                    for (size_t inner = 0; inner < k; ++inner) {
+                        sum += weights[a_base + inner] * activations[b_base + inner];
+                    }
+                    expected[i0 + m * (i1 + n * (i2 + b2 * i3))] = sum;
+                }
+            }
+        }
+    }
+    constexpr double floor = 1e-12;
+    constexpr double kappa = 1.5;
+    const double candidate_error = autokernel_fp64_relative_error(
+        candidate_output, expected);
+    const double sibling_error = autokernel_fp64_relative_error(sibling_output, expected);
+    const double tolerance = kappa * std::max(sibling_error, floor);
+    if (!host_property_fp64_ratio_values(candidate_error, sibling_error, floor, kappa)) {
+        std::ostringstream message;
+        message << "candidate fp64 error " << candidate_error << " exceeds " << kappa
+                << " * max(sibling_error=" << sibling_error << ", floor=" << floor << ')';
+        return host_property_fail("fp64_error_ratio/host-double-gguf-wire/v1",
+                                  candidate_error,
+                                  tolerance, message.str());
+    }
+    return { true, true, "fp64_error_ratio/host-double-gguf-wire/v1",
+             candidate_error, tolerance, "" };
+}
+
+static bool host_property_raw_i32(const ggml_tensor * tensor, std::vector<int32_t> & values,
+                                  std::string & detail) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_I32 ||
+            !host_property_packed(tensor, sizeof(int32_t))) {
+        detail = "property oracle requires a packed raw I32 tensor";
+        return false;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    values.resize(ggml_nelements(tensor));
+    memcpy(values.data(), bytes.data(), bytes.size());
+    return true;
+}
+
+struct autokernel_value_source {
+    ggml_tensor * tensor;
+    std::vector<double> original;
+};
+
+static uint64_t autokernel_value_input_hash(
+        const std::vector<autokernel_value_source> & sources) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const autokernel_value_source & source : sources) {
+        const int type = static_cast<int>(source.tensor->type);
+        hash = autokernel_fnv_update(hash, &type, sizeof(type));
+        const size_t size = ggml_nbytes(source.tensor);
+        hash = autokernel_fnv_update(hash, &size, sizeof(size));
+        std::vector<uint8_t> data(size);
+        ggml_backend_tensor_get(source.tensor, data.data(), 0, size);
+        hash = autokernel_fnv_update(hash, data.data(), data.size());
+    }
+    return hash;
+}
+
+static bool autokernel_write_scaled_float(ggml_tensor * tensor,
+                                          const std::vector<double> & original,
+                                          double scale, std::string & detail) {
+    if (original.size() != static_cast<size_t>(ggml_nelements(tensor))) {
+        detail = "value-transform source size changed";
+        return false;
+    }
+    if (tensor->type == GGML_TYPE_F32) {
+        std::vector<float> values(original.size());
+        for (size_t index = 0; index < values.size(); ++index) {
+            const double value = original[index] * scale;
+            if (!std::isfinite(value)) {
+                detail = "value transform produced a non-finite F32 input";
+                return false;
+            }
+            values[index] = static_cast<float>(value);
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        return true;
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> values(original.size());
+        for (size_t index = 0; index < values.size(); ++index) {
+            const double value = original[index] * scale;
+            if (!std::isfinite(value)) {
+                detail = "value transform produced a non-finite F16 input";
+                return false;
+            }
+            values[index] = ggml_fp32_to_fp16(static_cast<float>(value));
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0,
+                                values.size() * sizeof(ggml_fp16_t));
+        return true;
+    }
+    if (tensor->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> values(original.size());
+        for (size_t index = 0; index < values.size(); ++index) {
+            const double value = original[index] * scale;
+            if (!std::isfinite(value)) {
+                detail = "value transform produced a non-finite BF16 input";
+                return false;
+            }
+            values[index] = ggml_fp32_to_bf16(static_cast<float>(value));
+        }
+        ggml_backend_tensor_set(tensor, values.data(), 0,
+                                values.size() * sizeof(ggml_bf16_t));
+        return true;
+    }
+    detail = "value-transform source is not F32, F16, or BF16";
+    return false;
+}
+
+static bool autokernel_write_hostile_float(ggml_tensor * tensor,
+                                           const std::vector<double> & original,
+                                           const std::string & distribution,
+                                           std::string & detail) {
+    if (distribution == "baseline") {
+        return autokernel_write_scaled_float(tensor, original, 1.0, detail);
+    }
+    std::vector<double> values(original.size());
+    for (size_t index = 0; index < values.size(); ++index) {
+        const double magnitude = std::max(std::abs(original[index]), 0.125);
+        const double sign = (index & 1) == 0 ? 1.0 : -1.0;
+        if (distribution == "alternating") {
+            values[index] = sign * magnitude;
+        } else if (distribution == "sparse_outlier") {
+            values[index] = index % 31 == 0 ? sign * (4.0 + 4.0 * magnitude)
+                                             : sign * 0.0009765625;
+        } else if (distribution == "cancellation") {
+            const size_t pair_anchor = index - index % 2;
+            const double pair_magnitude = std::max(
+                std::abs(original[pair_anchor]), 0.25);
+            values[index] = sign * pair_magnitude;
+        } else {
+            detail = "unknown hostile input distribution";
+            return false;
+        }
+    }
+    return autokernel_write_scaled_float(tensor, values, 1.0, detail);
+}
+
+static bool autokernel_collect_value_sources(ggml_context * ctx,
+                                             std::vector<autokernel_value_source> & sources,
+                                             std::string & detail) {
+    if (ctx == nullptr) {
+        return true;
+    }
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
+            tensor = ggml_get_next_tensor(ctx, tensor)) {
+        if (tensor->op != GGML_OP_NONE || strncmp(tensor->name, "sent_", 5) == 0 ||
+                (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 &&
+                 tensor->type != GGML_TYPE_BF16)) {
+            continue;
+        }
+        std::vector<double> original;
+        if (!host_property_raw_float(tensor, original, detail)) {
+            return false;
+        }
+        sources.push_back({ tensor, std::move(original) });
+    }
+    return true;
+}
+
+static bool host_property_softmax_values(const std::vector<double> & output, size_t row_width,
+                                         double tolerance) {
+    if (row_width == 0 || output.empty() || output.size() % row_width != 0) {
+        return false;
+    }
+    for (size_t row = 0; row < output.size() / row_width; ++row) {
+        double sum = 0.0;
+        for (size_t col = 0; col < row_width; ++col) {
+            const double value = output[row * row_width + col];
+            if (!std::isfinite(value) || value < -tolerance || value > 1.0 + tolerance) {
+                return false;
+            }
+            sum += value;
+        }
+        if (std::fabs(sum - 1.0) > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool host_property_index_values(const std::vector<int32_t> & output, size_t row_width,
+                                       size_t source_width, bool full_permutation) {
+    if (row_width == 0 || source_width == 0 || row_width > source_width || output.empty() ||
+            output.size() % row_width != 0 || (full_permutation && row_width != source_width)) {
+        return false;
+    }
+    std::vector<uint8_t> seen(source_width);
+    for (size_t row = 0; row < output.size() / row_width; ++row) {
+        std::fill(seen.begin(), seen.end(), 0);
+        for (size_t col = 0; col < row_width; ++col) {
+            const int32_t index = output[row * row_width + col];
+            if (index < 0 || static_cast<size_t>(index) >= source_width || seen[index] != 0) {
+                return false;
+            }
+            seen[index] = 1;
+        }
+        if (full_permutation &&
+                std::find(seen.begin(), seen.end(), static_cast<uint8_t>(0)) != seen.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool host_property_solve_tri_values(const std::vector<double> & a,
+                                           const std::vector<double> & b,
+                                           const std::vector<double> & x,
+                                           size_t n, size_t k, size_t batches) {
+    if (n == 0 || k == 0 || batches == 0 || a.size() != batches * n * n ||
+            b.size() != batches * n * k || x.size() != b.size()) {
+        return false;
+    }
+    for (size_t batch = 0; batch < batches; ++batch) {
+        const size_t a_base = batch * n * n;
+        const size_t bx_base = batch * n * k;
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t rhs = 0; rhs < k; ++rhs) {
+                double lhs = 0.0;
+                double scale = std::fabs(b[bx_base + row * k + rhs]);
+                for (size_t col = 0; col <= row; ++col) {
+                    const double term = a[a_base + row * n + col] *
+                                        x[bx_base + col * k + rhs];
+                    lhs += term;
+                    scale += std::fabs(term);
+                }
+                const double residual = std::fabs(lhs - b[bx_base + row * k + rhs]);
+                const double tolerance = 128.0 * static_cast<double>(FLT_EPSILON) *
+                                         static_cast<double>(n) * std::max(1.0, scale);
+                if (!std::isfinite(residual) || residual > tolerance) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static host_property_result check_host_property(const ggml_tensor * output) {
+    std::string detail;
+    if (output->op == GGML_OP_SOFT_MAX) {
+        std::vector<double> values;
+        if (!host_property_raw_float(output, values, detail)) {
+            return host_property_fail("softmax_invariants/v1", 1.0, 0.0, detail);
+        }
+        const double tolerance = output->type == GGML_TYPE_F32 ? 1e-4
+                               : output->type == GGML_TYPE_F16 ? 1e-2 : 5e-2;
+        const size_t row_width = static_cast<size_t>(output->ne[0]);
+        double residual = 0.0;
+        if (row_width == 0 || values.empty() || values.size() % row_width != 0) {
+            residual = 1.0 + tolerance;
+        } else {
+            const bool has_implicit_sink_mass = output->src[2] != nullptr;
+            for (size_t row = 0; row < values.size() / row_width; ++row) {
+                double sum = 0.0;
+                for (size_t col = 0; col < row_width; ++col) {
+                    const double value = values[row * row_width + col];
+                    if (!std::isfinite(value)) {
+                        residual = std::max(residual, 1.0 + tolerance);
+                        continue;
+                    }
+                    residual = std::max(residual, std::max(0.0, -value));
+                    residual = std::max(residual, std::max(0.0, value - 1.0));
+                    sum += value;
+                }
+                // A sink participates in the normalization denominator but is
+                // intentionally omitted from the output tensor.  In that
+                // semantic domain the independently checkable invariant is
+                // positive explicit mass bounded by one; without a sink the
+                // raw row itself must sum to one.
+                if (has_implicit_sink_mass) {
+                    residual = std::max(residual, sum > 0.0
+                        ? std::max(0.0, sum - 1.0) : 1.0 + tolerance);
+                } else {
+                    residual = std::max(residual, std::fabs(sum - 1.0));
+                }
+            }
+        }
+        return residual <= tolerance
+            ? host_property_result { true, true, "softmax_invariants/v1", residual, tolerance, "" }
+            : host_property_fail("softmax_invariants/v1", residual, tolerance,
+                                 "SOFT_MAX raw output violates finite, range, or normalized-mass property");
+    }
+    if (output->op == GGML_OP_ARGSORT || output->op == GGML_OP_TOP_K) {
+        std::vector<int32_t> values;
+        if (!host_property_raw_i32(output, values, detail)) {
+            return host_property_fail("index_permutation/v1", 1.0, 0.0, detail);
+        }
+        const bool full = output->op == GGML_OP_ARGSORT;
+        const size_t source_width = output->src[0] == nullptr
+            ? 0 : static_cast<size_t>(output->src[0]->ne[0]);
+        const bool passed = host_property_index_values(
+            values, static_cast<size_t>(output->ne[0]), source_width, full);
+        const char * metric_id = full ? "argsort_permutation_violations/v1"
+                                      : "top_k_index_violations/v1";
+        return passed
+            ? host_property_result { true, true, metric_id, 0.0, 0.0, "" }
+            : host_property_fail(metric_id, 1.0, 0.0, full
+                ? "ARGSORT raw indices are not a bit-exact permutation"
+                : "TOP_K raw indices are out of range or duplicated");
+    }
+    if (output->op == GGML_OP_SOLVE_TRI) {
+        std::vector<double> a;
+        std::vector<double> b;
+        std::vector<double> x;
+        if (!host_property_raw_float(output->src[0], a, detail) ||
+                !host_property_raw_float(output->src[1], b, detail) ||
+                !host_property_raw_float(output, x, detail)) {
+            return host_property_fail("solve_tri_normalized_residual/v1", 2.0, 1.0, detail);
+        }
+        const size_t n = static_cast<size_t>(output->src[0]->ne[0]);
+        const size_t k = static_cast<size_t>(output->ne[0]);
+        const size_t batches = static_cast<size_t>(output->ne[2] * output->ne[3]);
+        double max_ratio = 0.0;
+        bool valid_shape = n > 0 && k > 0 && batches > 0 && a.size() == batches * n * n &&
+                           b.size() == batches * n * k && x.size() == b.size();
+        if (valid_shape) {
+            for (size_t batch = 0; batch < batches; ++batch) {
+                const size_t a_base = batch * n * n;
+                const size_t bx_base = batch * n * k;
+                for (size_t row = 0; row < n; ++row) {
+                    for (size_t rhs = 0; rhs < k; ++rhs) {
+                        double lhs = 0.0;
+                        double scale = std::fabs(b[bx_base + row * k + rhs]);
+                        for (size_t col = 0; col <= row; ++col) {
+                            const double term = a[a_base + row * n + col] *
+                                                x[bx_base + col * k + rhs];
+                            lhs += term;
+                            scale += std::fabs(term);
+                        }
+                        const double bound = 128.0 * static_cast<double>(FLT_EPSILON) *
+                                             static_cast<double>(n) * std::max(1.0, scale);
+                        const double residual = std::fabs(lhs - b[bx_base + row * k + rhs]);
+                        if (!std::isfinite(residual) || !std::isfinite(bound) || bound <= 0.0) {
+                            max_ratio = std::max(max_ratio, 2.0);
+                        } else {
+                            max_ratio = std::max(max_ratio, residual / bound);
+                        }
+                    }
+                }
+            }
+        } else {
+            max_ratio = 2.0;
+        }
+        return max_ratio <= 1.0
+            ? host_property_result { true, true, "solve_tri_normalized_residual/v1",
+                                     max_ratio, 1.0, "" }
+            : host_property_fail("solve_tri_normalized_residual/v1", max_ratio, 1.0,
+                                 "SOLVE_TRI raw output violates the host-double residual bound");
+    }
+    return {};
+}
+
+static std::vector<std::string> autokernel_layout_families(const ggml_tensor * output) {
+    std::vector<std::string> families;
+    for (int index = 0; index < GGML_MAX_SRC; ++index) {
+        const ggml_tensor * source = output->src[index];
+        if (source == nullptr) {
+            continue;
+        }
+        if (source->view_offs != 0 &&
+                std::find(families.begin(), families.end(), "offset") == families.end()) {
+            families.emplace_back("offset");
+        }
+        if (ggml_is_transposed(source) &&
+                std::find(families.begin(), families.end(), "transpose") == families.end()) {
+            families.emplace_back("transpose");
+        }
+        if (!ggml_is_contiguous(source) && !ggml_is_transposed(source) &&
+                std::find(families.begin(), families.end(), "stride_gap") == families.end()) {
+            families.emplace_back("stride_gap");
+        }
+    }
+    return families;
+}
+
+static std::string autokernel_layout_receipt(const std::vector<std::string> & families,
+                                             uint64_t suite_seed) {
+    if (families.empty()) {
+        return "";
+    }
+    std::string value = "AK_LAYOUT_V1 families=";
+    for (size_t index = 0; index < families.size(); ++index) {
+        if (index != 0) {
+            value += ",";
+        }
+        value += families[index];
+    }
+    value += " suite_seed=" + std::to_string(suite_seed);
+    return value;
+}
+
+struct autokernel_stateful_compare_result {
+    bool initial_equal = false;
+    bool input_immutable = false;
+    size_t final_outputs_verified = 0;
+    std::string detail;
+};
+
+static bool autokernel_read_logical_bytes(
+        ggml_tensor * tensor, std::vector<uint8_t> & bytes, std::string & detail) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        detail = "state tensor is null or unallocated";
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    bytes.resize(row_bytes * tensor->ne[1] * tensor->ne[2] * tensor->ne[3]);
+    size_t position = 0;
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                const size_t offset = i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3];
+                ggml_backend_tensor_get(tensor, bytes.data() + position, offset, row_bytes);
+                position += row_bytes;
+            }
+        }
+    }
+    return true;
+}
+
+static ggml_tensor * autokernel_find_copied_tensor(
+        const struct ggml_backend_graph_copy & copy, const char * name) {
+    ggml_tensor * tensor = ggml_get_tensor(copy.ctx_allocated, name);
+    return tensor != nullptr ? tensor : ggml_get_tensor(copy.ctx_unallocated, name);
+}
+
+static bool autokernel_compare_stateful_graph(
+        ggml_backend_t backend1,
+        ggml_backend_t backend2,
+        ggml_cgraph * graph,
+        ggml_backend_eval_callback callback,
+        void * callback_data,
+        const std::vector<ggml_tensor *> & state_inputs,
+        const std::vector<ggml_tensor *> & test_outputs,
+        const std::vector<ggml_tensor *> & final_state_outputs,
+        autokernel_stateful_compare_result & result) {
+    if (state_inputs.empty() || final_state_outputs.empty()) {
+        result.detail = "stateful contract has no explicit input or final-state output";
+        return false;
+    }
+    struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, graph);
+    if (copy.buffer == nullptr) {
+        result.detail = "reference graph copy failed";
+        return false;
+    }
+
+    std::vector<std::vector<uint8_t>> before1(state_inputs.size());
+    std::vector<std::vector<uint8_t>> before2(state_inputs.size());
+    std::vector<ggml_tensor *> copied_inputs;
+    bool ok = true;
+    for (size_t index = 0; index < state_inputs.size(); ++index) {
+        ggml_tensor * input = state_inputs[index];
+        if (input == nullptr || input->name[0] == '\0') {
+            result.detail = "state input is null or unnamed";
+            ok = false;
+            break;
+        }
+        ggml_tensor * copied = autokernel_find_copied_tensor(copy, input->name);
+        if (copied == nullptr ||
+                !autokernel_read_logical_bytes(input, before1[index], result.detail) ||
+                !autokernel_read_logical_bytes(copied, before2[index], result.detail)) {
+            if (result.detail.empty()) {
+                result.detail = std::string("reference state input not found: ") + input->name;
+            }
+            ok = false;
+            break;
+        }
+        if (before1[index] != before2[index]) {
+            result.detail = std::string("initial state bytes differ across backends: ") + input->name;
+            ok = false;
+            break;
+        }
+        copied_inputs.push_back(copied);
+    }
+    result.initial_equal = ok;
+
+    if (ok && (ggml_backend_graph_compute(backend1, graph) != GGML_STATUS_SUCCESS ||
+               ggml_backend_graph_compute(backend2, copy.graph) != GGML_STATUS_SUCCESS)) {
+        result.detail = "stateful graph compute failed";
+        ok = false;
+    }
+
+    if (ok) {
+        std::vector<bool> output_seen(test_outputs.size(), false);
+        std::vector<bool> final_seen(final_state_outputs.size(), false);
+        for (int node_index = 0; node_index < ggml_graph_n_nodes(graph); ++node_index) {
+            ggml_tensor * node1 = ggml_graph_node(graph, node_index);
+            ggml_tensor * node2 = ggml_graph_node(copy.graph, node_index);
+            for (size_t output_index = 0; output_index < test_outputs.size(); ++output_index) {
+                if (node1 == test_outputs[output_index]) {
+                    callback(node_index, node1, node2, callback_data);
+                    output_seen[output_index] = true;
+                }
+            }
+            for (size_t final_index = 0; final_index < final_state_outputs.size(); ++final_index) {
+                if (node1 == final_state_outputs[final_index]) {
+                    final_seen[final_index] = true;
+                }
+            }
+        }
+        if (std::find(output_seen.begin(), output_seen.end(), false) != output_seen.end() ||
+                std::find(final_seen.begin(), final_seen.end(), false) != final_seen.end()) {
+            result.detail = "declared output is absent from the compared graph";
+            ok = false;
+        } else {
+            result.final_outputs_verified = final_state_outputs.size();
+        }
+    }
+
+    bool immutable = ok;
+    for (size_t index = 0; index < copied_inputs.size(); ++index) {
+        std::vector<uint8_t> after1;
+        std::vector<uint8_t> after2;
+        if (!autokernel_read_logical_bytes(state_inputs[index], after1, result.detail) ||
+                !autokernel_read_logical_bytes(copied_inputs[index], after2, result.detail) ||
+                after1 != before1[index] || after2 != before2[index]) {
+            if (result.detail.empty()) {
+                result.detail = std::string("state input mutated during comparison: ") +
+                    state_inputs[index]->name;
+            }
+            immutable = false;
+        }
+    }
+    result.input_immutable = immutable;
+    ggml_backend_graph_copy_free(copy);
+    return ok && result.initial_equal && result.input_immutable &&
+        result.final_outputs_verified == final_state_outputs.size();
+}
+
+static bool autokernel_layout_self_test() {
+    ggml_init_params params = {
+        /* .mem_size = */ 1024 * 1024,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * contiguous_a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 8);
+    ggml_tensor * contiguous_b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 8);
+    ggml_tensor * contiguous_out = ggml_add(ctx.get(), contiguous_a, contiguous_b);
+
+    ggml_tensor * transpose_base = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 8);
+    ggml_tensor * transpose = ggml_transpose(ctx.get(), transpose_base);
+    ggml_tensor * transpose_out = ggml_add(ctx.get(), transpose, transpose);
+
+    ggml_tensor * gap_base = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 16, 8);
+    ggml_tensor * gap = ggml_view_2d(
+        ctx.get(), gap_base, 8, 8, gap_base->nb[1], 0);
+    ggml_tensor * gap_out = ggml_add(ctx.get(), gap, gap);
+
+    ggml_tensor * offset_base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 65);
+    ggml_tensor * offset = ggml_view_2d(
+        ctx.get(), offset_base, 8, 8, 8 * sizeof(float), sizeof(float));
+    ggml_tensor * offset_out = ggml_add(ctx.get(), offset, offset);
+
+    const bool passed =
+        autokernel_layout_families(contiguous_out).empty() &&
+        autokernel_layout_families(transpose_out) == std::vector<std::string> { "transpose" } &&
+        autokernel_layout_families(gap_out) == std::vector<std::string> { "stride_gap" } &&
+        autokernel_layout_families(offset_out) == std::vector<std::string> { "offset" };
+    fprintf(stderr, "AUTOKERNEL_LAYOUT_SELF_TEST passed=%d families=3 clean=1\n",
+            passed ? 1 : 0);
+    return passed;
+}
+
+static bool host_property_seeded_defect_gate(uint64_t suite_seed) {
+    std::vector<double> bad_softmax = { 0.2, 0.3, 0.5 };
+    bad_softmax[suite_seed_mix(suite_seed) % bad_softmax.size()] = 0.0;
+    std::vector<double> bad_solve = { 2.0, 5.0 / 3.0 };
+    bad_solve[suite_seed_mix(suite_seed ^ 0x534f4c5645ULL) % bad_solve.size()] += 1.0;
+    const std::array<bool, 5> clean = {
+        host_property_softmax_values({ 0.2, 0.3, 0.5 }, 3, 1e-6),
+        host_property_index_values({ 2, 0, 1 }, 3, 3, true),
+        host_property_index_values({ 2, 0 }, 2, 3, false),
+        host_property_solve_tri_values(
+            { 2.0, 0.0, 1.0, 3.0 }, { 4.0, 7.0 }, { 2.0, 5.0 / 3.0 }, 2, 1, 1),
+        host_property_fp64_ratio_values(1e-3, 1e-3),
+    };
+    const std::array<bool, 5> planted = {
+        host_property_softmax_values(bad_softmax, 3, 1e-6),
+        host_property_index_values({ 2, 2, 1 }, 3, 3, true),
+        host_property_index_values({ 2, 3 }, 2, 3, false),
+        host_property_solve_tri_values(
+            { 2.0, 0.0, 1.0, 3.0 }, { 4.0, 7.0 }, bad_solve, 2, 1, 1),
+        host_property_fp64_ratio_values(2e-3, 1e-3),
+    };
+    const size_t clean_passed = std::count(clean.begin(), clean.end(), true);
+    const size_t planted_caught = std::count(planted.begin(), planted.end(), false);
+    fprintf(stderr,
+            "AUTOKERNEL_PROPERTY_SELF_TEST suite_seed=%" PRIu64
+            " sensitivity=%.3f specificity=%.3f planted=%zu clean=%zu\n",
+            suite_seed,
+            static_cast<double>(planted_caught) / planted.size(),
+            static_cast<double>(clean_passed) / clean.size(), planted.size(), clean.size());
+    return clean_passed == clean.size() && planted_caught == planted.size();
+}
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const float * a, const float * b, size_t n) {
     double mse_a_b = 0.0;
     double mse_a_0 = 0.0;
 
     for (size_t i = 0; i < n; i++) {
-        float a_i = a[i];
-        float b_i = b[i];
+        const double a_i = a[i];
+        const double b_i = b[i];
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
     }
 
+    // Identical all-zero tensors have zero normalized error.  Preserve an
+    // infinite error for a non-zero candidate against a zero reference so the
+    // caller's finite-value guard continues to fail closed.
+    if (mse_a_0 == 0.0) {
+        return mse_a_b == 0.0 ? 0.0 : INFINITY;
+    }
     return mse_a_b / mse_a_0;
 }
 
@@ -538,7 +1604,16 @@ struct test_result {
     std::string test_mode;
     bool        supported;
     bool        passed;
+    bool        hard_failure;
     std::string error_message;
+    std::string layout_receipt;
+    std::string value_receipt;
+    std::string sensitivity_receipt;
+    std::string hostile_receipt;
+    std::string state_receipt;
+    std::string property_receipt;
+    std::string reference_receipt;
+    std::string checker_receipt;
     double      time_us;
     double      flops;
     double      bandwidth_gb_s;
@@ -556,6 +1631,7 @@ struct test_result {
         n_runs         = 0;
         supported      = false;
         passed         = false;
+        hard_failure   = false;
 
         test_time = test_time_now();
 
@@ -573,6 +1649,7 @@ struct test_result {
         test_mode(test_mode),
         supported(supported),
         passed(passed),
+        hard_failure(false),
         error_message(error_message),
         time_us(time_us),
         flops(flops),
@@ -590,7 +1667,7 @@ struct test_result {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "test_time", "build_commit",  "backend_name", "op_name", "op_params",      "test_mode", "supported",
-            "passed",    "error_message", "time_us",      "flops",   "bandwidth_gb_s", "memory_kb", "n_runs",
+            "passed",    "hard_failure", "error_message", "layout_receipt", "value_receipt", "sensitivity_receipt", "hostile_receipt", "state_receipt", "property_receipt", "reference_receipt", "checker_receipt", "time_us", "flops", "bandwidth_gb_s", "memory_kb", "n_runs",
             "device_description", "backend_reg_name"
         };
         return fields;
@@ -599,7 +1676,7 @@ struct test_result {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
-        if (field == "supported" || field == "passed") {
+        if (field == "supported" || field == "passed" || field == "hard_failure") {
             return BOOL;
         }
         if (field == "memory_kb" || field == "n_runs") {
@@ -620,7 +1697,16 @@ struct test_result {
                  test_mode,
                  std::to_string(supported),
                  std::to_string(passed),
+                 std::to_string(hard_failure),
                  error_message,
+                 layout_receipt,
+                 value_receipt,
+                 sensitivity_receipt,
+                 hostile_receipt,
+                 state_receipt,
+                 property_receipt,
+                 reference_receipt,
+                 checker_receipt,
                  std::to_string(time_us),
                  std::to_string(flops),
                  std::to_string(bandwidth_gb_s),
@@ -943,10 +2029,49 @@ struct console_printer : public printer {
         printf("  %s(%s): ", result.op_name.c_str(), result.op_params.c_str());
         fflush(stdout);
 
-        if (!result.supported) {
+        if (!result.supported && !result.hard_failure) {
             printf("not supported [%s] ", result.backend_name.c_str());
             printf("\n");
             return;
+        }
+
+        if (!result.layout_receipt.empty()) {
+            printf("%s ", result.layout_receipt.c_str());
+        }
+        if (!result.value_receipt.empty()) {
+            if (!result.layout_receipt.empty()) {
+                printf("| ");
+            }
+            printf("%s ", result.value_receipt.c_str());
+        }
+        if (!result.state_receipt.empty()) {
+            if (!result.layout_receipt.empty() || !result.value_receipt.empty()) {
+                printf("| ");
+            }
+            printf("%s ", result.state_receipt.c_str());
+        }
+        if (!result.property_receipt.empty()) {
+            if (!result.layout_receipt.empty() || !result.value_receipt.empty() ||
+                    !result.state_receipt.empty()) {
+                printf("| ");
+            }
+            printf("%s ", result.property_receipt.c_str());
+        }
+        if (!result.reference_receipt.empty()) {
+            if (!result.layout_receipt.empty() || !result.value_receipt.empty() ||
+                    !result.state_receipt.empty() ||
+                    !result.property_receipt.empty()) {
+                printf("| ");
+            }
+            printf("%s ", result.reference_receipt.c_str());
+        }
+        if (!result.error_message.empty()) {
+            if (!result.layout_receipt.empty() || !result.value_receipt.empty() ||
+                    !result.state_receipt.empty() ||
+                    !result.property_receipt.empty() || !result.reference_receipt.empty()) {
+                printf("| ");
+            }
+            printf("%s ", result.error_message.c_str());
         }
 
         if (result.passed) {
@@ -1093,7 +2218,16 @@ struct csv_printer : public printer {
             "op_name",
             "op_params",
             "supported",
+            "hard_failure",
             "error_message",
+            "layout_receipt",
+            "value_receipt",
+            "sensitivity_receipt",
+            "hostile_receipt",
+            "state_receipt",
+            "property_receipt",
+            "reference_receipt",
+            "checker_receipt",
             "test_mode",
             "backend_reg_name",
             "backend_name",
@@ -1127,6 +2261,12 @@ static void print_test_result_locked(printer * output_printer, const test_result
 
 struct test_case {
     virtual ~test_case() {}
+
+    void set_suite_seed(uint64_t seed, size_t case_index) {
+        suite_seeded    = true;
+        suite_seed      = seed;
+        suite_case_index = case_index;
+    }
 
     virtual std::string op_desc(ggml_tensor * t) {
         return ggml_op_desc(t);
@@ -1169,6 +2309,10 @@ struct test_case {
 
     virtual double err(const float * a, const float * b, size_t n) {
         return nmse(a, b, n);
+    }
+
+    virtual const char * err_metric_id() {
+        return "test_backend_ops_error/v1";
     }
 
     virtual float grad_eps() {
@@ -1217,6 +2361,8 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual std::vector<ggml_tensor *> autokernel_state_inputs() { return {}; }
+    virtual std::vector<ggml_tensor *> autokernel_final_state_outputs() { return {}; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1230,6 +2376,9 @@ struct test_case {
 
     std::string current_op_name;
     bool contains_f16 = false;
+    bool suite_seeded = false;
+    uint64_t suite_seed = 0;
+    size_t suite_case_index = 0;
 
     // Used by the WebGPU backend to relax error thresholds on ops on f16 tensors
     void check_for_f16_tensor(ggml_context * ctx) {
@@ -1316,7 +2465,13 @@ struct test_case {
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
-                       printer *      output_printer) {
+                       printer *      output_printer,
+                       bool           autokernel_properties,
+                       bool           autokernel_layouts,
+                       bool           autokernel_value_transforms,
+                       bool           autokernel_hostile_distributions,
+                       bool           autokernel_stateful,
+                       bool           reference_mode_active) {
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -1341,12 +2496,34 @@ struct test_case {
 
         ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
         current_op_name   = op_desc(out);
+        if (suite_seeded) {
+            suite_seed_begin(suite_seed, suite_case_index, current_op_name);
+        }
         check_for_f16_tensor(ctx.get());
 
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return test_status_t::SKIPPED;
         }
+
+        const std::vector<std::string> layout_families =
+            (autokernel_layouts || autokernel_value_transforms ||
+             autokernel_hostile_distributions)
+                ? autokernel_layout_families(out) : std::vector<std::string> {};
+        if (autokernel_layouts && layout_families.empty()) {
+            return test_status_t::SKIPPED;
+        }
+        if ((autokernel_value_transforms || autokernel_hostile_distributions) &&
+                !layout_families.empty()) {
+            return test_status_t::SKIPPED;
+        }
+        std::vector<ggml_tensor *> state_inputs = autokernel_state_inputs();
+        std::vector<ggml_tensor *> final_state_outputs = autokernel_final_state_outputs();
+        if (autokernel_stateful && (state_inputs.empty() || final_state_outputs.empty())) {
+            return test_status_t::SKIPPED;
+        }
+        const std::string layout_receipt =
+            autokernel_layout_receipt(layout_families, suite_seed);
 
         // check if the backends support the ops
         bool supported = true;
@@ -1362,11 +2539,26 @@ struct test_case {
         if (!supported) {
             // Create test result for unsupported operation
             test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
-                             false, false, "not supported");
+                             false, false, (autokernel_layouts || autokernel_hostile_distributions)
+                                ? "non-contiguous layout is not supported"
+                                : (autokernel_stateful
+                                    ? "stateful case is not supported"
+                                    : "not supported"));
+            result.layout_receipt = layout_receipt;
+            if (autokernel_stateful) {
+                result.state_receipt =
+                    "AK_STATE_V1 inputs=" + std::to_string(state_inputs.size()) +
+                    " initial_equal=0 input_immutable=0 final_outputs=0 suite_seed=" +
+                    std::to_string(suite_seed);
+            }
+            result.hard_failure = autokernel_layouts || autokernel_hostile_distributions ||
+                                  autokernel_stateful;
 
             print_test_result_locked(output_printer, result);
 
-            return test_status_t::NOT_SUPPORTED;
+            return (autokernel_layouts || autokernel_hostile_distributions ||
+                    autokernel_stateful)
+                ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
         }
 
         // post-graph sentinel
@@ -1395,6 +2587,11 @@ struct test_case {
 
         // build graph
         ggml_build_forward_expand(gf, out);
+        if (autokernel_stateful) {
+            for (ggml_tensor * final_state : final_state_outputs) {
+                ggml_build_forward_expand(gf, final_state);
+            }
+        }
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
@@ -1407,12 +2604,38 @@ struct test_case {
             initialize_tensors(ctx_weights.get());
         }
 
+        std::vector<autokernel_value_source> value_sources;
+        std::string value_source_error;
+        if ((autokernel_value_transforms || autokernel_hostile_distributions) &&
+                (!autokernel_collect_value_sources(ctx.get(), value_sources, value_source_error) ||
+                 !autokernel_collect_value_sources(
+                     ctx_weights.get(), value_sources, value_source_error))) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                               true, false, value_source_error);
+            result.hard_failure = true;
+            print_test_result_locked(output_printer, result);
+            return test_status_t::FAIL;
+        }
+        if ((autokernel_value_transforms || autokernel_hostile_distributions) &&
+                value_sources.empty()) {
+            return test_status_t::SKIPPED;
+        }
+
         // compare
         struct callback_userdata {
             bool   ok;
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            bool autokernel_properties;
+            double max_error_observed;
+            double tolerance;
+            size_t comparison_count;
+            std::vector<host_property_result> property_results;
+            std::string transform;
+            size_t transform_index;
+            std::array<uint64_t, 4> output_hashes;
+            std::array<size_t, 4> output_counts;
         };
 
         callback_userdata ud {
@@ -1420,6 +2643,15 @@ struct test_case {
             this,
             backend1,
             backend2,
+            autokernel_properties,
+            0.0,
+            max_err(backend1),
+            0,
+            {},
+            "identity",
+            0,
+            {},
+            {},
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
@@ -1443,6 +2675,41 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
+
+            if (t2->op != GGML_OP_NONE && !f2.empty()) {
+                uint64_t & hash = ud->output_hashes[ud->transform_index];
+                if (ud->output_counts[ud->transform_index] == 0) {
+                    hash = 1469598103934665603ULL;
+                }
+                hash = autokernel_fnv_update(hash, &index, sizeof(index));
+                hash = autokernel_fnv_update(hash, f2.data(), f2.size() * sizeof(float));
+                ud->output_counts[ud->transform_index] += f2.size();
+            }
+
+            if (ud->autokernel_properties) {
+                host_property_result property = check_host_property(t1);
+                if (property.checked) {
+                    property.transform = ud->transform;
+                    ud->property_results.push_back(property);
+                    if (!property.passed) {
+                        fprintf(stderr, "[%s] HOST PROPERTY FAIL: %s\n",
+                                ggml_op_desc(t1), property.detail.c_str());
+                        ud->ok = false;
+                        return true;
+                    }
+                }
+                host_property_result fp64_ratio = check_fp64_mul_mat_ratio(t1, t2);
+                if (fp64_ratio.checked) {
+                    fp64_ratio.transform = ud->transform;
+                    ud->property_results.push_back(fp64_ratio);
+                    if (!fp64_ratio.passed) {
+                        fprintf(stderr, "[%s] FP64 RATIO FAIL: %s\n", ggml_op_desc(t1),
+                                fp64_ratio.detail.c_str());
+                        ud->ok = false;
+                        return true;
+                    }
+                }
+            }
 
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
@@ -1468,8 +2735,15 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+            if (!std::isfinite(err) || err < 0.0) {
+                printf("[%s] ERR is invalid ", ggml_op_desc(t1));
+                ud->ok = false;
+                return true;
+            }
+            ud->max_error_observed = std::max(ud->max_error_observed, err);
+            ud->comparison_count++;
+            if (err > ud->tolerance) {
+                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tolerance);
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
@@ -1486,15 +2760,201 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        struct input_variant_spec {
+            const char * id;
+            double scale;
+            bool hostile;
+        };
+        const std::array<input_variant_spec, 4> input_variants =
+            autokernel_hostile_distributions
+                ? std::array<input_variant_spec, 4> {{
+                    { "baseline", 1.0, true },
+                    { "alternating", 1.0, true },
+                    { "sparse_outlier", 1.0, true },
+                    { "cancellation", 1.0, true },
+                }}
+                : std::array<input_variant_spec, 4> {{
+                    { "identity", 1.0, false },
+                    { "x3", 3.0, false },
+                    { "x0p01", 0.01, false },
+                    { "negate", -1.0, false },
+                }};
+        const size_t transform_count =
+            (autokernel_value_transforms || autokernel_hostile_distributions)
+                ? input_variants.size() : 1;
+        bool cmp_ok = true;
+        size_t transforms_completed = 0;
+        autokernel_stateful_compare_result state_result;
+        std::array<uint64_t, 4> input_hashes {};
+        for (size_t transform_index = 0; transform_index < transform_count; ++transform_index) {
+            const input_variant_spec & transform = input_variants[transform_index];
+            ud.transform = transform.id;
+            ud.transform_index = transform_index;
+            bool inputs_ok = true;
+            for (const autokernel_value_source & source : value_sources) {
+                const bool written = transform.hostile
+                    ? autokernel_write_hostile_float(
+                        source.tensor, source.original, transform.id, value_source_error)
+                    : autokernel_write_scaled_float(
+                        source.tensor, source.original, transform.scale, value_source_error);
+                if (!written) {
+                    inputs_ok = false;
+                    break;
+                }
+            }
+            if (!inputs_ok) {
+                printf("VALUE TRANSFORM FAIL: %s ", value_source_error.c_str());
+                ud.ok = false;
+                cmp_ok = false;
+                break;
+            }
+            if (autokernel_value_transforms || autokernel_hostile_distributions) {
+                input_hashes[transform_index] = autokernel_value_input_hash(value_sources);
+            }
+            bool transform_ok = false;
+            if (autokernel_stateful) {
+                std::vector<ggml_tensor *> state_test_outputs = { out };
+                for (ggml_tensor * final_state : final_state_outputs) {
+                    if (std::find(state_test_outputs.begin(), state_test_outputs.end(), final_state) ==
+                            state_test_outputs.end()) {
+                        state_test_outputs.push_back(final_state);
+                    }
+                }
+                transform_ok = autokernel_compare_stateful_graph(
+                    backend1, backend2, gf, callback, &ud, state_inputs,
+                    state_test_outputs, final_state_outputs, state_result);
+                if (!transform_ok && !state_result.detail.empty()) {
+                    printf("STATEFUL CONTRACT FAIL: %s ", state_result.detail.c_str());
+                }
+            } else {
+                transform_ok = ggml_backend_compare_graph_backend(
+                    backend1, backend2, gf, callback, &ud,
+                    run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                    fused_nodes_to_verify.size());
+            }
+            transforms_completed++;
+            cmp_ok = cmp_ok && transform_ok;
+            if (!transform_ok || !ud.ok) {
+                break;
+            }
+        }
+
+        const bool checker_sibling_cpu = ggml_backend_is_cpu(backend2);
+        const bool checker_isolated = reference_mode_active && checker_sibling_cpu &&
+            autokernel_checker_tu_device_code == 0 &&
+            autokernel_checker_tu_force_mmq == 0 &&
+            autokernel_checker_tu_cuda_fa == 0 &&
+            autokernel_checker_tu_rocwmma_fattn == 0;
+        if (autokernel_properties && !checker_isolated) {
+            fprintf(stderr, "AUTOKERNEL CHECKER ISOLATION FAIL\n");
+            ud.ok = false;
+        }
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        std::string value_receipt;
+        if (autokernel_value_transforms) {
+            value_receipt =
+                "AK_VALUE_V1 transforms=identity,x3,x0p01,negate completed=" +
+                std::to_string(transforms_completed) +
+                " suite_seed=" + std::to_string(suite_seed);
+        }
+        std::string sensitivity_receipt;
+        if (autokernel_value_transforms && transforms_completed == input_variants.size() &&
+                std::all_of(ud.output_counts.begin(), ud.output_counts.end(),
+                            [](size_t count) { return count > 0; })) {
+            sensitivity_receipt =
+                "AK_SENS_V1 suite_version=" + std::string(ggml_commit()) +
+                " suite_seed=" + std::to_string(suite_seed) +
+                " transforms=identity,x3,x0p01,negate inputs=";
+            for (size_t index = 0; index < input_variants.size(); ++index) {
+                if (index != 0) {
+                    sensitivity_receipt += ",";
+                }
+                sensitivity_receipt += autokernel_hex_u64(input_hashes[index]);
+            }
+            sensitivity_receipt += " outputs=";
+            for (size_t index = 0; index < input_variants.size(); ++index) {
+                if (index != 0) {
+                    sensitivity_receipt += ",";
+                }
+                sensitivity_receipt += autokernel_hex_u64(ud.output_hashes[index]);
+            }
+        }
+        std::string hostile_receipt;
+        if (autokernel_hostile_distributions &&
+                transforms_completed == input_variants.size() &&
+                std::all_of(ud.output_counts.begin(), ud.output_counts.end(),
+                            [](size_t count) { return count > 0; })) {
+            hostile_receipt =
+                "AK_HOSTILE_V1 suite_version=" + std::string(ggml_commit()) +
+                " suite_seed=" + std::to_string(suite_seed) +
+                " distributions=baseline,alternating,sparse_outlier,cancellation inputs=";
+            for (size_t index = 0; index < input_variants.size(); ++index) {
+                if (index != 0) {
+                    hostile_receipt += ",";
+                }
+                hostile_receipt += autokernel_hex_u64(input_hashes[index]);
+            }
+            hostile_receipt += " completed=" + std::to_string(transforms_completed);
+        }
+        std::string state_receipt;
+        if (autokernel_stateful) {
+            state_receipt =
+                "AK_STATE_V1 inputs=" + std::to_string(state_inputs.size()) +
+                " initial_equal=" + std::to_string(state_result.initial_equal ? 1 : 0) +
+                " input_immutable=" + std::to_string(state_result.input_immutable ? 1 : 0) +
+                " final_outputs=" + std::to_string(state_result.final_outputs_verified) +
+                " suite_seed=" + std::to_string(suite_seed);
+        }
+        std::string property_receipt;
+        for (const host_property_result & property : ud.property_results) {
+            char receipt[512];
+            const int n = snprintf(receipt, sizeof(receipt),
+                    "AK_PROP_V2 metric=%s residual=%.17g tolerance=%.17g passed=%d suite_seed=%" PRIu64 " transform=%s",
+                    property.metric_id, property.residual, property.tolerance,
+                    property.passed ? 1 : 0, suite_seed, property.transform.c_str());
+            GGML_ASSERT(n >= 0 && (size_t) n < sizeof(receipt));
+            if (!property_receipt.empty()) {
+                property_receipt += " | ";
+            }
+            property_receipt += receipt;
+        }
+        std::string reference_receipt;
+        if (test_passed && autokernel_properties && reference_mode_active && ud.comparison_count > 0) {
+            char receipt[512];
+            const int n = snprintf(receipt, sizeof(receipt),
+                    "AK_REF_V1 metric=%s observed=%.17g tolerance=%.17g comparisons=%zu oracle=ggml_cpu_reference/v1",
+                    err_metric_id(), ud.max_error_observed, ud.tolerance, ud.comparison_count);
+            GGML_ASSERT(n >= 0 && (size_t) n < sizeof(receipt));
+            reference_receipt = receipt;
+        }
+        std::string checker_receipt;
+        if (autokernel_properties) {
+            checker_receipt =
+                "AK_CHECKER_V1 suite_version=" + std::string(ggml_commit()) +
+                " oracle=host-double sibling_cpu=" +
+                std::to_string(checker_sibling_cpu ? 1 : 0) +
+                " cpu_reference=" + std::to_string(reference_mode_active ? 1 : 0) +
+                " tu_use_hip=" + std::to_string(autokernel_checker_tu_use_hip) +
+                " tu_device_code=" +
+                std::to_string(autokernel_checker_tu_device_code) +
+                " tu_force_mmq=" + std::to_string(autokernel_checker_tu_force_mmq) +
+                " tu_cuda_fa=" + std::to_string(autokernel_checker_tu_cuda_fa) +
+                " tu_rocwmma_fattn=" +
+                std::to_string(autokernel_checker_tu_rocwmma_fattn);
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
+        result.layout_receipt = layout_receipt;
+        result.value_receipt = value_receipt;
+        result.sensitivity_receipt = sensitivity_receipt;
+        result.hostile_receipt = hostile_receipt;
+        result.state_receipt = state_receipt;
+        result.property_receipt = property_receipt;
+        result.reference_receipt = reference_receipt;
+        result.checker_receipt = checker_receipt;
 
         print_test_result_locked(output_printer, result);
 
@@ -2284,9 +3744,10 @@ struct test_get_rows : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 // rows
+                std::mt19937 rng = suite_seed_rng();
                 std::vector<int> data(r*be1*be2);
                 for (int i = 0; i < r*be1*be2; i++) {
-                    data[i] = rand() % m;
+                    data[i] = rng() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
             } else {
@@ -2337,9 +3798,10 @@ struct test_get_rows_back : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 // rows
+                std::mt19937 rng = suite_seed_rng();
                 std::vector<int> data(r*b);
                 for (int i = 0; i < r*b; i++) {
-                    data[i] = rand() % m;
+                    data[i] = rng() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
             } else {
@@ -2350,8 +3812,7 @@ struct test_get_rows_back : public test_case {
 };
 
 static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    std::mt19937 rng = suite_seed_rng();
     for (int i2 = 0; i2 < t->ne[2]; i2++) {
         for (int i1 = 0; i1 < t->ne[1]; i1++) {
             // generate a shuffled subset of row indices
@@ -2552,10 +4013,11 @@ struct test_rope_set_rows : public test_case {
                 init_set_rows_row_ids(t, ne_a[2]);
             } else if (t->type == GGML_TYPE_I32) {
                 // pos
+                std::mt19937 rng = suite_seed_rng();
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = rng() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -2667,10 +4129,9 @@ struct test_argmax : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
+                std::mt19937 rng = suite_seed_rng();
                 // initialize with unique values to avoid ties
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
@@ -2728,10 +4189,9 @@ struct test_count_equal : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
+                std::mt19937 rng = suite_seed_rng();
                 // initialize with unique values to avoid ties
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
@@ -3231,8 +4691,7 @@ struct test_add_id : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                std::mt19937 rng = suite_seed_rng();
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -3803,7 +5262,9 @@ struct test_dsv4_hc : public test_case {
             }
 
             GGML_ASSERT(t->type == GGML_TYPE_F32);
-            std::mt19937 rng(tensor_seed(t));
+            const autokernel_tensor_seed seed = suite_seed_next_tensor();
+            std::mt19937 rng(seed.deterministic ? static_cast<uint32_t>(seed.value)
+                                                : tensor_seed(t));
             std::uniform_real_distribution<float> dist(lo, hi);
             std::vector<float> data(ggml_nelements(t));
             for (float & v : data) {
@@ -3917,6 +5378,8 @@ struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    ggml_tensor * state_input = nullptr;
+    ggml_tensor * final_state = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR3(type, ne_a, ne_b);
@@ -3931,8 +5394,21 @@ struct test_ssm_conv : public test_case {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_set_name(a, "ak_ssm_conv_state_input");
+        ggml_set_name(out, "out");
+        const int64_t state_length = b->ne[0] - 1;
+        GGML_ASSERT(state_length > 0 && a->ne[0] >= state_length);
+        final_state = ggml_view_4d(
+            ctx, a, state_length, a->ne[1], a->ne[2], a->ne[3],
+            a->nb[1], a->nb[2], a->nb[3],
+            (a->ne[0] - state_length) * a->nb[0]);
+        ggml_set_name(final_state, "ak_ssm_conv_final_state");
+        state_input = a;
         return out;
     }
+
+    std::vector<ggml_tensor *> autokernel_state_inputs() override { return { state_input }; }
+    std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { final_state }; }
 };
 
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
@@ -3989,6 +5465,8 @@ struct test_ssm_scan : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const bool    xbc_overlap;
+    ggml_tensor * state_input = nullptr;
+    ggml_tensor * final_state = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap);
@@ -4027,16 +5505,22 @@ struct test_ssm_scan : public test_case {
         }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
         ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids);
+        ggml_set_name(s, "ak_ssm_scan_state_input");
+        ggml_set_name(out, "ak_ssm_scan_output_and_final_state");
+        state_input = s;
+        final_state = out;
         return out;
     }
 
+    std::vector<ggml_tensor *> autokernel_state_inputs() override { return { state_input }; }
+    std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { final_state }; }
+
     // similar to test_mul_mat_id
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
+                std::mt19937 rng = suite_seed_rng();
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -4095,6 +5579,8 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    ggml_tensor * state_input = nullptr;
+    ggml_tensor * final_state = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
@@ -4134,8 +5620,14 @@ struct test_gated_delta_net : public test_case {
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(out, "ak_gdn_output_and_final_state");
+        state_input = state;
+        final_state = out;
         return out;
     }
+
+    std::vector<ggml_tensor *> autokernel_state_inputs() override { return { state_input }; }
+    std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { final_state }; }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -4387,11 +5879,10 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
+            std::mt19937 rng = suite_seed_rng();
             // ids
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
@@ -5200,10 +6691,11 @@ struct test_rope : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // pos
+                std::mt19937 rng = suite_seed_rng();
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = rng() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -5489,7 +6981,7 @@ struct test_im2col_3d : public test_case {
         ggml_set_name(input, "input");
 
         if (v) {
-            input = ggml_view_4d(ctx, input, ne_input[0] - 2, ne_input[1] - 2, ne_input[2] - 2, ne_input[3] - 2, input->nb[1], input->nb[2], input->nb[3], 0);
+            input = ggml_view_4d(ctx, input, ne_input[0] - 2, ne_input[1] - 2, ne_input[2] - 2, ne_input[3], input->nb[1], input->nb[2], input->nb[3], 0);
             ggml_set_name(input, "view_of_input");
         }
 
@@ -5847,14 +7339,13 @@ struct test_argsort : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::mt19937 rng = suite_seed_rng();
             if (t->type == GGML_TYPE_I32) {
                 // indices
                 std::vector<int> data(ggml_nelements(t));
                 for (int i = 0; i < ggml_nelements(t); i++) {
-                    data[i] = rand();
+                    data[i] = rng();
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
@@ -5975,9 +7466,8 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::mt19937 rng = suite_seed_rng();
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
@@ -6850,6 +8340,8 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    ggml_tensor * cache_k = nullptr;
+    ggml_tensor * cache_v = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
@@ -6932,9 +8424,14 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
+        cache_k = k;
+        cache_v = v;
 
         return out;
     }
+
+    std::vector<ggml_tensor *> autokernel_state_inputs() override { return { cache_k, cache_v }; }
+    std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { cache_k, cache_v }; }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -7546,9 +9043,6 @@ struct test_generic_op : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
-        std::random_device rd;
-        std::default_random_engine rng(rd());
-
         for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
             ggml_tensor * t = out->src[i];
             if (!t) {
@@ -7562,6 +9056,7 @@ struct test_generic_op : public test_case {
             }
 
             if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64) {
+                std::mt19937 rng = suite_seed_rng();
                 if (op == GGML_OP_GET_ROWS || op == GGML_OP_GET_ROWS_BACK) {
                     const int64_t num_rows = sources[0].ne[1];
                     const int64_t nels = ggml_nelements(t);
@@ -7738,9 +9233,10 @@ public:
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // pos
+                std::mt19937 rng = suite_seed_rng();
                 std::vector<int> data(hp.n_tokens);
                 for (int i = 0; i < hp.n_tokens; i++) {
-                    data[i] = rand() % hp.n_ctx;
+                    data[i] = rng() % hp.n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, hp.n_tokens * sizeof(int));
             } else {
@@ -10146,7 +11642,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers,
+                         bool suite_seed_enabled, uint64_t suite_seed, bool autokernel_properties,
+                         bool autokernel_layouts, bool autokernel_value_transforms,
+                         bool autokernel_hostile_distributions,
+                         bool autokernel_stateful) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -10224,7 +11724,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             while (my_begin < test_cases.size()) {
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
-                    test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
+                    if (suite_seed_enabled) {
+                        test->set_suite_seed(suite_seed, i);
+                    }
+                    test_status_t status = test->eval(
+                        b, b_cpu, op_names_filter, output_printer, autokernel_properties,
+                        autokernel_layouts,
+                        autokernel_value_transforms,
+                        autokernel_hostile_distributions,
+                        autokernel_stateful,
+                        set_use_ref != nullptr);
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                         continue;
                     }
@@ -10428,9 +11937,88 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+static bool autokernel_stateful_self_test() {
+    ggml_init_params params = {
+        /* .mem_size = */ 2 * 1024 * 1024,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    test_ssm_conv ssm_conv(GGML_TYPE_F32, { 5, 2, 1, 1 }, { 3, 2, 1, 1 });
+    ggml_tensor * conv_out = ssm_conv.build_graph(ctx.get());
+    const std::vector<ggml_tensor *> conv_inputs = ssm_conv.autokernel_state_inputs();
+    const std::vector<ggml_tensor *> conv_final = ssm_conv.autokernel_final_state_outputs();
+
+    test_ssm_scan ssm_scan(GGML_TYPE_F32, 4, 1, 2, 1, 3, 1, false);
+    ggml_tensor * scan_out = ssm_scan.build_graph(ctx.get());
+    const std::vector<ggml_tensor *> scan_inputs = ssm_scan.autokernel_state_inputs();
+    const std::vector<ggml_tensor *> scan_final = ssm_scan.autokernel_final_state_outputs();
+
+    test_flash_attn_ext flash(8, 8, 2, { 1, 1 }, 4, 1, false, false);
+    ggml_tensor * flash_out = flash.build_graph(ctx.get());
+    const std::vector<ggml_tensor *> flash_inputs = flash.autokernel_state_inputs();
+    const std::vector<ggml_tensor *> flash_final = flash.autokernel_final_state_outputs();
+
+    test_gated_delta_net gdn(GGML_TYPE_F32, 2, 4, 3, 1);
+    ggml_tensor * gdn_out = gdn.build_graph(ctx.get());
+    const std::vector<ggml_tensor *> gdn_inputs = gdn.autokernel_state_inputs();
+    const std::vector<ggml_tensor *> gdn_final = gdn.autokernel_final_state_outputs();
+
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    for (ggml_tensor * output : { conv_out, scan_out, flash_out, gdn_out }) {
+        ggml_build_forward_expand(graph, output);
+    }
+    for (const std::vector<ggml_tensor *> * finals :
+            { &conv_final, &scan_final, &flash_final, &gdn_final }) {
+        for (ggml_tensor * final_state : *finals) {
+            ggml_build_forward_expand(graph, final_state);
+        }
+    }
+    auto graph_contains = [graph](ggml_tensor * expected) {
+        for (int index = 0; index < ggml_graph_n_nodes(graph); ++index) {
+            if (ggml_graph_node(graph, index) == expected) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const bool contracts_ok =
+        conv_inputs.size() == 1 && conv_inputs[0] == conv_out->src[0] &&
+        conv_final.size() == 1 && conv_final[0]->view_src == conv_inputs[0] &&
+        conv_final[0]->ne[0] == 2 &&
+        scan_inputs.size() == 1 && scan_inputs[0] == scan_out->src[0] &&
+        scan_final == std::vector<ggml_tensor *> { scan_out } &&
+        flash_inputs.size() == 2 && flash_inputs[0] == flash_out->src[1] &&
+        flash_inputs[1] == flash_out->src[2] && flash_final == flash_inputs &&
+        gdn_inputs.size() == 1 && gdn_inputs[0] == gdn_out->src[5] &&
+        gdn_final == std::vector<ggml_tensor *> { gdn_out } &&
+        std::all_of(conv_final.begin(), conv_final.end(), graph_contains) &&
+        std::all_of(scan_final.begin(), scan_final.end(), graph_contains) &&
+        std::all_of(flash_final.begin(), flash_final.end(), graph_contains) &&
+        std::all_of(gdn_final.begin(), gdn_final.end(), graph_contains);
+
+    const std::vector<uint8_t> original = { 1, 2, 3, 4 };
+    std::vector<uint8_t> planted_initial = original;
+    planted_initial[0] ^= 1;
+    std::vector<uint8_t> planted_mutation = original;
+    planted_mutation[3] ^= 1;
+    const bool planted_ok = planted_initial != original && planted_mutation != original;
+    const bool passed = contracts_ok && planted_ok;
+    fprintf(stderr,
+            "AUTOKERNEL_STATE_SELF_TEST passed=%d targets=4 initial_mismatch_caught=%d mutation_caught=%d\n",
+            passed ? 1 : 0, planted_initial != original ? 1 : 0,
+            planted_mutation != original ? 1 : 0);
+    return passed;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>] [-j <n>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [-j <n>] [--suite-seed <u64>] [--repeat-suite <n>] [--autokernel-properties] [--autokernel-layouts] [--autokernel-value-transforms] [--autokernel-hostile-distributions] [--autokernel-stateful]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -10443,6 +12031,16 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --suite-seed <u64> deterministically derives tensor seeds from suite, op, case, and tensor ids\n");
+    printf("    --repeat-suite <n> repeats each selected test in one backend process (1..10000; test mode, -j 1 only)\n");
+    printf("    --autokernel-properties enables raw-buffer host property checks and their planted-defect self-test\n");
+    printf("    --autokernel-layouts runs only non-contiguous/offset input cases and treats unsupported layouts as failures\n");
+    printf("    --autokernel-value-transforms runs packed floating cases at identity, x3, x0.01, and negate\n");
+    printf("    --autokernel-hostile-distributions runs identical shapes with alternating, sparse-outlier, and cancellation inputs\n");
+    printf("    --autokernel-stateful checks explicit state inputs, input immutability, and final-state outputs\n");
+    printf("    --autokernel-stateful-self-test checks four state contracts with no backend work\n");
+    printf("    --autokernel-layout-self-test checks layout classification only, with no backend work\n");
+    printf("    --autokernel-property-self-test runs only the planted-defect gate, with no backend work\n");
 }
 
 int main(int argc, char ** argv) {
@@ -10453,6 +12051,17 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
+    bool suite_seed_enabled = false;
+    uint64_t suite_seed = 0;
+    size_t repeat_suite = 1;
+    bool autokernel_properties = false;
+    bool autokernel_layouts = false;
+    bool autokernel_value_transforms = false;
+    bool autokernel_hostile_distributions = false;
+    bool autokernel_stateful = false;
+    bool autokernel_stateful_self_test_only = false;
+    bool autokernel_layout_self_test_only = false;
+    bool autokernel_property_self_test_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -10518,10 +12127,100 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--suite-seed") == 0) {
+            if (i + 1 < argc) {
+                char * end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = strtoull(argv[++i], &end, 10);
+                if (errno != 0 || end == argv[i] || *end != '\0') {
+                    usage(argv);
+                    return 1;
+                }
+                suite_seed = static_cast<uint64_t>(parsed);
+                suite_seed_enabled = true;
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--repeat-suite") == 0) {
+            if (i + 1 < argc) {
+                char * end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = strtoull(argv[++i], &end, 10);
+                if (errno != 0 || end == argv[i] || *end != '\0' || parsed < 1 || parsed > 10000) {
+                    usage(argv);
+                    return 1;
+                }
+                repeat_suite = static_cast<size_t>(parsed);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--autokernel-properties") == 0) {
+            autokernel_properties = true;
+        } else if (strcmp(argv[i], "--autokernel-layouts") == 0) {
+            autokernel_layouts = true;
+        } else if (strcmp(argv[i], "--autokernel-value-transforms") == 0) {
+            autokernel_value_transforms = true;
+        } else if (strcmp(argv[i], "--autokernel-hostile-distributions") == 0) {
+            autokernel_hostile_distributions = true;
+        } else if (strcmp(argv[i], "--autokernel-stateful") == 0) {
+            autokernel_stateful = true;
+        } else if (strcmp(argv[i], "--autokernel-stateful-self-test") == 0) {
+            autokernel_stateful_self_test_only = true;
+        } else if (strcmp(argv[i], "--autokernel-layout-self-test") == 0) {
+            autokernel_layout_self_test_only = true;
+        } else if (strcmp(argv[i], "--autokernel-property-self-test") == 0) {
+            autokernel_properties = true;
+            autokernel_property_self_test_only = true;
         } else {
             usage(argv);
             return 1;
         }
+    }
+
+    if (autokernel_properties && (mode != MODE_TEST || !suite_seed_enabled)) {
+        fprintf(stderr, "--autokernel-properties requires test mode and --suite-seed\n");
+        return 1;
+    }
+    if (autokernel_layouts && (mode != MODE_TEST || !suite_seed_enabled)) {
+        fprintf(stderr, "--autokernel-layouts requires test mode and --suite-seed\n");
+        return 1;
+    }
+    if (autokernel_value_transforms && (mode != MODE_TEST || !suite_seed_enabled)) {
+        fprintf(stderr, "--autokernel-value-transforms requires test mode and --suite-seed\n");
+        return 1;
+    }
+    if (autokernel_hostile_distributions && (mode != MODE_TEST || !suite_seed_enabled)) {
+        fprintf(stderr, "--autokernel-hostile-distributions requires test mode and --suite-seed\n");
+        return 1;
+    }
+    if (autokernel_stateful && (mode != MODE_TEST || !suite_seed_enabled)) {
+        fprintf(stderr, "--autokernel-stateful requires test mode and --suite-seed\n");
+        return 1;
+    }
+    if (repeat_suite != 1 && (mode != MODE_TEST || parallel_workers != 1)) {
+        fprintf(stderr, "--repeat-suite requires test mode and -j 1\n");
+        return 1;
+    }
+    if ((autokernel_layouts ? 1 : 0) + (autokernel_value_transforms ? 1 : 0) +
+            (autokernel_hostile_distributions ? 1 : 0) +
+            (autokernel_stateful ? 1 : 0) > 1) {
+        fprintf(stderr, "AutoKernel layout, value, hostile-distribution, and stateful probes are separate passes\n");
+        return 1;
+    }
+    if (autokernel_properties && !host_property_seeded_defect_gate(suite_seed)) {
+        fprintf(stderr, "AutoKernel host property planted-defect gate failed\n");
+        return 1;
+    }
+    if (autokernel_property_self_test_only) {
+        return 0;
+    }
+    if (autokernel_layout_self_test_only) {
+        return autokernel_layout_self_test() ? 0 : 1;
+    }
+    if (autokernel_stateful_self_test_only) {
+        return autokernel_stateful_self_test() ? 0 : 1;
     }
 
     // load and enumerate backends
@@ -10570,7 +12269,15 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool ok = true;
+        for (size_t repeat = 0; repeat < repeat_suite; ++repeat) {
+            ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter,
+                              output_printer.get(), test_file_path, parallel_workers,
+                              suite_seed_enabled, suite_seed, autokernel_properties,
+                              autokernel_layouts, autokernel_value_transforms,
+                              autokernel_hostile_distributions,
+                              autokernel_stateful) && ok;
+        }
 
         if (ok) {
             n_ok++;
