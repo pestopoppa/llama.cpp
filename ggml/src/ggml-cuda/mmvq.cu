@@ -397,6 +397,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         if (ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
             return 4;
         }
+        // CDNA2 Q4_K batch-1 discovery: one wave owns one output row. This
+        // removes the cross-wave reduction while small_k preserves total wave
+        // count by launching twice as many row blocks.
+        if (ncols_dst == 1 && type == GGML_TYPE_Q4_K) {
+            return 1;
+        }
         switch (ncols_dst) {
             case 1:
             case 2:
