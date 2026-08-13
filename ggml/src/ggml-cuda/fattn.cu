@@ -504,6 +504,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // CDNA2 D64 single-token/GQA7 decode: select the vector kernel directly.
+    // This is the exact shape that otherwise falls through to TILE when the
+    // optional ROCWMMA selector is disabled.
+    if (GGML_CUDA_CC_IS_CDNA2(cc) && can_use_vector_kernel && Q->ne[0] == 64 &&
+            Q->ne[1] == 1 && Q->ne[3] == 1 && K->type == GGML_TYPE_F16 &&
+            V->type == GGML_TYPE_F16 && gqa_ratio == 7 && gqa_opt_applies) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // Use the WMMA kernel if possible:
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 320 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
