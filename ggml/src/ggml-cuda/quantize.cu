@@ -51,6 +51,62 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+// CDNA2 batch-1 MMVQ activation quantizer. One physical wave covers the same
+// 256 input values as four waves in quantize_q8_1: eight lanes cooperate on
+// each 32-value Q8_1 block and every lane quantizes four contiguous values.
+// Keeping 256 values per workgroup preserves the hot decode launch grid while
+// reducing scalar thread and shuffle work.
+__launch_bounds__(64, 1)
+static __global__ void quantize_q8_1_cdna2_vec4(
+        const float * x_ptr, void * vy_ptr,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = 4*((int64_t) blockDim.x*blockIdx.x + threadIdx.x);
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+    const int64_t x_base = i3*s03 + i2*s02 + i1*s01 + i0;
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    float vals[4];
+    float amax = 0.0f;
+    float sum  = 0.0f;
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        vals[j] = i0 + j < ne00 ? x[x_base + j] : 0.0f;
+        amax = fmaxf(amax, fabsf(vals[j]));
+        sum += vals[j];
+    }
+
+    amax = warp_reduce_max<8>(amax);
+    sum  = warp_reduce_sum<8>(sum);
+
+    const float d = amax / 127.0f;
+    char4 q;
+    q.x = amax == 0.0f ? 0 : roundf(vals[0] / d);
+    q.y = amax == 0.0f ? 0 : roundf(vals[1] / d);
+    q.z = amax == 0.0f ? 0 : roundf(vals[2] / d);
+    q.w = amax == 0.0f ? 0 : roundf(vals[3] / d);
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+    const int64_t ib  = i_cont / QK8_1;
+    const int64_t iqs = i_cont % QK8_1;
+    ((char4 *) y[ib].qs)[iqs/4] = q;
+
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -420,6 +476,18 @@ void quantize_row_q8_1_cuda(
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (GGML_CUDA_CC_IS_CDNA2(cc)) {
+        constexpr int cdna2_block_size = 64;
+        const int64_t block_num_x = (ne0 + 4*cdna2_block_size - 1) / (4*cdna2_block_size);
+        const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+        const dim3 block_size(cdna2_block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+        ggml_cuda_kernel_launch(quantize_q8_1_cdna2_vec4, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+        GGML_UNUSED(type_src0);
+        return;
+    }
 
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
