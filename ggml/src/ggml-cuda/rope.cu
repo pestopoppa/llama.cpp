@@ -398,8 +398,10 @@ static void rope_neox_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int rope_block_size = GGML_CUDA_CC_IS_CDNA2(cc) ? 64 : CUDA_ROPE_BLOCK_SIZE;
+    const dim3 block_dims(1, rope_block_size, 1);
+    const int  n_blocks_x = (ne00 + 2 * rope_block_size - 1) / (2 * rope_block_size);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
