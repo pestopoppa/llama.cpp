@@ -1175,12 +1175,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         }
     }
 
-#if defined(CDNA)
     // A single-token decode column otherwise falls through to the two-column
     // kernel and computes a duplicate, out-of-bounds column. Keep this narrow
     // until the CDNA decode specialization has broader shape coverage.
     if constexpr (DKQ == 64 && DV == 64 && ncols2 == 1) {
-        if (Q->ne[1] == 1) {
+        if (GGML_CUDA_CC_IS_CDNA(cc) && Q->ne[1] == 1) {
             static const bool log_singlecol = getenv("GGML_HIP_LOG_FATTN_D64_SINGLECOL") != nullptr;
             static bool logged_singlecol = false;
             if (log_singlecol && !logged_singlecol) {
@@ -1196,7 +1195,6 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
-#endif // defined(CDNA)
 #endif // GGML_USE_HIP
 
 #ifndef GGML_USE_HIP
