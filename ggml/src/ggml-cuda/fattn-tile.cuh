@@ -165,6 +165,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 32, 256, 2,  32,  40)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 64, 256, 2,  32,  40)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  1,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  2,  64, 3,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  4, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  8, 128, 2,  32,  64)
@@ -1173,6 +1174,29 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
+
+#if defined(CDNA)
+    // A single-token decode column otherwise falls through to the two-column
+    // kernel and computes a duplicate, out-of-bounds column. Keep this narrow
+    // until the CDNA decode specialization has broader shape coverage.
+    if constexpr (DKQ == 64 && DV == 64 && ncols2 == 1) {
+        if (Q->ne[1] == 1) {
+            static const bool log_singlecol = getenv("GGML_HIP_LOG_FATTN_D64_SINGLECOL") != nullptr;
+            static bool logged_singlecol = false;
+            if (log_singlecol && !logged_singlecol) {
+                GGML_LOG_INFO("GGML_HIP_FATTN_ROUTE route=tile_d64_singlecol ncols1=1 ncols2=1\n");
+                logged_singlecol = true;
+            }
+            constexpr int cols_per_block = 1;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block, ncols2, use_logit_softcap>;
+            launch_fattn<DV, cols_per_block, ncols2>
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+            return;
+        }
+    }
+#endif // defined(CDNA)
 #endif // GGML_USE_HIP
 
 #ifndef GGML_USE_HIP
