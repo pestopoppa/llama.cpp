@@ -9596,6 +9596,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen2.5-Coder-0.5B decode selector coverage: D64, Q1, batch 1,
+    // F16 K/V, GQA ratio 7, masked/padded KV. This exact case exercises the
+    // CDNA2 vector-attention selector rather than only nearby GQA ratios.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 2, {7, 1}, 512, 1, true, false, 0.0f, 0.0f,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
