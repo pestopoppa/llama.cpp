@@ -475,7 +475,8 @@ static bool autokernel_write_ready_and_wait(const cmd_params & params) {
     if (ready < 0) {
         return false;
     }
-    const bool wrote = write(ready, payload.data(), payload.size()) == (ssize_t) payload.size()
+    const bool wrote = fchmod(ready, 0600) == 0
+        && write(ready, payload.data(), payload.size()) == (ssize_t) payload.size()
         && fsync(ready) == 0;
     close(ready);
     if (!wrote) {
