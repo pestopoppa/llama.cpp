@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cerrno>
 #include <cinttypes>
@@ -13,6 +14,9 @@
 #if defined(__linux__)
 #include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 #include <iterator>
 #include <iomanip>
@@ -369,6 +373,10 @@ struct cmd_params {
     bool                             no_warmup;
     bool                             autokernel_harden;
     uint64_t                         autokernel_seed;
+    std::string                      autokernel_ready_file;
+    std::string                      autokernel_continue_file;
+    std::string                      autokernel_ready_token;
+    uint64_t                         autokernel_ready_timeout_ms;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -416,9 +424,85 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* autokernel_harden    */ false,
     /* autokernel_seed      */ 0,
+    /* autokernel_ready_file */ "",
+    /* autokernel_continue_file */ "",
+    /* autokernel_ready_token */ "",
+    /* autokernel_ready_timeout_ms */ 600000,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
+
+// This barrier is intentionally available only to the governed AutoKernel
+// measurement instrument.  The ready marker is emitted after model/context
+// construction and warmups but immediately before the first timed repetition.
+// The supervisor validates its in-window KFD/maps evidence, releases its
+// cold-load mutex, then creates the token-bound continue marker. No timed work
+// begins until that acknowledgement has been read exactly.
+static bool autokernel_ready_continue_enabled(const cmd_params & params) {
+    return !params.autokernel_ready_file.empty()
+        || !params.autokernel_continue_file.empty()
+        || !params.autokernel_ready_token.empty();
+}
+
+static bool autokernel_ready_continue_valid(const cmd_params & params) {
+    const auto valid_path = [](const std::string & value) {
+        return !value.empty() && value.front() == '/' && value.find("..") == std::string::npos;
+    };
+    if (!params.autokernel_harden || !valid_path(params.autokernel_ready_file)
+            || !valid_path(params.autokernel_continue_file)
+            || params.autokernel_ready_file == params.autokernel_continue_file
+            || params.autokernel_ready_timeout_ms == 0
+            || params.autokernel_ready_token.size() != 64) {
+        return false;
+    }
+    return std::all_of(params.autokernel_ready_token.begin(),
+                       params.autokernel_ready_token.end(), [](unsigned char c) {
+        return std::isxdigit(c) != 0;
+    });
+}
+
+static bool autokernel_write_ready_and_wait(const cmd_params & params) {
+#if !defined(__linux__)
+    (void) params;
+    return false;
+#else
+    const std::string payload = "epyc.autokernel.ready_continue.v1 "
+        + std::to_string((long long) getpid()) + " "
+        + std::to_string(params.autokernel_seed) + " "
+        + std::to_string(params.reps) + " " + params.autokernel_ready_token + "\n";
+    const int ready = open(params.autokernel_ready_file.c_str(),
+                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (ready < 0) {
+        return false;
+    }
+    const bool wrote = write(ready, payload.data(), payload.size()) == (ssize_t) payload.size()
+        && fsync(ready) == 0;
+    close(ready);
+    if (!wrote) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(params.autokernel_ready_timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = open(params.autokernel_continue_file.c_str(),
+                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) {
+            struct stat st = {};
+            char buffer[80] = {};
+            const ssize_t size = fstat(fd, &st) == 0 && S_ISREG(st.st_mode)
+                ? read(fd, buffer, sizeof(buffer)) : -1;
+            close(fd);
+            return size == 65 && std::string(buffer, 64) == params.autokernel_ready_token
+                && buffer[64] == '\n';
+        }
+        if (errno != ENOENT) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+#endif
+}
 
 static void print_usage(int /* argc */, char ** argv) {
     printf("usage: %s [options]\n", argv[0]);
@@ -436,6 +520,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  --autokernel-harden <seed>                 trusted T1 mode: unique content/addresses plus an ordinary/full-device-sync hybrid pair per repetition\n");
+    printf("  --autokernel-ready-file <absolute-path>    opt-in governed ready/continue barrier (requires all ready options)\n");
+    printf("  --autokernel-continue-file <absolute-path> opt-in governed ready/continue barrier acknowledgement\n");
+    printf("  --autokernel-ready-token <64-hex>          sealed ready/continue barrier nonce\n");
+    printf("  --autokernel-ready-timeout-ms <n>          barrier timeout in milliseconds (default: %" PRIu64 ")\n", cmd_params_defaults.autokernel_ready_timeout_ms);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -989,6 +1077,30 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.autokernel_harden = true;
                 params.autokernel_seed = std::stoull(argv[i]);
+            } else if (arg == "--autokernel-ready-file") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.autokernel_ready_file = argv[i];
+            } else if (arg == "--autokernel-continue-file") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.autokernel_continue_file = argv[i];
+            } else if (arg == "--autokernel-ready-token") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.autokernel_ready_token = argv[i];
+            } else if (arg == "--autokernel-ready-timeout-ms") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.autokernel_ready_timeout_ms = std::stoull(argv[i]);
             } else if (arg == "--prio") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2386,6 +2498,13 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+    if (autokernel_ready_continue_enabled(params)
+            && !autokernel_ready_continue_valid(params)) {
+        fprintf(stderr,
+                "%s: --autokernel-ready-* requires --autokernel-harden, two distinct absolute files, a 64-hex token, and a positive timeout\n",
+                __func__);
+        return 1;
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -2620,6 +2739,24 @@ int llama_bench(int argc, char ** argv) {
                     ggml_threadpool_free_fn(threadpool);
                     return 1;
                 }
+            }
+
+            // This is deliberately after all model/context allocation and
+            // warmups, and directly before the first get_time_ns() timed
+            // region below.  The ready/continue handshake therefore provides
+            // an actual load-to-measurement boundary rather than inferring one
+            // from buffered JSONL output.
+            if (autokernel_ready_continue_enabled(params)
+                    && !autokernel_write_ready_and_wait(params)) {
+                fprintf(stderr,
+                        "%s: --autokernel-ready-* handshake failed before timed repetitions\n",
+                        __func__);
+                for (llama_context * item : contexts) {
+                    llama_free(item);
+                }
+                llama_model_free(lmodel);
+                ggml_threadpool_free_fn(threadpool);
+                return 1;
             }
 
             std::vector<std::string> input_hashes;
