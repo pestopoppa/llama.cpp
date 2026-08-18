@@ -11440,6 +11440,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // AutoKernel odd-GQA7 authority.  The reviewed case-set selector keeps the
+    // established generic FLASH_ATTN_EXT corpus at 2868 cases while allowing
+    // a second, separately receipted invocation to exercise these exact three
+    // D64/Q1 shapes.  The controller pins this environment variable to either
+    // the empty string or this one literal; inherited process state cannot
+    // silently widen the suite.
+    const char * autokernel_case_set = std::getenv("AUTOKERNEL_CORRECTNESS_CASE_SET");
+    if (autokernel_case_set != nullptr && std::strcmp(autokernel_case_set, "odd_gqa7_d64_q1_v1") == 0) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {7, 1},  128, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {7, 1},  512, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {7, 1}, 2048, 1, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
