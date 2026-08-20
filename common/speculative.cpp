@@ -1588,6 +1588,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+
+                // The server may switch contexts before the next draft decode.
+                llama_synchronize(ctx_dft);
             }
         }
 
