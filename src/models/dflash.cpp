@@ -7,6 +7,16 @@
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
+    hparams.f_final_logit_softcapping = 0.0f;
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,      hparams.f_final_logit_softcapping, false);
+    ml.get_key(LLM_KV_EMBEDDING_SCALE,              hparams.f_embedding_scale, false);
+
+    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,        hparams.dflash_block_size,       false);
+    ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
+    ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -119,6 +129,29 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
     }
 
+    const struct ggml_tensor * selector_meta = ml.get_tensor_meta("selector_hidden.weight");
+    if (selector_meta) {
+        const int64_t rank = hparams.dflash_selector_rank;
+        if (rank <= 0 || hparams.dflash_block_size <= 0 || hparams.dflash_selector_top_k <= 0 ||
+                hparams.dflash_conv_kernel_size <= 0 || hparams.dflash_conv_group_size <= 0) {
+            throw std::runtime_error("DFlash2 model is missing conv/selector metadata");
+        }
+        if (n_embd % hparams.dflash_conv_group_size != 0) {
+            throw std::runtime_error("DFlash2 hidden size must be divisible by conv_group_size");
+        }
+        if (n_embd < hparams.dflash_selector_top_k * (hparams.dflash_selector_top_k + 1)) {
+            throw std::runtime_error("DFlash2 hidden size is too small for the selector lattice");
+        }
+
+        dflash_selector_prev   = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_PREV,   "weight"), { rank, n_vocab }, 0);
+        dflash_selector_next   = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_NEXT,   "weight"), { rank, n_vocab }, 0);
+        dflash_selector_hidden = create_tensor(tn(LLM_TENSOR_DFLASH_SELECTOR_HIDDEN, "weight"), { n_embd, rank }, 0);
+
+        LLAMA_LOG_INFO("%s: DFlash2 conv kernel = %u, group = %u, selector rank = %u, top-k = %u\n", __func__,
+                hparams.dflash_conv_kernel_size, hparams.dflash_conv_group_size,
+                hparams.dflash_selector_rank, hparams.dflash_selector_top_k);
+    }
+
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
@@ -214,6 +247,16 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+
+        if (selector_meta) {
+            const int64_t kernel = hparams.dflash_conv_kernel_size;
+            const int64_t groups = n_embd / hparams.dflash_conv_group_size;
+            const int64_t projected = 2 * kernel * groups;
+            layer.dflash_attn_conv_base = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_CONV_BASE, i), { n_embd, kernel, 2 }, 0);
+            layer.dflash_attn_conv_proj = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_CONV_PROJ, "weight", i), { n_embd, projected }, 0);
+            layer.dflash_ffn_conv_base  = create_tensor(tn(LLM_TENSOR_DFLASH_FFN_CONV_BASE, i), { n_embd, kernel, 2 }, 0);
+            layer.dflash_ffn_conv_proj  = create_tensor(tn(LLM_TENSOR_DFLASH_FFN_CONV_PROJ,  "weight", i), { n_embd, projected }, 0);
+        }
     }
 }
 
