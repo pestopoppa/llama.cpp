@@ -1468,6 +1468,11 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // [G15/G16] always-print the NMSE when GGML_TESTBACKEND_PRINT_NMSE=1 (default off):
+            // the G16 gate is the unrelaxed 1e-7, and passing cases print no ERR otherwise.
+            if (getenv("GGML_TESTBACKEND_PRINT_NMSE") != nullptr && strcmp(ggml_op_desc(t1), "GATED_DELTA_NET") == 0) {
+                printf("[GATED_DELTA_NET %s] NMSE = %.10f ", ud->tc->vars().c_str(), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
