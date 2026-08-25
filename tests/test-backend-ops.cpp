@@ -10092,6 +10092,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // [G15] n_seqs=2 (the "-np >= 2" occupancy knob): 512 blocks >= 3*nsm, fires at the
+    // default MIN_BLOCKS_PER_SM=3 too — production frontdoor serves -np 2.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 2));
     // Qwen3.6-27B geometry: 48 heads, d=128 -> fires chunked path (blocks=384)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 512, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1024, 1));
