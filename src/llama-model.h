@@ -714,13 +714,39 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
 
+    // storage for env-gated GEMV-fusion weight tensors (see add_fused_tensor)
+    ggml_context_ptr ctx_fusion;
+    ggml_backend_buffer_ptr buf_fusion;
+
+    struct fused_tensor_desc {
+        ggml_tensor * dst;
+        std::vector<const ggml_tensor *> srcs;
+    };
+    std::vector<fused_tensor_desc> fused_tensor_descs;
+
     explicit llama_model_base(const llama_model_params & params);
-    virtual ~llama_model_base() = default;
+    virtual ~llama_model_base();
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // --- GEMV graph-fusion (env-gated, default OFF; no effect on production paths) ---
+    // Synthesizes fused weight tensors at model load: ffn_gate_up_exps from
+    // ffn_gate_exps+ffn_up_exps (GGML_GEMV_FUSION_GATE_UP=1) and attn qkv from
+    // wq+wk+wv (GGML_GEMV_FUSION_QKV=1), cutting per-op barriers at decode.
+    static bool fusion_gate_up_enabled();
+    static bool fusion_qkv_enabled();
+    // Creates fused-tensor metadata (concat of srcs along ne[1] at row granularity,
+    // outer dims shared) in a dedicated context; data is filled by
+    // build_fused_tensor_data() after weight loading completes.
+    ggml_tensor * add_fused_tensor(
+            const std::vector<const ggml_tensor *> & srcs,
+            const std::initializer_list<int64_t> & ne,
+            const char * name);
+    // Allocates the fused-tensor buffer and copies the concatenated weights.
+    void build_fused_tensor_data();
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

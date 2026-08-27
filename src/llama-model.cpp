@@ -1648,6 +1648,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // GEMV graph-fusion (env-gated, default off): allocate and fill the synthesized
+    // fused weight tensors now that all source weights are resident.
+    build_fused_tensor_data();
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -2812,6 +2816,12 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE) {}
 
+llama_model_base::~llama_model_base() {
+    // fused-tensor context/buffer are members; buffers must be released before the
+    // context (ggml_backend_buffer_ptr dtor runs first as members are destroyed in
+    // reverse declaration order: buf_fusion is declared after ctx_fusion).
+}
+
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
@@ -2822,6 +2832,20 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+
+        // GEMV graph-fusion arm (GGML_GEMV_FUSION_GATE_UP=1): synthesize the merged
+        // gate_up tensor from the separate per-expert tensors so build_moe_ffn takes
+        // its single-mul_mat_id fused path, removing one barrier per MoE layer.
+        if (fusion_gate_up_enabled() &&
+                layer.ffn_gate_exps && layer.ffn_up_exps &&
+                layer.ffn_gate_exps->type == layer.ffn_up_exps->type &&
+                layer.ffn_gate_exps->type != GGML_TYPE_NVFP4) {
+            const std::string name = format("blk.%d.ffn_gate_up_exps.fused", bid);
+            layer.ffn_gate_up_exps = add_fused_tensor(
+                    { layer.ffn_gate_exps, layer.ffn_up_exps },
+                    { n_embd_, n_ff_ * 2, n_expert_ },
+                    name.c_str());
+        }
     }
 }
 
@@ -2839,12 +2863,108 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+
+        // GEMV graph-fusion arm (GGML_GEMV_FUSION_QKV=1): synthesize the merged
+        // QKV weight from wq+wk+wv so arch graph builders that consume wqkv run a
+        // single mul_mat instead of three, removing two barriers per attention layer.
+        if (fusion_qkv_enabled() &&
+                layer.wq && layer.wk && layer.wv &&
+                layer.wq->type == layer.wk->type && layer.wq->type == layer.wv->type &&
+                layer.wq->type != GGML_TYPE_NVFP4) {
+            const std::string name = format("blk.%d.attn_qkv.fused", bid);
+            layer.wqkv = add_fused_tensor(
+                    { layer.wq, layer.wk, layer.wv },
+                    { n_embd_, n_embd_qkv },
+                    name.c_str());
+        }
     }
 }
 
 const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
     const auto & v = model->target_layer_ids;
     return v.empty() ? nullptr : v.data();
+}
+
+bool llama_model_base::fusion_gate_up_enabled() {
+    const char * v = getenv("GGML_GEMV_FUSION_GATE_UP");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+bool llama_model_base::fusion_qkv_enabled() {
+    const char * v = getenv("GGML_GEMV_FUSION_QKV");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+ggml_tensor * llama_model_base::add_fused_tensor(
+        const std::vector<const ggml_tensor *> & srcs,
+        const std::initializer_list<int64_t> & ne,
+        const char * name) {
+    if (srcs.empty()) {
+        return nullptr;
+    }
+    if (!ctx_fusion) {
+        // metadata-only context; storage is allocated in build_fused_tensor_data()
+        const size_t ctx_size = ggml_tensor_overhead() * (hparams.n_layer_all * 2 + 16);
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_fusion.reset(ggml_init(params));
+        GGML_ASSERT(ctx_fusion && "failed to create gemv-fusion context");
+    }
+
+    const ggml_tensor * src0 = srcs[0];
+    const auto ne_vec = std::vector<int64_t>(ne);
+    GGML_ASSERT(ne_vec.size() <= 3);
+    ggml_tensor * dst = ne_vec.size() == 3
+        ? ggml_new_tensor_3d(ctx_fusion.get(), src0->type, ne_vec[0], ne_vec[1], ne_vec[2])
+        : ggml_new_tensor_2d(ctx_fusion.get(), src0->type, ne_vec[0], ne_vec[1]);
+    ggml_set_name(dst, name);
+
+    for (const ggml_tensor * s : srcs) {
+        GGML_ASSERT(s->type == src0->type);
+        GGML_ASSERT(s->ne[0] == dst->ne[0]);
+        GGML_ASSERT(s->ne[2] == dst->ne[2] && s->ne[3] == dst->ne[3]);
+    }
+
+    fused_tensor_descs.push_back({ dst, srcs });
+
+    LLAMA_LOG_INFO("%s: gemv-fusion: synthesized fused tensor %s [%lld, %lld, %lld]\n",
+            __func__, name, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2]);
+    return dst;
+}
+
+void llama_model_base::build_fused_tensor_data() {
+    if (!ctx_fusion || fused_tensor_descs.empty()) {
+        return;
+    }
+
+    buf_fusion.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_fusion.get(), ggml_backend_cpu_buffer_type()));
+    if (!buf_fusion) {
+        throw std::runtime_error(format("%s: failed to allocate buffer for gemv-fusion tensors", __func__));
+    }
+    ggml_backend_buffer_set_usage(buf_fusion.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    for (const auto & desc : fused_tensor_descs) {
+        ggml_tensor * dst = desc.dst;
+        const size_t row_bytes = ggml_row_size(dst->type, dst->ne[0]);
+        const size_t n_outer  = dst->ne[2] * dst->ne[3];
+        uint8_t * dst_ptr = (uint8_t *) dst->data;
+        for (size_t o = 0; o < n_outer; ++o) {
+            for (const ggml_tensor * s : desc.srcs) {
+                const size_t rows = s->ne[1];
+                memcpy(dst_ptr,
+                       (const uint8_t *) s->data + o * rows * row_bytes,
+                       rows * row_bytes);
+                dst_ptr += rows * row_bytes;
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: gemv-fusion: built %zu fused weight tensor(s) in %.1f MiB buffer\n",
+            __func__, fused_tensor_descs.size(),
+            ggml_backend_buffer_get_size(buf_fusion.get()) / 1024.0 / 1024.0);
 }
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
