@@ -364,6 +364,12 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // MoE-Spec budget (arXiv:2602.16052) — top-B aggregate-routing-score
+        // expert shortlist applied per-batch before per-token argsort_top_k.
+        // 0 = off (default); 1..n_expert-1 = budget. Fires when n_tokens >= moe_spec_min_batch.
+        int32_t  moe_spec_budget;
+        int32_t  moe_spec_min_batch;  // default 4
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
