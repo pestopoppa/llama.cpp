@@ -1809,12 +1809,21 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static bool ggml_cuda_log_mmvq_route_enabled() {
-    static const bool enabled = []() {
+// CH-9: verbosity LEVEL, not a bool. Level 1 keeps the original Q8_0-only behaviour
+// (the MMVQ->MMQ campaign only ever cared about Q8_0). Level 2 logs EVERY type, which
+// is what makes the instrument usable as a diagnostic: at level 1 an empty log is
+// ambiguous between "no Q8_0 matmul was routed" and "the instrument never fired at
+// all", and DF2-6 lost its mandated routing evidence to exactly that ambiguity.
+static int ggml_cuda_log_mmvq_route_level() {
+    static const int level = []() {
         const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
-        return s != nullptr && atoi(s) != 0;
+        return s == nullptr ? 0 : atoi(s);
     }();
-    return enabled;
+    return level;
+}
+
+static bool ggml_cuda_log_mmvq_route_enabled() {
+    return ggml_cuda_log_mmvq_route_level() != 0;
 }
 
 static void ggml_cuda_log_mul_mat_route(
@@ -1824,7 +1833,8 @@ static void ggml_cuda_log_mul_mat_route(
         const ggml_tensor * dst,
         int cc,
         int64_t ne11) {
-    if (!ggml_cuda_log_mmvq_route_enabled() || src0->type != GGML_TYPE_Q8_0) {
+    const int level = ggml_cuda_log_mmvq_route_level();
+    if (level == 0 || (level < 2 && src0->type != GGML_TYPE_Q8_0)) {
         return;
     }
 
@@ -1910,11 +1920,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    // CH-9: mul_mat_id was previously UNINSTRUMENTED, so on a MoE model
+                    // every expert matmul was invisible to GGML_CUDA_LOG_MMVQ_ROUTE and
+                    // DF2-6 captured zero route lines on all four arms. The batch width
+                    // that selects a route here is ne2 (the expert-batch dimension), not
+                    // ne11, so it is ne2 that is reported.
+                    ggml_cuda_log_mul_mat_route("MMVQ_MMID", src0, src1, dst, cc, ne2);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    ggml_cuda_log_mul_mat_route("MMVF_MMID", src0, src1, dst, cc, ne2);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1922,15 +1939,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_log_mul_mat_route("MMQ_MMID", src0, src1, dst, cc, ne12);
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ggml_cuda_log_mul_mat_route("MMF_MMID", src0, src1, dst, cc, src1->ne[2]);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
+    ggml_cuda_log_mul_mat_route("CUBLAS_MMID", src0, src1, dst, cc, ne2);
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
