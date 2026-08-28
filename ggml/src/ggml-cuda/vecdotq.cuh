@@ -170,24 +170,19 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
 #define VDR_Q5_0_Q8_1_MMQ  4
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_impl(
-    const int * vl, const int * vh, const int * u, const float & d5, const half2 & ds8) {
+    const int * vl, const uint32_t vh, const int * u, const float & d5, const half2 & ds8) {
 
     int sumi = 0;
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        int vi0 = (vl[i] >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
-        vi0    |= (vh[i] <<  4) & 0x00000010; // 0 ->  4
-        vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
-        vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
-        vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
+        const uint32_t qh = vh >> (4*i);
+        int vi0 = (vl[i] >> 0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
+        vi0 |= ((qh & 0x0000000F) * 0x02040810) & 0x10101010;
         sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
-        int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
-        vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
-        vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
-        vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
-        vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
+        int vi1 = (vl[i] >> 4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
+        vi1 |= (((qh >> 16) & 0x0000000F) * 0x02040810) & 0x10101010;
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
@@ -765,13 +760,12 @@ static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
     const block_q5_0 * bq5_0 = (const block_q5_0 *) vbq + kbx;
 
     int vl[VDR_Q5_0_Q8_1_MMVQ];
-    int vh[VDR_Q5_0_Q8_1_MMVQ];
     int  u[2*VDR_Q5_0_Q8_1_MMVQ];
+    const uint32_t vh = get_int_b2(bq5_0->qh, 0) >> (4*iqs);
 
 #pragma unroll
     for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ; ++i) {
         vl[i]    = get_int_b2(bq5_0->qs, iqs + i);
-        vh[i]    = get_int_b2(bq5_0->qh, 0) >> (4 * (iqs + i));
         u[2*i+0] = get_int_b4(bq8_1->qs, iqs + i);
         u[2*i+1] = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
     }
