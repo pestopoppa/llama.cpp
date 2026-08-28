@@ -9,18 +9,12 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-// CH-9: mirrors the level helper in ggml-cuda.cu (this translation unit has its own
-// static copy). Level 1 = Q8_0 only, level 2 = every type.
-static int ggml_cuda_log_mmvq_route_level() {
-    static const int level = []() {
-        const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
-        return s == nullptr ? 0 : atoi(s);
-    }();
-    return level;
-}
-
 static bool ggml_cuda_log_mmvq_route_enabled() {
-    return ggml_cuda_log_mmvq_route_level() != 0;
+    static const bool enabled = []() {
+        const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
 }
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -295,8 +289,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     const auto log_decision = [type, cc, ne11](bool decision) {
-        const int level = ggml_cuda_log_mmvq_route_level();
-        if (level != 0 && (level >= 2 || type == GGML_TYPE_Q8_0)) {
+        if (ggml_cuda_log_mmvq_route_enabled() && type == GGML_TYPE_Q8_0) {
             GGML_LOG_INFO("GGML_CUDA_MMVQ_ROUTE_DECISION type=%s cc=%d ne11=%" PRId64 " use_mmvq=%d\n",
                 ggml_type_name(type), cc, ne11, decision ? 1 : 0);
         }
