@@ -806,6 +806,9 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
+    INDEXER_Q_PROJ       = auto()
+    INDEXER_K_PROJ       = auto()
+    INDEXER_Q_NORM       = auto()
     INDEXER_COMPRESSOR_WKV = auto()
     INDEXER_COMPRESSOR_WGATE = auto()
     INDEXER_COMPRESSOR_APE = auto()
@@ -1410,6 +1413,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_Q_PROJ:            "blk.{bid}.indexer.q_proj",
+    MODEL_TENSOR.INDEXER_K_PROJ:            "blk.{bid}.indexer.k_proj",
+    MODEL_TENSOR.INDEXER_Q_NORM:            "blk.{bid}.indexer.q_norm",
     MODEL_TENSOR.INDEXER_COMPRESSOR_WKV:    "blk.{bid}.indexer_compressor_kv",
     MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE:  "blk.{bid}.indexer_compressor_gate",
     MODEL_TENSOR.INDEXER_COMPRESSOR_APE:    "blk.{bid}.indexer_compressor_ape",
