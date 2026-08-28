@@ -34,6 +34,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        self._ple_scale: float | None = None
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -117,6 +118,13 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
+        # the n-gram table is FP8 in the FP8 checkpoint release: 128 shards of
+        # F8_E4M3 rows scaled by one shared scalar
+        if name.endswith("ple_embedding.ngram_embedding.weight_scale"):
+            from .base import LazyTorchTensor
+            self._ple_scale = float(LazyTorchTensor.to_eager(data_torch).item())
+            return []
+
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
@@ -177,7 +185,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
             # a fresh lazy tensor every call, or to_eager() memoizes every shard
             eager = LazyTorchTensor.to_eager(self.model_tensors[name]())
-            return eager.to(torch.float32).contiguous().numpy()
+            f32 = eager.to(torch.float32)
+            if self._ple_scale is not None:
+                f32 = f32 * self._ple_scale
+            return f32.contiguous().numpy()
         return load
 
     def prepare_tensors(self):
