@@ -2,7 +2,55 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
+
+template <int DV, int ncols1, int ncols2>
+static void launch_fattn_vec(
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const dim3 block_dim(warp_size, nwarps, 1);
+    int max_blocks_per_sm = 1;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+
+    const int ntiles_x     = (Q->ne[1] + ncols1 - 1) / ncols1;
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+    const int ntiles_KV    = (K->ne[1] + nbatch_fa - 1) / nbatch_fa;
+
+    int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_dst * parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+        const int efficiency_percent = 100 * nblocks_total / (nwaves * blocks_per_wave);
+
+        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+            break;
+        }
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+
+    const int nbatch_fa_launch = !stream_k && parallel_blocks == 2 ? K->ne[1] : nbatch_fa;
+    launch_fattn<DV, ncols1, ncols2>(
+        ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_launch,
+        need_f16_K, need_f16_V, stream_k, warp_size);
+}
+
+#define launch_fattn launch_fattn_vec
 #include "fattn-vec.cuh"
+#undef launch_fattn
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
