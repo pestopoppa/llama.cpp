@@ -1291,6 +1291,10 @@ void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#ifdef GGML_CPU_PROF
+    const int64_t mm_t0 = getenv("GGML_CPU_PROF") ? ggml_time_us() : 0;
+#endif
+
 #if defined(GGML_USE_IQK_MULMAT)
     // iqk port: fast quantized GEMM (ik_llama kernels) for supported quant types.
     // Runtime-gated by env GGML_IQK=1; returns false (falls through) otherwise or
@@ -1458,6 +1462,13 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+#ifdef GGML_CPU_PROF
+    if (mm_t0 != 0 && ith == 0) {
+        fprintf(stderr, "[mm_prof] type=%-8s ne00=%lld ne01=%lld ne11=%lld total=%.0fus\n",
+                ggml_type_name(src0->type), (long long) ne00, (long long) ne01, (long long) ne11,
+                (double)(ggml_time_us() - mm_t0));
+    }
+#endif
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -1583,6 +1594,11 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+#ifdef GGML_CPU_PROF
+    const int64_t mmid_t0 = ggml_time_us();
+    int64_t mmid_t_quant = 0, mmid_t_map = 0, mmid_t_dots = 0;
+#endif
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1636,6 +1652,9 @@ static void ggml_compute_forward_mul_mat_id(
         }
 #endif
     }
+#ifdef GGML_CPU_PROF
+    if (getenv("GGML_CPU_PROF")) mmid_t_quant = ggml_time_us();
+#endif
 
     if (ith == 0) {
         // initialize matrix_row_counts
@@ -1666,6 +1685,9 @@ static void ggml_compute_forward_mul_mat_id(
         *current_chunk_ctr = nth;
     }
 
+#ifdef GGML_CPU_PROF
+    if (getenv("GGML_CPU_PROF")) mmid_t_map = ggml_time_us();
+#endif
     ggml_barrier(params->threadpool);
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -1728,6 +1750,15 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+#ifdef GGML_CPU_PROF
+    if (getenv("GGML_CPU_PROF") && ith == 0) {
+        mmid_t_dots = ggml_time_us();
+        fprintf(stderr, "[mmid_prof] type=%-8s ne11=%lld n_as=%d quant=%.0fus map=%.0fus dots=%.0fus total=%.0fus\n",
+                ggml_type_name(type), (long long) ne11, n_as,
+                (double)(mmid_t_quant - mmid_t0), (double)(mmid_t_map - mmid_t_quant),
+                (double)(mmid_t_dots - mmid_t_map), (double)(mmid_t_dots - mmid_t0));
+    }
+#endif
 }
 
 /////////////////////////////////
