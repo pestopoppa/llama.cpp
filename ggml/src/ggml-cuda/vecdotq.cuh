@@ -888,8 +888,21 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[1] = q4[4];
 
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
-    uint16_t aux[2];
     const int j = bq8_offset/2;
+    const uint8_t * sc;
+#if defined(GGML_USE_HIP)
+    const int is = j & 1;
+    const uint32_t s0 = scales[is + 0];
+    const uint32_t s1 = scales[is + 2];
+    const uint32_t s2 = scales[is + 4];
+    const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
+    const uint32_t aux_low = s01 & 0x3f3f3f3f;
+    const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
+                              ((s01 & 0xc0c0c0c0) >> 2);
+    const uint32_t aux = j < 2 ? aux_low : aux_high;
+    sc = (const uint8_t *)&aux;
+#else
+    uint16_t aux[2];
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -897,7 +910,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
-    const uint8_t * sc = (const uint8_t *)aux;
+    sc = (const uint8_t *)aux;
+#endif
     const uint8_t * m  = sc + 2;
 
     for (int i = 0; i < QR4_K; ++i) {
