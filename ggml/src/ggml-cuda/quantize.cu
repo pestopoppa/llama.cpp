@@ -57,6 +57,45 @@ static __global__ void quantize_q8_1_1d(
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+#if defined(CDNA2)
+    const int lane = threadIdx.x % 64;
+    const int64_t iw = (int64_t) blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
+    const int64_t ib = 4*iw + lane/16;
+
+    if (ib*QK8_1 >= ne0) {
+        return;
+    }
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+    const int iqs = 2*(lane % 16);
+    const int64_t i0 = ib*QK8_1 + iqs;
+
+    ggml_cuda_pdl_sync();
+    float2 xi = make_float2(0.0f, 0.0f);
+    if (i0 + 1 < ne00) {
+        xi = ((const float2 *) x)[i0/2];
+    } else if (i0 < ne00) {
+        xi.x = x[i0];
+    }
+
+    float amax = fmaxf(fabsf(xi.x), fabsf(xi.y));
+    float sum = xi.x + xi.y;
+
+    amax = warp_reduce_max<16>(amax);
+    sum  = warp_reduce_sum<16>(sum);
+
+    const float d = amax / 127.0f;
+    const int8_t q0 = amax == 0.0f ? 0 : roundf(xi.x / d);
+    const int8_t q1 = amax == 0.0f ? 0 : roundf(xi.y / d);
+    const uint16_t q = (uint8_t) q0 | ((uint16_t) (uint8_t) q1 << 8);
+
+    ((uint16_t *) y[ib].qs)[iqs/2] = q;
+
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+#else
     const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i0 >= ne0) {
@@ -86,6 +125,7 @@ static __global__ void quantize_q8_1_1d(
     }
 
     y[ib].ds = make_half2(d, sum);
+#endif // CDNA2
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -456,13 +496,20 @@ void quantize_row_q8_1_cuda(
     GGML_ASSERT(!ids);
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
-    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
-    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
     if (ne1 == 1 && ne2 == 1 && ne3 == 1) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int values_per_block = cc == GGML_CUDA_CC_CDNA2 ? 2*CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE;
+        const int64_t block_num_x = (ne0 + values_per_block - 1) / values_per_block;
+        const dim3 num_blocks(block_num_x, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
         ggml_cuda_kernel_launch(quantize_q8_1_1d, launch_params, x, vy, ne00, ne0);
     } else {
+        const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+        const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
         const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
         ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     }
