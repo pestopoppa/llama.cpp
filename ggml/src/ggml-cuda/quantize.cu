@@ -60,7 +60,7 @@ static __global__ void quantize_q8_1_1d(
 #if defined(CDNA2)
     const int lane = threadIdx.x % 64;
     const int64_t iw = (int64_t) blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
-    const int64_t ib = 4*iw + lane/16;
+    const int64_t ib = 8*iw + lane/8;
 
     if (ib*QK8_1 >= ne0) {
         return;
@@ -68,32 +68,43 @@ static __global__ void quantize_q8_1_1d(
 
     block_q8_1 * y = (block_q8_1 *) vy;
 
-    const int iqs = 2*(lane % 16);
+    const int iqs = 4*(lane % 8);
     const int64_t i0 = ib*QK8_1 + iqs;
 
     ggml_cuda_pdl_sync();
-    float2 xi = make_float2(0.0f, 0.0f);
-    if (i0 + 1 < ne00) {
-        xi = ((const float2 *) x)[i0/2];
-    } else if (i0 < ne00) {
-        xi.x = x[i0];
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 + 3 < ne00) {
+        xi = ((const float4 *) x)[i0/4];
+    } else {
+        if (i0 + 0 < ne00) {
+            xi.x = x[i0 + 0];
+        }
+        if (i0 + 1 < ne00) {
+            xi.y = x[i0 + 1];
+        }
+        if (i0 + 2 < ne00) {
+            xi.z = x[i0 + 2];
+        }
     }
 
-    float amax = fmaxf(fabsf(xi.x), fabsf(xi.y));
-    float sum = xi.x + xi.y;
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    float2 sum = make_float2(xi.x + xi.y, xi.z + xi.w);
 
-    amax = warp_reduce_max<16>(amax);
-    sum  = warp_reduce_sum<16>(sum);
+    amax = warp_reduce_max<8>(amax);
+    sum  = warp_reduce_sum<8>(sum);
 
     const float d = amax / 127.0f;
     const int8_t q0 = amax == 0.0f ? 0 : roundf(xi.x / d);
     const int8_t q1 = amax == 0.0f ? 0 : roundf(xi.y / d);
-    const uint16_t q = (uint8_t) q0 | ((uint16_t) (uint8_t) q1 << 8);
+    const int8_t q2 = amax == 0.0f ? 0 : roundf(xi.z / d);
+    const int8_t q3 = amax == 0.0f ? 0 : roundf(xi.w / d);
+    const uint32_t q = (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+        ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
 
-    ((uint16_t *) y[ib].qs)[iqs/2] = q;
+    ((uint32_t *) y[ib].qs)[iqs/4] = q;
 
     if (iqs == 0) {
-        y[ib].ds = make_half2(d, sum);
+        y[ib].ds = make_half2(d, sum.x + sum.y);
     }
 #else
     const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
@@ -499,7 +510,7 @@ void quantize_row_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     if (ne1 == 1 && ne2 == 1 && ne3 == 1) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const int values_per_block = cc == GGML_CUDA_CC_CDNA2 ? 2*CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE;
+        const int values_per_block = cc == GGML_CUDA_CC_CDNA2 ? 4*CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE;
         const int64_t block_num_x = (ne0 + values_per_block - 1) / values_per_block;
         const dim3 num_blocks(block_num_x, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params =
