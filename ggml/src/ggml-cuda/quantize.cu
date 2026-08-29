@@ -1,6 +1,31 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+#if defined(__gfx90a__)
+template<int offset>
+static __device__ __forceinline__ float quantize_q8_1_shuffle_xor_gfx90a(float x) {
+    union {
+        float f;
+        int32_t i;
+    } value = {x};
+
+    if constexpr (offset == 16) {
+        value.i = __builtin_amdgcn_ds_swizzle(value.i, 0x401f);
+    } else if constexpr (offset == 8) {
+        value.i = __builtin_amdgcn_mov_dpp(value.i, 0x128, 0xf, 0xf, false);
+    } else if constexpr (offset == 4) {
+        value.i = __builtin_amdgcn_ds_swizzle(value.i, 0x101f);
+    } else if constexpr (offset == 2) {
+        value.i = __builtin_amdgcn_mov_dpp(value.i, 0x4e, 0xf, 0xf, false);
+    } else {
+        static_assert(offset == 1, "unsupported XOR shuffle offset");
+        value.i = __builtin_amdgcn_mov_dpp(value.i, 0xb1, 0xf, 0xf, false);
+    }
+
+    return value.f;
+}
+#endif // defined(__gfx90a__)
+
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -73,8 +98,21 @@ static __global__ void quantize_q8_1_1d(
     float amax = fabsf(xi);
     float sum = xi;
 
+#if defined(__gfx90a__)
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<16>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<16>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<8>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<8>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<4>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<4>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<2>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<2>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<1>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<1>(sum);
+#else
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
+#endif // defined(__gfx90a__)
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
