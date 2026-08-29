@@ -1318,11 +1318,17 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+#ifdef GGML_CPU_PROF
+    const int64_t t_phase0 = ggml_time_us();
+#endif
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_mctx = ggml_time_us();
+#endif
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1376,6 +1382,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_inputs = ggml_time_us();
+#endif
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -1383,6 +1392,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_graph = ggml_time_us();
+    if (getenv("GGML_CPU_PROF") != NULL) {
+        fprintf(stderr, "[phase_prof] n_tokens=%d mctx_apply=%.3f ms set_inputs=%.3f ms graph_compute=%.3f ms\n",
+                ubatch.n_tokens, (t_mctx - t_phase0)/1e3, (t_inputs - t_mctx)/1e3, (t_graph - t_inputs)/1e3);
+    }
+#endif
 
     ret = GGML_STATUS_SUCCESS;
 

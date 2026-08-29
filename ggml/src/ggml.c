@@ -1007,6 +1007,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SUM_ROWS",
     "CUMSUM",
     "MEAN",
+    "MEAN_D1",
     "ARGMAX",
     "COUNT_EQUAL",
     "REPEAT",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1122,6 +1123,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "Σx_k",
     "cumsum(x)",
     "Σx/n",
+    "Σx_c/n",
     "argmax(x)",
     "count_equal(x)",
     "repeat(x)",
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2526,6 +2528,18 @@ struct ggml_tensor * ggml_mean(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_MEAN;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mean_d1(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    int64_t ne[4] = { a->ne[0], 1, a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MEAN_D1;
     result->src[0] = a;
 
     return result;
@@ -6770,6 +6784,9 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
             }
+        } break;
+        case GGML_OP_MEAN_D1: {
+            // no grad support (inference-only op)
         } break;
         case GGML_OP_REPEAT: {
             if (src0_needs_grads) {

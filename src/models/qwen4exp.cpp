@@ -240,19 +240,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(gate, "hc_gate", il);
 
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
+    // collapse the streams by their mean: mean over the hc column dim in one
+    // parallel op (no transpose, no copy, same accumulation order as the
+    // view+add chain it replaces)
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
-
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
-    }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    ggml_tensor * mixed = ggml_mean_d1(ctx0, gated);
+    mixed = ggml_reshape_2d(ctx0, mixed, n_embd, nt);
     cb(mixed, "hc_mixed", il);
 
     if (inject) {

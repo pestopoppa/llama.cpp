@@ -1517,12 +1517,6 @@ static void ggml_compute_forward_mean_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
-    assert(src0->nb[0] == sizeof(float));
-
     GGML_TENSOR_UNARY_OP_LOCALS
 
     assert(ne0 == 1);
@@ -1535,14 +1529,21 @@ static void ggml_compute_forward_mean_f32(
     GGML_UNUSED(ne2);
     GGML_UNUSED(ne3);
 
+    // parallel over rows (i01), strided source reads (nb00) so transposed
+    // views work; each row still accumulates ne00 sequentially in f32
+    const int64_t dr = (ne01 + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, ne01);
+
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = 0; i01 < ne01; i01++) {
-                ggml_vec_sum_f32(ne00,
-                        (float *) ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3),
-                        (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03));
-
-                *(float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3) /= (float) ne00;
+            for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                const char * src = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+                float sum = 0.0f;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum += *(const float *) (src + i00*nb00);
+                }
+                *(float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3) = sum / (float) ne00;
             }
         }
     }
@@ -1558,6 +1559,58 @@ void ggml_compute_forward_mean(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_mean_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// mean over ne1 (columns); strided nb01 reads so stream-blocked layouts work
+static void ggml_compute_forward_mean_d1_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    assert(ne1 == 1);
+    assert(ne0 == ne00);
+    assert(ne2 == ne02);
+    assert(ne3 == ne03);
+
+    GGML_UNUSED(ne1);
+
+    const int64_t dn = (ne0 + params->nth - 1) / params->nth;
+    const int64_t i0_start = dn * params->ith;
+    const int64_t i0_end   = MIN(i0_start + dn, ne0);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i00 = i0_start; i00 < i0_end; i00++) {
+                const char * src = (const char *) src0->data + i00*nb00 + i02*nb02 + i03*nb03;
+                float sum = 0.0f;
+                for (int64_t i01 = 0; i01 < ne01; i01++) {
+                    sum += *(const float *) (src + i01*nb01);
+                }
+                *(float *) ((char *) dst->data + i00*nb0 + i02*nb2 + i03*nb3) = sum / (float) ne01;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_mean_d1(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mean_d1_f32(params, dst);
             } break;
         default:
             {

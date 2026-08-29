@@ -1813,6 +1813,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mean(params, tensor);
             } break;
+        case GGML_OP_MEAN_D1:
+            {
+                ggml_compute_forward_mean_d1(params, tensor);
+            } break;
         case GGML_OP_ARGMAX:
             {
                 ggml_compute_forward_argmax(params, tensor);
@@ -2276,6 +2280,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGMAX:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_MEAN_D1:
+            {
+                // parallel over ne0; give it real threads when there are rows to share
+                n_tasks = MIN(n_threads, MAX(1, (int) node->src[0]->ne[0] / 32));
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
@@ -3047,6 +3056,73 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+#ifdef GGML_CPU_PROF
+// per-op wall-time profiling, profiling build only; enabled via GGML_CPU_PROF=1
+static uint64_t ggml_cpu_prof_ns[GGML_OP_COUNT];
+static uint64_t ggml_cpu_prof_cnt[GGML_OP_COUNT];
+static uint64_t ggml_cpu_prof_fused_ns = 0;
+static uint64_t ggml_cpu_prof_fused_cnt = 0;
+static uint64_t ggml_cpu_prof_total_ns = 0;
+static int      ggml_cpu_prof_enabled = -1;
+
+static bool ggml_cpu_prof_is_enabled(void) {
+    if (ggml_cpu_prof_enabled < 0) {
+        ggml_cpu_prof_enabled = getenv("GGML_CPU_PROF") != NULL ? 1 : 0;
+    }
+    return ggml_cpu_prof_enabled != 0;
+}
+
+static void ggml_cpu_prof_reset(void) {
+    memset(ggml_cpu_prof_ns, 0, sizeof(ggml_cpu_prof_ns));
+    memset(ggml_cpu_prof_cnt, 0, sizeof(ggml_cpu_prof_cnt));
+    ggml_cpu_prof_fused_ns = 0;
+    ggml_cpu_prof_fused_cnt = 0;
+    ggml_cpu_prof_total_ns = 0;
+}
+
+static void ggml_cpu_prof_dump(const struct ggml_cgraph * cgraph) {
+    if (ggml_cpu_prof_total_ns == 0) {
+        return;
+    }
+    fprintf(stderr, "[ggml_cpu_prof] graph n_nodes=%d n_tokens_ctx=%zu wall_total=%.1f ms (fused: %llu ops / %.1f ms)\n",
+            cgraph->n_nodes, (size_t) cgraph->nodes[0]->ne[0],
+            ggml_cpu_prof_total_ns/1e3, (unsigned long long) ggml_cpu_prof_fused_cnt, ggml_cpu_prof_fused_ns/1e3);
+
+    if (getenv("GGML_CPU_PROF_NODES") != NULL) {
+        for (int i = 0; i < cgraph->n_nodes && i < 260; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            fprintf(stderr, "[ggml_node_%04d] op=%-14s type=%-8s ne=[%zu x %zu x %zu x %zu] src0=%s src1=%s\n",
+                    i, ggml_op_name(node->op), ggml_type_name(node->type),
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                    node->src[0] ? ggml_op_name(node->src[0]->op) : "-",
+                    node->src[1] ? ggml_op_name(node->src[1]->op) : "-");
+        }
+    }
+
+    struct { int op; uint64_t ns; uint64_t cnt; } rows[GGML_OP_COUNT];
+    int n_rows = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (ggml_cpu_prof_cnt[i] > 0) {
+            rows[n_rows++] = (typeof(rows[0])) { i, ggml_cpu_prof_ns[i], ggml_cpu_prof_cnt[i] };
+        }
+    }
+    for (int i = 0; i < n_rows; i++) {
+        for (int j = i + 1; j < n_rows; j++) {
+            if (rows[j].ns > rows[i].ns) {
+                typeof(rows[0]) tmp = rows[i]; rows[i] = rows[j]; rows[j] = tmp;
+            }
+        }
+    }
+    for (int i = 0; i < n_rows && i < 25; i++) {
+        fprintf(stderr, "[ggml_cpu_prof] %6.2f%% %7.2f ms %8llu x %-24s (avg %7.2f us)\n",
+                100.0*rows[i].ns/ggml_cpu_prof_total_ns, rows[i].ns/1e3,
+                (unsigned long long) rows[i].cnt, ggml_op_name(rows[i].op),
+                (double) rows[i].ns / 1e3 / rows[i].cnt);
+    }
+    fflush(stderr);
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3121,6 +3197,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+#ifdef GGML_CPU_PROF
+        const int64_t t0 = (state->ith == 0 && ggml_cpu_prof_is_enabled()) ? ggml_time_us() : 0;
+#endif
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3129,6 +3209,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         } else {
             ggml_compute_forward(&params, node);
         }
+
+#ifdef GGML_CPU_PROF
+        if (t0 != 0) {
+            const uint64_t dt = ggml_time_us() - t0;
+            ggml_cpu_prof_total_ns += dt;
+            if (n_fused > 0) {
+                ggml_cpu_prof_fused_ns += dt;
+                ggml_cpu_prof_fused_cnt++;
+            } else {
+                ggml_cpu_prof_ns[node->op] += dt;
+                ggml_cpu_prof_cnt[node->op]++;
+            }
+        }
+#endif
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3140,6 +3234,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
     }
+
+#ifdef GGML_CPU_PROF
+    if (state->ith == 0 && ggml_cpu_prof_is_enabled()) {
+        ggml_cpu_prof_dump(cgraph);
+        ggml_cpu_prof_reset();
+    }
+#endif
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);

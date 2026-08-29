@@ -848,6 +848,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SUM_ROWS:
             case GGML_OP_CUMSUM:
             case GGML_OP_MEAN:
+            case GGML_OP_MEAN_D1:
             case GGML_OP_ARGMAX:
             case GGML_OP_COUNT_EQUAL: {
                 split_state = handle_per_row(src_ss);

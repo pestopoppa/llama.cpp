@@ -498,6 +498,7 @@ extern "C" {
         GGML_OP_SUM_ROWS,
         GGML_OP_CUMSUM,
         GGML_OP_MEAN,
+        GGML_OP_MEAN_D1,
         GGML_OP_ARGMAX,
         GGML_OP_COUNT_EQUAL,
         GGML_OP_REPEAT,
@@ -1054,6 +1055,11 @@ extern "C" {
 
     // mean along rows
     GGML_API struct ggml_tensor * ggml_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // mean along columns (ne1)
+    GGML_API struct ggml_tensor * ggml_mean_d1(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
