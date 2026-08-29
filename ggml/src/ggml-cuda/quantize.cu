@@ -51,6 +51,7 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+template <bool dual_fragment>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1_1d(
         const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t ne0) {
@@ -58,9 +59,10 @@ static __global__ void quantize_q8_1_1d(
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
 #if defined(CDNA2)
+    constexpr int lanes_per_block = dual_fragment ? 4 : 8;
     const int lane = threadIdx.x % 64;
     const int64_t iw = (int64_t) blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
-    const int64_t ib = 8*iw + lane/8;
+    const int64_t ib = (64/lanes_per_block)*iw + lane/lanes_per_block;
 
     if (ib*QK8_1 >= ne0) {
         return;
@@ -68,7 +70,7 @@ static __global__ void quantize_q8_1_1d(
 
     block_q8_1 * y = (block_q8_1 *) vy;
 
-    const int iqs = 4*(lane % 8);
+    const int iqs = 4*(lane % lanes_per_block);
     const int64_t i0 = ib*QK8_1 + iqs;
 
     ggml_cuda_pdl_sync();
@@ -87,11 +89,23 @@ static __global__ void quantize_q8_1_1d(
         }
     }
 
+    float4 xi2;
+    if constexpr (dual_fragment) {
+        xi2 = ((const float4 *) x)[(i0 + 16)/4];
+    }
+
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     float2 sum = make_float2(xi.x + xi.y, xi.z + xi.w);
+    if constexpr (dual_fragment) {
+        const float amax2 = fmaxf(fmaxf(fabsf(xi2.x), fabsf(xi2.y)), fmaxf(fabsf(xi2.z), fabsf(xi2.w)));
+        const float2 sum2 = make_float2(xi2.x + xi2.y, xi2.z + xi2.w);
+        amax = fmaxf(amax, amax2);
+        sum.x += sum2.x;
+        sum.y += sum2.y;
+    }
 
-    amax = warp_reduce_max<8>(amax);
-    sum  = warp_reduce_sum<8>(sum);
+    amax = warp_reduce_max<lanes_per_block>(amax);
+    sum  = warp_reduce_sum<lanes_per_block>(sum);
 
     const float d = amax / 127.0f;
     const int8_t q0 = amax == 0.0f ? 0 : roundf(xi.x / d);
@@ -102,6 +116,16 @@ static __global__ void quantize_q8_1_1d(
         ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
 
     ((uint32_t *) y[ib].qs)[iqs/4] = q;
+
+    if constexpr (dual_fragment) {
+        const int8_t q4 = amax == 0.0f ? 0 : roundf(xi2.x / d);
+        const int8_t q5 = amax == 0.0f ? 0 : roundf(xi2.y / d);
+        const int8_t q6 = amax == 0.0f ? 0 : roundf(xi2.z / d);
+        const int8_t q7 = amax == 0.0f ? 0 : roundf(xi2.w / d);
+        const uint32_t q2 = (uint8_t) q4 | ((uint32_t) (uint8_t) q5 << 8) |
+            ((uint32_t) (uint8_t) q6 << 16) | ((uint32_t) (uint8_t) q7 << 24);
+        ((uint32_t *) y[ib].qs)[iqs/4 + 4] = q2;
+    }
 
     if (iqs == 0) {
         y[ib].ds = make_half2(d, sum.x + sum.y);
@@ -510,12 +534,18 @@ void quantize_row_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     if (ne1 == 1 && ne2 == 1 && ne3 == 1) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const int values_per_block = cc == GGML_CUDA_CC_CDNA2 ? 4*CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE;
+        const bool dual_fragment = cc == GGML_CUDA_CC_CDNA2 && ne00 == 1536 && ne0 == 1536;
+        const int values_per_block = cc == GGML_CUDA_CC_CDNA2 ?
+            (dual_fragment ? 8 : 4)*CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE;
         const int64_t block_num_x = (ne0 + values_per_block - 1) / values_per_block;
         const dim3 num_blocks(block_num_x, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params =
             ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-        ggml_cuda_kernel_launch(quantize_q8_1_1d, launch_params, x, vy, ne00, ne0);
+        if (dual_fragment) {
+            ggml_cuda_kernel_launch(quantize_q8_1_1d<true>, launch_params, x, vy, ne00, ne0);
+        } else {
+            ggml_cuda_kernel_launch(quantize_q8_1_1d<false>, launch_params, x, vy, ne00, ne0);
+        }
     } else {
         const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
         const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
