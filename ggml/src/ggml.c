@@ -1008,6 +1008,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CUMSUM",
     "MEAN",
     "MEAN_D1",
+    "MOE_TOPK_NORM",
     "ARGMAX",
     "COUNT_EQUAL",
     "REPEAT",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1124,6 +1125,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cumsum(x)",
     "Σx/n",
     "Σx_c/n",
+    "moe_topk_norm(x)",
     "argmax(x)",
     "count_equal(x)",
     "repeat(x)",
@@ -1217,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2541,6 +2543,24 @@ struct ggml_tensor * ggml_mean_d1(
 
     result->op     = GGML_OP_MEAN_D1;
     result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_topk_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * indices) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(logits->ne[1] == indices->ne[1]);
+
+    int64_t ne[4] = { 1, indices->ne[0], logits->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op      = GGML_OP_MOE_TOPK_NORM;
+    result->src[0]  = logits;
+    result->src[1]  = indices;
 
     return result;
 }
@@ -6785,8 +6805,9 @@ static void ggml_compute_backward(
                 ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
             }
         } break;
-        case GGML_OP_MEAN_D1: {
-            // no grad support (inference-only op)
+        case GGML_OP_MEAN_D1:
+        case GGML_OP_MOE_TOPK_NORM: {
+            // no grad support (inference-only ops)
         } break;
         case GGML_OP_REPEAT: {
             if (src0_needs_grads) {

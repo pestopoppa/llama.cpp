@@ -499,6 +499,7 @@ extern "C" {
         GGML_OP_CUMSUM,
         GGML_OP_MEAN,
         GGML_OP_MEAN_D1,
+        GGML_OP_MOE_TOPK_NORM,
         GGML_OP_ARGMAX,
         GGML_OP_COUNT_EQUAL,
         GGML_OP_REPEAT,
@@ -1062,6 +1063,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_mean_d1(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // top-k softmax weights of logits [n_expert, n_tokens] at the given indices
+    // [n_expert_used, n_tokens]; renormalizes over the selected entries and
+    // clamps the sum at GGML_CMOE_TOPK_EPS before dividing (f32 only)
+    GGML_API struct ggml_tensor * ggml_moe_topk_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * indices);
 
     // argmax along rows
     GGML_API struct ggml_tensor * ggml_argmax(

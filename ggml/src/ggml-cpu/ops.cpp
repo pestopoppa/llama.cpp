@@ -1619,6 +1619,87 @@ void ggml_compute_forward_mean_d1(
     }
 }
 
+// top-k softmax weights: logits [n_expert, n_tokens] x indices [n_used, n_tokens]
+// -> weights [1, n_used, n_tokens], renormalized over the selected entries with
+// the sum clamped at 6.103515625e-5 (F16 min). Matches the decomposed
+// soft_max -> get_rows -> sum_rows -> clamp -> div chain bit for bit:
+// same max, same sequential exp/sum accumulation, same exact /.
+static void ggml_compute_forward_moe_topk_norm_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * logits  = dst->src[0];
+    const ggml_tensor * indices = dst->src[1];
+
+    GGML_ASSERT(logits->type  == GGML_TYPE_F32);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(logits->nb[0] == sizeof(float));
+    GGML_ASSERT(indices->nb[0] == sizeof(int32_t));
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_used   = indices->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+
+    GGML_ASSERT(dst->ne[0] == 1);
+    GGML_ASSERT(dst->ne[1] == n_used);
+    GGML_ASSERT(dst->ne[2] == n_tokens);
+
+    const size_t nb1_logits  = logits->nb[1];
+    const size_t nb1_indices = indices->nb[1];
+    const size_t nb1_dst     = dst->nb[1];
+    const size_t nb2_dst     = dst->nb[2];
+
+    const int64_t dt = (n_tokens + params->nth - 1) / params->nth;
+    const int64_t t0 = dt * params->ith;
+    const int64_t t1 = MIN(t0 + dt, n_tokens);
+
+    for (int64_t it = t0; it < t1; it++) {
+        const float   * lp = (const float *) ((const char *) logits->data  + it*nb1_logits);
+        const int32_t * ip = (const int32_t *) ((const char *) indices->data + it*nb1_indices);
+
+        float maxv = -INFINITY;
+        for (int64_t e = 0; e < n_expert; e++) {
+            maxv = MAX(maxv, lp[e]);
+        }
+
+        float sum = 0.0f;
+        for (int64_t e = 0; e < n_expert; e++) {
+            sum += expf(lp[e] - maxv);
+        }
+
+        float wsum = 0.0f;
+        for (int64_t j = 0; j < n_used; j++) {
+            const float w = expf(lp[ip[j]] - maxv) / sum;
+            *(float *) ((char *) dst->data + j*nb1_dst + it*nb2_dst) = w;
+            wsum += w;
+        }
+
+        const float s = MAX(wsum, 6.103515625e-5f);
+        for (int64_t j = 0; j < n_used; j++) {
+            float * wj = (float *) ((char *) dst->data + j*nb1_dst + it*nb2_dst);
+            *wj /= s;
+        }
+    }
+}
+
+void ggml_compute_forward_moe_topk_norm(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_moe_topk_norm_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_argmax
 
 static void ggml_compute_forward_argmax_f32(

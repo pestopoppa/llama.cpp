@@ -1817,6 +1817,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mean_d1(params, tensor);
             } break;
+        case GGML_OP_MOE_TOPK_NORM:
+            {
+                ggml_compute_forward_moe_topk_norm(params, tensor);
+            } break;
         case GGML_OP_ARGMAX:
             {
                 ggml_compute_forward_argmax(params, tensor);
@@ -2285,6 +2289,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 // parallel over ne0; give it real threads when there are rows to share
                 n_tasks = MIN(n_threads, MAX(1, (int) node->src[0]->ne[0] / 32));
+            } break;
+        case GGML_OP_MOE_TOPK_NORM:
+            {
+                // parallel over tokens (ne1)
+                n_tasks = MIN(n_threads, MAX(1, (int) node->src[0]->ne[1]));
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
