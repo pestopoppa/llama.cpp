@@ -504,7 +504,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm4, const block_q8_1 * __restrict__ bq8_1,
+    const uint8_t * __restrict__ m, const half2 & dm4, const half2 * __restrict__ ds8,
     const bool sum_lane) {
 
     float sumf_d = 0.0f;
@@ -517,12 +517,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
 
         const int dot0 = ggml_cuda_dp4a(v0i, u[2*i+0], 0);
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], 0);
-        const half2 ds8 = bq8_1[i].ds;
-        const float d8 = __low2float(ds8);
+        const half2 ds8i = ds8[i];
+        const float d8 = __low2float(ds8i);
 
         sumf_d += d8 * ((dot0 + dot1) * sc[i]);
         if (sum_lane) {
-            const float s8 = __high2float(ds8);
+            const float s8 = __high2float(ds8i);
             sumf_m += s8 * m[i]; // sum of q8_1 block * q4_K min val
         }
     }
@@ -858,6 +858,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     int    v[2];
     int    u[2*QR4_K];
+    half2 ds8[QR4_K];
 
     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
@@ -909,13 +910,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        ds8[i] = bq8i->ds;
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, bq8_1 + bq8_offset, sum_lane);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, ds8, sum_lane);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
