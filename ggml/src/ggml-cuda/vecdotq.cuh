@@ -537,16 +537,18 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 
 #pragma unroll
     for (int i = 0; i < QR4_K*VDR_Q4_K_Q8_1_MMQ/QI8_1; ++i) {
-        int sumi_d = 0;
+        int sumi_d0 = 0;
+        int sumi_d1 = 0;
 
 #pragma unroll
-        for (int j = 0; j < QI8_1; ++j) {
-            sumi_d = ggml_cuda_dp4a((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
+        for (int j = 0; j < QI8_1; j += 2) {
+            sumi_d0 = ggml_cuda_dp4a((v[j + 0] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j + 0], sumi_d0);
+            sumi_d1 = ggml_cuda_dp4a((v[j + 1] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j + 1], sumi_d1);
         }
 
         const float2 ds8f = __half22float2(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
+        sumf_d += ds8f.x * (sc[i] * (sumi_d0 + sumi_d1));
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
