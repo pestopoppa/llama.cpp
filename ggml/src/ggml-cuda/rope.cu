@@ -12,6 +12,19 @@ struct mrope_sections {
     int v[4];
 };
 
+#if defined(__gfx90a__)
+static __device__ __forceinline__ float rope_neox_quad_broadcast(float x) {
+    union {
+        float f;
+        int32_t i;
+    } value = {x};
+
+    value.i = __builtin_amdgcn_mov_dpp(value.i, 0x00, 0xf, 0xf, false);
+
+    return value.f;
+}
+#endif // defined(__gfx90a__)
+
 static __device__ float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -137,6 +150,18 @@ static __global__ void rope_neox(const T *            x,
     ggml_cuda_pdl_lc();
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
+#if defined(__gfx90a__)
+    const int head_blocks = (ne01 + 3) / 4;
+    const int i23 = blockIdx.x / head_blocks;
+    const int i1  = 4 * (blockIdx.x - i23 * head_blocks) + threadIdx.x;
+
+    if (i0 >= ne00 || i1 >= ne01) {
+        return;
+    }
+
+    const uint32_t i3 = i23 / ne02;
+    const uint32_t i2 = i23 - i3 * ne02;
+#else
     if (i0 >= ne00) {
         return;
     }
@@ -146,6 +171,7 @@ static __global__ void rope_neox(const T *            x,
     const uint32_t i3 = row_dst / (ne01 * ne02);
     const uint32_t i2 = (row_dst - i3 * ne01 * ne02) / ne01;
     const uint32_t i1 = row_dst - i3 * ne01 * ne02 - i2 * ne01;
+#endif // defined(__gfx90a__)
 
     int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
@@ -165,14 +191,20 @@ static __global__ void rope_neox(const T *            x,
         return;
     }
 
-    const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
+    float cos_theta = 0.0f;
+    float sin_theta = 0.0f;
 
-    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
-
-    float cos_theta;
-    float sin_theta;
-
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+#if defined(__gfx90a__)
+    if (threadIdx.x == 0) {
+#endif // defined(__gfx90a__)
+        const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
+        const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+#if defined(__gfx90a__)
+    }
+    cos_theta = rope_neox_quad_broadcast(cos_theta);
+    sin_theta = rope_neox_quad_broadcast(sin_theta);
+#endif // defined(__gfx90a__)
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
@@ -398,9 +430,12 @@ static void rope_neox_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
-    const dim3 block_nums(nr, n_blocks_x, 1);
+    const bool use_quad_broadcast = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_CDNA2;
+    const dim3 block_dims = use_quad_broadcast ?
+        dim3(4, CUDA_ROPE_BLOCK_SIZE / 4, 1) : dim3(1, CUDA_ROPE_BLOCK_SIZE, 1);
+    const int n_blocks_y = (ne00 + 2 * block_dims.y - 1) / (2 * block_dims.y);
+    const int n_blocks_x = use_quad_broadcast ? (nr / ne01) * ((ne01 + 3) / 4) : nr;
+    const dim3 block_nums(n_blocks_x, n_blocks_y, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
