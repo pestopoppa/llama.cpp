@@ -515,12 +515,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
         const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
 
-        const int dot0 = ggml_cuda_dp4a(v0i, u[2*i+0], 0);
-        const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], 0);
+        const int dot0 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0));
         const half2 ds8 = bq8_1[i].ds;
         const float d8 = __low2float(ds8);
 
-        sumf_d += d8 * ((dot0 + dot1) * sc[i]);
+        sumf_d += d8 * (dot0 * sc[i]);
         if (sum_lane) {
             const float s8 = __high2float(ds8);
             sumf_m += s8 * m[i]; // sum of q8_1 block * q4_K min val
