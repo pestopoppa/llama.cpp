@@ -623,28 +623,6 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 #define VDR_Q6_K_Q8_1_MMVQ 1
 #define VDR_Q6_K_Q8_1_MMQ  8
 
-// contiguous v/x values
-static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
-    const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
-    const float & d, const float * __restrict__ d8) {
-
-    const int vil0 = (vl >> 0) & 0x0F0F0F0F;
-    const int vil1 = (vl >> 4) & 0x0F0F0F0F;
-
-    const int vih0 = ((vh >> 0) << 4) & 0x30303030;
-    const int vih1 = ((vh >> 4) << 4) & 0x30303030;
-
-    const int vi0 = __vsubss4((vil0 | vih0), 0x20202020);
-    const int vi1 = __vsubss4((vil1 | vih1), 0x20202020);
-
-    const int dot0 = ggml_cuda_dp4a(vi0, u[0], 0);
-    const int dot1 = ggml_cuda_dp4a(vi1, u[1], 0);
-
-    const float sumf = d8[0] * (dot0 * scales[0]) + d8[1] * (dot1 * scales[4]);
-
-    return d*sumf;
-}
-
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
@@ -986,21 +964,32 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    float sumf;
+    {
+        const int vl  = get_int_b2(bq6_K->ql, iqs);
+        const int vh  = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+        const int vil = (vl >> 0) & 0x0F0F0F0F;
+        const int vih = ((vh >> 0) << 4) & 0x30303030;
+        const int vi  = __vsubss4((vil | vih), 0x20202020);
+        const int u   = get_int_b4(bq8_1[bq8_offset].qs, iqs % QI8_1);
+        const int dot = ggml_cuda_dp4a(vi, u, 0);
 
-    const int8_t * scales = bq6_K->scales + scale_offset;
+        sumf = __low2float(bq8_1[bq8_offset].ds) * (dot * bq6_K->scales[scale_offset]);
+    }
+    {
+        const int vl  = get_int_b2(bq6_K->ql, iqs);
+        const int vh  = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+        const int vil = (vl >> 4) & 0x0F0F0F0F;
+        const int vih = ((vh >> 4) << 4) & 0x30303030;
+        const int vi  = __vsubss4((vil | vih), 0x20202020);
+        const int u   = get_int_b4(bq8_1[bq8_offset + 2].qs, iqs % QI8_1);
+        const int dot = ggml_cuda_dp4a(vi, u, 0);
 
-    int    u[QR6_K];
-    float d8[QR6_K];
-
-#pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+        sumf += __low2float(bq8_1[bq8_offset + 2].ds) * (dot * bq6_K->scales[scale_offset + 4]);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    const float d = bq6_K->d;
+    return d * sumf;
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
