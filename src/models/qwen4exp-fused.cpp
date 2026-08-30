@@ -558,3 +558,286 @@ static void fused_rope(const FusedRopeParams & rp, float * x, int64_t n_dims,
     memcpy(x, rope->data, n_dims * n_head * n_stream * sizeof(float));
     ggml_free(gctx);
 }
+
+// ---- the fused full-attention layer ----------------------------------------
+
+// the QSA-masked attention for one token via the graph's own flash kernel.
+// Bit-exact path: builds the flash_attn_ext op on scratch tensors and runs the
+// graph's kernel on it (same kernel, same inputs => same bits).
+static void fused_attn_flash(
+        const float * q, const float * k, const float * v,
+        const int64_t n_embd_head, const int64_t n_head, const int64_t n_head_kv,
+        const int64_t n_kv, const float * selected_cells, float * out) {
+    ggml_init_params gip = { 64 << 20, nullptr, false };
+    ggml_context * gctx = ggml_init(gip);
+    ggml_tensor * tq = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head, 1, 1);
+    ggml_tensor * tk = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_kv, 1);
+    ggml_tensor * tv = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_kv, 1);
+    ggml_tensor * tm = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, n_kv, 1, 1, 1);
+    memcpy(tq->data, q, n_embd_head * n_head * sizeof(float));
+    memcpy(tk->data, k, n_embd_head * n_head_kv * n_kv * sizeof(float));
+    memcpy(tv->data, v, n_embd_head * n_head_kv * n_kv * sizeof(float));
+    for (int64_t j = 0; j < n_kv; j++) {
+        ((ggml_fp16_t *) tm->data)[j] = selected_cells[j] == 0.0f
+            ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
+    }
+    const float scale = 1.0f / sqrtf((float) n_embd_head);
+    ggml_tensor * tfa = ggml_flash_attn_ext(gctx, tq, tk, tv, tm, scale, 0.0f, 0.0f);
+    struct ggml_compute_params gparams;
+    gparams.ith = 0; gparams.nth = 1; gparams.wsize = 0; gparams.wdata = nullptr;
+    gparams.threadpool = nullptr; gparams.use_ref = false;
+    ggml_compute_forward_flash_attn_ext(&gparams, tfa);
+    memcpy(out, tfa->data, n_embd_head * n_head * sizeof(float));
+    ggml_free(gctx);
+}
+
+// the QSA-masked attention for one token via the graph's own flash kernel.
+//   q/k/v : [n_embd_head, n_head(_kv), 1] rotated + roped (q/k) and raw (v)
+//   k_all/v_all : the attention cache slices [n_embd_head, n_head_kv, n_kv]
+//   selected : the per-cell visibility (0 visible, -inf blocked), F16 [n_kv]
+//   kq_scale : 1/sqrt(n_embd_head)
+static void fused_attn_qsa(
+        const struct llama_hparams & hp,
+        const float * q, const float * k, const float * v,
+        const float * k_all, const float * v_all, const int n_kv,
+        const float * selected_cells, float * out, int n_head, int n_head_kv,
+        const int n_threads) {
+    (void) n_threads;
+    const int64_t n_embd_head = hp.n_embd_head_k();
+    const float kq_scale = 1.0f / sqrtf((float) n_embd_head);
+    const int n_repeat = n_head / n_head_kv;
+
+    // the manual attention: for each kv head, its q-group's heads attend to
+    // the visible cells. The flash kernel's accumulation differs, so this is
+    // the NMSE-ok path; the bit-exact flash path lands with the kernel call.
+    std::vector<float> scores(n_kv);
+    std::vector<float> out_h(n_embd_head * n_head, 0.0f);
+
+    for (int hk = 0; hk < n_head_kv; hk++) {
+        // max over the visible cells for the numeric stability
+        float mx = -INFINITY;
+        for (int j = 0; j < n_kv; j++) {
+            if (selected_cells[j] == 0.0f) {
+                float s = 0.0f;
+                for (int i = 0; i < n_embd_head; i++) {
+                    s += q[hk * n_embd_head + i] * k_all[(size_t) hk * n_embd_head * n_kv + (size_t) i * n_kv + j];
+                }
+                scores[j] = s * kq_scale;
+                mx = fmaxf(mx, scores[j]);
+            }
+        }
+        double sum = 0.0;
+        for (int j = 0; j < n_kv; j++) {
+            scores[j] = selected_cells[j] == 0.0f ? expf(scores[j] - mx) : 0.0f;
+            sum += scores[j];
+        }
+        const float inv = (float) (1.0 / sum);
+        for (int j = 0; j < n_kv; j++) {
+            scores[j] *= inv;
+        }
+        for (int r = 0; r < n_repeat; r++) {
+            const int h = hk * n_repeat + r;
+            for (int i = 0; i < n_embd_head; i++) {
+                float acc = 0.0f;
+                for (int j = 0; j < n_kv; j++) {
+                    acc += scores[j] * v_all[(size_t) hk * n_embd_head * n_kv + (size_t) i * n_kv + j];
+                }
+                out_h[(size_t) h * n_embd_head + i] = acc;
+            }
+        }
+    }
+    memcpy(out, out_h.data(), n_embd_head * n_head * sizeof(float));
+    (void) k; (void) v;
+}
+
+// the fused full-attention layer for the single-token decode:
+//   x/res_in_out : the hc-wide input / residual stream
+//   pos          : the current token position
+//   attn_k/v     : the attention cache slices [n_embd_head_k, n_head_kv, n_kv]
+//   idx_k        : the indexer cache slice [indexer_head_size, idx_n_kv]
+// Returns false until the QSA long-context path and the rotations are wired.
+bool fused_full_attn_layer(
+        const struct llama_layer & L,
+        const struct llama_hparams & hp,
+        const FusedRopeParams & rp,
+        int32_t pos,
+        const float * x, float * res_in_out, float * out,
+        float * attn_k, float * attn_v, int n_kv,
+        float * idx_k, int idx_n_kv,
+        int n_threads) {
+
+    const int64_t hc = hp.dsv4_hc_mult;
+    const int64_t n_embd = hp.n_embd;
+    const int64_t n_embd_head = hp.n_embd_head_k(); // 256
+    const int64_t n_head = hp.n_head();             // 24
+    const int64_t n_head_kv = hp.n_head_kv();       // 2
+    const float eps = hp.f_norm_rms_eps;
+    const int n_rot = (int) hp.n_rot();
+
+    std::vector<float> xn(hc * n_embd), mixed(n_embd), inject(hc * n_embd);
+    hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
+    hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
+
+    // ---- QSA indexer (short-context dense fallback: n_kv <= width) ----
+    const int64_t r = hp.dsv4_compress_ratios[0] ? hp.dsv4_compress_ratios[0] : 4;
+    const int64_t width = std::min<int64_t>(idx_n_kv, (int64_t) hp.indexer_top_k + r - 1);
+    const bool dense = idx_n_kv <= width;
+
+    std::vector<float> k_raw(hp.indexer_head_size);
+    lora_mm(L.index_k_proj, mixed.data(), nullptr, k_raw.data(), n_threads);
+    if (idx_n_kv > 0 && idx_k != nullptr) {
+        memcpy(idx_k + (size_t) pos * hp.indexer_head_size, k_raw.data(),
+               hp.indexer_head_size * sizeof(float));
+    }
+
+    std::vector<float> selected(n_kv, -INFINITY);
+    if (dense) {
+        for (int64_t j = 0; j < n_kv; j++) selected[j] = 0.0f;
+    } else {
+        // pooled block scores (mean over the r members, norm, rope, query, relu-sum)
+        const int64_t n_blocks = (idx_n_kv + r - 1) / r;
+        const int64_t idx_dim = hp.indexer_head_size;
+        const int64_t n_idx_h = hp.indexer_n_head;
+        std::vector<float> pooled(idx_dim * n_blocks), pooled_n(idx_dim * n_blocks);
+        for (int64_t b = 0; b < n_blocks; b++) {
+            for (int64_t i = 0; i < idx_dim; i++) {
+                double s = 0.0;
+                for (int64_t m = 0; m < r; m++) {
+                    const int64_t cell = b * r + m;
+                    if (cell < idx_n_kv) s += idx_k[(size_t) cell * idx_dim + i];
+                }
+                pooled[(size_t) b * idx_dim + i] = (float) (s / r);
+            }
+            // rms norm over the block key (the index_k_norm gamma folded to 1+w)
+            const float * pk = pooled.data() + (size_t) b * idx_dim;
+            const float * wn = (const float *) L.index_k_norm->data;
+            double ss = 0.0;
+            for (int64_t i = 0; i < idx_dim; i++) ss += (double) (pk[i] * pk[i]);
+            const float sc = 1.0f / sqrtf((float) (ss / idx_dim) + eps);
+            for (int64_t i = 0; i < idx_dim; i++) pooled_n[(size_t) b * idx_dim + i] = pk[i] * sc * wn[i];
+        }
+        // the block rope (position = b*r) + the query + the query rope
+        std::vector<float> q_idx(n_idx_h * idx_dim);
+        lora_mm(L.index_q_proj, mixed.data(), nullptr, q_idx.data(), n_threads);
+        {
+            const float * wn = (const float *) L.index_q_norm->data;
+            for (int64_t h = 0; h < n_idx_h; h++) {
+                const float * qh = q_idx.data() + h * idx_dim;
+                double ss = 0.0;
+                for (int64_t i = 0; i < idx_dim; i++) ss += (double) (qh[i] * qh[i]);
+                const float sc = 1.0f / sqrtf((float) (ss / idx_dim) + eps);
+                for (int64_t i = 0; i < idx_dim; i++) q_idx[h * idx_dim + i] = qh[i] * sc * wn[i];
+            }
+        }
+        // the rectified scores: sum over the heads of relu(pooled dot q)
+        std::vector<float> blk_score(n_blocks);
+        for (int64_t b = 0; b < n_blocks; b++) {
+            float s = 0.0f;
+            for (int64_t h = 0; h < n_idx_h; h++) {
+                float d = 0.0f;
+                for (int64_t i = 0; i < idx_dim; i++) {
+                    d += pooled_n[(size_t) b * idx_dim + i] * q_idx[(size_t) h * idx_dim + i];
+                }
+                s += fmaxf(d, 0.0f);
+            }
+            blk_score[b] = s;
+        }
+        // pick the width best blocks (the tail cells of the last blocks follow)
+        std::vector<int> picked;
+        {
+            std::vector<float> sc = blk_score;
+            for (int64_t k = 0; k < width; k++) {
+                int best = -1; float bestv = -INFINITY;
+                for (int64_t b = 0; b < n_blocks; b++) {
+                    if (sc[b] > bestv) { bestv = sc[b]; best = (int) b; }
+                }
+                if (best < 0) break;
+                picked.push_back(best);
+                sc[best] = -INFINITY;
+            }
+        }
+        for (int64_t j = 0; j < n_kv; j++) {
+            const int64_t b = j / r;
+            bool ok = false;
+            for (size_t k = 0; k < picked.size(); k++) if (picked[k] == (int) b) { ok = true; break; }
+            if (ok) selected[j] = 0.0f;
+        }
+    }
+
+    // ---- the q/k/v projections + norms + rope ----
+    std::vector<float> qfull(hp.n_embd_head_v() * 2 * n_head);
+    lora_mm(L.wq, mixed.data(), nullptr, qfull.data(), n_threads);
+    const int64_t hdim2 = n_embd_head * n_head;
+    std::vector<float> q(hdim2), gate(hdim2);
+    {
+        const float * qn = (const float *) L.attn_q_norm->data;
+        for (int64_t h = 0; h < n_head; h++) {
+            const float * qh = qfull.data() + h * 2 * n_embd_head;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd_head; i++) ss += (double) (qh[i] * qh[i]);
+            const float sc = 1.0f / sqrtf((float) (ss / n_embd_head) + eps);
+            for (int64_t i = 0; i < n_embd_head; i++) q[h * n_embd_head + i] = qh[i] * sc * qn[i];
+            memcpy(gate.data() + h * n_embd_head, qh + n_embd_head, n_embd_head * sizeof(float));
+        }
+    }
+    std::vector<float> k(n_embd_head * n_head_kv), v(n_embd_head * n_head_kv);
+    {
+        std::vector<float> kraw(n_embd_head * n_head_kv), vraw(n_embd_head * n_head_kv);
+        lora_mm(L.wk, mixed.data(), nullptr, kraw.data(), n_threads);
+        lora_mm(L.wv, mixed.data(), nullptr, vraw.data(), n_threads);
+        const float * kn = (const float *) L.attn_k_norm->data;
+        for (int64_t h = 0; h < n_head_kv; h++) {
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd_head; i++) ss += (double) (kraw[h * n_embd_head + i] * kraw[h * n_embd_head + i]);
+            const float sc = 1.0f / sqrtf((float) (ss / n_embd_head) + eps);
+            for (int64_t i = 0; i < n_embd_head; i++) {
+                k[h * n_embd_head + i] = kraw[h * n_embd_head + i] * sc * kn[i];
+                v[h * n_embd_head + i] = vraw[h * n_embd_head + i];
+            }
+        }
+    }
+
+    int sections[4] = { 11, 11, 10, 0 };
+    fused_rope(rp, q.data(), n_rot, n_head, pos, sections, 1);
+    fused_rope(rp, k.data(), n_rot, n_head_kv, pos, sections, 1);
+
+    // ---- KV write + the attention ----
+    if (n_kv > 0 && attn_k != nullptr) {
+        for (int64_t h = 0; h < n_head_kv; h++) {
+            memcpy(attn_k + (size_t) h * n_embd_head * n_kv + (size_t) pos * n_embd_head,
+                   k.data() + h * n_embd_head, n_embd_head * sizeof(float));
+            memcpy(attn_v + (size_t) h * n_embd_head * n_kv + (size_t) pos * n_embd_head,
+                   v.data() + h * n_embd_head, n_embd_head * sizeof(float));
+        }
+    }
+
+    std::vector<float> attn_out(hdim2);
+    if (n_kv > 0) {
+        std::vector<float> k_all(n_embd_head * n_head_kv * n_kv), v_all(n_embd_head * n_head_kv * n_kv);
+        memcpy(k_all.data(), attn_k, n_embd_head * n_head_kv * n_kv * sizeof(float));
+        memcpy(v_all.data(), attn_v, n_embd_head * n_head_kv * n_kv * sizeof(float));
+        // the QSA-masked attention via the graph's flash kernel (bit-exact)
+        fused_attn_flash(q.data(), k_all.data(), v_all.data(), n_embd_head, n_head, n_head_kv,
+                         n_kv, selected.data(), attn_out.data());
+    }
+
+    // the gate + the output projection
+    for (int64_t i = 0; i < hdim2; i++) {
+        const float g = gate[i];
+        attn_out[i] *= 1.0f / (1.0f + expf(-g));
+    }
+    std::vector<float> layer_out(n_embd);
+    lora_mm(L.wo, attn_out.data(), nullptr, layer_out.data(), n_threads);
+
+    // the MoE + the hc combine (same as the GDN layers)
+    std::vector<float> moe_out(n_embd);
+    fused_moe(L, hp, layer_out.data(), moe_out.data(), n_threads);
+    hc_combine(res_in_out, layer_out.data(), inject.data(), hc, n_embd);
+    hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
+    hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
+    fused_moe(L, hp, mixed.data(), moe_out.data(), n_threads);
+    hc_combine(res_in_out, moe_out.data(), inject.data(), hc, n_embd);
+
+    memcpy(out, res_in_out, n_embd * sizeof(float));
+    return true;
+}
