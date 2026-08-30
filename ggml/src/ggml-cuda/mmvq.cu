@@ -124,13 +124,25 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
 #endif
     }
 
-    const float2 dm4 = __half22float2(bq4_K->dm);
-    const float2 dm4_gate = __half22float2(bq4_K_gate->dm);
 #if defined(__gfx90a__)
+    union {
+        half2 h;
+        uint32_t u;
+    } dm4_packed = {}, dm4_gate_packed = {};
+    if ((threadIdx.x & 3) == 0) {
+        dm4_packed.h = bq4_K->dm;
+        dm4_gate_packed.h = bq4_K_gate->dm;
+    }
+    dm4_packed.u = __builtin_amdgcn_mov_dpp(dm4_packed.u, 0x00, 0xf, 0xf, false);
+    dm4_gate_packed.u = __builtin_amdgcn_mov_dpp(dm4_gate_packed.u, 0x00, 0xf, 0xf, false);
+    const float2 dm4 = __half22float2(dm4_packed.h);
+    const float2 dm4_gate = __half22float2(dm4_gate_packed.h);
     return make_float2(
         dm4.x*sumf_d[0] - dm4.y*sumf_m[0],
         dm4_gate.x*sumf_d[1] - dm4_gate.y*sumf_m[1]);
 #else
+    const float2 dm4 = __half22float2(bq4_K->dm);
+    const float2 dm4_gate = __half22float2(bq4_K_gate->dm);
     return make_float2(
         dm4.x*sumf_d - dm4.y*sumf_m,
         dm4_gate.x*sumf_d_gate - dm4_gate.y*sumf_m_gate);
