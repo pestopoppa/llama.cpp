@@ -626,20 +626,19 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
 
-    float sumf = 0.0f;
+    const int vil0 = (vl >> 0) & 0x0F0F0F0F;
+    const int vil1 = (vl >> 4) & 0x0F0F0F0F;
 
-#pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        const int sc = scales[4*i];
+    const int vih0 = ((vh >> 0) << 4) & 0x30303030;
+    const int vih1 = ((vh >> 4) << 4) & 0x30303030;
 
-        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+    const int vi0 = __vsubss4((vil0 | vih0), 0x20202020);
+    const int vi1 = __vsubss4((vil1 | vih1), 0x20202020);
 
-        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+    const int dot0 = ggml_cuda_dp4a(vi0, u[0], 0);
+    const int dot1 = ggml_cuda_dp4a(vi1, u[1], 0);
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
-
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
-    }
+    const float sumf = d8[0] * (dot0 * scales[0]) + d8[1] * (dot1 * scales[4]);
 
     return d*sumf;
 }
