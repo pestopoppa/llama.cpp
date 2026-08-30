@@ -1630,6 +1630,32 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+struct mmvq_q8_1_graph_cache {
+    unsigned long long capture_id = 0;
+    hipGraphNode_t tail = nullptr;
+    const void * src1 = nullptr;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    size_t nb[GGML_MAX_DIMS] = {};
+    void * q8_1 = nullptr;
+    bool valid = false;
+};
+
+static thread_local mmvq_q8_1_graph_cache q8_1_graph_cache;
+
+static bool mmvq_q8_1_graph_cache_matches(const ggml_tensor * src1) {
+    if (q8_1_graph_cache.src1 != src1->data) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (q8_1_graph_cache.ne[i] != src1->ne[i] || q8_1_graph_cache.nb[i] != src1->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1709,7 +1735,28 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+
+    bool reuse_src1_q8_1 = false;
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+    const bool cache_eligible = ctx.curr_stream_no == 0 && ids == nullptr &&
+        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && ne11 == 1 && ne12 == 1 && ne13 == 1;
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    unsigned long long capture_id = 0;
+    const hipGraphNode_t * dependencies = nullptr;
+    size_t dependency_count = 0;
+    if (cache_eligible) {
+        CUDA_CHECK(hipStreamGetCaptureInfo_v2(
+            stream, &capture_status, &capture_id, nullptr, &dependencies, &dependency_count));
+    }
+    const bool capture_active = capture_status == hipStreamCaptureStatusActive;
+    const hipGraphNode_t capture_tail = dependency_count == 1 ? dependencies[0] : nullptr;
+
+    reuse_src1_q8_1 = cache_eligible && capture_active && q8_1_graph_cache.valid &&
+        q8_1_graph_cache.capture_id == capture_id && q8_1_graph_cache.tail == capture_tail &&
+        q8_1_graph_cache.q8_1 == src1_q8_1.get() && mmvq_q8_1_graph_cache_matches(src1);
+#endif
+
+    if (!reuse_src1_q8_1) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -1743,6 +1790,31 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+    q8_1_graph_cache.valid = false;
+    if (cache_eligible && capture_active) {
+        hipStreamCaptureStatus capture_status_after;
+        unsigned long long capture_id_after = 0;
+        const hipGraphNode_t * dependencies_after = nullptr;
+        size_t dependency_count_after = 0;
+        CUDA_CHECK(hipStreamGetCaptureInfo_v2(
+            stream, &capture_status_after, &capture_id_after, nullptr,
+            &dependencies_after, &dependency_count_after));
+        if (capture_status_after == hipStreamCaptureStatusActive && capture_id_after == capture_id &&
+            dependency_count_after == 1) {
+            q8_1_graph_cache.capture_id = capture_id;
+            q8_1_graph_cache.tail = dependencies_after[0];
+            q8_1_graph_cache.src1 = src1->data;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                q8_1_graph_cache.ne[i] = src1->ne[i];
+                q8_1_graph_cache.nb[i] = src1->nb[i];
+            }
+            q8_1_graph_cache.q8_1 = src1_q8_1.get();
+            q8_1_graph_cache.valid = true;
+        }
+    }
+#endif
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
