@@ -841,3 +841,155 @@ bool fused_full_attn_layer(
     memcpy(out, res_in_out, n_embd * sizeof(float));
     return true;
 }
+
+// ---- the fused PLE (n-gram hash embedding) ---------------------------------
+
+// the host-side n-gram hash + the 51GB-table gather + the key/value
+// projections + the gate + the dilated depthwise conv, mirroring build_ple.
+//   tok : the current token; prev : the n_gram-1 predecessors (oldest first)
+//   hidden : the hc-wide input; res : the wide residual (updated in place)
+//   ple_conv_state : the [hist, hc_dim] conv history (updated in place)
+void fused_ple(
+        const struct llama_model_qwen4exp & model,
+        const struct llama_hparams & hp,
+        const struct llama_layer & L,
+        int32_t tok, const int32_t * prev,
+        const float * hidden, float * res,
+        float * ple_conv_state, int n_threads) {
+
+    const int64_t hc = hp.dsv4_hc_mult;
+    const int64_t n_embd = hp.n_embd;
+    const int64_t hc_dim = hc * n_embd;
+    const float eps = hp.f_norm_rms_eps;
+
+    // ---- the host-side hash (mirrors llm_graph_input_ple::set_input) ----
+    const int64_t n_gram = hp.ple_ngram_size;
+    const int64_t per_gram = hp.ple_heads_per_ngram;
+    const int64_t n_heads = hp.ple_n_heads;
+    const int64_t eos = hp.ple_eos_token_id;
+    const int64_t n_prev = n_gram - 1;
+
+    int64_t ctxv[8];
+    ctxv[0] = tok;
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; s++) {
+        const int64_t t = cut ? -1 : prev[n_prev - s];
+        cut = cut || t < 0 || t == eos;
+        ctxv[s] = cut ? eos : t;
+    }
+    std::vector<int32_t> rows(n_heads);
+    for (int64_t n = 2; n <= n_gram; n++) {
+        uint64_t mixed = (uint64_t) ctxv[0] * hp.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; j++) {
+            mixed ^= (uint64_t) ctxv[j] * hp.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; g++) {
+            const int64_t h_i = base + g;
+            rows[h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+        }
+    }
+
+    // ---- the gather from the per-layer token embedding table + the f32 cast
+    //      (the table is IQ4_NL in the on-disk file) ----
+    const struct ggml_tensor * table = model.per_layer_tok_embd;
+    const int64_t head_dim = hp.ple_head_dim;
+    std::vector<float> emb(n_heads * head_dim);
+    {
+        const struct ggml_type_traits * qtt = ggml_get_type_traits(table->type);
+        const size_t row_bytes = ggml_row_size(table->type, head_dim);
+        for (int64_t h = 0; h < n_heads; h++) {
+            const char * row = (const char *) table->data + (size_t) rows[h] * row_bytes;
+            if (table->type == GGML_TYPE_F32) {
+                memcpy(emb.data() + h * head_dim, row, head_dim * sizeof(float));
+            } else {
+                qtt->to_float(row, emb.data() + h * head_dim, head_dim);
+            }
+        }
+    }
+
+    // ---- the key/value projections ----
+    std::vector<float> key(hc_dim), value(n_embd);
+    lora_mm(L.ple_key, emb.data(), nullptr, key.data(), n_threads);
+    lora_mm(L.ple_value, emb.data(), nullptr, value.data(), n_threads);
+
+    // the grouped norms (the key + the query=hidden) + the gate
+    std::vector<float> key_n(hc_dim), query_n(hc_dim);
+    {
+        const float * kn = (const float *) L.ple_norm_key->data;
+        for (int64_t c = 0; c < hc; c++) {
+            const float * xc = key.data() + c * n_embd;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
+            const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
+            for (int64_t i = 0; i < n_embd; i++) key_n[c * n_embd + i] = xc[i] * sc * kn[c * n_embd + i];
+        }
+        const float * qn = (const float *) L.ple_norm_query->data;
+        for (int64_t c = 0; c < hc; c++) {
+            const float * xc = hidden + c * n_embd;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
+            const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
+            for (int64_t i = 0; i < n_embd; i++) query_n[c * n_embd + i] = xc[i] * sc * qn[c * n_embd + i];
+        }
+    }
+
+    // the per-stream score + the signed-square-root gate
+    std::vector<float> gate(hc);
+    {
+        const float inv = 1.0f / sqrtf((float) n_embd);
+        for (int64_t c = 0; c < hc; c++) {
+            float s = 0.0f;
+            for (int64_t i = 0; i < n_embd; i++) s += key_n[c * n_embd + i] * query_n[c * n_embd + i];
+            s *= inv;
+            const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
+            gate[c] = 1.0f / (1.0f + expf(-(s >= 0.0f ? mag : -mag)));
+        }
+    }
+
+    // the gated value + the conv norm
+    std::vector<float> gated(hc_dim), norm_conv(hc_dim);
+    for (int64_t c = 0; c < hc; c++) {
+        for (int64_t i = 0; i < n_embd; i++) gated[c * n_embd + i] = value[i] * gate[c];
+    }
+    {
+        const float * cn = (const float *) L.ple_norm_conv->data;
+        for (int64_t c = 0; c < hc; c++) {
+            const float * xc = gated.data() + c * n_embd;
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
+            const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
+            for (int64_t i = 0; i < n_embd; i++) norm_conv[c * n_embd + i] = xc[i] * sc * cn[c * n_embd + i];
+        }
+    }
+
+    // the dilated depthwise causal conv over the [hist, hc_dim] state:
+    // out[c] = sum_k w[k,c] * x[c, hist - (K-1-k)*dil]; the state shifts
+    const int64_t kern = hp.ple_conv_kernel;
+    const int64_t dil = hp.ple_ngram_size;
+    const int64_t hist = (kern - 1) * dil;
+    const float * w = (const float *) L.ple_conv1d->data;
+    std::vector<float> conv_out(hc_dim);
+    {
+        // the window: state [hist, hc_dim] + the current norm_conv at position hist
+        std::vector<float> window((hist + 1) * hc_dim);
+        memcpy(window.data(), ple_conv_state, hist * hc_dim * sizeof(float));
+        memcpy(window.data() + hist * hc_dim, norm_conv.data(), hc_dim * sizeof(float));
+        for (int64_t c = 0; c < hc_dim; c++) {
+            float sumf = 0.0f;
+            for (int64_t k = 0; k < kern; k++) {
+                const int64_t pos = hist - (kern - 1 - k) * dil;
+                sumf += window[(size_t) pos * hc_dim + c] * w[(size_t) k * hc_dim + c];
+            }
+            const float v = sumf;
+            conv_out[c] = v / (1.0f + expf(-v)); // silu
+        }
+        // the state update: keep the last hist positions
+        memcpy(ple_conv_state, window.data() + hc_dim, hist * hc_dim * sizeof(float));
+    }
+
+    // the combine: hidden + gated + conv_out
+    for (int64_t i = 0; i < hc_dim; i++) {
+        res[i] = hidden[i] + gated[i] + conv_out[i];
+    }
+}
