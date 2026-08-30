@@ -522,3 +522,39 @@ bool fused_decode_token(const struct llama_model_qwen4exp & model,
     fused_head(model, hp, res_hc.data(), logits, n_threads);
     return true;
 }
+
+// ---- the fused full-attention layer ----------------------------------------
+
+extern "C" {
+void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+}
+
+// the interleaved mrope parameters (the graph context's rope members, which
+// come from the llama_context_params in llm_graph_context's ctor)
+struct FusedRopeParams {
+    int n_ctx_orig;
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+};
+
+// apply the interleaved mrope via the graph's own rope tensor + kernel
+static void fused_rope(const FusedRopeParams & rp, float * x, int64_t n_dims,
+                       int64_t n_head, int32_t pos, int * sections,
+                       const int64_t n_stream) {
+    ggml_init_params gip = { 16 << 20, nullptr, false };
+    ggml_context * gctx = ggml_init(gip);
+    ggml_tensor * a = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_dims, n_head, n_stream);
+    memcpy(a->data, x, n_dims * n_head * n_stream * sizeof(float));
+    ggml_tensor * b = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_stream);
+    ((int32_t *) b->data)[0] = pos;
+    ggml_tensor * rope = ggml_rope_multi(gctx, a, b, nullptr,
+            (int) n_dims, sections, LLAMA_ROPE_TYPE_IMROPE,
+            rp.n_ctx_orig, rp.freq_base, rp.freq_scale,
+            rp.ext_factor, rp.attn_factor, rp.beta_fast, rp.beta_slow);
+    struct ggml_compute_params gparams;
+    gparams.ith = 0; gparams.nth = 1; gparams.wsize = 0; gparams.wdata = nullptr;
+    gparams.threadpool = nullptr; gparams.use_ref = false;
+    ggml_compute_forward_rope(&gparams, rope);
+    memcpy(x, rope->data, n_dims * n_head * n_stream * sizeof(float));
+    ggml_free(gctx);
+}
