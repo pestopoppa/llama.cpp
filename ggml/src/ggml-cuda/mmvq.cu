@@ -689,13 +689,21 @@ static __global__ void mul_mat_vec_q(
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+#if defined(CDNA2)
+    constexpr bool wave_per_row = type == GGML_TYPE_Q4_K && ncols_dst == 1 && small_k && nwarps == 2;
+#else
+    constexpr bool wave_per_row = false;
+#endif
+    constexpr int rows_per_thread = wave_per_row ? 1 : rows_per_cuda_block;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+    const     int k_tid = wave_per_row ? threadIdx.x : tid;
+    const     int row = wave_per_row ? threadIdx.y : 0;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    constexpr int blocks_per_iter = vdr * (wave_per_row ? 1 : nwarps)*warp_size / qi;
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -750,20 +758,20 @@ static __global__ void mul_mat_vec_q(
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+        if (threadIdx.x < rows_per_thread && (wave_per_row || threadIdx.y == 0) &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + row + threadIdx.x) < stride_col_dst)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                    x_biases[j] = x_bias[j * stride_col_dst + row + threadIdx.x];
                 }
             }
             if (use_gate_bias) {
                 gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                    gate_biases[j] = gate_bias[j * stride_col_dst + row + threadIdx.x];
                 }
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
@@ -778,79 +786,89 @@ static __global__ void mul_mat_vec_q(
     }
 
     // partial sum for each thread
-    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
-    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp[ncols_dst][rows_per_thread] = {{0.0f}};
+    float tmp_gate[ncols_dst][rows_per_thread] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = k_tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+        const int kqs = vdr * (k_tid % (qi/vdr));
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_thread; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
                 if constexpr (gate_only_swiglu) {
                     tmp_gate[j][i] += vec_dot_q_cuda(
-                        vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
                 } else if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
                     }
                 }
             }
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    if constexpr (!wave_per_row) {
+        __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_thread][warp_size];
+        [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_thread][warp_size];
 
-    if (threadIdx.y > 0) {
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_thread; ++i) {
+                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                    if constexpr (gate_only_swiglu) {
+                        tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                    } else if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
+
+        // sum up partial sums
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
-                if constexpr (gate_only_swiglu) {
-                    tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
-                } else if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+            for (int i = 0; i < rows_per_thread; ++i) {
+#pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                    if constexpr (gate_only_swiglu) {
+                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+                    } else if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+                        }
                     }
                 }
             }
         }
-    }
-    __syncthreads();
-    if (threadIdx.y > 0) {
-        return;
     }
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
-    // sum up partial sums and write back result
+    // finish the per-row reduction and write back result
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
-#pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
-                if constexpr (gate_only_swiglu) {
-                    tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
-                } else if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
-                    }
-                }
-            }
+        for (int i = 0; i < rows_per_thread; ++i) {
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
             if constexpr (gate_only_swiglu) {
                 tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
@@ -860,7 +878,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
                 float result = tmp[j][i];
                 if constexpr (gate_only_swiglu) {
                     result *= ggml_cuda_op_silu_single(tmp_gate[j][i]);
@@ -891,7 +909,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst[j*stride_col_dst + row + i] = result;
             }
         }
     }
