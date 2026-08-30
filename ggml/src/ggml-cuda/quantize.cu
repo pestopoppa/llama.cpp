@@ -4,7 +4,7 @@
 #if defined(__gfx90a__)
 template<int offset>
 static __device__ __forceinline__ float quantize_q8_1_shuffle_xor_gfx90a(float x) {
-    static_assert(offset == 1 || offset == 2 || offset == 4 || offset == 8 || offset == 16,
+    static_assert(offset == 4 || offset == 8 || offset == 16,
         "unsupported XOR shuffle offset");
 
     union {
@@ -76,9 +76,11 @@ static __global__ void quantize_q8_1_1d(
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
     const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
 
+#if !defined(__gfx90a__)
     if (i0 >= ne0) {
         return;
     }
+#endif // !defined(__gfx90a__)
 
     block_q8_1 * y = (block_q8_1 *) vy;
 
@@ -86,7 +88,7 @@ static __global__ void quantize_q8_1_1d(
     const int64_t iqs = i0 % QK8_1;
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i0] : 0.0f;
+    const float xi = i0 < ne0 && i0 < ne00 ? x[i0] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -97,10 +99,20 @@ static __global__ void quantize_q8_1_1d(
     sum += quantize_q8_1_shuffle_xor_gfx90a<8>(sum);
     amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<4>(amax));
     sum += quantize_q8_1_shuffle_xor_gfx90a<4>(sum);
-    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<2>(amax));
-    sum += quantize_q8_1_shuffle_xor_gfx90a<2>(sum);
-    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<1>(amax));
-    sum += quantize_q8_1_shuffle_xor_gfx90a<1>(sum);
+    // DPP reads need two wait states after a VGPR write on gfx90a.
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_max_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0"
+        : "+v"(amax), "+v"(sum));
+    __builtin_amdgcn_wave_barrier();
+    if (i0 >= ne0) {
+        return;
+    }
 #else
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
