@@ -964,26 +964,26 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
+    int vi0;
+    int vi1;
+    {
+        const int ql = get_int_b2(bq6_K->ql, iqs);
+        const int qh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+        vi0 = __vsubss4((ql & 0x0F0F0F0F) | ((qh << 4) & 0x30303030), 0x20202020);
+        vi1 = __vsubss4(((ql >> 4) & 0x0F0F0F0F) | (qh & 0x30303030), 0x20202020);
+    }
+
     float sumf;
     {
-        const int vl  = get_int_b2(bq6_K->ql, iqs);
-        const int vh  = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
-        const int vil = (vl >> 0) & 0x0F0F0F0F;
-        const int vih = ((vh >> 0) << 4) & 0x30303030;
-        const int vi  = __vsubss4((vil | vih), 0x20202020);
         const int u   = get_int_b4(bq8_1[bq8_offset].qs, iqs % QI8_1);
-        const int dot = ggml_cuda_dp4a(vi, u, 0);
+        const int dot = ggml_cuda_dp4a(vi0, u, 0);
 
         sumf = __low2float(bq8_1[bq8_offset].ds) * (dot * bq6_K->scales[scale_offset]);
     }
     {
-        const int vl  = get_int_b2(bq6_K->ql, iqs);
-        const int vh  = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
-        const int vil = (vl >> 4) & 0x0F0F0F0F;
-        const int vih = ((vh >> 4) << 4) & 0x30303030;
-        const int vi  = __vsubss4((vil | vih), 0x20202020);
         const int u   = get_int_b4(bq8_1[bq8_offset + 2].qs, iqs % QI8_1);
-        const int dot = ggml_cuda_dp4a(vi, u, 0);
+        const int dot = ggml_cuda_dp4a(vi1, u, 0);
 
         sumf += __low2float(bq8_1[bq8_offset + 2].ds) * (dot * bq6_K->scales[scale_offset + 4]);
     }
