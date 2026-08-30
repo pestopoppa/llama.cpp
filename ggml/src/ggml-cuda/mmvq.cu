@@ -666,7 +666,7 @@ static __global__ void mul_mat_vec_q8_0_prefetch(
 }
 #endif // GGML_USE_HIP
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool gate_only_swiglu = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool gate_only_swiglu = false, bool bias_only = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -676,6 +676,8 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride) {
     static_assert(!gate_only_swiglu || has_fusion, "gate-only SwiGLU requires fusion");
+    static_assert(!bias_only || (has_fusion && type == GGML_TYPE_Q4_K), "bias-only fusion requires Q4_K");
+    static_assert(!bias_only || !gate_only_swiglu, "bias-only fusion and gate-only SwiGLU are mutually exclusive");
 
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
@@ -731,7 +733,9 @@ static __global__ void mul_mat_vec_q(
     const float * gate_scale = nullptr;
     ggml_glu_op active_glu;
 
-    if constexpr (gate_only_swiglu) {
+    if constexpr (bias_only) {
+        x_bias = (const float *) fusion.x_bias;
+    } else if constexpr (gate_only_swiglu) {
         vgate = fusion.gate;
     } else if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -754,7 +758,17 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
-    if constexpr (has_fusion && !gate_only_swiglu) {
+    if constexpr (bias_only) {
+        const uint32_t channel_bias = ids ? channel_x : channel_dst;
+        if (threadIdx.x < rows_per_thread && (wave_per_row || threadIdx.y == 0) &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + row + threadIdx.x) < stride_col_dst)) {
+            x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                x_biases[j] = x_bias[j * stride_col_dst + row + threadIdx.x];
+            }
+        }
+    } else if constexpr (has_fusion && !gate_only_swiglu) {
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
@@ -807,7 +821,7 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (gate_only_swiglu) {
                     tmp_gate[j][i] += vec_dot_q_cuda(
                         vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
-                } else if constexpr (has_fusion) {
+                } else if constexpr (has_fusion && !bias_only) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
@@ -819,7 +833,7 @@ static __global__ void mul_mat_vec_q(
 
     if constexpr (!wave_per_row) {
         __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_thread][warp_size];
-        [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_thread][warp_size];
+        [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && !bias_only && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_thread][warp_size];
 
         if (threadIdx.y > 0) {
 #pragma unroll
@@ -829,7 +843,7 @@ static __global__ void mul_mat_vec_q(
                     tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                     if constexpr (gate_only_swiglu) {
                         tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
-                    } else if constexpr (has_fusion) {
+                    } else if constexpr (has_fusion && !bias_only) {
                         if (use_gate) {
                             tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
                         }
@@ -852,7 +866,7 @@ static __global__ void mul_mat_vec_q(
                     tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                     if constexpr (gate_only_swiglu) {
                         tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
-                    } else if constexpr (has_fusion) {
+                    } else if constexpr (has_fusion && !bias_only) {
                         if (use_gate) {
                             tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
                         }
@@ -872,7 +886,7 @@ static __global__ void mul_mat_vec_q(
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
             if constexpr (gate_only_swiglu) {
                 tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
-            } else if constexpr (has_fusion) {
+            } else if constexpr (has_fusion && !bias_only) {
                 if (use_gate) {
                     tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
                 }
@@ -880,7 +894,9 @@ static __global__ void mul_mat_vec_q(
 
             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
                 float result = tmp[j][i];
-                if constexpr (gate_only_swiglu) {
+                if constexpr (bias_only) {
+                    result += x_biases[j];
+                } else if constexpr (gate_only_swiglu) {
                     result *= ggml_cuda_op_silu_single(tmp_gate[j][i]);
                 } else if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -919,6 +935,9 @@ static __global__ void mul_mat_vec_q(
     }
     if constexpr (gate_only_swiglu) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, active_glu, gate_bias, x_bias);
+    }
+    if constexpr (bias_only) {
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, active_glu, vgate, gate_bias, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1054,6 +1073,15 @@ static void mul_mat_vec_q_switch_fusion(
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             if constexpr (type == GGML_TYPE_Q4_K) {
+                const bool use_bias_only = fusion.gate == nullptr && fusion.x_bias != nullptr &&
+                    fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
+                if (use_bias_only) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, true>, launch_params,
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                    return;
+                }
                 const bool use_gate_only_swiglu = fusion.gate != nullptr && fusion.x_bias == nullptr &&
                     fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
                     fusion.glu_op == GGML_GLU_OP_SWIGLU;
