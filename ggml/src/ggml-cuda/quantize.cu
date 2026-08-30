@@ -84,8 +84,13 @@ static __global__ void quantize_q8_1_1d(
 
     block_q8_1 * y = (block_q8_1 *) vy;
 
+#if defined(__gfx90a__)
+    const int64_t ib  = 2*(int64_t) blockIdx.x + threadIdx.x / QK8_1;
+    const int64_t iqs = threadIdx.x % QK8_1;
+#else
     const int64_t ib  = i0 / QK8_1;
     const int64_t iqs = i0 % QK8_1;
+#endif // defined(__gfx90a__)
 
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne0 && i0 < ne00 ? x[i0] : 0.0f;
