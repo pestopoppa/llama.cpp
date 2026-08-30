@@ -9,6 +9,103 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
+        const void * __restrict__ vbq, const void * __restrict__ vgate,
+        const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q4_K * bq4_K      = (const block_q4_K *) vbq   + kbx;
+    const block_q4_K * bq4_K_gate = (const block_q4_K *) vgate + kbx;
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int q4_offset = 16 * bq8_offset + 4 * ((iqs/2)%4);
+
+    const int * q4      = (const int *) (bq4_K->qs      + q4_offset);
+    const int * q4_gate = (const int *) (bq4_K_gate->qs + q4_offset);
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+    const int v0_gate = q4_gate[0];
+    const int v1_gate = q4_gate[4];
+
+    const uint16_t * scales      = (const uint16_t *) bq4_K->scales;
+    const uint16_t * scales_gate = (const uint16_t *) bq4_K_gate->scales;
+    const int j = bq8_offset/2;
+    const uint8_t * sc;
+    const uint8_t * sc_gate;
+#if defined(GGML_USE_HIP)
+    const int is = j & 1;
+    const uint32_t s0 = scales[is + 0];
+    const uint32_t s1 = scales[is + 2];
+    const uint32_t s2 = scales[is + 4];
+    const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
+    const uint32_t aux_low = s01 & 0x3f3f3f3f;
+    const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
+                              ((s01 & 0xc0c0c0c0) >> 2);
+    const uint32_t aux = j < 2 ? aux_low : aux_high;
+    sc = (const uint8_t *) &aux;
+
+    const uint32_t s0_gate = scales_gate[is + 0];
+    const uint32_t s1_gate = scales_gate[is + 2];
+    const uint32_t s2_gate = scales_gate[is + 4];
+    const uint32_t s01_gate = __builtin_amdgcn_perm(s1_gate, s0_gate, 0x05040100);
+    const uint32_t aux_low_gate = s01_gate & 0x3f3f3f3f;
+    const uint32_t aux_high_gate =
+        (__builtin_amdgcn_perm(s2_gate >> 4, s2_gate, 0x05040100) & 0x0f0f0f0f) |
+        ((s01_gate & 0xc0c0c0c0) >> 2);
+    const uint32_t aux_gate = j < 2 ? aux_low_gate : aux_high_gate;
+    sc_gate = (const uint8_t *) &aux_gate;
+#else
+    uint16_t aux[2];
+    uint16_t aux_gate[2];
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+        aux_gate[0] = scales_gate[j+0] & 0x3f3f;
+        aux_gate[1] = scales_gate[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+        aux_gate[0] = ((scales_gate[j+2] >> 0) & 0x0f0f) | ((scales_gate[j-2] & 0xc0c0) >> 2);
+        aux_gate[1] = ((scales_gate[j+2] >> 4) & 0x0f0f) | ((scales_gate[j-0] & 0xc0c0) >> 2);
+    }
+    sc = (const uint8_t *) aux;
+    sc_gate = (const uint8_t *) aux_gate;
+#endif
+    const uint8_t * m      = sc      + 2;
+    const uint8_t * m_gate = sc_gate + 2;
+    const bool sum_lane = iqs % QI8_1 == 0;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    float sumf_d_gate = 0.0f;
+    float sumf_m_gate = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        const half2 ds8 = bq8i->ds;
+        const float d8 = __low2float(ds8);
+        const float s8 = sum_lane ? __high2float(ds8) : 0.0f;
+        const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
+        const int u0 = q8[0];
+        const int u1 = q8[4];
+
+        const int dot0 = ggml_cuda_dp4a((v0 >> (4*i)) & 0x0F0F0F0F, u0, 0);
+        const int dot1 = ggml_cuda_dp4a((v1 >> (4*i)) & 0x0F0F0F0F, u1, 0);
+        sumf_d += d8 * ((dot0 + dot1) * sc[i]);
+        sumf_m += s8 * m[i];
+
+        const int dot0_gate = ggml_cuda_dp4a((v0_gate >> (4*i)) & 0x0F0F0F0F, u0, 0);
+        const int dot1_gate = ggml_cuda_dp4a((v1_gate >> (4*i)) & 0x0F0F0F0F, u1, 0);
+        sumf_d_gate += d8 * ((dot0_gate + dot1_gate) * sc_gate[i]);
+        sumf_m_gate += s8 * m_gate[i];
+    }
+
+    const float2 dm4 = __half22float2(bq4_K->dm);
+    const float2 dm4_gate = __half22float2(bq4_K_gate->dm);
+    return make_float2(
+        dm4.x*sumf_d - dm4.y*sumf_m,
+        dm4_gate.x*sumf_d_gate - dm4_gate.y*sumf_m_gate);
+}
+
 static bool ggml_cuda_log_mmvq_route_enabled() {
     static const bool enabled = []() {
         const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
@@ -816,15 +913,20 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_thread; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
-                if constexpr (gate_only_swiglu) {
-                    tmp_gate[j][i] += vec_dot_q_cuda(
-                        vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
-                } else if constexpr (has_fusion && !bias_only) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + (row + i)*stride_row_x + kbx, kqs);
+                const int kbx_row = kbx_offset + (row + i)*stride_row_x + kbx;
+                if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 1 && small_k && gate_only_swiglu) {
+                    const float2 dots = vec_dot_q4_K_q8_1_dual(
+                        vx, vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                    tmp[j][i] += dots.x;
+                    tmp_gate[j][i] += dots.y;
+                } else {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_row, kqs);
+                    if constexpr (gate_only_swiglu) {
+                        tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                    } else if constexpr (has_fusion && !bias_only) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                        }
                     }
                 }
             }
