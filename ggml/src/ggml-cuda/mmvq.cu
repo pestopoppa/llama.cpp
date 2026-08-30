@@ -83,10 +83,16 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
     const uint8_t * m_gate = sc_gate + 2;
     const bool sum_lane = iqs % QI8_1 == 0;
 
+#if defined(__gfx90a__)
+    using floatx2_t = __attribute__((ext_vector_type(2))) float;
+    floatx2_t sumf_d = {0.0f, 0.0f};
+    floatx2_t sumf_m = {0.0f, 0.0f};
+#else
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
     float sumf_d_gate = 0.0f;
     float sumf_m_gate = 0.0f;
+#endif
 
 #pragma unroll
     for (int i = 0; i < QR4_K; ++i) {
@@ -100,20 +106,35 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
 
         const int dot0 = ggml_cuda_dp4a((v0 >> (4*i)) & 0x0F0F0F0F, u0, 0);
         const int dot1 = ggml_cuda_dp4a((v1 >> (4*i)) & 0x0F0F0F0F, u1, 0);
-        sumf_d += d8 * ((dot0 + dot1) * sc[i]);
-        sumf_m += s8 * m[i];
-
         const int dot0_gate = ggml_cuda_dp4a((v0_gate >> (4*i)) & 0x0F0F0F0F, u0, 0);
         const int dot1_gate = ggml_cuda_dp4a((v1_gate >> (4*i)) & 0x0F0F0F0F, u1, 0);
+#if defined(__gfx90a__)
+        const floatx2_t d8_packed = {d8, d8};
+        const floatx2_t s8_packed = {s8, s8};
+        const floatx2_t dot_packed = {
+            float((dot0 + dot1) * sc[i]), float((dot0_gate + dot1_gate) * sc_gate[i])};
+        const floatx2_t min_packed = {float(m[i]), float(m_gate[i])};
+        sumf_d = __builtin_elementwise_fma(d8_packed, dot_packed, sumf_d);
+        sumf_m = __builtin_elementwise_fma(s8_packed, min_packed, sumf_m);
+#else
+        sumf_d += d8 * ((dot0 + dot1) * sc[i]);
+        sumf_m += s8 * m[i];
         sumf_d_gate += d8 * ((dot0_gate + dot1_gate) * sc_gate[i]);
         sumf_m_gate += s8 * m_gate[i];
+#endif
     }
 
     const float2 dm4 = __half22float2(bq4_K->dm);
     const float2 dm4_gate = __half22float2(bq4_K_gate->dm);
+#if defined(__gfx90a__)
+    return make_float2(
+        dm4.x*sumf_d[0] - dm4.y*sumf_m[0],
+        dm4_gate.x*sumf_d[1] - dm4_gate.y*sumf_m[1]);
+#else
     return make_float2(
         dm4.x*sumf_d - dm4.y*sumf_m,
         dm4_gate.x*sumf_d_gate - dm4_gate.y*sumf_m_gate);
+#endif
 }
 
 static bool ggml_cuda_log_mmvq_route_enabled() {
