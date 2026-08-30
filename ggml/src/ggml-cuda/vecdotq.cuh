@@ -872,15 +872,23 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const int j = bq8_offset/2;
     const uint8_t * sc;
 #if defined(GGML_USE_HIP)
-    const int is = j & 1;
-    const uint32_t s0 = scales[is + 0];
-    const uint32_t s1 = scales[is + 2];
-    const uint32_t s2 = scales[is + 4];
-    const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
-    const uint32_t aux_low = s01 & 0x3f3f3f3f;
-    const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
-                              ((s01 & 0xc0c0c0c0) >> 2);
-    const uint32_t aux = j < 2 ? aux_low : aux_high;
+    uint32_t aux = 0;
+#if defined(__gfx90a__)
+    if ((threadIdx.x & 3) == 0) {
+#endif
+        const int is = j & 1;
+        const uint32_t s0 = scales[is + 0];
+        const uint32_t s1 = scales[is + 2];
+        const uint32_t s2 = scales[is + 4];
+        const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
+        const uint32_t aux_low = s01 & 0x3f3f3f3f;
+        const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
+                                  ((s01 & 0xc0c0c0c0) >> 2);
+        aux = j < 2 ? aux_low : aux_high;
+#if defined(__gfx90a__)
+    }
+    aux = __builtin_amdgcn_mov_dpp(aux, 0x00, 0xf, 0xf, false); // quad_perm:[0,0,0,0]
+#endif
     sc = (const uint8_t *)&aux;
 #else
     uint16_t aux[2];
