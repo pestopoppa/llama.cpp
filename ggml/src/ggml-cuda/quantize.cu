@@ -4,23 +4,15 @@
 #if defined(__gfx90a__)
 template<int offset>
 static __device__ __forceinline__ float quantize_q8_1_shuffle_xor_gfx90a(float x) {
+    static_assert(offset == 1 || offset == 2 || offset == 4 || offset == 8 || offset == 16,
+        "unsupported XOR shuffle offset");
+
     union {
         float f;
         int32_t i;
     } value = {x};
 
-    if constexpr (offset == 16) {
-        value.i = __builtin_amdgcn_ds_swizzle(value.i, 0x401f);
-    } else if constexpr (offset == 8) {
-        value.i = __builtin_amdgcn_mov_dpp(value.i, 0x128, 0xf, 0xf, false);
-    } else if constexpr (offset == 4) {
-        value.i = __builtin_amdgcn_ds_swizzle(value.i, 0x101f);
-    } else if constexpr (offset == 2) {
-        value.i = __builtin_amdgcn_mov_dpp(value.i, 0x4e, 0xf, 0xf, false);
-    } else {
-        static_assert(offset == 1, "unsupported XOR shuffle offset");
-        value.i = __builtin_amdgcn_mov_dpp(value.i, 0xb1, 0xf, 0xf, false);
-    }
+    value.i = __builtin_amdgcn_ds_swizzle(value.i, (offset << 10) | 0x1f);
 
     return value.f;
 }
