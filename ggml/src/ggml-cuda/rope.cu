@@ -155,7 +155,7 @@ static __global__ void rope_neox(const T *            x,
     const int i23 = blockIdx.x / head_blocks;
     const int i1  = 4 * (blockIdx.x - i23 * head_blocks) + threadIdx.x;
 
-    if (i0 >= ne00 || i1 >= ne01) {
+    if (i0 >= ne00) {
         return;
     }
 
@@ -173,9 +173,33 @@ static __global__ void rope_neox(const T *            x,
     const uint32_t i1 = row_dst - i3 * ne01 * ne02 - i2 * ne01;
 #endif // defined(__gfx90a__)
 
+    ggml_cuda_pdl_sync();
+
+    float cos_theta = 0.0f;
+    float sin_theta = 0.0f;
+
+    if (i0 < n_dims) {
+#if defined(__gfx90a__)
+        if (threadIdx.x == 0) {
+#endif // defined(__gfx90a__)
+            const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
+            const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+            rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+#if defined(__gfx90a__)
+        }
+        cos_theta = rope_neox_quad_broadcast(cos_theta);
+        sin_theta = rope_neox_quad_broadcast(sin_theta);
+#endif // defined(__gfx90a__)
+    }
+
+#if defined(__gfx90a__)
+    if (i1 >= ne01) {
+        return;
+    }
+#endif // defined(__gfx90a__)
+
     int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
-    ggml_cuda_pdl_sync();
 
     // Fusion optimization: ROPE + VIEW + SET_ROWS.
     // The rope output is viewed as a 1D tensor and offset based on a row index in row_indices.
@@ -190,21 +214,6 @@ static __global__ void rope_neox(const T *            x,
 
         return;
     }
-
-    float cos_theta = 0.0f;
-    float sin_theta = 0.0f;
-
-#if defined(__gfx90a__)
-    if (threadIdx.x == 0) {
-#endif // defined(__gfx90a__)
-        const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
-        const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
-        rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
-#if defined(__gfx90a__)
-    }
-    cos_theta = rope_neox_quad_broadcast(cos_theta);
-    sin_theta = rope_neox_quad_broadcast(sin_theta);
-#endif // defined(__gfx90a__)
 
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
