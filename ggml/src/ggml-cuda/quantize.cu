@@ -494,11 +494,14 @@ void quantize_row_q8_1_cuda(
     GGML_ASSERT(!ids);
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
-    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const bool is_1d = ne1 == 1 && ne2 == 1 && ne3 == 1;
+    const int block_size_x = is_1d && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_CDNA2 ?
+        64 : CUDA_QUANTIZE_BLOCK_SIZE;
+    const int64_t block_num_x = (ne0 + block_size_x - 1) / block_size_x;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const dim3 block_size(block_size_x, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    if (ne1 == 1 && ne2 == 1 && ne3 == 1) {
+    if (is_1d) {
         ggml_cuda_kernel_launch(quantize_q8_1_1d, launch_params, x, vy, ne00, ne0);
     } else {
         const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
