@@ -31,26 +31,36 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
     const uint8_t * sc;
     const uint8_t * sc_gate;
 #if defined(GGML_USE_HIP)
-    const int is = j & 1;
-    const uint32_t s0 = scales[is + 0];
-    const uint32_t s1 = scales[is + 2];
-    const uint32_t s2 = scales[is + 4];
-    const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
-    const uint32_t aux_low = s01 & 0x3f3f3f3f;
-    const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
-                              ((s01 & 0xc0c0c0c0) >> 2);
-    const uint32_t aux = j < 2 ? aux_low : aux_high;
-    sc = (const uint8_t *) &aux;
+    uint32_t aux = 0;
+    uint32_t aux_gate = 0;
+#if defined(__gfx90a__)
+    if ((threadIdx.x & 3) == 0) {
+#endif
+        const int is = j & 1;
+        const uint32_t s0 = scales[is + 0];
+        const uint32_t s1 = scales[is + 2];
+        const uint32_t s2 = scales[is + 4];
+        const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
+        const uint32_t aux_low = s01 & 0x3f3f3f3f;
+        const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
+                                  ((s01 & 0xc0c0c0c0) >> 2);
+        aux = j < 2 ? aux_low : aux_high;
 
-    const uint32_t s0_gate = scales_gate[is + 0];
-    const uint32_t s1_gate = scales_gate[is + 2];
-    const uint32_t s2_gate = scales_gate[is + 4];
-    const uint32_t s01_gate = __builtin_amdgcn_perm(s1_gate, s0_gate, 0x05040100);
-    const uint32_t aux_low_gate = s01_gate & 0x3f3f3f3f;
-    const uint32_t aux_high_gate =
-        (__builtin_amdgcn_perm(s2_gate >> 4, s2_gate, 0x05040100) & 0x0f0f0f0f) |
-        ((s01_gate & 0xc0c0c0c0) >> 2);
-    const uint32_t aux_gate = j < 2 ? aux_low_gate : aux_high_gate;
+        const uint32_t s0_gate = scales_gate[is + 0];
+        const uint32_t s1_gate = scales_gate[is + 2];
+        const uint32_t s2_gate = scales_gate[is + 4];
+        const uint32_t s01_gate = __builtin_amdgcn_perm(s1_gate, s0_gate, 0x05040100);
+        const uint32_t aux_low_gate = s01_gate & 0x3f3f3f3f;
+        const uint32_t aux_high_gate =
+            (__builtin_amdgcn_perm(s2_gate >> 4, s2_gate, 0x05040100) & 0x0f0f0f0f) |
+            ((s01_gate & 0xc0c0c0c0) >> 2);
+        aux_gate = j < 2 ? aux_low_gate : aux_high_gate;
+#if defined(__gfx90a__)
+    }
+    aux = __builtin_amdgcn_mov_dpp(aux, 0x00, 0xf, 0xf, false);
+    aux_gate = __builtin_amdgcn_mov_dpp(aux_gate, 0x00, 0xf, 0xf, false);
+#endif
+    sc = (const uint8_t *) &aux;
     sc_gate = (const uint8_t *) &aux_gate;
 #else
     uint16_t aux[2];
@@ -907,7 +917,10 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    if (!halfwave_rows || uint32_t(row0 + row) < stride_col_dst) {
+    constexpr bool converged_q4_K_dual =
+        type == GGML_TYPE_Q4_K && ncols_dst == 1 && small_k && gate_only_swiglu;
+    const bool row_in_bounds = !halfwave_rows || uint32_t(row0 + row) < stride_col_dst;
+    if (row_in_bounds || converged_q4_K_dual) {
 #pragma unroll
         for (int k_part = 0; k_part < k_part_count; ++k_part) {
             const int k_tid = k_tid_base + k_part*reduction_width;
@@ -921,12 +934,15 @@ static __global__ void mul_mat_vec_q(
                 for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                     for (int i = 0; i < rows_per_thread; ++i) {
-                        const int kbx_row = kbx_offset + (row + i)*stride_row_x + kbx;
-                        if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 1 && small_k && gate_only_swiglu) {
+                        const int row_i = converged_q4_K_dual && !row_in_bounds ? 0 : row + i;
+                        const int kbx_row = kbx_offset + row_i*stride_row_x + kbx;
+                        if constexpr (converged_q4_K_dual) {
                             const float2 dots = vec_dot_q4_K_q8_1_dual(
                                 vx, vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
-                            tmp[j][i][k_part] += dots.x;
-                            tmp_gate[j][i][k_part] += dots.y;
+                            if (row_in_bounds) {
+                                tmp[j][i][k_part] += dots.x;
+                                tmp_gate[j][i][k_part] += dots.y;
+                            }
                         } else {
                             tmp[j][i][k_part] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_row, kqs);
                             if constexpr (gate_only_swiglu) {
