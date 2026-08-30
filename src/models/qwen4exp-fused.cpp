@@ -458,3 +458,67 @@ void fused_gdn_layer(
     memcpy(out, res_in_out, n_embd * sizeof(float));
 }
 
+
+// ---- the head + the decode loop --------------------------------------------
+
+// the final hc_mix (the output norm; no inject) + the output projection
+static void fused_head(const struct llama_model_qwen4exp & model,
+                       const struct llama_hparams & hp,
+                       const float * res_hc, float * logits, int n_threads) {
+    const int64_t hc = hp.dsv4_hc_mult;
+    const int64_t n_embd = hp.n_embd;
+    const float eps = hp.f_norm_rms_eps;
+
+    std::vector<float> xn(hc * n_embd), mixed(n_embd);
+    hc_rms_norm_gamma(res_hc, model.hc_head_norm, xn.data(), n_embd, hc, eps);
+    hc_mix(model.hc_head_down, model.hc_head_up, nullptr, hc, xn.data(), mixed.data(), nullptr, n_threads);
+    lora_mm(model.output, mixed.data(), model.output_s, logits, n_threads);
+}
+
+// the full fused decode for a single token: PLE + the layer loop + the head.
+// The PLE (layer 1) and the full-attention layers still need the memory-context
+// transcription; this skeleton runs the GDN layers and marks the rest.
+// Returns false until every layer type is wired.
+bool fused_decode_token(const struct llama_model_qwen4exp & model,
+                        const struct llama_hparams & hp,
+                        const float * tok_embd,
+                        float * logits,
+                        int n_threads) {
+    const int64_t hc = hp.dsv4_hc_mult;
+    const int64_t n_embd = hp.n_embd;
+    const int64_t hc_dim = hc * n_embd;
+
+    // the wide residual starts as hc identical copies of the embedding
+    std::vector<float> res_hc(hc_dim);
+    for (int64_t c = 0; c < hc; c++) {
+        memcpy(res_hc.data() + c * n_embd, tok_embd, n_embd * sizeof(float));
+    }
+
+    std::vector<float> layer_out(n_embd);
+
+    for (int il = 0; il < (int) hp.n_layer(); il++) {
+        const struct llama_layer & L = model.layers[il];
+
+        if (hp.is_ple_impl[il]) {
+            // TODO(INF-64): the PLE fused transcription (host-side n-gram hash +
+            // the 51GB-table gather + the conv + the gate)
+            return false;
+        }
+        if (hp.is_recr(il)) {
+            // TODO(INF-64): the conv/ssm state rows from the memory context
+            float * conv_state = nullptr;
+            float * ssm_state = nullptr;
+            if (conv_state == nullptr || ssm_state == nullptr) {
+                return false;
+            }
+            fused_gdn_layer(L, hp, res_hc.data(), res_hc.data(), layer_out.data(),
+                            conv_state, ssm_state, n_threads);
+        } else {
+            // TODO(INF-64): the full-attention layer fused transcription
+            return false;
+        }
+    }
+
+    fused_head(model, hp, res_hc.data(), logits, n_threads);
+    return true;
+}
