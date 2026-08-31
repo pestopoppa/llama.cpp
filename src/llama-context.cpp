@@ -1455,13 +1455,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 for (int ni = 0; ni < n_nodes; ni++) {
                     const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
                     if (!nd || !nd->data) continue;
-                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni < 30) {
-                        // the rms_norm output + its eps + the name
-                        fprintf(stderr, "rms_norm[%d] %s eps=%.6g out[0..3]=%.6g %.6g %.6g %.6g\n",
+                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni == 3 && nd->src[0] && nd->src[0]->data && !getenv("GGML_FUSED_NORMSRC") && nd->src[0]->ne[2] == 1) {
+                        // dump the full step-1 hc_init (the rms_norm input)
+                        const ggml_tensor * s0 = nd->src[0];
+                        FILE * f = fopen("/tmp/qwen4exp-builds/g_hcinit.bin", "wb");
+                        if (f) { fwrite(s0->data, 4, s0->ne[0] * s0->ne[1], f); fclose(f); }
+                    }
+                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni < 30 && !getenv("GGML_FUSED_NORMSRC")) {
+                        // the rms_norm output + its eps + the name + the src0's first values
+                        const ggml_tensor * s0 = nd->src[0];
+                        fprintf(stderr, "rms_norm[%d] %s eps=%.6g out[0..3]=%.6g %.6g %.6g %.6g src0=%s ne=[%lld,%lld,%lld] src0[0..3]=%.6g %.6g %.6g %.6g\n",
                                 ni, ggml_get_name(nd),
                                 ((const float *) nd->op_params)[0],
                                 ((const float *) nd->data)[0], ((const float *) nd->data)[1],
-                                ((const float *) nd->data)[2], ((const float *) nd->data)[3]);
+                                ((const float *) nd->data)[2], ((const float *) nd->data)[3],
+                                s0 ? ggml_get_name(s0) : "?",
+                                s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[0] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[1] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[2] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[3] : 0);
                     }
                     if (nd->op == GGML_OP_MEAN_D1 && nd->data && nd->src[0] && nd->src[0]->data) {
                         const ggml_tensor * gated = nd->src[0];

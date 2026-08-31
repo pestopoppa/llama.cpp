@@ -1351,6 +1351,10 @@ bool llama_model_qwen4exp::fused_decode(
         for (int64_t c = 0; c < hc; c++) {
             memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
         }
+        if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/f_embd.bin", "wb");
+            if (f) { fwrite(emb.data(), 4, n_embd, f); fclose(f); }
+        }
     }
 
     // scratch ggml context for the cache views
