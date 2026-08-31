@@ -1420,9 +1420,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
         const ggml_tensor * tk = res->get_inp_tokens();
-        fprintf(stderr, "before compute: inp_tokens %02x %02x %02x %02x\n",
+        fprintf(stderr, "before compute: inp_tokens %02x %02x %02x %02x (data %p flags %u view_src %p)\n",
                 ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
-                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3]);
+                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3], (void *) tk->data,
+                tk->flags, (void *) tk->view_src);
+        ggml_cgraph * gf = (ggml_cgraph *) res->get_gf();
+        fprintf(stderr, "graph n_nodes=%d\n", ggml_graph_n_nodes(gf));
+        for (int i = 0; i < 26; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            const char * nm = nd->name[0] ? nd->name : ggml_op_name(nd->op);
+            fprintf(stderr, "node %d op=%-16s name=%-30s data=%p\n", i, ggml_op_name(nd->op), nm, (void *) nd->data);
+        }
+        {
+            const ggml_tensor * nd = ggml_graph_node(gf, 21);
+            fprintf(stderr, "node21: src0=%s data=%p | src1=%s data=%p | out data=%p shape %lld x %lld type=%d\n",
+                    nd->src[0] ? nd->src[0]->name : "-", (void *) (nd->src[0] ? nd->src[0]->data : nullptr),
+                    nd->src[1] ? nd->src[1]->name : "-", (void *) (nd->src[1] ? nd->src[1]->data : nullptr),
+                    (void *) nd->data, (long long) nd->ne[0], (long long) nd->ne[1], (int) nd->type);
+        }
+        for (int i = 19; i <= 21; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            fprintf(stderr, "node%d: op=%s ne=%lldx%lldx%lldx%lld data=%p | src1=%s ne=%lldx%lld data=%p\n",
+                    i, ggml_op_name(nd->op), (long long) nd->ne[0], (long long) nd->ne[1],
+                    (long long) nd->ne[2], (long long) nd->ne[3], (void *) nd->data,
+                    nd->src[1] ? nd->src[1]->name : "-",
+                    nd->src[1] ? (long long) nd->src[1]->ne[0] : -1,
+                    nd->src[1] ? (long long) nd->src[1]->ne[1] : -1,
+                    (void *) (nd->src[1] ? nd->src[1]->data : nullptr));
+        }
+        const ggml_tensor * lf7 = ggml_graph_node(gf, 18)->src[0];
+        if (lf7) {
+            const uint8_t * b = (const uint8_t *) lf7->data;
+            fprintf(stderr, "leaf7 name=%s data=%p first bytes: %02x %02x %02x %02x | i32 %d %d | ne %lldx%lld\n",
+                    lf7->name, (void *) lf7->data, b[0], b[1], b[2], b[3],
+                    ((const int32_t *) lf7->data)[0], ((const int32_t *) lf7->data)[1],
+                    (long long) lf7->ne[0], (long long) lf7->ne[1]);
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            if (nd->data == tk->data) {
+                fprintf(stderr, "NODE %d type=%s name=%s data == inp_tokens data!\n", i, ggml_op_name(nd->op), nd->name);
+            }
+        }
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {

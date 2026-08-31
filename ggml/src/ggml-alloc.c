@@ -15,7 +15,7 @@
 
 //#define GGML_ALLOCATOR_DEBUG
 
-//#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
 #define AT_PRINTF(...)
 
 // ops that return true for this function must not use restrict pointers for their backend implementations
