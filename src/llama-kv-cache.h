@@ -434,6 +434,12 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // the used cells of a sequence (the fused decode fast path reads the cell
+    // positions to compute the visible set and the current write cell)
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const {
+        return kv->get_cells(seq_id);
+    }
+
 private:
     llama_memory_status status;
 

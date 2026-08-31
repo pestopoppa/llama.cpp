@@ -150,6 +150,12 @@ static void fused_moe(
     // router logits
     std::vector<float> logits(n_expert);
     lora_mm(L.ffn_gate_inp, x, nullptr, logits.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  moe router[0..5] = %.6g %.6g %.6g %.6g %.6g %.6g  (n_used=%d)\n",
+                (double) logits[0], (double) logits[1], (double) logits[2],
+                (double) logits[3], (double) logits[4], (double) logits[5],
+                (int) n_used);
+    }
 
     // softmax over the experts (max-subtract, sequential exp/sum — the
     // ggml_vec_soft_max_f32 contract)
@@ -338,8 +344,11 @@ void fused_gdn_layer(
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn hc_mix done\n");
     // ---- GDN body ----
-    std::vector<float> qkv(hp.ssm_d_inner);            // 10240
+    // the qkv span is the conv channels (q+k+v), not ssm_d_inner (the v span alone)
+    const int64_t qkv_span = L.wqkv->ne[1];
+    std::vector<float> qkv(qkv_span);
     std::vector<float> z(hp.ssm_d_inner);              // 6144 (v-dim)
     lora_mm(L.wqkv, mixed.data(), nullptr, qkv.data(), n_threads);
     lora_mm(L.wqkv_gate, mixed.data(), nullptr, z.data(), n_threads);
@@ -385,6 +394,7 @@ void fused_gdn_layer(
     l2_norm(conv_out.data() + k_off, k.data(), S_k * H_k, eps);
     memcpy(v.data(), conv_out.data() + v_off, S_v * H_v * sizeof(float));
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn conv done\n");
     // GDN scan: the ggml_gated_delta_net kernel on scratch tensors (nth=1)
     // q/k [S_k, H_k, 1, 1]; v [S_v, H_v, 1, 1]; g/b [1, H_v, 1, 1]; s [S_v, S_v, H_v, 1]
     ggml_init_params gip = { 64 << 20, nullptr, false };
@@ -401,7 +411,14 @@ void fused_gdn_layer(
     memcpy(tg->data, gate.data(), H_v * sizeof(float));
     memcpy(tb->data, beta.data(), H_v * sizeof(float));
     memcpy(ts->data, ssm_state_row, S_v * S_v * H_v * sizeof(float));
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn qkv[0..2]=%.6g %.6g %.6g conv[0..2]=%.6g %.6g %.6g\n", (double)qkv[0],(double)qkv[1],(double)qkv[2],(double)conv_out[0],(double)conv_out[1],(double)conv_out[2]);
     ggml_tensor * tgd = ggml_gated_delta_net(gctx, tq, tk, tv, tg, tb, ts, 1);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        float gmin = 1e30f, gmax = -1e30f, bmin = 1e30f, bmax = -1e30f, smin = 1e30f, smax = -1e30f;
+        for (int64_t i = 0; i < H_v; i++) { gmin = fminf(gmin, gate[i]); gmax = fmaxf(gmax, gate[i]); bmin = fminf(bmin, beta[i]); bmax = fmaxf(bmax, beta[i]); }
+        for (int64_t i = 0; i < S_v*S_v*H_v; i++) { smin = fminf(smin, ((const float*)ts->data)[i]); smax = fmaxf(smax, ((const float*)ts->data)[i]); }
+        fprintf(stderr, "  gdn gate[min=%.6g max=%.6g] beta[min=%.6g max=%.6g] state[min=%.6g max=%.6g]\n", (double)gmin,(double)gmax,(double)bmin,(double)bmax,(double)smin,(double)smax);
+    }
 
     static struct ggml_threadpool * gdn_tp = nullptr;
     if (gdn_tp == nullptr) {
@@ -412,15 +429,25 @@ void fused_gdn_layer(
     struct ggml_compute_params gparams;
     gparams.ith = 0;
     gparams.nth = 1;
-    gparams.wsize = 0;
-    gparams.wdata = nullptr;
+    // the GDN kernel uses wdata as per-thread scratch: delta = wdata + ith*per_thread + CACHE_LINE_SIZE_F32
+    // (CACHE_LINE_SIZE_F32 = 64 bytes / sizeof(float) = 16; internal to ggml-cpu, so mirrored here)
+    std::vector<float> gdn_wdata(S_v + 16);
+    gparams.wsize = gdn_wdata.size() * sizeof(float);
+    gparams.wdata = gdn_wdata.data();
     gparams.threadpool = gdn_tp;
     gparams.use_ref = false;
     ggml_compute_forward_gated_delta_net(&gparams, tgd);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn kernel done\n");
     // z-gated rms norm: rms_norm(output, ssm_norm) * sigmoid(z)
     std::vector<float> gdn_out(S_v * H_v);
     memcpy(gdn_out.data(), tgd->data, S_v * H_v * sizeof(float));
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        float omin = 1e30f, omax = -1e30f; int onn = 0, oni = 0;
+        for (int64_t i = 0; i < S_v*H_v; i++) { if (std::isnan(gdn_out[i])) onn++; if (std::isinf(gdn_out[i])) oni++; omin = fminf(omin, gdn_out[i]); omax = fmaxf(omax, gdn_out[i]); }
+        fprintf(stderr, "  gdn out: nan=%d inf=%d min=%.6g max=%.6g\n", onn, oni, (double)omin, (double)omax);
+    }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn out[0..2]=%.6g %.6g %.6g z[0..2]=%.6g %.6g %.6g\n", (double)gdn_out[0],(double)gdn_out[1],(double)gdn_out[2],(double)z[0],(double)z[1],(double)z[2]);
     memcpy(ssm_state_row, ts->data, S_v * S_v * H_v * sizeof(float));
     ggml_free(gctx);
 
@@ -433,28 +460,59 @@ void fused_gdn_layer(
             sum += (double) (row[i] * row[i]);
         }
         const float scale = 1.0f / sqrtf((float) (sum / S_v) + eps);
-        const float zg = 1.0f / (1.0f + expf(-z[h * S_v]));
         for (int64_t i = 0; i < S_v; i++) {
-            final_in[h * S_v + i] = row[i] * scale * znorm[h * S_v + i] * zg;
+            const float zg = 1.0f / (1.0f + expf(-z[h * S_v + i]));
+            final_in[h * S_v + i] = row[i] * scale * znorm[i] * zg;
         }
     }
 
     std::vector<float> attn_out(n_embd);
     lora_mm(L.ssm_out, final_in.data(), nullptr, attn_out.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int nn = 0, ni = 0;
+        float mn = 1e30f, mx = -1e30f;
+        for (int64_t i = 0; i < S_v * H_v; i++) {
+            if (std::isnan(final_in[i])) nn++;
+            if (std::isinf(final_in[i])) ni++;
+            mn = fminf(mn, final_in[i]); mx = fmaxf(mx, final_in[i]);
+        }
+        fprintf(stderr, "  gdn final_in: nan=%d inf=%d min=%.6g max=%.6g  attn_out nan=%d\n",
+                nn, ni, (double) mn, (double) mx, (int) std::isnan(attn_out[0]));
+    }
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn ssm_out done\n");
     // ---- MoE ----
     std::vector<float> moe_out(n_embd);
     fused_moe(L, hp, attn_out.data(), moe_out.data(), n_threads);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn moe1 done\n");
     // ---- hc_combine (attn side): res = res + repeat(attn_out) * (2*sigmoid(inject/hc)) ----
     hc_combine(res_in_out, attn_out.data(), inject.data(), hc, n_embd);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn comb1 done\n");
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int mn = 0; for (int64_t i = 0; i < n_embd; i++) if (std::isnan(moe_out[i])) mn++;
+        int xn2 = 0; for (int64_t i = 0; i < hc*n_embd; i++) if (std::isnan(xn[i])) xn2++;
+        fprintf(stderr, "  gdn moe1 out nan=%d xn(attn-side) nan=%d\n", mn, xn2);
+    }
     // ---- hc_mix (ffn side) + MoE again ----
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int mm = 0; for (int64_t i = 0; i < n_embd; i++) if (std::isnan(mixed[i])) mm++;
+        fprintf(stderr, "  gdn ffn mixed nan=%d\n", mm);
+    }
     fused_moe(L, hp, mixed.data(), moe_out.data(), n_threads);
     hc_combine(res_in_out, moe_out.data(), inject.data(), hc, n_embd);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn moe2 done\n");
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int rn = 0, mn = 0, in = 0;
+        for (int64_t i = 0; i < hc*n_embd; i++) { if (std::isnan(res_in_out[i])) rn++; }
+        for (int64_t i = 0; i < n_embd; i++) { if (std::isnan(moe_out[i])) mn++; }
+        for (int64_t i = 0; i < hc; i++) { if (std::isnan(inject[i])) in++; }
+        fprintf(stderr, "  gdn final: res nan=%d moe_out nan=%d inject nan=%d\n", rn, mn, in);
+    }
     memcpy(out, res_in_out, n_embd * sizeof(float));
 }
 
@@ -653,17 +711,20 @@ static void fused_attn_qsa(
 // the fused full-attention layer for the single-token decode:
 //   x/res_in_out : the hc-wide input / residual stream
 //   pos          : the current token position
-//   attn_k/v     : the attention cache slices [n_embd_head_k, n_head_kv, n_kv]
-//   idx_k        : the indexer cache slice [indexer_head_size, idx_n_kv]
-// Returns false until the QSA long-context path and the rotations are wired.
+//   tk/tv/ti     : the attention/indexer cache views (written in place at the
+//                  current cell; read for the attention over the used cells)
+//   n_used       : the used attention cells (incl. the current token's cell)
+//   n_visible    : the cells this token may attend to (pos < pos)
+//   idx_n_used   : the used indexer cells
+// Returns false when a cache type is unsupported (falls back to the graph).
 bool fused_full_attn_layer(
         const struct llama_layer & L,
         const struct llama_hparams & hp,
         const FusedRopeParams & rp,
         int32_t pos,
         const float * x, float * res_in_out, float * out,
-        float * attn_k, float * attn_v, int n_kv,
-        float * idx_k, int idx_n_kv,
+        struct ggml_tensor * tk, struct ggml_tensor * tv, struct ggml_tensor * ti,
+        int n_used, int n_visible, int idx_n_used,
         int n_threads) {
 
     const int64_t hc = hp.dsv4_hc_mult;
@@ -674,28 +735,37 @@ bool fused_full_attn_layer(
     const float eps = hp.f_norm_rms_eps;
     const int n_rot = (int) hp.n_rot();
 
+    if (tk->type != GGML_TYPE_F32 || tv->type != GGML_TYPE_F32 || ti->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t k_cell = (int64_t) n_embd_head * n_head_kv;
+    const float * k_cache = (const float *) tk->data;
+    const float * v_cache = (const float *) tv->data;
+    const float * idx_cache = (const float *) ti->data;
+
     std::vector<float> xn(hc * n_embd), mixed(n_embd), inject(hc * n_embd);
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
 
-    // ---- QSA indexer (short-context dense fallback: n_kv <= width) ----
+    // ---- QSA indexer (short-context dense fallback: n_visible <= width) ----
     const int64_t r = hp.dsv4_compress_ratios[0] ? hp.dsv4_compress_ratios[0] : 4;
-    const int64_t width = std::min<int64_t>(idx_n_kv, (int64_t) hp.indexer_top_k + r - 1);
-    const bool dense = idx_n_kv <= width;
+    const int64_t width = std::min<int64_t>(idx_n_used, (int64_t) hp.indexer_top_k + r - 1);
+    const bool dense = n_visible <= width;
 
     std::vector<float> k_raw(hp.indexer_head_size);
     lora_mm(L.index_k_proj, mixed.data(), nullptr, k_raw.data(), n_threads);
-    if (idx_n_kv > 0 && idx_k != nullptr) {
-        memcpy(idx_k + (size_t) pos * hp.indexer_head_size, k_raw.data(),
-               hp.indexer_head_size * sizeof(float));
+    if (idx_n_used > 0) {
+        // write the new key at the current cell (the last used one)
+        memcpy((void *) (idx_cache + (size_t) (idx_n_used - 1) * hp.indexer_head_size),
+               k_raw.data(), hp.indexer_head_size * sizeof(float));
     }
 
-    std::vector<float> selected(n_kv, -INFINITY);
+    std::vector<float> selected(n_used, -INFINITY);
     if (dense) {
-        for (int64_t j = 0; j < n_kv; j++) selected[j] = 0.0f;
+        for (int64_t j = 0; j < n_visible; j++) selected[j] = 0.0f;
     } else {
         // pooled block scores (mean over the r members, norm, rope, query, relu-sum)
-        const int64_t n_blocks = (idx_n_kv + r - 1) / r;
+        const int64_t n_blocks = (n_visible + r - 1) / r;
         const int64_t idx_dim = hp.indexer_head_size;
         const int64_t n_idx_h = hp.indexer_n_head;
         std::vector<float> pooled(idx_dim * n_blocks), pooled_n(idx_dim * n_blocks);
@@ -704,7 +774,7 @@ bool fused_full_attn_layer(
                 double s = 0.0;
                 for (int64_t m = 0; m < r; m++) {
                     const int64_t cell = b * r + m;
-                    if (cell < idx_n_kv) s += idx_k[(size_t) cell * idx_dim + i];
+                    if (cell < n_visible) s += idx_cache[(size_t) cell * idx_dim + i];
                 }
                 pooled[(size_t) b * idx_dim + i] = (float) (s / r);
             }
@@ -756,7 +826,7 @@ bool fused_full_attn_layer(
                 sc[best] = -INFINITY;
             }
         }
-        for (int64_t j = 0; j < n_kv; j++) {
+        for (int64_t j = 0; j < n_visible; j++) {
             const int64_t b = j / r;
             bool ok = false;
             for (size_t k = 0; k < picked.size(); k++) if (picked[k] == (int) b) { ok = true; break; }
@@ -802,23 +872,24 @@ bool fused_full_attn_layer(
     fused_rope(rp, k.data(), n_rot, n_head_kv, pos, sections, 1);
 
     // ---- KV write + the attention ----
-    if (n_kv > 0 && attn_k != nullptr) {
+    if (n_used > 0) {
+        // write the new k/v at the current cell (the last used one)
         for (int64_t h = 0; h < n_head_kv; h++) {
-            memcpy(attn_k + (size_t) h * n_embd_head * n_kv + (size_t) pos * n_embd_head,
+            memcpy((void *) (k_cache + (size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head),
                    k.data() + h * n_embd_head, n_embd_head * sizeof(float));
-            memcpy(attn_v + (size_t) h * n_embd_head * n_kv + (size_t) pos * n_embd_head,
+            memcpy((void *) (v_cache + (size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head),
                    v.data() + h * n_embd_head, n_embd_head * sizeof(float));
         }
     }
 
     std::vector<float> attn_out(hdim2);
-    if (n_kv > 0) {
-        std::vector<float> k_all(n_embd_head * n_head_kv * n_kv), v_all(n_embd_head * n_head_kv * n_kv);
-        memcpy(k_all.data(), attn_k, n_embd_head * n_head_kv * n_kv * sizeof(float));
-        memcpy(v_all.data(), attn_v, n_embd_head * n_head_kv * n_kv * sizeof(float));
+    if (n_visible > 0) {
+        std::vector<float> k_all(n_embd_head * n_head_kv * n_used), v_all(n_embd_head * n_head_kv * n_used);
+        memcpy(k_all.data(), k_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
+        memcpy(v_all.data(), v_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
         // the QSA-masked attention via the graph's flash kernel (bit-exact)
         fused_attn_flash(q.data(), k_all.data(), v_all.data(), n_embd_head, n_head, n_head_kv,
-                         n_kv, selected.data(), attn_out.data());
+                         n_used, selected.data(), attn_out.data());
     }
 
     // the gate + the output projection
@@ -908,6 +979,11 @@ void fused_ple(
         }
     }
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  ple rows[0..2]=%d %d %d head_dim=%lld\n", rows[0], rows[1], rows[2], (long long)head_dim);
+        int nn = 0; for (int64_t i = 0; i < n_heads*head_dim; i++) if (std::isnan(emb[i])) nn++;
+        fprintf(stderr, "  ple emb nan=%d [0..2]=%.6g %.6g %.6g\n", nn, (double)emb[0], (double)emb[1], (double)emb[2]);
+    }
     // ---- the key/value projections ----
     std::vector<float> key(hc_dim), value(n_embd);
     lora_mm(L.ple_key, emb.data(), nullptr, key.data(), n_threads);
@@ -988,9 +1064,20 @@ void fused_ple(
         memcpy(ple_conv_state, window.data() + hc_dim, hist * hc_dim * sizeof(float));
     }
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int nn = 0; for (int64_t i = 0; i < hc_dim; i++) if (std::isnan(conv_out[i])) nn++;
+        fprintf(stderr, "  ple key nan=%d value nan=%d conv_out nan=%d gate[0]=%.6g\n",
+                (int) std::isnan(key[0]), (int) std::isnan(value[0]), nn, (double)gate[0]);
+    }
     // the combine: hidden + gated + conv_out
     for (int64_t i = 0; i < hc_dim; i++) {
         res[i] = hidden[i] + gated[i] + conv_out[i];
+    }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int nn = 0, gn = 0, vn = 0;
+        for (int64_t i = 0; i < hc_dim; i++) { if (std::isnan(res[i])) nn++; if (std::isnan(gated[i])) gn++; }
+        for (int64_t i = 0; i < n_embd; i++) if (std::isnan(value[i])) vn++;
+        fprintf(stderr, "  ple res nan=%d gated nan=%d value nan=%d\n", nn, gn, vn);
     }
 }
 
@@ -1059,6 +1146,10 @@ bool llama_model_qwen4exp::fused_decode(
 
     for (int il = 0; il < (int) hparams.n_layer(); il++) {
         const struct llama_layer & L = layers[il];
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            fprintf(stderr, "fused layer %2d: %s\n", il,
+                    hparams.is_ple_impl[il] ? "PLE" : (hparams.is_recr(il) ? "GDN" : "ATTN"));
+        }
 
         if (hparams.is_ple_impl[il]) {
             // the PLE: the predecessors from the attention cells
@@ -1093,39 +1184,38 @@ bool llama_model_qwen4exp::fused_decode(
             const size_t srow = ggml_row_size(sl->type, sl->ne[0]);
             const float * conv_state = (const float *) ((const char *) rl->data + (size_t) head * rrow);
             const float * ssm_state  = (const float *) ((const char *) sl->data + (size_t) head * srow);
-            // the fused layer works on copies for the state (in-place safety)
-            std::vector<float> conv_c(rl->ne[0] * 4), ssm_c(sl->ne[0]);
-            memcpy(conv_c.data(), conv_state, rl->ne[0] * 4 * sizeof(float));
+            // the fused layer works on copies for the state (in-place safety);
+            // the conv row width is (d_conv-1)*conv_channels == rl->ne[0]
+            std::vector<float> conv_c(rl->ne[0]), ssm_c(sl->ne[0]);
+            memcpy(conv_c.data(), conv_state, rl->ne[0] * sizeof(float));
             memcpy(ssm_c.data(), ssm_state, sl->ne[0] * sizeof(float));
             fused_gdn_layer(L, hparams, res_hc.data(), res_hc.data(), layer_out.data(),
                             conv_c.data(), ssm_c.data(), n_threads);
-            memcpy((void *) conv_state, conv_c.data(), rl->ne[0] * 4 * sizeof(float));
+            memcpy((void *) conv_state, conv_c.data(), rl->ne[0] * sizeof(float));
             memcpy((void *) ssm_state, ssm_c.data(), sl->ne[0] * sizeof(float));
         } else {
-            // the full-attn layer: the KV + indexer cache slices
+            // the full-attn layer: the KV + indexer cache slices. The cell
+            // bookkeeping ran in apply(): the current ubatch's cell is already
+            // allocated, so the last used cell is this token's write target.
             const auto * attn = mctx->get_attn();
             const auto * idx = mctx->get_idx();
             if (idx == nullptr) return false;
-            const int n_kv = (int) attn->get_n_kv();
-            const int idx_n_kv = (int) idx->get_n_kv();
+            const llama_seq_id seq = ubatch.seq_id[0][0];
+            const auto & attn_cells = attn->get_cells(seq);
+            const auto & idx_cells  = idx->get_cells(seq);
+            const int n_used    = (int) attn_cells.used_max_p1();
+            const int idx_n_used = (int) idx_cells.used_max_p1();
+            int n_visible = 0;
+            for (int j = 0; j < n_used; j++) {
+                if (attn_cells.pos_get((uint32_t) j) < pos) n_visible++;
+            }
             ggml_tensor * tk = attn->get_k(vctx, il);
             ggml_tensor * tv = attn->get_v(vctx, il);
             ggml_tensor * ti = idx->get_k(vctx, il);
             if (tk == nullptr || tv == nullptr || ti == nullptr) return false;
-            std::vector<float> k_all(tk->ne[0] * tk->ne[1] * tk->ne[2]),
-                               v_all(tv->ne[0] * tv->ne[1] * tv->ne[2]),
-                               idx_all(ti->ne[0] * ti->ne[1]);
-            memcpy(k_all.data(), tk->data, k_all.size() * sizeof(float));
-            memcpy(v_all.data(), tv->data, v_all.size() * sizeof(float));
-            for (int64_t j = 0; j < idx_n_kv; j++) {
-                memcpy(idx_all.data() + j * ti->ne[0],
-                       (const char *) ti->data + (size_t) j * ti->nb[1],
-                       ti->ne[0] * sizeof(float));
-            }
             if (!fused_full_attn_layer(L, hparams, rp, (int32_t) pos,
                         res_hc.data(), res_hc.data(), layer_out.data(),
-                        k_all.data(), v_all.data(), n_kv,
-                        idx_all.data(), idx_n_kv, n_threads)) {
+                        tk, tv, ti, n_used, n_visible, idx_n_used, n_threads)) {
                 ggml_free(vctx);
                 return false;
             }
