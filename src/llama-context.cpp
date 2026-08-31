@@ -1455,30 +1455,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 for (int ni = 0; ni < n_nodes; ni++) {
                     const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
                     if (!nd || !nd->data) continue;
-                    if (strcmp(ggml_get_name(nd) ? ggml_get_name(nd) : "", "hc_mixed-0") == 0 && nd->data) {
-                        char nm[32];
-                        snprintf(nm, sizeof(nm), "hc_mixed");
-                        size_t nm_len = strlen(nm);
-                        fwrite(&nm_len, 4, 1, f);
-                        fwrite(nm, 1, nm_len, f);
-                        uint32_t nmpad = (4 - (nm_len % 4)) % 4;
-                        for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
-                        char tag[32];
-                        snprintf(tag, sizeof(tag), "%d", (int) nd->op);
-                        size_t tlen = strlen(tag);
-                        fwrite(&tlen, 4, 1, f);
-                        fwrite(tag, 1, tlen, f);
-                        uint32_t pad = (4 - (tlen % 4)) % 4;
-                        for (uint32_t z = 0; z < pad; z++) fputc(0, f);
-                        int64_t ne[4] = { nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3] };
-                        size_t nb[4] = { nd->nb[0], nd->nb[1], nd->nb[2], nd->nb[3] };
-                        fwrite(ne, 8, 4, f);
-                        fwrite(nb, 8, 4, f);
-                        int type = (int) nd->type;
-                        fwrite(&type, 4, 1, f);
-                        size_t nbytes = ggml_nbytes(nd);
-                        fwrite(&nbytes, 8, 1, f);
-                        fwrite(nd->data, 1, nbytes, f);
+                    if (nd->op == GGML_OP_MEAN_D1 && nd->data && nd->src[0] && nd->src[0]->data) {
+                        const ggml_tensor * gated = nd->src[0];
+                        for (int si = 0; si < 3; si++) {
+                            const ggml_tensor * s0 = si == 0 ? gated : (si == 1 ? (gated ? gated->src[0] : nullptr) : (gated ? gated->src[1] : nullptr));
+                            if (!s0 || !s0->data) continue;
+                            char nm[32];
+                            snprintf(nm, sizeof(nm), si == 0 ? "hc_gated" : (si == 1 ? "hc_xn" : "hc_gate"));
+                            size_t nm_len = strlen(nm);
+                            fwrite(&nm_len, 4, 1, f);
+                            fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) s0->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { s0->ne[0], s0->ne[1], s0->ne[2], s0->ne[3] };
+                            size_t nb[4] = { s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) s0->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(s0);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(s0->data, 1, nbytes, f);
+                        }
                     }
                     if ((nd->op == GGML_OP_SSM_CONV || nd->op == GGML_OP_DSV4_HC_PRE) && nd->src[0] && nd->src[0]->data && want[8] == GGML_OP_COUNT) {
                         // dump the src0 (and src1 for the hc pre) as side entries
