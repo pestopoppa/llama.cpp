@@ -124,6 +124,12 @@ static void hc_mix(const struct ggml_tensor * w_down, const struct ggml_tensor *
     // the gate: sigmoid(mm(w_up, lo)); gated = xn*gate; mean over streams
     const int64_t hc_dim = w_up->ne[1];
     std::vector<float> gate(hc_dim);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  hc_mix w: down type=%s extra=%d up type=%s extra=%d inject type=%s extra=%d\n",
+                ggml_type_name(w_down->type), (int) (w_down->extra != nullptr),
+                ggml_type_name(w_up->type), (int) (w_up->extra != nullptr),
+                ggml_type_name(w_inject->type), (int) (w_inject->extra != nullptr));
+    }
     FusedMM mm_up(w_up, lo.data(), n_threads);
     for (int64_t i = 0; i < hc_dim; i++) {
         mm_up.dot(w_up, (int) i, &gate[i]);
@@ -251,7 +257,15 @@ static void fused_moe(
     }
     static const int8_t kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
     const bool dn_repacked = L.ffn_down_exps->extra != nullptr;
+    const bool up_repacked = L.ffn_up_exps->extra != nullptr;
+    const bool gt_repacked = L.ffn_gate_exps->extra != nullptr;
     const int64_t rp_I = dn_repacked ? (ggml_cpu_has_avx2() ? 8 : 4) : 0;
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  moe repack: up=%s extra=%d gt=%s extra=%d dn=%s extra=%d rp_I=%lld\n",
+                ggml_type_name(L.ffn_up_exps->type), (int) up_repacked,
+                ggml_type_name(L.ffn_gate_exps->type), (int) gt_repacked,
+                ggml_type_name(L.ffn_down_exps->type), (int) dn_repacked, (long long) rp_I);
+    }
     const int64_t rp_nblocks = n_ff / 32;
     const size_t nb_dn_exp = L.ffn_down_exps->nb[2];
     std::vector<float> down_acc(hp.n_embd, 0.0f);
@@ -336,21 +350,32 @@ static void fused_moe(
             fclose(fs);
         }
         fprintf(stderr, "  moe dump call=%d\n", moe_call);
+        if (moe_call == 15 || moe_call == 7) {
+            FILE * fl = fopen(moe_call == 15 ? "/tmp/qwen4exp-builds/f_moe_logits_15.bin" : "/tmp/qwen4exp-builds/f_moe_logits_7.bin", "wb");
+            if (fl) { fwrite(logits.data(), 4, n_expert, fl); fclose(fl); }
+        }
         moe_call++;
     }
     // the shared expert + its sigmoided gate
     {
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            static int sh_i = 0;
+            fprintf(stderr, "  shexp step A call=%d up type=%s extra=%d\n", sh_i++, ggml_type_name(L.ffn_up_shexp->type), (int)(L.ffn_up_shexp->extra != nullptr));
+        }
         std::vector<float> up_s(n_ff), gate_s(n_ff), glu_s(n_ff), down_s(hp.n_embd);
         lora_mm(L.ffn_up_shexp, x, nullptr, up_s.data(), n_threads);
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  shexp step B\n");
         lora_mm(L.ffn_gate_shexp, x, nullptr, gate_s.data(), n_threads);
         for (int64_t r = 0; r < n_ff; r++) {
             const float g = gate_s[r];
             glu_s[r] = up_s[r] * (g / (1.0f + expf(-g)));
         }
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  shexp step C\n");
         lora_mm(L.ffn_down_shexp, glu_s.data(), nullptr, down_s.data(), n_threads);
         float shg = 0.0f;
         FusedMM mm_shg(L.ffn_gate_inp_shexp, x, n_threads);
         mm_shg.dot(L.ffn_gate_inp_shexp, 0, &shg);
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  shexp step D shg=%.6g\n", (double) shg);
         shg = 1.0f / (1.0f + expf(-shg));
         if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
             static int sh_dump = 0;
@@ -574,6 +599,13 @@ void fused_gdn_layer(
     memcpy(ts->data, ssm_state_row, S_v * S_v * H_v * sizeof(float));
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn qkv[0..2]=%.6g %.6g %.6g conv[0..2]=%.6g %.6g %.6g\n", (double)qkv[0],(double)qkv[1],(double)qkv[2],(double)conv_out[0],(double)conv_out[1],(double)conv_out[2]);
     ggml_tensor * tgd = ggml_gated_delta_net(gctx, tq, tk, tv, tg, tb, ts, 1);
+    // the kernel's K=1 output carries [attn (S_v*H_v) | new_state (S_v*S_v*H_v)],
+    // written past the tensor's own ne-based allocation — point it at a full-size
+    // buffer (a 3 MB write into the 24 KB tensor buffer was the heap corruption
+    // that surfaced as the nondeterministic teardown segfault)
+    static std::vector<float> tgd_buf; // static: the kernel writes through the tensor's data pointer
+    tgd_buf.resize(S_v * H_v + S_v * S_v * H_v);
+    tgd->data = tgd_buf.data();
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         float gmin = 1e30f, gmax = -1e30f, bmin = 1e30f, bmax = -1e30f, smin = 1e30f, smax = -1e30f;
         for (int64_t i = 0; i < H_v; i++) { gmin = fminf(gmin, gate[i]); gmax = fmaxf(gmax, gate[i]); bmin = fminf(bmin, beta[i]); bmax = fmaxf(bmax, beta[i]); }
@@ -856,8 +888,10 @@ static void fused_attn_flash(
     ggml_tensor * pv = ggml_permute(gctx, tv, 0, 2, 1, 3);
     const float scale = 1.0f / sqrtf((float) n_embd_head);
     ggml_tensor * tfa = ggml_flash_attn_ext(gctx, pq, pk, pv, tm, scale, 0.0f, 0.0f);
-    // the flash kernel's decode-path scratch (VKQ acc + partial M/S + V/Q/VKQ)
-    const int64_t fw = n_head * (2 + n_embd_head) + n_embd_head + 2 * n_embd_head;
+    // the flash kernel's decode-path scratch: per-thread Q/V copies (DK + 2*DV +
+    // CACHE_LINE_SIZE_F32) plus the [q_head][kv_chunk][M, S, VKQ] partials
+    // (flash_attn_ext_f16: partials_base = wdata + nth*(DK + 2*DV + 16))
+    const int64_t fw = 16 + (n_embd_head + 2 * n_embd_head + 16) + n_head * (2 + n_embd_head);
     std::vector<float> fw_buf(fw);
     static struct ggml_threadpool * fa_tp = nullptr;
     if (fa_tp == nullptr) {
@@ -1301,6 +1335,13 @@ bool fused_full_attn_layer(
     hc_combine(res_in_out, layer_out.data(), inject.data(), hc, n_embd);
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        char fnm2[128], fnm3[128];
+        snprintf(fnm2, sizeof(fnm2), "/tmp/qwen4exp-builds/f_attn_ffnmixed_%d.bin", il);
+        FILE * fm2 = fopen(fnm2, "wb"); if (fm2) { fwrite(mixed.data(), 4, n_embd, fm2); fclose(fm2); }
+        snprintf(fnm3, sizeof(fnm3), "/tmp/qwen4exp-builds/f_attn_ffnxn_%d.bin", il);
+        FILE * fm3 = fopen(fnm3, "wb"); if (fm3) { fwrite(xn.data(), 4, hc * n_embd, fm3); fclose(fm3); }
+    }
     fused_moe(L, hp, mixed.data(), moe_out.data(), n_threads);
     hc_combine(res_in_out, moe_out.data(), inject.data(), hc, n_embd);
 
