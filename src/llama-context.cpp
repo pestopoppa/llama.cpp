@@ -1455,11 +1455,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 for (int ni = 0; ni < n_nodes; ni++) {
                     const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
                     if (!nd || !nd->data) continue;
+                    if (nd->op == GGML_OP_GET_ROWS && nd->src[1] && nd->src[1]->data && nd->src[1]->ne[0] == 1) {
+                        fprintf(stderr, "get_rows token: %lld\n", (long long) ((const int32_t *) nd->src[1]->data)[0]);
+                    }
                     if (nd->op == GGML_OP_RMS_NORM && nd->data && ni == 3 && nd->src[0] && nd->src[0]->data && !getenv("GGML_FUSED_NORMSRC") && nd->src[0]->ne[2] == 1) {
-                        // dump the full step-1 hc_init (the rms_norm input)
+                        // dump the full step-1 hc_init (the rms_norm input) + its src chain
                         const ggml_tensor * s0 = nd->src[0];
                         FILE * f = fopen("/tmp/qwen4exp-builds/g_hcinit.bin", "wb");
                         if (f) { fwrite(s0->data, 4, s0->ne[0] * s0->ne[1], f); fclose(f); }
+                        if (s0->src[0] && s0->src[0]->src[0] && s0->src[0]->src[0]->src[0] && s0->src[0]->src[0]->src[0]->op == GGML_OP_GET_ROWS) {
+                            const ggml_tensor * gr = s0->src[0]->src[0]->src[0];
+                            fprintf(stderr, "embedding get_rows: tokens[0]=%lld src0=%s src1=%s ne0=[%lld,%lld]\n",
+                                    gr->src[1] && gr->src[1]->data ? (long long) ((const int32_t *) gr->src[1]->data)[0] : -1,
+                                    gr->src[0] ? ggml_get_name(gr->src[0]) : "?",
+                                    gr->src[1] ? ggml_get_name(gr->src[1]) : "?",
+                                    gr->src[0] ? (long long) gr->src[0]->ne[0] : 0,
+                                    gr->src[0] ? (long long) gr->src[0]->ne[1] : 0);
+                        }
+                        fprintf(stderr, "hc_init node: op=%d name=%s src0=%s src1=%s src2=%s src0op=%d src0name=%s src0ne=[%lld,%lld,%lld]\n",
+                                (int) nd->op, ggml_get_name(nd),
+                                s0->src[0] ? ggml_get_name(s0->src[0]) : "?",
+                                s0->src[1] ? ggml_get_name(s0->src[1]) : "?",
+                                s0->src[2] ? ggml_get_name(s0->src[2]) : "?",
+                                s0->src[0] ? (int) s0->src[0]->op : -1,
+                                s0->src[0] ? ggml_get_name(s0->src[0]) : "?",
+                                s0->src[0] ? (long long) s0->src[0]->ne[0] : 0,
+                                s0->src[0] ? (long long) s0->src[0]->ne[1] : 0,
+                                s0->src[0] ? (long long) s0->src[0]->ne[2] : 0);
                     }
                     if (nd->op == GGML_OP_RMS_NORM && nd->data && ni < 30 && !getenv("GGML_FUSED_NORMSRC")) {
                         // the rms_norm output + its eps + the name + the src0's first values
