@@ -1318,6 +1318,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.token != nullptr && ubatch.n_tokens == 1) {
+        fprintf(stderr, "process_ubatch: ubatch.token[0]=%d (0x%x) pos=%lld n_tokens=%lld\n",
+                ubatch.token[0], (unsigned) ubatch.token[0], (long long) ubatch.pos[0], (long long) ubatch.n_tokens);
+    }
 #ifdef GGML_CPU_PROF
     const int64_t t_phase0 = ggml_time_us();
 #endif
@@ -1400,6 +1404,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+            const ggml_tensor * tk = res->get_inp_tokens();
+            fprintf(stderr, "after set_inputs: inp_tokens raw bytes: %02x %02x %02x %02x (ubatch token %d)\n",
+                    ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                    ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3],
+                    ubatch.token[0]);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1407,7 +1418,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const int64_t t_inputs = ggml_time_us();
 #endif
 
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+        const ggml_tensor * tk = res->get_inp_tokens();
+        fprintf(stderr, "before compute: inp_tokens %02x %02x %02x %02x\n",
+                ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3]);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+        const ggml_tensor * tk = res->get_inp_tokens();
+        fprintf(stderr, "after compute:  inp_tokens %02x %02x %02x %02x\n",
+                ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3]);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1455,8 +1478,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 for (int ni = 0; ni < n_nodes; ni++) {
                     const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
                     if (!nd || !nd->data) continue;
-                    if (nd->op == GGML_OP_GET_ROWS && nd->src[1] && nd->src[1]->data && nd->src[1]->ne[0] == 1) {
-                        fprintf(stderr, "get_rows token: %lld\n", (long long) ((const int32_t *) nd->src[1]->data)[0]);
+                    if (nd->op == GGML_OP_GET_ROWS && strcmp(ggml_get_name(nd->src[1]), "inp_tokens") == 0) {
+                        fprintf(stderr, "inp_tokens data: %d 0x%x (expect 11751)\n",
+                                ((const int32_t *) nd->src[1]->data)[0],
+                                (unsigned) ((const int32_t *) nd->src[1]->data)[0]);
+                    }
+                    if (nd->op == GGML_OP_GET_ROWS && nd->src[1] && nd->src[1]->data && nd->src[1]->ne[0] == 1 && ni < 20) {
+                        fprintf(stderr, "get_rows[%d] src1=%s src0=%s token=%lld (0x%x)\n",
+                                ni, ggml_get_name(nd->src[1]), nd->src[0] ? ggml_get_name(nd->src[0]) : "?",
+                                (long long) ((const int32_t *) nd->src[1]->data)[0],
+                                (unsigned) ((const int32_t *) nd->src[1]->data)[0]);
                     }
                     if (nd->op == GGML_OP_RMS_NORM && nd->data && ni == 3 && nd->src[0] && nd->src[0]->data && !getenv("GGML_FUSED_NORMSRC") && nd->src[0]->ne[2] == 1) {
                         // dump the full step-1 hc_init (the rms_norm input) + its src chain
