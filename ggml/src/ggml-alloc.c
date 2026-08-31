@@ -201,6 +201,14 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, struct buff
 static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor) {
     size = aligned_offset(NULL, size, alloc->alignment);
 
+    if (size == 0) {
+        // zero-sized tensors cannot take a slot: a best-fit match would alias the slot
+        // of another live tensor without consuming it, so later (small) allocations can
+        // reuse that address and overwrite a live tensor's data (e.g. the inp_tokens).
+        // give them a synthetic address that never aliases a real allocation.
+        return (struct buffer_address) { .chunk = 0, .offset = 0 };
+    }
+
     AT_PRINTF("%s: allocating %s (%zu bytes) - ", __func__, tensor->name, size);
 
     int best_fit_chunk = -1;
@@ -691,6 +699,15 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
+        return;
+    }
+
+    // graph inputs are never freed: set_inputs() writes them before the compute
+    // and the compute may read them at any point, so their memory must stay
+    // exclusive for the whole graph run (the dyn_tallocr would otherwise reuse
+    // the slot for a later node and overwrite the input data)
+    if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+        AT_PRINTF("not freeing input %s\n", node->name);
         return;
     }
 

@@ -1181,6 +1181,23 @@ void fused_ple(
     {
         const struct ggml_type_traits * qtt = ggml_get_type_traits(table->type);
         const size_t row_bytes = ggml_row_size(table->type, head_dim);
+        fprintf(stderr, "  ple table: name=%s type=%d ne=[%lld,%lld] row_bytes=%zu buf=%s buft=%s to_float=%p\n",
+                table->name, (int) table->type, (long long) table->ne[0], (long long) table->ne[1], row_bytes,
+                table->buffer ? ggml_backend_buffer_name(table->buffer) : "-",
+                table->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(table->buffer)) : "-",
+                (const void *) qtt->to_float);
+        // dump the first row raw (the dequant reference for the graph's gather)
+        const char * r0 = (const char *) table->data + (size_t) rows[0] * row_bytes;
+        fprintf(stderr, "  ple row0 raw first 36 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                (unsigned char) r0[0], (unsigned char) r0[1], (unsigned char) r0[2], (unsigned char) r0[3],
+                (unsigned char) r0[4], (unsigned char) r0[5], (unsigned char) r0[6], (unsigned char) r0[7],
+                (unsigned char) r0[8], (unsigned char) r0[9], (unsigned char) r0[10], (unsigned char) r0[11],
+                (unsigned char) r0[12], (unsigned char) r0[13], (unsigned char) r0[14], (unsigned char) r0[15],
+                (unsigned char) r0[16], (unsigned char) r0[17], (unsigned char) r0[18], (unsigned char) r0[19],
+                (unsigned char) r0[20], (unsigned char) r0[21], (unsigned char) r0[22], (unsigned char) r0[23],
+                (unsigned char) r0[24], (unsigned char) r0[25], (unsigned char) r0[26], (unsigned char) r0[27],
+                (unsigned char) r0[28], (unsigned char) r0[29], (unsigned char) r0[30], (unsigned char) r0[31],
+                (unsigned char) r0[32], (unsigned char) r0[33], (unsigned char) r0[34], (unsigned char) r0[35]);
         for (int64_t h = 0; h < n_heads; h++) {
             const char * row = (const char *) table->data + (size_t) rows[h] * row_bytes;
             if (table->type == GGML_TYPE_F32) {
@@ -1193,6 +1210,13 @@ void fused_ple(
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         fprintf(stderr, "  ple rows[0..2]=%d %d %d head_dim=%lld\n", rows[0], rows[1], rows[2], (long long)head_dim);
+        fprintf(stderr, "  ple ctxv=[%lld %lld %lld] prev=[%d %d] n_gram=%lld per_gram=%lld n_heads=%lld\n",
+                (long long) ctxv[0], (long long) ctxv[1], (long long) ctxv[2],
+                (int) prev[0], (int) prev[1], (long long) n_gram, (long long) per_gram, (long long) n_heads);
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_rows.bin", "wb");
+        if (f) { fwrite(rows.data(), 4, rows.size(), f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_emb.bin", "wb");
+        if (f2) { fwrite(emb.data(), 4, n_heads * head_dim, f2); fclose(f2); }
         int nn = 0; for (int64_t i = 0; i < n_heads*head_dim; i++) if (std::isnan(emb[i])) nn++;
         fprintf(stderr, "  ple emb nan=%d [0..2]=%.6g %.6g %.6g\n", nn, (double)emb[0], (double)emb[1], (double)emb[2]);
     }
@@ -1388,10 +1412,13 @@ bool llama_model_qwen4exp::fused_decode(
             const auto * attn = mctx->get_attn();
             std::vector<llama_token> prev_toks;
             attn->get_prev_tokens(ubatch, hparams.ple_ngram_size - 1, prev_toks);
+            // get_prev_tokens is oldest-first (the furthest back first), and the
+            // hash below reads prev[n_prev - s] with that same convention — keep
+            // the order as-is (a reversal here would flip the n-gram context)
             int32_t prev[2] = { -1, -1 };
             for (int64_t s = 0; s < hparams.ple_ngram_size - 1; s++) {
                 const llama_token t = prev_toks[s];
-                prev[hparams.ple_ngram_size - 2 - s] = t < 0 ? -1 : (int32_t) t;
+                prev[s] = t < 0 ? -1 : (int32_t) t;
             }
             const auto * recr = mctx->get_recr();
             const auto * pl = recr->get_p_l(il);

@@ -1032,6 +1032,16 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && n_tokens == 1) {
+        fprintf(stderr, "graph ple ctx: n_gram=%lld per_gram=%lld n_heads=%lld tok=%lld prev=[%lld %lld] idx0=%d\n",
+                (long long) n_gram, (long long) per_gram, (long long) n_heads,
+                (long long) tok_of(0),
+                (long long) (prev.size() > 0 ? prev[0] : -99),
+                (long long) (prev.size() > 1 ? prev[1] : -99),
+                (int) idx[0]);
+        FILE * f = fopen("/tmp/qwen4exp-builds/g_ple_rows.bin", "wb");
+        if (f) { fwrite(idx.data(), 4, n_heads * n_tokens, f); fclose(f); }
+    }
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 

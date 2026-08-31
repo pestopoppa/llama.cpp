@@ -1426,6 +1426,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 tk->flags, (void *) tk->view_src);
         ggml_cgraph * gf = (ggml_cgraph *) res->get_gf();
         fprintf(stderr, "graph n_nodes=%d\n", ggml_graph_n_nodes(gf));
+        for (int i = 0; i < ggml_graph_n_nodes(gf) && i < 300; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            if (nd->data == tk->data && nd != tk) {
+                fprintf(stderr, "ALIAS i=%d op=%s name=%s size=%zu nbytes=%zu\n", i, ggml_op_name(nd->op), nd->name,
+                        (size_t) ggml_nbytes(nd), (size_t) ggml_nbytes(nd));
+            }
+        }
         for (int i = 0; i < 26; i++) {
             const ggml_tensor * nd = ggml_graph_node(gf, i);
             const char * nm = nd->name[0] ? nd->name : ggml_op_name(nd->op);
@@ -1527,6 +1534,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 ni, ggml_get_name(nd->src[1]), nd->src[0] ? ggml_get_name(nd->src[0]) : "?",
                                 (long long) ((const int32_t *) nd->src[1]->data)[0],
                                 (unsigned) ((const int32_t *) nd->src[1]->data)[0]);
+                    }
+                    if (nd->op == GGML_OP_GET_ROWS && nd->src[0] && strstr(ggml_get_name(nd->src[0]), "per_layer") && nd->src[1]->data) {
+                        const int64_t nr = nd->src[1]->ne[0];
+                        fprintf(stderr, "graph ple gather: node %d rows[0..2]=%d %d %d nrows=%lld out_type=%d out_ne=[%lld,%lld] src0_ne=[%lld,%lld] data=%p src1_ne=[%lld,%lld]\n",
+                                ni,
+                                ((const int32_t *) nd->src[1]->data)[0],
+                                ((const int32_t *) nd->src[1]->data)[1],
+                                ((const int32_t *) nd->src[1]->data)[2],
+                                (long long) nr, (int) nd->type,
+                                (long long) nd->ne[0], (long long) nd->ne[1],
+                                (long long) nd->src[0]->ne[0], (long long) nd->src[0]->ne[1],
+                                (void *) nd->data,
+                                (long long) nd->src[1]->ne[0], (long long) nd->src[1]->ne[1]);
+                        const char * gr0 = (const char *) nd->src[0]->data + (size_t) ((const int32_t *) nd->src[1]->data)[0] * ggml_row_size(nd->src[0]->type, nd->src[0]->ne[0]);
+                        fprintf(stderr, "graph ple row0 raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                (unsigned char) gr0[0], (unsigned char) gr0[1], (unsigned char) gr0[2], (unsigned char) gr0[3],
+                                (unsigned char) gr0[4], (unsigned char) gr0[5], (unsigned char) gr0[6], (unsigned char) gr0[7],
+                                (unsigned char) gr0[8], (unsigned char) gr0[9], (unsigned char) gr0[10], (unsigned char) gr0[11],
+                                (unsigned char) gr0[12], (unsigned char) gr0[13], (unsigned char) gr0[14], (unsigned char) gr0[15],
+                                (unsigned char) gr0[16], (unsigned char) gr0[17], (unsigned char) gr0[18], (unsigned char) gr0[19],
+                                (unsigned char) gr0[20], (unsigned char) gr0[21], (unsigned char) gr0[22], (unsigned char) gr0[23],
+                                (unsigned char) gr0[24], (unsigned char) gr0[25], (unsigned char) gr0[26], (unsigned char) gr0[27],
+                                (unsigned char) gr0[28], (unsigned char) gr0[29], (unsigned char) gr0[30], (unsigned char) gr0[31],
+                                (unsigned char) gr0[32], (unsigned char) gr0[33], (unsigned char) gr0[34], (unsigned char) gr0[35]);
+                        FILE * f = fopen("/tmp/qwen4exp-builds/g_ple_rows.bin", "wb");
+                        if (f) { fwrite(nd->src[1]->data, 4, nr, f); fclose(f); }
+                        FILE * f2 = fopen("/tmp/qwen4exp-builds/g_ple_emb.bin", "wb");
+                        if (f2) { fwrite(nd->data, 4, nd->ne[0] * nd->ne[1], f2); fclose(f2); }
                     }
                     if (nd->op == GGML_OP_RMS_NORM && nd->data && ni == 3 && nd->src[0] && nd->src[0]->data && !getenv("GGML_FUSED_NORMSRC") && nd->src[0]->ne[2] == 1) {
                         // dump the full step-1 hc_init (the rms_norm input) + its src chain
