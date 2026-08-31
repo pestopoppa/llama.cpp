@@ -405,7 +405,7 @@ void fused_gdn_layer(
         const struct llama_hparams & hp,
         const float * x, float * res_in_out, float * out,
         float * conv_state_row, float * ssm_state_row,
-        int n_threads) {
+        int n_threads, int il) {
 
     const int64_t hc      = hp.dsv4_hc_mult; // 4
     const int64_t n_embd  = hp.n_embd;       // 2560
@@ -424,7 +424,19 @@ void fused_gdn_layer(
     std::vector<float> xn(hc_dim), mixed(n_embd), inject(hc * n_embd), gate_hc(hc_dim);
 
     // ---- hc_mix (attn side) ----
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        const float * w0 = (const float *) L.hc_attn_norm->data;
+        fprintf(stderr, "  gdn hc input: x[0..3]=%.6g %.6g %.6g %.6g w_norm type=%d ne=[%lld,%lld,%lld] w[0..3]=%.6g %.6g %.6g %.6g\n",
+                (double) x[0], (double) x[1], (double) x[2], (double) x[3],
+                (int) L.hc_attn_norm->type, (long long) L.hc_attn_norm->ne[0],
+                (long long) L.hc_attn_norm->ne[1], (long long) L.hc_attn_norm->ne[2],
+                (double) w0[0], (double) w0[1], (double) w0[2], (double) w0[3]);
+    }
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  gdn hc xn: xn[0..3]=%.6g %.6g %.6g %.6g\n",
+                (double) xn[0], (double) xn[1], (double) xn[2], (double) xn[3]);
+    }
     hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn hc_mix done\n");
@@ -434,8 +446,16 @@ void fused_gdn_layer(
     std::vector<float> qkv(qkv_span);
     std::vector<float> z(hp.ssm_d_inner);              // 6144 (v-dim)
     lora_mm(L.wqkv, mixed.data(), nullptr, qkv.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  gdn post-wqkv: xn[0..1]=%.6g %.6g mixed[0..1]=%.6g %.6g qkv[0..1]=%.6g %.6g (qkv_span=%lld wqkv ne=[%lld,%lld,%lld] type=%d)\n",
+                (double) xn[0], (double) xn[1], (double) mixed[0], (double) mixed[1],
+                (double) qkv[0], (double) qkv[1], (long long) qkv_span,
+                (long long) L.wqkv->ne[0], (long long) L.wqkv->ne[1], (long long) L.wqkv->ne[2], (int) L.wqkv->type);
+    }
     if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
-        FILE * f = fopen("/tmp/qwen4exp-builds/f_mix.bin", "wb");
+        char fmix[128];
+        snprintf(fmix, sizeof(fmix), "/tmp/qwen4exp-builds/f_mix_%d.bin", il);
+        FILE * f = fopen(fmix, "wb");
         if (f) {
             fwrite(mixed.data(), 4, n_embd, f);
             fwrite(xn.data(), 4, hc * n_embd, f);
@@ -463,26 +483,42 @@ void fused_gdn_layer(
         gate[i] = v * ssa[i];
     }
 
-    // conv: window = conv_state [3, 10240] + qkv [1, 10240]
+    // conv: window = conv_state + qkv, in the graph's channel-major layout:
+    // element (tap k, channel i) at i*d_conv + k; the state row is (channel i,
+    // tap k) at i*(d_conv-1) + k (the concat's ne[0]-fastest layout)
     const int64_t d_conv = L.ssm_conv1d->ne[0]; // 4
     const int64_t n_ch   = L.ssm_conv1d->ne[1]; // 10240
     std::vector<float> window((d_conv) * n_ch);
-    memcpy(window.data(), conv_state_row, (d_conv - 1) * n_ch * sizeof(float));
-    memcpy(window.data() + (d_conv - 1) * n_ch, qkv.data(), n_ch * sizeof(float));
-    std::vector<float> conv_out(n_ch);
-    conv1d_4tap(window.data(), (const float *) L.ssm_conv1d->data, conv_out.data(), n_ch);
     for (int64_t i = 0; i < n_ch; i++) {
-        const float v = conv_out[i];
+        for (int64_t k = 0; k < d_conv - 1; k++) {
+            window[i * d_conv + k] = conv_state_row[i * (d_conv - 1) + k];
+        }
+        window[i * d_conv + (d_conv - 1)] = qkv[i];
+    }
+    std::vector<float> conv_out(n_ch);
+    for (int64_t i = 0; i < n_ch; i++) {
+        float sumf = 0.0f;
+        for (int64_t k = 0; k < d_conv; k++) {
+            sumf += window[i * d_conv + k] * ((const float *) L.ssm_conv1d->data)[k + i * d_conv];
+        }
+        const float v = sumf;
         conv_out[i] = v / (1.0f + expf(-v)); // silu
     }
-    // conv state update: keep the last d_conv-1 columns (the 3-token tail)
-    memcpy(conv_state_row, window.data() + n_ch, (d_conv - 1) * n_ch * sizeof(float));
+    // conv state update: keep the last d_conv-1 taps (drop tap 0, append qkv)
+    for (int64_t i = 0; i < n_ch; i++) {
+        for (int64_t k = 0; k < d_conv - 1; k++) {
+            conv_state_row[i * (d_conv - 1) + k] = window[i * d_conv + k + 1];
+        }
+    }
 
     // q/k/v split + l2 norms
     const int64_t q_off = 0, k_off = S_k * H_k, v_off = 2 * S_k * H_k;
     std::vector<float> q(S_k * H_k), k(S_k * H_k), v(S_v * H_v);
-    l2_norm(conv_out.data() + q_off, q.data(), S_k * H_k, eps);
-    l2_norm(conv_out.data() + k_off, k.data(), S_k * H_k, eps);
+    // the graph's l2_norm normalizes each ne[0] column separately (one scale per head)
+    for (int64_t h = 0; h < H_k; h++) {
+        l2_norm(conv_out.data() + q_off + h * S_k, q.data() + h * S_k, S_k, eps);
+        l2_norm(conv_out.data() + k_off + h * S_k, k.data() + h * S_k, S_k, eps);
+    }
     memcpy(v.data(), conv_out.data() + v_off, S_v * H_v * sizeof(float));
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn conv done\n");
@@ -610,14 +646,18 @@ void fused_gdn_layer(
     }
     memcpy(out, res_in_out, n_embd * sizeof(float));
     if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL) {
-        FILE * fc = fopen("/tmp/qwen4exp-builds/f_conv.bin", "wb");
+        char fconv[128];
+        snprintf(fconv, sizeof(fconv), "/tmp/qwen4exp-builds/f_conv_%d.bin", il);
+        FILE * fc = fopen(fconv, "wb");
         if (fc) {
             fwrite(qkv.data(), 4, qkv_span, fc);
             fwrite(window.data(), 4, (d_conv) * n_ch, fc);
             fwrite(conv_out.data(), 4, n_ch, fc);
             fclose(fc);
         }
-        FILE * f = fopen("/tmp/qwen4exp-builds/f_nodes.bin", "wb");
+        char fnd[128];
+        snprintf(fnd, sizeof(fnd), "/tmp/qwen4exp-builds/f_nodes_%d.bin", il);
+        FILE * f = fopen(fnd, "wb");
         if (f) {
             auto wr = [&](const char * nm, const float * d, size_t n) {
                 size_t tag = strlen(nm);
@@ -691,7 +731,7 @@ bool fused_decode_token(const struct llama_model_qwen4exp & model,
                 return false;
             }
             fused_gdn_layer(L, hp, res_hc.data(), res_hc.data(), layer_out.data(),
-                            conv_state, ssm_state, n_threads);
+                            conv_state, ssm_state, n_threads, il);
         } else {
             // TODO(INF-64): the full-attention layer fused transcription
             return false;
@@ -1307,21 +1347,37 @@ void fused_ple(
     const float * w = (const float *) L.ple_conv1d->data;
     std::vector<float> conv_out(hc_dim);
     {
-        // the window: state [hist, hc_dim] + the current norm_conv at position hist
+        // the window: state + the current norm_conv, in the graph's channel-major
+        // layout: element (tap pos, channel c) at c*(hist+1) + pos; the state row
+        // is (channel c, tap j) at c*hist + j (the concat's ne[0]-fastest layout)
         std::vector<float> window((hist + 1) * hc_dim);
-        memcpy(window.data(), ple_conv_state, hist * hc_dim * sizeof(float));
-        memcpy(window.data() + hist * hc_dim, norm_conv.data(), hc_dim * sizeof(float));
+        for (int64_t c = 0; c < hc_dim; c++) {
+            for (int64_t j = 0; j < hist; j++) {
+                window[c * (hist + 1) + j] = ple_conv_state[c * hist + j];
+            }
+            window[c * (hist + 1) + hist] = norm_conv[c];
+        }
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_normconv.bin", "wb");
+            if (f) { fwrite(norm_conv.data(), 4, hc_dim, f); fclose(f); }
+            FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_win.bin", "wb");
+            if (f2) { fwrite(window.data(), 4, window.size(), f2); fclose(f2); }
+        }
         for (int64_t c = 0; c < hc_dim; c++) {
             float sumf = 0.0f;
             for (int64_t k = 0; k < kern; k++) {
                 const int64_t pos = hist - (kern - 1 - k) * dil;
-                sumf += window[(size_t) pos * hc_dim + c] * w[(size_t) k + c * 4];
+                sumf += window[c * (hist + 1) + pos] * w[(size_t) k + c * 4];
             }
             const float v = sumf;
             conv_out[c] = v / (1.0f + expf(-v)); // silu
         }
-        // the state update: keep the last hist positions
-        memcpy(ple_conv_state, window.data() + hc_dim, hist * hc_dim * sizeof(float));
+        // the state update: keep the last hist taps (drop tap 0, append norm_conv)
+        for (int64_t c = 0; c < hc_dim; c++) {
+            for (int64_t j = 0; j < hist; j++) {
+                ple_conv_state[c * hist + j] = window[c * (hist + 1) + j + 1];
+            }
+        }
     }
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
@@ -1451,8 +1507,9 @@ bool llama_model_qwen4exp::fused_decode(
     for (int il = 0; il < (int) hparams.n_layer(); il++) {
         const struct llama_layer & L = layers[il];
         if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
-            fprintf(stderr, "fused layer %2d: %s\n", il,
-                    hparams.is_ple_impl[il] ? "PLE" : (hparams.is_recr(il) ? "GDN" : "ATTN"));
+            fprintf(stderr, "fused layer %2d: %s (ple=%d recr=%d)\n", il,
+                    hparams.is_ple_impl[il] ? "PLE" : (hparams.is_recr(il) ? "GDN" : "ATTN"),
+                    (int) hparams.is_ple_impl[il], (int) hparams.is_recr(il));
         }
 
         if (getenv("GGML_FUSED_SKIP_PLE") != NULL && hparams.is_ple_impl[il]) {
@@ -1463,6 +1520,23 @@ bool llama_model_qwen4exp::fused_decode(
         }
         if (hparams.is_ple_impl[il]) {
             // the PLE: the predecessors from the attention cells
+            if (getenv("GGML_FUSED_LAYER_CMP") != NULL && prev_layer_inp && prev_layer_inp[il] && prev_layer_inp[il]->data) {
+                const ggml_tensor * g0 = prev_layer_inp[il];
+                const int64_t nt = g0->ne[2] > 1 ? g0->ne[2] : 1;
+                const float * gp = (const float *) g0->data + (nt - 1) * g0->ne[0] * g0->ne[1];
+                double md = 0.0, ss = 0.0;
+                for (int64_t i = 0; i < hc_dim; i++) {
+                    md = fmax(md, (double) fabs(res_hc[i] - gp[i]));
+                    ss += (double) (gp[i] * gp[i]);
+                }
+                fprintf(stderr, "  fused cmp ple hidden il=%d: max_abs=%.6g graph_sc=%.6f graph_first=%.6g %.6g f_first=%.6g %.6g\n",
+                        il, md, 1.0 / sqrt((ss / hc_dim) + hparams.f_norm_rms_eps),
+                        (double) gp[0], (double) gp[1], (double) res_hc[0], (double) res_hc[1]);
+                FILE * f = fopen("/tmp/qwen4exp-builds/g_layer_inp.bin", "wb");
+                if (f) { fwrite(gp, 4, hc_dim, f); fclose(f); }
+                FILE * f2 = fopen("/tmp/qwen4exp-builds/f_layer_inp.bin", "wb");
+                if (f2) { fwrite(res_hc.data(), 4, hc_dim, f2); fclose(f2); }
+            }
             const auto * attn = mctx->get_attn();
             std::vector<llama_token> prev_toks;
             attn->get_prev_tokens(ubatch, hparams.ple_ngram_size - 1, prev_toks);
@@ -1487,7 +1561,8 @@ bool llama_model_qwen4exp::fused_decode(
                       ple_state_copy.data(), n_threads);
             memcpy((void *) ((const char *) pl->data + (size_t) head * row_bytes),
                    ple_state_copy.data(), hist * hc_dim * sizeof(float));
-        } else if (hparams.is_recr(il)) {
+        } 
+        if (hparams.is_recr(il)) {
             // the GDN: the conv + ssm state rows at the current head
             const auto * recr = mctx->get_recr();
             const auto * rl = recr->get_r_l(il);
@@ -1503,10 +1578,11 @@ bool llama_model_qwen4exp::fused_decode(
             memcpy(conv_c.data(), conv_state, rl->ne[0] * sizeof(float));
             memcpy(ssm_c.data(), ssm_state, sl->ne[0] * sizeof(float));
             fused_gdn_layer(L, hparams, res_hc.data(), res_hc.data(), layer_out.data(),
-                            conv_c.data(), ssm_c.data(), n_threads);
+                            conv_c.data(), ssm_c.data(), n_threads, il);
             memcpy((void *) conv_state, conv_c.data(), rl->ne[0] * sizeof(float));
             memcpy((void *) ssm_state, ssm_c.data(), sl->ne[0] * sizeof(float));
-        } else {
+        }
+        if (!hparams.is_recr(il)) {
             // the full-attn layer: the KV + indexer cache slices. The cell
             // bookkeeping ran in apply(): the current ubatch's cell is already
             // allocated, so the last used cell is this token's write target.
