@@ -131,6 +131,15 @@ static void hc_mix(const struct ggml_tensor * w_down, const struct ggml_tensor *
                    const struct ggml_tensor * w_inject, int64_t hc,
                    const float * xn, float * mixed, float * inject,
                    int n_threads) {
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        static int hcmix_n = 0;
+        if (hcmix_n < 1 || hcmix_n >= 48) {
+            fprintf(stderr, "  hc_mix enter: n=%d w_down=%p w_up=%p w_inject=%p hc=%lld xn=%p\n",
+                    hcmix_n, (const void *) w_down, (const void *) w_up,
+                    (const void *) w_inject, (long long) hc, (const void *) xn);
+        }
+        hcmix_n++;
+    }
     // the lo-rank down: lo = silu(mm(w_down, xn) * (1/hc))
     const int64_t low_rank = w_down->ne[1];
     std::vector<float> lo(low_rank);
