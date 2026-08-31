@@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool direct_mul = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -111,7 +111,7 @@ static __global__ void rms_norm_f32(const float * x,
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
 
-    if constexpr (do_multiply) {
+    if constexpr (do_multiply && !direct_mul) {
         const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
         const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
         const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
@@ -161,10 +161,19 @@ static __global__ void rms_norm_f32(const float * x,
             x4.w = scale * x4.w * mul[fastmodulo(col + 3, mul_ncols_packed)]
                 + add[fastmodulo(col + 3, add_ncols_packed)];
         } else if constexpr (do_multiply) {
-            x4.x = scale * x4.x * mul[fastmodulo(col + 0, mul_ncols_packed)];
-            x4.y = scale * x4.y * mul[fastmodulo(col + 1, mul_ncols_packed)];
-            x4.z = scale * x4.z * mul[fastmodulo(col + 2, mul_ncols_packed)];
-            x4.w = scale * x4.w * mul[fastmodulo(col + 3, mul_ncols_packed)];
+            if constexpr (direct_mul) {
+                float4 mul4;
+                ggml_cuda_memcpy_1<sizeof(mul4)>(&mul4, mul + col);
+                x4.x = scale * x4.x * mul4.x;
+                x4.y = scale * x4.y * mul4.y;
+                x4.z = scale * x4.z * mul4.z;
+                x4.w = scale * x4.w * mul4.w;
+            } else {
+                x4.x = scale * x4.x * mul[fastmodulo(col + 0, mul_ncols_packed)];
+                x4.y = scale * x4.y * mul[fastmodulo(col + 1, mul_ncols_packed)];
+                x4.z = scale * x4.z * mul[fastmodulo(col + 2, mul_ncols_packed)];
+                x4.w = scale * x4.w * mul[fastmodulo(col + 3, mul_ncols_packed)];
+            }
         } else {
             x4.x = scale * x4.x;
             x4.y = scale * x4.y;
@@ -402,7 +411,15 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-        if (ncols == 1536) {
+        if (ncols == 1536 && mul_ncols == 1536 && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1) {
+            const dim3 block_dims(384, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 12 * sizeof(float), stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<384, true, false, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                // underlying cudaLaunchKernelEx does not support default params
+            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        } else if (ncols == 1536) {
             const dim3 block_dims(384, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 12 * sizeof(float), stream};
             ggml_cuda_kernel_launch(rms_norm_f32<384, true>, launch_params,
