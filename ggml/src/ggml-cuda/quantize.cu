@@ -1,6 +1,23 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+#if defined(__gfx90a__)
+template<int offset>
+static __device__ __forceinline__ float quantize_q8_1_shuffle_xor_gfx90a(float x) {
+    static_assert(offset == 4 || offset == 8 || offset == 16,
+        "unsupported XOR shuffle offset");
+
+    union {
+        float f;
+        int32_t i;
+    } value = {x};
+
+    value.i = __builtin_amdgcn_ds_swizzle(value.i, (offset << 10) | 0x1f);
+
+    return value.f;
+}
+#endif // defined(__gfx90a__)
+
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -38,6 +55,73 @@ static __global__ void quantize_q8_1(
 
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].ds = make_half2(d, sum);
+}
+
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_1d(
+        const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t ne0) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+#if !defined(__gfx90a__)
+    if (i0 >= ne0) {
+        return;
+    }
+#endif // !defined(__gfx90a__)
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+#if defined(__gfx90a__)
+    const int64_t ib  = 2*(int64_t) blockIdx.x + threadIdx.x / QK8_1;
+    const int64_t iqs = threadIdx.x % QK8_1;
+#else
+    const int64_t ib  = i0 / QK8_1;
+    const int64_t iqs = i0 % QK8_1;
+#endif // defined(__gfx90a__)
+
+    ggml_cuda_pdl_sync();
+    const float xi = i0 < ne0 && i0 < ne00 ? x[i0] : 0.0f;
+    float amax = fabsf(xi);
+    float sum = xi;
+
+#if defined(__gfx90a__)
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<16>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<16>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<8>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<8>(sum);
+    amax = fmaxf(amax, quantize_q8_1_shuffle_xor_gfx90a<4>(amax));
+    sum += quantize_q8_1_shuffle_xor_gfx90a<4>(sum);
+    // DPP reads need two wait states after a VGPR write on gfx90a.
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_max_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0"
+        : "+v"(amax), "+v"(sum));
+    __builtin_amdgcn_wave_barrier();
+    if (i0 >= ne0) {
+        return;
+    }
+#else
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+#endif // defined(__gfx90a__)
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
@@ -419,13 +503,19 @@ void quantize_row_q8_1_cuda(
     GGML_ASSERT(!ids);
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
-    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
-
-    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const bool is_1d = ne1 == 1 && ne2 == 1 && ne3 == 1;
+    const int block_size_x = is_1d && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_CDNA2 ?
+        64 : CUDA_QUANTIZE_BLOCK_SIZE;
+    const int64_t block_num_x = (ne0 + block_size_x - 1) / block_size_x;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const dim3 block_size(block_size_x, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    if (is_1d) {
+        ggml_cuda_kernel_launch(quantize_q8_1_1d, launch_params, x, vy, ne00, ne0);
+    } else {
+        const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+        ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
     GGML_UNUSED(type_src0);
 }
 

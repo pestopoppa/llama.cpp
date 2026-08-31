@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool fuse_combine = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -50,6 +50,13 @@ static __global__ void flash_attn_ext_vec(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+
+    if constexpr (fuse_combine) {
+        static_assert(D == 128 && ncols == 1, "fused combine requires D == 128 and ncols == 1");
+        const size_t nrows = size_t(ne01.z)*ne02*ne03;
+        dst      = (float *) dst_meta_ptr;
+        dst_meta = (float2 *) (dst + nrows*gridDim.y*D);
+    }
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
@@ -123,10 +130,10 @@ static __global__ void flash_attn_ext_vec(
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ __align__(8) half KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    __shared__ __align__(8) float KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     float KQ_max[ncols];
@@ -513,6 +520,55 @@ static __global__ void flash_attn_ext_vec(
     if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
+
+    if constexpr (fuse_combine) {
+        const int j_dst_unrolled = (sequence*int(ne01.z) + ic0)*ne02 + head;
+        const size_t nrows = size_t(ne01.z)*ne02*ne03;
+        unsigned int * completion = (unsigned int *) (dst_meta + nrows*gridDim.y);
+
+        __threadfence();
+        __syncthreads();
+
+        __shared__ bool is_last;
+        if (tid == 0) {
+            is_last = atomicAdd(completion + j_dst_unrolled, 1u) == gridDim.y - 1;
+        }
+        __syncthreads();
+
+        if (!is_last) {
+            return;
+        }
+
+        float2 * meta = (float2 *) KQ;
+        for (int i = tid; i < int(gridDim.y); i += nthreads) {
+            meta[i] = dst_meta[j_dst_unrolled*gridDim.y + i];
+        }
+        __syncthreads();
+
+        const float * VKQ_parts = dst + j_dst_unrolled*gridDim.y*D;
+        for (int i = tid; i < D; i += nthreads) {
+            float kqmax = meta[0].x;
+            for (int l = 1; l < int(gridDim.y); ++l) {
+                kqmax = max(kqmax, meta[l].x);
+            }
+
+            float VKQ_numerator   = 0.0f;
+            float VKQ_denominator = 0.0f;
+            for (int l = 0; l < int(gridDim.y); ++l) {
+                const float KQ_max_scale = expf(meta[l].x - kqmax);
+
+                VKQ_numerator   += KQ_max_scale*VKQ_parts[l*D + i];
+                VKQ_denominator += KQ_max_scale*meta[l].y;
+            }
+
+            dst_ptr[j_dst_unrolled*D + i] = VKQ_numerator/VKQ_denominator;
+        }
+
+        __syncthreads();
+        if (tid == 0) {
+            atomicExch(completion + j_dst_unrolled, 0u);
+        }
+    }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -530,9 +586,113 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+#ifdef GGML_USE_HIP
+static bool launch_flash_attn_ext_vec_fused_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int D = 128;
+    constexpr int ncols = 1;
+    constexpr int nthreads = 128;
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const dim3 block_dim(WARP_SIZE, nthreads/WARP_SIZE, 1);
+    const auto producer_kernel = flash_attn_ext_vec<D, ncols, GGML_TYPE_F16, GGML_TYPE_F16, false>;
+    const auto fused_kernel = flash_attn_ext_vec<D, ncols, GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
+
+    int max_blocks_per_sm = 1;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, producer_kernel, nthreads, 0));
+
+    const int ntiles_dst = Q->ne[1]*Q->ne[2]*Q->ne[3];
+    const int ntiles_KV  = (K->ne[1] + D - 1)/D;
+    int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
+
+    const int blocks_per_wave = nsm*max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_dst*parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1)/blocks_per_wave;
+        const int efficiency_percent = 100*nblocks_total/(nwaves*blocks_per_wave);
+
+        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+            break;
+        }
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+
+    if (parallel_blocks <= 2 || parallel_blocks > 128) {
+        return false;
+    }
+
+    ggml_cuda_pool_alloc<char> scratch(ctx.pool(),
+        parallel_blocks*ggml_nelements(dst)*sizeof(float) +
+        parallel_blocks*ggml_nrows(dst)*sizeof(float2) +
+        ggml_nrows(dst)*sizeof(unsigned int));
+
+    const size_t completion_offset =
+        parallel_blocks*ggml_nelements(dst)*sizeof(float) +
+        parallel_blocks*ggml_nrows(dst)*sizeof(float2);
+    CUDA_CHECK(cudaMemsetAsync(
+        scratch.ptr + completion_offset, 0, ggml_nrows(dst)*sizeof(unsigned int), ctx.stream()));
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(Q->ne[2]))));
+    const float m0 = powf(2.0f, -max_bias/n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
+    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
+
+    const dim3 blocks_num(Q->ne[1], parallel_blocks, Q->ne[2]*Q->ne[3]);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(blocks_num, block_dim, 0, ctx.stream());
+    ggml_cuda_kernel_launch(fused_kernel, launch_params,
+        (const char *) Q->data,
+        (const char *) K->data,
+        (const char *) V->data,
+        mask ? (const char *) mask->data : nullptr,
+        sinks ? (const char *) sinks->data : nullptr,
+        nullptr,
+        (float *) dst->data,
+        (float2 *) scratch.ptr,
+        scale, max_bias, m0, m1, n_head_log2, 0.0f,
+        Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
+        V->nb[1], V->nb[2], V->nb[3],
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // GGML_USE_HIP
+
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+#ifdef GGML_USE_HIP
+    if constexpr (D == 128 && cols_per_block == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !use_logit_softcap) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        if (cc == GGML_CUDA_CC_CDNA2 && Q->ne[1] == 1 && Q->ne[3] == 1 &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            launch_flash_attn_ext_vec_fused_combine(ctx, dst)) {
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
