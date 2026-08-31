@@ -755,6 +755,15 @@ static void fused_head(const struct llama_model_qwen4exp & model,
     const float eps = hp.f_norm_rms_eps;
 
     std::vector<float> xn(hc * n_embd), mixed(n_embd);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  head: norm=%p data=%p down=%p data=%p ne=[%lld,%lld] up=%p data=%p ne=[%lld,%lld] out=%p data=%p\n",
+                (const void *) model.hc_head_norm, (const void *) (model.hc_head_norm ? model.hc_head_norm->data : nullptr),
+                (const void *) model.hc_head_down, (const void *) (model.hc_head_down ? model.hc_head_down->data : nullptr),
+                model.hc_head_down ? (long long) model.hc_head_down->ne[0] : -1, model.hc_head_down ? (long long) model.hc_head_down->ne[1] : -1,
+                (const void *) model.hc_head_up, (const void *) (model.hc_head_up ? model.hc_head_up->data : nullptr),
+                model.hc_head_up ? (long long) model.hc_head_up->ne[0] : -1, model.hc_head_up ? (long long) model.hc_head_up->ne[1] : -1,
+                (const void *) model.output, (const void *) (model.output ? model.output->data : nullptr));
+    }
     hc_rms_norm_gamma(res_hc, model.hc_head_norm, xn.data(), n_embd, hc, eps);
     hc_mix(model.hc_head_down, model.hc_head_up, nullptr, hc, xn.data(), mixed.data(), nullptr, n_threads);
     lora_mm(model.output, mixed.data(), model.output_s, logits, n_threads);
