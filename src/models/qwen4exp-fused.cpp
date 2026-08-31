@@ -993,3 +993,154 @@ void fused_ple(
         res[i] = hidden[i] + gated[i] + conv_out[i];
     }
 }
+
+// ---- the fused decode wiring (the process_ubatch fast path) ----------------
+
+#include "llama-memory-hybrid-idx.h"
+#include "llama-kv-cache.h"
+
+// the token embedding gather (the graph's build_inp_embd)
+static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float * out, int64_t n_embd) {
+    const size_t row_bytes = ggml_row_size(tok_embd->type, n_embd);
+    const char * row = (const char *) tok_embd->data + (size_t) tok * row_bytes;
+    if (tok_embd->type == GGML_TYPE_F32) {
+        memcpy(out, row, n_embd * sizeof(float));
+    } else if (tok_embd->type == GGML_TYPE_BF16) {
+        const ggml_bf16_t * b = (const ggml_bf16_t *) row;
+        for (int64_t i = 0; i < n_embd; i++) out[i] = ggml_bf16_to_fp32(b[i]);
+    } else {
+        const struct ggml_type_traits * qtt = ggml_get_type_traits(tok_embd->type);
+        qtt->to_float(row, out, n_embd);
+    }
+}
+
+bool llama_model_qwen4exp::fused_decode(
+        const llama_ubatch & ubatch,
+        const struct llama_memory_context_i * mctx_in,
+        class llm_graph_result * res,
+        int n_threads) const {
+    if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
+    if (ubatch.token == nullptr) return false;
+
+    const auto * mctx = static_cast<const llama_memory_hybrid_idx_context *>(mctx_in);
+    if (mctx == nullptr || mctx->get_attn() == nullptr) return false;
+
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t hc_dim = hc * n_embd;
+    const int32_t tok = ubatch.token[0];
+    const int64_t pos = ubatch.pos[0];
+    const int64_t seq = ubatch.seq_id[0][0];
+
+    FusedRopeParams rp;
+    rp.n_ctx_orig = 0; // filled by the caller's cparams via the hook
+    // the rope values are set by the hook's caller (the cparams); defaults here
+    rp.freq_base = 10000000.0f;
+    rp.freq_scale = 1.0f;
+    rp.ext_factor = 0.0f;
+    rp.attn_factor = 1.0f;
+    rp.beta_fast = 32.0f;
+    rp.beta_slow = 1.0f;
+
+    // the token embedding
+    std::vector<float> res_hc(hc_dim);
+    {
+        std::vector<float> emb(n_embd);
+        fused_embd(tok_embd, tok, emb.data(), n_embd);
+        for (int64_t c = 0; c < hc; c++) {
+            memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
+        }
+    }
+
+    // scratch ggml context for the cache views
+    ggml_init_params gip = { 64 << 20, nullptr, false };
+    ggml_context * vctx = ggml_init(gip);
+    std::vector<float> layer_out(n_embd);
+
+    for (int il = 0; il < (int) hparams.n_layer(); il++) {
+        const struct llama_layer & L = layers[il];
+
+        if (hparams.is_ple_impl[il]) {
+            // the PLE: the predecessors from the attention cells
+            const auto * attn = mctx->get_attn();
+            std::vector<llama_token> prev_toks;
+            attn->get_prev_tokens(ubatch, hparams.ple_ngram_size - 1, prev_toks);
+            int32_t prev[2] = { -1, -1 };
+            for (int64_t s = 0; s < hparams.ple_ngram_size - 1; s++) {
+                const llama_token t = prev_toks[s];
+                prev[hparams.ple_ngram_size - 2 - s] = t < 0 ? -1 : (int32_t) t;
+            }
+            const auto * recr = mctx->get_recr();
+            const auto * pl = recr->get_p_l(il);
+            const size_t row_bytes = ggml_row_size(pl->type, pl->ne[0]);
+            const int head = (int) recr->get_head();
+            const int64_t hist = (hparams.ple_conv_kernel - 1) * hparams.ple_ngram_size;
+            std::vector<float> ple_state_copy(hist * hc_dim);
+            memcpy(ple_state_copy.data(),
+                   (const char *) pl->data + (size_t) head * row_bytes,
+                   hist * hc_dim * sizeof(float));
+            fused_ple(*this, hparams, L, tok, prev, res_hc.data(), res_hc.data(),
+                      ple_state_copy.data(), n_threads);
+            memcpy((void *) ((const char *) pl->data + (size_t) head * row_bytes),
+                   ple_state_copy.data(), hist * hc_dim * sizeof(float));
+        } else if (hparams.is_recr(il)) {
+            // the GDN: the conv + ssm state rows at the current head
+            const auto * recr = mctx->get_recr();
+            const auto * rl = recr->get_r_l(il);
+            const auto * sl = recr->get_s_l(il);
+            const int head = (int) recr->get_head();
+            const size_t rrow = ggml_row_size(rl->type, rl->ne[0]);
+            const size_t srow = ggml_row_size(sl->type, sl->ne[0]);
+            const float * conv_state = (const float *) ((const char *) rl->data + (size_t) head * rrow);
+            const float * ssm_state  = (const float *) ((const char *) sl->data + (size_t) head * srow);
+            // the fused layer works on copies for the state (in-place safety)
+            std::vector<float> conv_c(rl->ne[0] * 4), ssm_c(sl->ne[0]);
+            memcpy(conv_c.data(), conv_state, rl->ne[0] * 4 * sizeof(float));
+            memcpy(ssm_c.data(), ssm_state, sl->ne[0] * sizeof(float));
+            fused_gdn_layer(L, hparams, res_hc.data(), res_hc.data(), layer_out.data(),
+                            conv_c.data(), ssm_c.data(), n_threads);
+            memcpy((void *) conv_state, conv_c.data(), rl->ne[0] * 4 * sizeof(float));
+            memcpy((void *) ssm_state, ssm_c.data(), sl->ne[0] * sizeof(float));
+        } else {
+            // the full-attn layer: the KV + indexer cache slices
+            const auto * attn = mctx->get_attn();
+            const auto * idx = mctx->get_idx();
+            if (idx == nullptr) return false;
+            const int n_kv = (int) attn->get_n_kv();
+            const int idx_n_kv = (int) idx->get_n_kv();
+            ggml_tensor * tk = attn->get_k(vctx, il);
+            ggml_tensor * tv = attn->get_v(vctx, il);
+            ggml_tensor * ti = idx->get_k(vctx, il);
+            if (tk == nullptr || tv == nullptr || ti == nullptr) return false;
+            std::vector<float> k_all(tk->ne[0] * tk->ne[1] * tk->ne[2]),
+                               v_all(tv->ne[0] * tv->ne[1] * tv->ne[2]),
+                               idx_all(ti->ne[0] * ti->ne[1]);
+            memcpy(k_all.data(), tk->data, k_all.size() * sizeof(float));
+            memcpy(v_all.data(), tv->data, v_all.size() * sizeof(float));
+            for (int64_t j = 0; j < idx_n_kv; j++) {
+                memcpy(idx_all.data() + j * ti->ne[0],
+                       (const char *) ti->data + (size_t) j * ti->nb[1],
+                       ti->ne[0] * sizeof(float));
+            }
+            if (!fused_full_attn_layer(L, hparams, rp, (int32_t) pos,
+                        res_hc.data(), res_hc.data(), layer_out.data(),
+                        k_all.data(), v_all.data(), n_kv,
+                        idx_all.data(), idx_n_kv, n_threads)) {
+                ggml_free(vctx);
+                return false;
+            }
+        }
+    }
+
+    // the head -> the logits
+    const int64_t n_vocab = vocab.n_tokens();
+    std::vector<float> logits(n_vocab);
+    fused_head(*this, hparams, res_hc.data(), logits.data(), n_threads);
+
+    ggml_tensor * t_logits = ggml_new_tensor_1d(res->get_ctx(), GGML_TYPE_F32, n_vocab);
+    res->t_logits = t_logits;
+    memcpy(t_logits->data, logits.data(), n_vocab * sizeof(float));
+
+    ggml_free(vctx);
+    return true;
+}

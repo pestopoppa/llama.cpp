@@ -2059,6 +2059,9 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_qsa;
 
+    bool supports_fused_decode() const override { return true; }
+    bool fused_decode(const llama_ubatch & ubatch, const struct llama_memory_context_i * mctx, class llm_graph_result * res, int n_threads) const override;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

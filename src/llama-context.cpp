@@ -1333,6 +1333,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // the fused decode fast path (INF-64): single-token decode on a fully
+    // CPU-resident model runs the fused layer functions instead of the graph;
+    // any failure falls through to the graph path below
+    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
+            gtype == LLM_GRAPH_TYPE_DEFAULT &&
+            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
+        res->reset();
+        if (model.fused_decode(ubatch, mctx, res, cparams.n_threads)) {
+            ret = GGML_STATUS_SUCCESS;
+            return res;
+        }
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
