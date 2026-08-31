@@ -972,6 +972,34 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
+#if defined(__gfx90a__)
+    const int ql = get_int_b2(bq6_K->ql, iqs);
+    const int qh = get_int_b2(
+        bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int vil0 = (ql >> 0) & 0x0F0F0F0F;
+    const int vih0 = ((qh >> 0) << 4) & 0x30303030;
+    const int vi0  = int((uint32_t(vil0 | vih0) << 2) ^ 0x80808080u);
+    const int u0   = get_int_b4(bq8_1[bq8_offset].qs, iqs % QI8_1);
+    const int dot0 = ggml_cuda_dp4a(vi0, u0, 0);
+
+    const int vil1 = (ql >> 4) & 0x0F0F0F0F;
+    const int vih1 = ((qh >> 4) << 4) & 0x30303030;
+    const int vi1  = int((uint32_t(vil1 | vih1) << 2) ^ 0x80808080u);
+    const int u1   = get_int_b4(bq8_1[bq8_offset + 2].qs, iqs % QI8_1);
+    const int dot1 = ggml_cuda_dp4a(vi1, u1, 0);
+
+    using floatx2_t = __attribute__((ext_vector_type(2))) float;
+    const floatx2_t d8_packed = {
+        __low2float(bq8_1[bq8_offset].ds), __low2float(bq8_1[bq8_offset + 2].ds)};
+    const floatx2_t dot_packed = {
+        float(dot0 * bq6_K->scales[scale_offset]), float(dot1 * bq6_K->scales[scale_offset + 4])};
+    floatx2_t sumf = {0.0f, 0.0f};
+    sumf = __builtin_elementwise_fma(d8_packed, dot_packed, sumf);
+
+    const float d = 0.25f * __half2float(bq6_K->d);
+    return d * (sumf[0] + sumf[1]);
+#else
     float sumf;
     {
         const int ql  = get_int_b2(bq6_K->ql, iqs);
@@ -998,6 +1026,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     const float d = bq6_K->d;
     return d * sumf;
+#endif
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
