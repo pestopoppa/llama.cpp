@@ -1455,6 +1455,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 for (int ni = 0; ni < n_nodes; ni++) {
                     const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
                     if (!nd || !nd->data) continue;
+                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni < 30) {
+                        // the rms_norm output + its eps + the name
+                        fprintf(stderr, "rms_norm[%d] %s eps=%.6g out[0..3]=%.6g %.6g %.6g %.6g\n",
+                                ni, ggml_get_name(nd),
+                                ((const float *) nd->op_params)[0],
+                                ((const float *) nd->data)[0], ((const float *) nd->data)[1],
+                                ((const float *) nd->data)[2], ((const float *) nd->data)[3]);
+                    }
                     if (nd->op == GGML_OP_MEAN_D1 && nd->data && nd->src[0] && nd->src[0]->data) {
                         const ggml_tensor * gated = nd->src[0];
                         for (int si = 0; si < 3; si++) {
