@@ -716,7 +716,7 @@ struct llama_model {
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual bool supports_fused_decode() const { return false; }
-    virtual bool fused_decode(const llama_ubatch & ubatch, const struct llama_memory_context_i * mctx, class llm_graph_result * res, int n_threads) const { return false; }
+    virtual bool fused_decode(const llama_ubatch & ubatch, const struct llama_memory_context_i * mctx, class llm_graph_result * res, int n_threads, const struct ggml_tensor * const * prev_layer_inp) const { return false; }
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

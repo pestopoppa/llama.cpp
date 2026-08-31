@@ -1339,8 +1339,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
             gtype == LLM_GRAPH_TYPE_DEFAULT &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
+        // snapshot the previous graph's per-layer inputs (the fused path may
+        // compare against them for layer-level isolation; the reset clears them)
+        const int64_t n_layers = model.hparams.n_layer();
+        std::vector<const ggml_tensor *> prev_inp(n_layers + 2);
+        for (int64_t il = 0; il <= n_layers; il++) {
+            prev_inp[il] = res->get_layer_inp((int) il);
+        }
+        prev_inp[n_layers + 1] = res->get_logits();
         res->reset();
-        if (model.fused_decode(ubatch, mctx, res, cparams.n_threads)) {
+        if (model.fused_decode(ubatch, mctx, res, cparams.n_threads, prev_inp.data())) {
             ret = GGML_STATUS_SUCCESS;
             return res;
         }

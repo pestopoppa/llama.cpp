@@ -151,6 +151,11 @@ static void fused_moe(
     std::vector<float> logits(n_expert);
     lora_mm(L.ffn_gate_inp, x, nullptr, logits.data(), n_threads);
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        extern float ggml_table_f32_f16[1 << 16];
+        fprintf(stderr, "  moe f16table[0x3C00]=%.6g f16table[0]=%.6g\n",
+                (double) ggml_table_f32_f16[0x3C00], (double) ggml_table_f32_f16[0]);
+    }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         fprintf(stderr, "  moe router[0..5] = %.6g %.6g %.6g %.6g %.6g %.6g  (n_used=%d)\n",
                 (double) logits[0], (double) logits[1], (double) logits[2],
                 (double) logits[3], (double) logits[4], (double) logits[5],
@@ -206,6 +211,11 @@ static void fused_moe(
     std::vector<float> glu(n_used * n_ff), up_tmp(n_used * n_ff), gate_tmp(n_used * n_ff);
     const size_t nb_up_exp = L.ffn_up_exps->nb[2]; // expert stride
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  moe up: type=%s nb1=%zu nb2=%zu n_embd=%lld sel[0]=%d\n",
+                ggml_type_name(L.ffn_up_exps->type), (size_t) L.ffn_up_exps->nb[1],
+                (size_t) L.ffn_up_exps->nb[2], (long long) hp.n_embd, sel[0]);
+    }
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
         const char * up_e = (const char *) L.ffn_up_exps->data + (size_t) e * nb_up_exp;
@@ -219,8 +229,19 @@ static void fused_moe(
             glu[j * n_ff + r] = up_tmp[j * n_ff + r] * (g / (1.0f + expf(-g))); // silu(gate)*up
         }
     }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int un = 0, gn = 0, gln = 0;
+        for (int64_t i = 0; i < n_used * n_ff; i++) { if (std::isnan(up_tmp[i])) un++; if (std::isnan(gate_tmp[i])) gn++; if (std::isnan(glu[i])) gln++; }
+        fprintf(stderr, "  moe updots: up nan=%d gate nan=%d glu nan=%d  up[0]=%.6g glu[0]=%.6g\n", un, gn, gln, (double) up_tmp[0], (double) glu[0]);
+    }
 
-    // the down expert gemvs: [640, 2560, 512] IQ4_NL with its vec_dot_type
+    // the down expert gemvs: [640, 2560, 512] IQ4_NL with its vec_dot_type.
+    // NOTE: the CPU_REPACK buffer may have interleaved the IQ4_NL rows (the
+    // graph's repack compute handles that layout; the plain vec_dot cannot).
+    // Detect via tensor->extra and mirror the interleaved layout here, per
+    // ggml_gemv_iq4_nl_{4x4,8x8}_q8_0_generic: a group holds I rows; the row's
+    // slot j reads scale d[j] and nibbles qs[k*I*I + j*I + i] (low nibble vs the
+    // activation qs[k*I+i], high nibble vs qs[k*I+i+16]).
     const struct ggml_type_traits_cpu * qt_dn = ggml_get_type_traits_cpu(L.ffn_down_exps->type);
     const struct ggml_type_traits_cpu * qt_dnv = ggml_get_type_traits_cpu(qt_dn->vec_dot_type);
     const size_t glu_q_size = ggml_row_size(qt_dn->vec_dot_type, n_ff);
@@ -228,17 +249,78 @@ static void fused_moe(
     for (int64_t j = 0; j < n_used; j++) {
         qt_dnv->from_float(glu.data() + j * n_ff, glu_q.data() + j * glu_q_size, n_ff);
     }
+    static const int8_t kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    const bool dn_repacked = L.ffn_down_exps->extra != nullptr;
+    const int64_t rp_I = dn_repacked ? (ggml_cpu_has_avx2() ? 8 : 4) : 0;
+    const int64_t rp_nblocks = n_ff / 32;
     const size_t nb_dn_exp = L.ffn_down_exps->nb[2];
     std::vector<float> down_acc(hp.n_embd, 0.0f);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  moe dn: type=%s vec_dot_type=%s nb1=%zu nb2=%zu glu_q_size=%zu buf=%s repacked=%d I=%lld\n",
+                ggml_type_name(L.ffn_down_exps->type), ggml_type_name(qt_dn->vec_dot_type),
+                (size_t) L.ffn_down_exps->nb[1], (size_t) L.ffn_down_exps->nb[2], glu_q_size,
+                L.ffn_down_exps->buffer ? ggml_backend_buffer_name(L.ffn_down_exps->buffer) : "none",
+                (int) dn_repacked, (long long) rp_I);
+        fprintf(stderr, "  moe up: type=%s buf=%s\n", ggml_type_name(L.ffn_up_exps->type),
+                L.ffn_up_exps->buffer ? ggml_backend_buffer_name(L.ffn_up_exps->buffer) : "none");
+    }
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
         const char * dn_e = (const char *) L.ffn_down_exps->data + (size_t) e * nb_dn_exp;
         for (int64_t r = 0; r < hp.n_embd; r++) {
             float v = 0.0f;
-            qt_dn->vec_dot((int) n_ff, &v, 0, dn_e + (size_t) r * L.ffn_down_exps->nb[1], 0,
-                           glu_q.data() + j * glu_q_size, 0, 1);
+            if (dn_repacked) {
+                // the interleaved IQ4_NL dot for one row of its group
+                const int64_t g = r / rp_I, slot = r % rp_I;
+                const char * grp = dn_e + g * (rp_nblocks * 18 * rp_I);
+                if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && j == 0 && r < 3) {
+                    const ggml_fp16_t * d0 = (const ggml_fp16_t *) grp;
+                    const ggml_fp16_t * d1 = (const ggml_fp16_t *) (grp + 18 * rp_I);
+                    fprintf(stderr, "  moe dn r%lld: slot=%lld d[0..2]=%.6g %.6g %.6g  l1d[0..2]=%.6g %.6g %.6g\n",
+                            (long long) r, (long long) slot,
+                            (double) ggml_fp16_to_fp32(d0[0]), (double) ggml_fp16_to_fp32(d0[1]), (double) ggml_fp16_to_fp32(d0[2]),
+                            (double) ggml_fp16_to_fp32(d1[0]), (double) ggml_fp16_to_fp32(d1[1]), (double) ggml_fp16_to_fp32(d1[2]));
+                }
+                const char * act = (const char *) glu_q.data() + j * glu_q_size;
+                float dot = 0.0f;
+                if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && j == 0 && r == 3) {
+                    const char * bl0 = grp + 0 * (18 * rp_I);
+                    const ggml_fp16_t * dsc0 = (const ggml_fp16_t *) bl0;
+                    const uint8_t * qs0 = (const uint8_t *) (bl0 + 2 * rp_I);
+                    fprintf(stderr, "  moe dn r3 rep: slot=%lld d[slot]=%.6g qs[0..3]=%d %d %d %d qs[64..67]=%d %d %d %d\n",
+                            (long long) slot, (double) ggml_fp16_to_fp32(dsc0[slot]),
+                            qs0[0], qs0[1], qs0[2], qs0[3], qs0[64], qs0[65], qs0[66], qs0[67]);
+                }
+                for (int64_t l = 0; l < rp_nblocks; l++) {
+                    const char * bl = grp + l * (18 * rp_I);
+                    const ggml_fp16_t * dsc = (const ggml_fp16_t *) bl;
+                    const uint8_t * qs = (const uint8_t *) (bl + 2 * rp_I);
+                    const ggml_fp16_t * ad = (const ggml_fp16_t *) (act + l * 34);
+                    const int8_t * aqs = (const int8_t *) (act + l * 34 + 2);
+                    int sumi = 0;
+                    for (int64_t k = 0; k < 32 / (2 * rp_I); k++) {
+                        for (int64_t i = 0; i < rp_I; i++) {
+                            const uint8_t byte = qs[k * rp_I * rp_I + slot * rp_I + i];
+                            sumi += kv_iq4nl[byte & 0xF] * aqs[k * rp_I + i]
+                                 +  kv_iq4nl[byte >> 4] * aqs[k * rp_I + i + 16];
+                        }
+                    }
+                    dot += (float) sumi * ggml_fp16_to_fp32(dsc[slot]) * ggml_fp16_to_fp32(ad[0]);
+                }
+                v = dot;
+            } else {
+                qt_dn->vec_dot((int) n_ff, &v, 0, dn_e + (size_t) r * L.ffn_down_exps->nb[1], 0,
+                               glu_q.data() + j * glu_q_size, 0, 1);
+            }
             down_acc[r] += v * w[j];
+            if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && r < 2) {
+                fprintf(stderr, "  moe dn j%lld r%lld: e=%d v=%.6g w=%.6g\n", (long long) j, (long long) r, e, (double) v, (double) w[j]);
+            }
         }
+    }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int dn = 0; for (int64_t i = 0; i < hp.n_embd; i++) if (std::isnan(down_acc[i])) dn++;
+        fprintf(stderr, "  moe dnacc: nan=%d [0]=%.6g\n", dn, (double) down_acc[0]);
     }
 
     // the shared expert + its sigmoided gate
@@ -287,12 +369,13 @@ static void hc_combine(float * res, const float * block, const float * inject,
 
 // ---- the fused GDN layer ---------------------------------------------------
 
-// mirror of ggml_compute_forward_ssm_conv_f32 at batch-1 (float accumulation)
+// mirror of ggml_compute_forward_ssm_conv_f32 at batch-1 (float accumulation);
+// the kernel is {d_conv, n_ch} with the tap as the fast index (c[i0 + i1*nc])
 static void conv1d_4tap(const float * window, const float * kernel, float * out, int64_t n_ch) {
     for (int64_t i = 0; i < n_ch; i++) {
         float sumf = 0.0f;
         for (int k = 0; k < 4; k++) {
-            sumf += window[k * n_ch + i] * kernel[k * n_ch + i];
+            sumf += window[k * n_ch + i] * kernel[k + i * 4];
         }
         out[i] = sumf;
     }
@@ -448,7 +531,9 @@ void fused_gdn_layer(
         fprintf(stderr, "  gdn out: nan=%d inf=%d min=%.6g max=%.6g\n", onn, oni, (double)omin, (double)omax);
     }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn out[0..2]=%.6g %.6g %.6g z[0..2]=%.6g %.6g %.6g\n", (double)gdn_out[0],(double)gdn_out[1],(double)gdn_out[2],(double)z[0],(double)z[1],(double)z[2]);
-    memcpy(ssm_state_row, ts->data, S_v * S_v * H_v * sizeof(float));
+    // the kernel's K=1 output carries [attn | new_state]; the state advances
+    // (ts holds the input state; copying it back would freeze the recurrence)
+    memcpy(ssm_state_row, (const char *) tgd->data + S_v * H_v, S_v * S_v * H_v * sizeof(float));
     ggml_free(gctx);
 
     const float * znorm = (const float *) L.ssm_norm->data;
@@ -476,8 +561,10 @@ void fused_gdn_layer(
             if (std::isinf(final_in[i])) ni++;
             mn = fminf(mn, final_in[i]); mx = fmaxf(mx, final_in[i]);
         }
-        fprintf(stderr, "  gdn final_in: nan=%d inf=%d min=%.6g max=%.6g  attn_out nan=%d\n",
-                nn, ni, (double) mn, (double) mx, (int) std::isnan(attn_out[0]));
+        int ann = 0, ain = 0; float amn = 1e30f, amx = -1e30f;
+        for (int64_t i = 0; i < n_embd; i++) { if (std::isnan(attn_out[i])) ann++; if (std::isinf(attn_out[i])) ain++; amn = fminf(amn, attn_out[i]); amx = fmaxf(amx, attn_out[i]); }
+        fprintf(stderr, "  gdn final_in: nan=%d inf=%d min=%.6g max=%.6g  attn_out: nan=%d inf=%d min=%.6g max=%.6g\n",
+                nn, ni, (double) mn, (double) mx, ann, ain, (double) amn, (double) amx);
     }
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn ssm_out done\n");
@@ -603,14 +690,24 @@ static void fused_rope(const FusedRopeParams & rp, float * x, int64_t n_dims,
     ggml_context * gctx = ggml_init(gip);
     ggml_tensor * a = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_dims, n_head, n_stream);
     memcpy(a->data, x, n_dims * n_head * n_stream * sizeof(float));
-    ggml_tensor * b = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_stream);
-    ((int32_t *) b->data)[0] = pos;
+    // IMROPE: 4 positions per token (text tokens: [pos, pos, pos, 0])
+    ggml_tensor * b = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 4 * n_stream);
+    for (int64_t s = 0; s < n_stream; s++) {
+        ((int32_t *) b->data)[0 * n_stream + s] = pos;
+        ((int32_t *) b->data)[1 * n_stream + s] = pos;
+        ((int32_t *) b->data)[2 * n_stream + s] = pos;
+        ((int32_t *) b->data)[3 * n_stream + s] = 0;
+    }
     ggml_tensor * rope = ggml_rope_multi(gctx, a, b, nullptr,
             (int) n_dims, sections, LLAMA_ROPE_TYPE_IMROPE,
             rp.n_ctx_orig, rp.freq_base, rp.freq_scale,
             rp.ext_factor, rp.attn_factor, rp.beta_fast, rp.beta_slow);
+    // the rope kernel uses wdata for the mrope cache (ne[0] floats per thread)
+    std::vector<float> rw(n_dims);
     struct ggml_compute_params gparams;
-    gparams.ith = 0; gparams.nth = 1; gparams.wsize = 0; gparams.wdata = nullptr;
+    gparams.ith = 0; gparams.nth = 1;
+    gparams.wsize = rw.size() * sizeof(float);
+    gparams.wdata = rw.data();
     gparams.threadpool = nullptr; gparams.use_ref = false;
     ggml_compute_forward_rope(&gparams, rope);
     memcpy(x, rope->data, n_dims * n_head * n_stream * sizeof(float));
@@ -628,22 +725,38 @@ static void fused_attn_flash(
         const int64_t n_kv, const float * selected_cells, float * out) {
     ggml_init_params gip = { 64 << 20, nullptr, false };
     ggml_context * gctx = ggml_init(gip);
-    ggml_tensor * tq = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head, 1, 1);
-    ggml_tensor * tk = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_kv, 1);
-    ggml_tensor * tv = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_kv, 1);
+    // the graph casts the F32 activations to F16 for the flash and permutes the
+    // heads/kv dims (build_attn_mha) before the op; mirror that exactly
+    ggml_tensor * tq = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, n_embd_head, n_head, 1, 1);
+    ggml_tensor * tk = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, n_embd_head, n_head_kv, n_kv, 1);
+    ggml_tensor * tv = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, n_embd_head, n_head_kv, n_kv, 1);
     ggml_tensor * tm = ggml_new_tensor_4d(gctx, GGML_TYPE_F16, n_kv, 1, 1, 1);
-    memcpy(tq->data, q, n_embd_head * n_head * sizeof(float));
-    memcpy(tk->data, k, n_embd_head * n_head_kv * n_kv * sizeof(float));
-    memcpy(tv->data, v, n_embd_head * n_head_kv * n_kv * sizeof(float));
+    for (int64_t i = 0; i < n_embd_head * n_head; i++) ((ggml_fp16_t *) tq->data)[i] = ggml_fp32_to_fp16(q[i]);
+    for (int64_t i = 0; i < n_embd_head * n_head_kv * n_kv; i++) ((ggml_fp16_t *) tk->data)[i] = ggml_fp32_to_fp16(k[i]);
+    for (int64_t i = 0; i < n_embd_head * n_head_kv * n_kv; i++) ((ggml_fp16_t *) tv->data)[i] = ggml_fp32_to_fp16(v[i]);
     for (int64_t j = 0; j < n_kv; j++) {
         ((ggml_fp16_t *) tm->data)[j] = selected_cells[j] == 0.0f
             ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
     }
+    ggml_tensor * pq = ggml_permute(gctx, tq, 0, 2, 1, 3);
+    ggml_tensor * pk = ggml_permute(gctx, tk, 0, 2, 1, 3);
+    ggml_tensor * pv = ggml_permute(gctx, tv, 0, 2, 1, 3);
     const float scale = 1.0f / sqrtf((float) n_embd_head);
-    ggml_tensor * tfa = ggml_flash_attn_ext(gctx, tq, tk, tv, tm, scale, 0.0f, 0.0f);
+    ggml_tensor * tfa = ggml_flash_attn_ext(gctx, pq, pk, pv, tm, scale, 0.0f, 0.0f);
+    // the flash kernel's decode-path scratch (VKQ acc + partial M/S + V/Q/VKQ)
+    const int64_t fw = n_head * (2 + n_embd_head) + n_embd_head + 2 * n_embd_head;
+    std::vector<float> fw_buf(fw);
+    static struct ggml_threadpool * fa_tp = nullptr;
+    if (fa_tp == nullptr) {
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
+        tpp.n_threads = 1;
+        fa_tp = ggml_threadpool_new(&tpp);
+    }
     struct ggml_compute_params gparams;
-    gparams.ith = 0; gparams.nth = 1; gparams.wsize = 0; gparams.wdata = nullptr;
-    gparams.threadpool = nullptr; gparams.use_ref = false;
+    gparams.ith = 0; gparams.nth = 1;
+    gparams.wsize = fw_buf.size() * sizeof(float);
+    gparams.wdata = fw_buf.data();
+    gparams.threadpool = fa_tp; gparams.use_ref = false;
     ggml_compute_forward_flash_attn_ext(&gparams, tfa);
     memcpy(out, tfa->data, n_embd_head * n_head * sizeof(float));
     ggml_free(gctx);
@@ -735,13 +848,43 @@ bool fused_full_attn_layer(
     const float eps = hp.f_norm_rms_eps;
     const int n_rot = (int) hp.n_rot();
 
-    if (tk->type != GGML_TYPE_F32 || tv->type != GGML_TYPE_F32 || ti->type != GGML_TYPE_F32) {
+    if (tk->type != GGML_TYPE_F32 && tk->type != GGML_TYPE_F16) {
+        fprintf(stderr, "  fused attn fallback: cache type %s %s %s\n",
+                ggml_type_name(tk->type), ggml_type_name(tv->type), ggml_type_name(ti->type));
         return false;
     }
+    // the cache may be F16 (the graph dequantizes it for the attention; the
+    // fused path stages a converted F32 view and casts back on the writes)
+    const bool k16 = tk->type == GGML_TYPE_F16;
+    const bool i16 = ti->type == GGML_TYPE_F16;
     const int64_t k_cell = (int64_t) n_embd_head * n_head_kv;
-    const float * k_cache = (const float *) tk->data;
-    const float * v_cache = (const float *) tv->data;
-    const float * idx_cache = (const float *) ti->data;
+    std::vector<float> k_stage, v_stage, idx_stage;
+    const float * k_cache, * v_cache, * idx_cache;
+    if (k16) {
+        k_stage.resize(k_cell * n_used);
+        for (int64_t i = 0; i < k_cell * n_used; i++) k_stage[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) tk->data)[i]);
+        v_stage.resize(k_cell * n_used);
+        for (int64_t i = 0; i < k_cell * n_used; i++) v_stage[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) tv->data)[i]);
+        k_cache = k_stage.data();
+        v_cache = v_stage.data();
+    } else {
+        k_cache = (const float *) tk->data;
+        v_cache = (const float *) tv->data;
+    }
+    if (i16) {
+        idx_stage.resize(hp.indexer_head_size * idx_n_used);
+        for (int64_t i = 0; i < hp.indexer_head_size * idx_n_used; i++) idx_stage[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) ti->data)[i]);
+        idx_cache = idx_stage.data();
+    } else {
+        idx_cache = (const float *) ti->data;
+    }
+    auto write_cache_f32 = [](void * dst, bool is16, const float * src, size_t n) {
+        if (is16) {
+            for (size_t i = 0; i < n; i++) ((ggml_fp16_t *) dst)[i] = ggml_fp32_to_fp16(src[i]);
+        } else {
+            memcpy(dst, src, n * sizeof(float));
+        }
+    };
 
     std::vector<float> xn(hc * n_embd), mixed(n_embd), inject(hc * n_embd);
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
@@ -756,8 +899,8 @@ bool fused_full_attn_layer(
     lora_mm(L.index_k_proj, mixed.data(), nullptr, k_raw.data(), n_threads);
     if (idx_n_used > 0) {
         // write the new key at the current cell (the last used one)
-        memcpy((void *) (idx_cache + (size_t) (idx_n_used - 1) * hp.indexer_head_size),
-               k_raw.data(), hp.indexer_head_size * sizeof(float));
+        write_cache_f32((char *) ti->data + (size_t) (idx_n_used - 1) * hp.indexer_head_size * ggml_type_size(ti->type),
+                        i16, k_raw.data(), hp.indexer_head_size);
     }
 
     std::vector<float> selected(n_used, -INFINITY);
@@ -875,23 +1018,58 @@ bool fused_full_attn_layer(
     if (n_used > 0) {
         // write the new k/v at the current cell (the last used one)
         for (int64_t h = 0; h < n_head_kv; h++) {
-            memcpy((void *) (k_cache + (size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head),
-                   k.data() + h * n_embd_head, n_embd_head * sizeof(float));
-            memcpy((void *) (v_cache + (size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head),
-                   v.data() + h * n_embd_head, n_embd_head * sizeof(float));
+            write_cache_f32((char *) tk->data + ((size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head) * ggml_type_size(tk->type),
+                            k16, k.data() + h * n_embd_head, n_embd_head);
+            write_cache_f32((char *) tv->data + ((size_t) (n_used - 1) * k_cell + (size_t) h * n_embd_head) * ggml_type_size(tv->type),
+                            k16, v.data() + h * n_embd_head, n_embd_head);
         }
     }
 
     std::vector<float> attn_out(hdim2);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        fprintf(stderr, "  attn: n_used=%d n_visible=%d q[0..2]=%.6g %.6g %.6g\n", n_used, n_visible,
+                (double) q[0], (double) q[1], (double) q[2]);
+    }
     if (n_visible > 0) {
         std::vector<float> k_all(n_embd_head * n_head_kv * n_used), v_all(n_embd_head * n_head_kv * n_used);
         memcpy(k_all.data(), k_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
         memcpy(v_all.data(), v_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
         // the QSA-masked attention via the graph's flash kernel (bit-exact)
-        fused_attn_flash(q.data(), k_all.data(), v_all.data(), n_embd_head, n_head, n_head_kv,
-                         n_used, selected.data(), attn_out.data());
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            int kn = 0, vn = 0;
+            for (int64_t i = 0; i < (int64_t) k_all.size(); i++) { if (std::isnan(k_all[i])) kn++; if (std::isnan(v_all[i])) vn++; }
+            fprintf(stderr, "  attn flash in: k nan=%d v nan=%d k[0..2]=%.6g %.6g %.6g v[0..2]=%.6g %.6g %.6g mask[0..3]=%.6g %.6g %.6g %.6g\n",
+                    kn, vn, (double) k_all[0], (double) k_all[1], (double) k_all[2],
+                    (double) v_all[0], (double) v_all[1], (double) v_all[2],
+                    (double) selected[0], (double) selected[1], (double) selected[2], (double) selected[3]);
+        }
+        if (getenv("GGML_FUSED_DUMP_FLASH") != NULL) {
+            FILE * fq = fopen("/tmp/qwen4exp-builds/flash_q.bin", "wb");
+            fwrite(q.data(), 4, n_embd_head * n_head, fq); fclose(fq);
+            FILE * fk = fopen("/tmp/qwen4exp-builds/flash_k.bin", "wb");
+            fwrite(k_all.data(), 4, n_embd_head * n_head_kv * n_used, fk); fclose(fk);
+            FILE * fv = fopen("/tmp/qwen4exp-builds/flash_v.bin", "wb");
+            fwrite(v_all.data(), 4, n_embd_head * n_head_kv * n_used, fv); fclose(fv);
+            FILE * fm = fopen("/tmp/qwen4exp-builds/flash_m.bin", "wb");
+            fwrite(selected.data(), 4, n_used, fm); fclose(fm);
+            FILE * fi = fopen("/tmp/qwen4exp-builds/flash_info.txt", "w");
+            fprintf(fi, "%lld %lld %lld %lld\n", (long long) n_embd_head, (long long) n_head, (long long) n_head_kv, (long long) n_used);
+            fclose(fi);
+            fprintf(stderr, "  attn flash dumped\n");
+        }
+        // the graph runs the non-flash MHA (flash_attn=false), and the flash
+        // kernel is NaN on this model's real activations; the manual path
+        // mirrors the graph's math (NMSE-ok)
+        fused_attn_qsa(hp, q.data(), k.data(), v.data(),
+                       k_all.data(), v_all.data(), n_used,
+                       selected.data(), attn_out.data(), (int) n_head, (int) n_head_kv,
+                       n_threads);
     }
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        int ann = 0; for (int64_t i = 0; i < hdim2; i++) if (std::isnan(attn_out[i])) ann++;
+        fprintf(stderr, "  attn out: nan=%d [0..2]=%.6g %.6g %.6g\n", ann, (double) attn_out[0], (double) attn_out[1], (double) attn_out[2]);
+    }
     // the gate + the output projection
     for (int64_t i = 0; i < hdim2; i++) {
         const float g = gate[i];
@@ -1055,7 +1233,7 @@ void fused_ple(
             float sumf = 0.0f;
             for (int64_t k = 0; k < kern; k++) {
                 const int64_t pos = hist - (kern - 1 - k) * dil;
-                sumf += window[(size_t) pos * hc_dim + c] * w[(size_t) k * hc_dim + c];
+                sumf += window[(size_t) pos * hc_dim + c] * w[(size_t) k + c * 4];
             }
             const float v = sumf;
             conv_out[c] = v / (1.0f + expf(-v)); // silu
@@ -1105,10 +1283,12 @@ bool llama_model_qwen4exp::fused_decode(
         const llama_ubatch & ubatch,
         const struct llama_memory_context_i * mctx_in,
         class llm_graph_result * res,
-        int n_threads) const {
+        int n_threads,
+        const struct ggml_tensor * const * prev_layer_inp) const {
     if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
     if (ubatch.token == nullptr) return false;
 
+    const int64_t n_layer_slot = hparams.n_layer() + 1;
     const auto * mctx = static_cast<const llama_memory_hybrid_idx_context *>(mctx_in);
     if (mctx == nullptr || mctx->get_attn() == nullptr) return false;
 
@@ -1144,6 +1324,14 @@ bool llama_model_qwen4exp::fused_decode(
     ggml_context * vctx = ggml_init(gip);
     std::vector<float> layer_out(n_embd);
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && getenv("GGML_FUSED_LAYER_CMP") != NULL && prev_layer_inp && prev_layer_inp[0] && prev_layer_inp[0]->data) {
+        const ggml_tensor * g0 = prev_layer_inp[0];
+        const int64_t nt = g0->ne[1];
+        const float * gp = (const float *) g0->data + (nt - 1) * g0->ne[0];
+        double md = 0.0;
+        for (int64_t i = 0; i < g0->ne[0]; i++) md = fmax(md, (double) fabs(res_hc[i] - gp[i]));
+        fprintf(stderr, "  fused cmp input embd: max_abs=%.6g\n", md);
+    }
     for (int il = 0; il < (int) hparams.n_layer(); il++) {
         const struct llama_layer & L = layers[il];
         if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
@@ -1151,6 +1339,12 @@ bool llama_model_qwen4exp::fused_decode(
                     hparams.is_ple_impl[il] ? "PLE" : (hparams.is_recr(il) ? "GDN" : "ATTN"));
         }
 
+        if (getenv("GGML_FUSED_SKIP_PLE") != NULL && hparams.is_ple_impl[il]) {
+            continue;
+        }
+        if (getenv("GGML_FUSED_SKIP_ATTN") != NULL && !hparams.is_ple_impl[il] && !hparams.is_recr(il)) {
+            continue;
+        }
         if (hparams.is_ple_impl[il]) {
             // the PLE: the predecessors from the attention cells
             const auto * attn = mctx->get_attn();
@@ -1199,7 +1393,7 @@ bool llama_model_qwen4exp::fused_decode(
             // allocated, so the last used cell is this token's write target.
             const auto * attn = mctx->get_attn();
             const auto * idx = mctx->get_idx();
-            if (idx == nullptr) return false;
+            if (idx == nullptr) { fprintf(stderr, "  fused attn fallback: idx null\n"); return false; }
             const llama_seq_id seq = ubatch.seq_id[0][0];
             const auto & attn_cells = attn->get_cells(seq);
             const auto & idx_cells  = idx->get_cells(seq);
@@ -1212,12 +1406,29 @@ bool llama_model_qwen4exp::fused_decode(
             ggml_tensor * tk = attn->get_k(vctx, il);
             ggml_tensor * tv = attn->get_v(vctx, il);
             ggml_tensor * ti = idx->get_k(vctx, il);
-            if (tk == nullptr || tv == nullptr || ti == nullptr) return false;
+            if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 3) {
+                fprintf(stderr, "  fused cache: tk ne=[%lld,%lld,%lld,%lld] nb1=%zu data=%p\n", (long long)tk->ne[0],(long long)tk->ne[1],(long long)tk->ne[2],(long long)tk->ne[3],(size_t)tk->nb[1], (const void*)tk->data);
+                fprintf(stderr, "  fused cache: tv ne=[%lld,%lld,%lld,%lld] nb1=%zu data=%p same=%d\n", (long long)tv->ne[0],(long long)tv->ne[1],(long long)tv->ne[2],(long long)tv->ne[3],(size_t)tv->nb[1], (const void*)tv->data, (int)(tv->data == tk->data));
+                fprintf(stderr, "  fused cache: ti ne=[%lld,%lld,%lld,%lld] nb1=%zu\n", (long long)ti->ne[0],(long long)ti->ne[1],(long long)ti->ne[2],(long long)ti->ne[3],(size_t)ti->nb[1]);
+            }
+            if (tk == nullptr || tv == nullptr || ti == nullptr) { fprintf(stderr, "  fused attn fallback: cache view null (tk=%p tv=%p ti=%p)\n", (const void*) tk, (const void*) tv, (const void*) ti); return false; }
             if (!fused_full_attn_layer(L, hparams, rp, (int32_t) pos,
                         res_hc.data(), res_hc.data(), layer_out.data(),
                         tk, tv, ti, n_used, n_visible, idx_n_used, n_threads)) {
                 ggml_free(vctx);
                 return false;
+            }
+        }
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && getenv("GGML_FUSED_LAYER_CMP") != NULL) {
+            const ggml_tensor * g = prev_layer_inp ? prev_layer_inp[il + 1] : nullptr;
+            if (g && g->data) {
+                const int64_t nt = g->ne[1];
+                const float * gp = (const float *) g->data + (nt - 1) * g->ne[0];
+                double md = 0.0;
+                for (int64_t i = 0; i < g->ne[0]; i++) md = fmax(md, (double) fabs(res_hc[i] - gp[i]));
+                fprintf(stderr, "  fused cmp il=%2d: max_abs=%.6g (g=%p nt=%lld)\n", il, md, (const void*) g, (long long) nt);
+            } else {
+                fprintf(stderr, "  fused cmp il=%2d: no ref\n", il);
             }
         }
     }
@@ -1227,7 +1438,12 @@ bool llama_model_qwen4exp::fused_decode(
     std::vector<float> logits(n_vocab);
     fused_head(*this, hparams, res_hc.data(), logits.data(), n_threads);
 
-    ggml_tensor * t_logits = ggml_new_tensor_1d(res->get_ctx(), GGML_TYPE_F32, n_vocab);
+    // write into the previous graph's logits tensor (sched-known, so the
+    // post-decode extraction and llama_get_logits_ith see the values)
+    ggml_tensor * t_logits = const_cast<ggml_tensor *>(prev_layer_inp[n_layer_slot]);
+    if (t_logits == nullptr || t_logits->data == nullptr) {
+        return false;
+    }
     res->t_logits = t_logits;
     memcpy(t_logits->data, logits.data(), n_vocab * sizeof(float));
 
