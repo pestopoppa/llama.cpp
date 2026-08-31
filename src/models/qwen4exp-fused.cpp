@@ -1257,6 +1257,8 @@ void fused_ple(
             double ss = 0.0;
             for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
             const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
+            fprintf(stderr, "  fused query c=%lld: ss/n=%.6e sc=%.6f first=%.6g qn0=%.6g\n",
+                    (long long) c, ss / n_embd, (double) sc, (double) (xc[0] * sc * qn[c * n_embd]), (double) qn[c * n_embd]);
             for (int64_t i = 0; i < n_embd; i++) query_n[c * n_embd + i] = xc[i] * sc * qn[c * n_embd + i];
         }
     }
