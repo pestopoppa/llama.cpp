@@ -434,6 +434,14 @@ void fused_gdn_layer(
     std::vector<float> qkv(qkv_span);
     std::vector<float> z(hp.ssm_d_inner);              // 6144 (v-dim)
     lora_mm(L.wqkv, mixed.data(), nullptr, qkv.data(), n_threads);
+    if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_mix.bin", "wb");
+        if (f) {
+            fwrite(mixed.data(), 4, n_embd, f);
+            fwrite(xn.data(), 4, hc * n_embd, f);
+            fclose(f);
+        }
+    }
     lora_mm(L.wqkv_gate, mixed.data(), nullptr, z.data(), n_threads);
 
     // beta = sigmoid(mm(ssm_beta, mixed))
@@ -601,6 +609,32 @@ void fused_gdn_layer(
         fprintf(stderr, "  gdn final: res nan=%d moe_out nan=%d inject nan=%d\n", rn, mn, in);
     }
     memcpy(out, res_in_out, n_embd * sizeof(float));
+    if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL) {
+        FILE * fc = fopen("/tmp/qwen4exp-builds/f_conv.bin", "wb");
+        if (fc) {
+            fwrite(qkv.data(), 4, qkv_span, fc);
+            fwrite(window.data(), 4, (d_conv) * n_ch, fc);
+            fwrite(conv_out.data(), 4, n_ch, fc);
+            fclose(fc);
+        }
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_nodes.bin", "wb");
+        if (f) {
+            auto wr = [&](const char * nm, const float * d, size_t n) {
+                size_t tag = strlen(nm);
+                fwrite(&tag, 4, 1, f);
+                fwrite(nm, 1, tag, f);
+                uint32_t pad = (4 - (tag % 4)) % 4;
+                for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                fwrite(d, 4, n, f);
+            };
+            wr("conv_output_silu", conv_out.data(), n_ch);
+            wr("final_output", final_in.data(), S_v * H_v);
+            wr("linear_attn_out", attn_out.data(), n_embd);
+            wr("ffn_out", moe_out.data(), n_embd);
+            wr("hc_combine", res_in_out, hc * n_embd);
+            fclose(f);
+        }
+    }
 }
 
 
@@ -1419,16 +1453,11 @@ bool llama_model_qwen4exp::fused_decode(
                 return false;
             }
         }
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && getenv("GGML_FUSED_LAYER_CMP") != NULL) {
-            const ggml_tensor * g = prev_layer_inp ? prev_layer_inp[il + 1] : nullptr;
-            if (g && g->data) {
-                const int64_t nt = g->ne[1];
-                const float * gp = (const float *) g->data + (nt - 1) * g->ne[0];
-                double md = 0.0;
-                for (int64_t i = 0; i < g->ne[0]; i++) md = fmax(md, (double) fabs(res_hc[i] - gp[i]));
-                fprintf(stderr, "  fused cmp il=%2d: max_abs=%.6g (g=%p nt=%lld)\n", il, md, (const void*) g, (long long) nt);
-            } else {
-                fprintf(stderr, "  fused cmp il=%2d: no ref\n", il);
+        if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && il + 1 < (int64_t) hparams.n_layer()) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/f_layers.bin", "ab");
+            if (f) {
+                fwrite(res_hc.data(), 4, res_hc.size(), f);
+                fclose(f);
             }
         }
     }

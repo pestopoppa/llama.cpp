@@ -1423,6 +1423,131 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
+    // INF-64 debug: dump the graph's per-layer outputs (env-gated) for the
+    // same-position comparison against the fused decode's layer dump
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/g_layers.bin", "wb");
+        if (f) {
+            const int64_t nl = model.hparams.n_layer();
+            for (int64_t il = 0; il + 1 < nl; il++) {
+                const ggml_tensor * t = res->get_layer_inp((int) il + 1);
+                if (!t || !t->data) {
+                    fprintf(stderr, "g_layers: il=%lld missing\\n", (long long) il);
+                    fclose(f);
+                    return res;
+                }
+                const int64_t nt = t->ne[1];
+                fwrite((const float *) t->data + (nt - 1) * t->ne[0] * t->ne[1], 4, t->ne[0] * t->ne[1], f);
+            }
+            fclose(f);
+        }
+        // the first occurrence of each fused-relevant op (layer 0), by op type
+        if (res->get_gf()) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/g_nodes.bin", "wb");
+            if (f) {
+                enum ggml_op want[] = {
+                    GGML_OP_SSM_CONV, GGML_OP_GATED_DELTA_NET, GGML_OP_MUL_MAT_ID,
+                    GGML_OP_DSV4_HC_PRE, GGML_OP_DSV4_HC_COMB, GGML_OP_MEAN_D1,
+                    GGML_OP_MOE_TOPK_NORM, GGML_OP_L2_NORM, GGML_OP_MUL_MAT, GGML_OP_COUNT
+                };
+                const int64_t n_nodes = ggml_graph_n_nodes(res->get_gf());
+                const int n_want = 9;
+                for (int ni = 0; ni < n_nodes; ni++) {
+                    const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
+                    if (!nd || !nd->data) continue;
+                    if (strcmp(ggml_get_name(nd) ? ggml_get_name(nd) : "", "hc_mixed-0") == 0 && nd->data) {
+                        char nm[32];
+                        snprintf(nm, sizeof(nm), "hc_mixed");
+                        size_t nm_len = strlen(nm);
+                        fwrite(&nm_len, 4, 1, f);
+                        fwrite(nm, 1, nm_len, f);
+                        uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                        for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                        char tag[32];
+                        snprintf(tag, sizeof(tag), "%d", (int) nd->op);
+                        size_t tlen = strlen(tag);
+                        fwrite(&tlen, 4, 1, f);
+                        fwrite(tag, 1, tlen, f);
+                        uint32_t pad = (4 - (tlen % 4)) % 4;
+                        for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                        int64_t ne[4] = { nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3] };
+                        size_t nb[4] = { nd->nb[0], nd->nb[1], nd->nb[2], nd->nb[3] };
+                        fwrite(ne, 8, 4, f);
+                        fwrite(nb, 8, 4, f);
+                        int type = (int) nd->type;
+                        fwrite(&type, 4, 1, f);
+                        size_t nbytes = ggml_nbytes(nd);
+                        fwrite(&nbytes, 8, 1, f);
+                        fwrite(nd->data, 1, nbytes, f);
+                    }
+                    if ((nd->op == GGML_OP_SSM_CONV || nd->op == GGML_OP_DSV4_HC_PRE) && nd->src[0] && nd->src[0]->data && want[8] == GGML_OP_COUNT) {
+                        // dump the src0 (and src1 for the hc pre) as side entries
+                        for (int si = 0; si < (nd->op == GGML_OP_DSV4_HC_PRE ? 2 : 1); si++) {
+                            const ggml_tensor * s0 = nd->src[si];
+                            if (!s0 || !s0->data) continue;
+                            char nm[32];
+                            if (nd->op == GGML_OP_DSV4_HC_PRE) {
+                                snprintf(nm, sizeof(nm), "hcpre_s%d", si);
+                            } else {
+                                snprintf(nm, sizeof(nm), "conv_window");
+                            }
+                            size_t nm_len = strlen(nm);
+                            fwrite(&nm_len, 4, 1, f);
+                            fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) nd->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { s0->ne[0], s0->ne[1], s0->ne[2], s0->ne[3] };
+                            size_t nb[4] = { s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) s0->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(s0);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(s0->data, 1, nbytes, f);
+                        }
+                    }
+                    for (int k = 0; k < n_want; k++) {
+                        if (want[k] != GGML_OP_COUNT && nd->op == want[k]) {
+                            const char * nm = ggml_get_name(nd);
+                            size_t nm_len = nm ? strlen(nm) : 0;
+                            fwrite(&nm_len, 4, 1, f);
+                            if (nm_len) fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) nd->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3] };
+                            size_t nb[4] = { nd->nb[0], nd->nb[1], nd->nb[2], nd->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) nd->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(nd);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(nd->data, 1, nbytes, f);
+                            want[k] = GGML_OP_COUNT;
+                            break;
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+
     return res;
 }
 
