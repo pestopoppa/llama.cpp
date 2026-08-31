@@ -1222,8 +1222,23 @@ void fused_ple(
     }
     // ---- the key/value projections ----
     std::vector<float> key(hc_dim), value(n_embd);
+    fprintf(stderr, "  ple w: key type=%s buf=%s extra=%p nb1=%zu nb2=%zu ne=[%lld,%lld,%lld] | val type=%s buf=%s extra=%p\n",
+            ggml_type_name(L.ple_key->type), L.ple_key->buffer ? ggml_backend_buffer_name(L.ple_key->buffer) : "-",
+            (const void *) L.ple_key->extra, (size_t) L.ple_key->nb[1], (size_t) L.ple_key->nb[2],
+            (long long) L.ple_key->ne[0], (long long) L.ple_key->ne[1], (long long) L.ple_key->ne[2],
+            ggml_type_name(L.ple_value->type), L.ple_value->buffer ? ggml_backend_buffer_name(L.ple_value->buffer) : "-",
+            (const void *) L.ple_value->extra);
     lora_mm(L.ple_key, emb.data(), nullptr, key.data(), n_threads);
     lora_mm(L.ple_value, emb.data(), nullptr, value.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_key.bin", "wb");
+        if (f) { fwrite(key.data(), 4, key.size(), f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_val.bin", "wb");
+        if (f2) { fwrite(value.data(), 4, value.size(), f2); fclose(f2); }
+        fprintf(stderr, "  ple key[0..2]=%.6g %.6g %.6g value[0..2]=%.6g %.6g %.6g\n",
+                (double) key[0], (double) key[1], (double) key[2],
+                (double) value[0], (double) value[1], (double) value[2]);
+    }
 
     // the grouped norms (the key + the query=hidden) + the gate
     std::vector<float> key_n(hc_dim), query_n(hc_dim);
@@ -1244,6 +1259,13 @@ void fused_ple(
             const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
             for (int64_t i = 0; i < n_embd; i++) query_n[c * n_embd + i] = xc[i] * sc * qn[c * n_embd + i];
         }
+    }
+
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_keyn.bin", "wb");
+        if (f) { fwrite(key_n.data(), 4, key_n.size(), f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_queryn.bin", "wb");
+        if (f2) { fwrite(query_n.data(), 4, query_n.size(), f2); fclose(f2); }
     }
 
     // the per-stream score + the signed-square-root gate
@@ -1302,8 +1324,12 @@ void fused_ple(
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         int nn = 0; for (int64_t i = 0; i < hc_dim; i++) if (std::isnan(conv_out[i])) nn++;
-        fprintf(stderr, "  ple key nan=%d value nan=%d conv_out nan=%d gate[0]=%.6g\n",
-                (int) std::isnan(key[0]), (int) std::isnan(value[0]), nn, (double)gate[0]);
+        fprintf(stderr, "  ple key nan=%d value nan=%d conv_out nan=%d gate[0]=%.6g gate[1]=%.6g\n",
+                (int) std::isnan(key[0]), (int) std::isnan(value[0]), nn, (double)gate[0], (double)gate[1]);
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_gate.bin", "wb");
+        if (f) { fwrite(gate.data(), 4, gate.size(), f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_conv.bin", "wb");
+        if (f2) { fwrite(conv_out.data(), 4, conv_out.size(), f2); fclose(f2); }
     }
     // the combine: hidden + gated + conv_out
     for (int64_t i = 0; i < hc_dim; i++) {
@@ -1326,6 +1352,26 @@ void fused_ple(
 static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float * out, int64_t n_embd) {
     const size_t row_bytes = ggml_row_size(tok_embd->type, n_embd);
     const char * row = (const char *) tok_embd->data + (size_t) tok * row_bytes;
+    fprintf(stderr, "fused_embd: name=%s type=%d ne=[%lld,%lld] rb=%zu buf=%s buft=%s extra=%p row0=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            tok_embd->name, (int) tok_embd->type, (long long) tok_embd->ne[0], (long long) tok_embd->ne[1],
+            row_bytes, tok_embd->buffer ? ggml_backend_buffer_name(tok_embd->buffer) : "-",
+            tok_embd->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(tok_embd->buffer)) : "-",
+            (const void *) tok_embd->extra,
+            (unsigned char) row[0], (unsigned char) row[1], (unsigned char) row[2], (unsigned char) row[3],
+            (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
+            (unsigned char) row[8], (unsigned char) row[9], (unsigned char) row[10], (unsigned char) row[11],
+            (unsigned char) row[12], (unsigned char) row[13], (unsigned char) row[14], (unsigned char) row[15]);
+    fprintf(stderr, "fused_embd row40: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            (unsigned char) row[0], (unsigned char) row[1], (unsigned char) row[2], (unsigned char) row[3],
+            (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
+            (unsigned char) row[8], (unsigned char) row[9], (unsigned char) row[10], (unsigned char) row[11],
+            (unsigned char) row[12], (unsigned char) row[13], (unsigned char) row[14], (unsigned char) row[15],
+            (unsigned char) row[16], (unsigned char) row[17], (unsigned char) row[18], (unsigned char) row[19],
+            (unsigned char) row[20], (unsigned char) row[21], (unsigned char) row[22], (unsigned char) row[23],
+            (unsigned char) row[24], (unsigned char) row[25], (unsigned char) row[26], (unsigned char) row[27],
+            (unsigned char) row[28], (unsigned char) row[29], (unsigned char) row[30], (unsigned char) row[31],
+            (unsigned char) row[32], (unsigned char) row[33], (unsigned char) row[34], (unsigned char) row[35],
+            (unsigned char) row[36], (unsigned char) row[37], (unsigned char) row[38], (unsigned char) row[39]);
     if (tok_embd->type == GGML_TYPE_F32) {
         memcpy(out, row, n_embd * sizeof(float));
     } else if (tok_embd->type == GGML_TYPE_BF16) {
@@ -1372,9 +1418,15 @@ bool llama_model_qwen4exp::fused_decode(
     {
         std::vector<float> emb(n_embd);
         fused_embd(tok_embd, tok, emb.data(), n_embd);
+        fprintf(stderr, "fused res_hc: hc=%lld n_embd=%lld hc_dim=%lld emb[0]=%.8f\n",
+                (long long) hc, (long long) n_embd, (long long) hc_dim, (double) emb[0]);
         for (int64_t c = 0; c < hc; c++) {
             memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
         }
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_res_hc.bin", "wb");
+        if (f) { fwrite(res_hc.data(), 4, res_hc.size(), f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_embd_tok.bin", "wb");
+        if (f2) { fwrite(emb.data(), 4, emb.size(), f2); fclose(f2); }
         if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
             FILE * f = fopen("/tmp/qwen4exp-builds/f_embd.bin", "wb");
             if (f) { fwrite(emb.data(), 4, n_embd, f); fclose(f); }
