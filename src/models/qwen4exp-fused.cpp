@@ -49,7 +49,17 @@ struct FusedMM {
 
     FusedMM(const struct ggml_tensor * w, const float * x, int n_threads);
     void dot(const struct ggml_tensor * w, int row, float * out) const {
-        qt->vec_dot((int) n_in, out, 0, (const char *) w->data + (size_t) row * w->nb[1], 0, xq.data(), 0, 1);
+        const char * s1 = (const char *) w->data + (size_t) row * w->nb[1];
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            static long dotn = 0;
+            if (dotn < 4 || s1 == nullptr || xq.data() == nullptr || ((uintptr_t) s1) < 0x1000) {
+                fprintf(stderr, "  fused dot: n=%lld w=%p data=%p row=%d nb1=%zu s1=%p xq=%p xqsz=%zu\n",
+                        (long long) n_in, (const void *) w, (const void *) w->data, row, w->nb[1],
+                        (const void *) s1, (const void *) xq.data(), xq.size());
+            }
+            dotn++;
+        }
+        qt->vec_dot((int) n_in, out, 0, s1, 0, xq.data(), 0, 1);
     }
 };
 
@@ -59,6 +69,15 @@ FusedMM::FusedMM(const struct ggml_tensor * w, const float * x, int n_threads) {
     n_in = w->ne[0];
     qrow = ggml_row_size(qt->vec_dot_type, n_in);
     xq.resize(qrow);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        static int ctor_n = 0;
+        if (ctor_n < 6 || x == nullptr || ((uintptr_t) x) < 0x1000) {
+            fprintf(stderr, "  fused mm ctor: w=%p type=%s ne0=%lld x=%p qrow=%zu from_float=%p\n",
+                    (const void *) w, ggml_type_name(w->type), (long long) w->ne[0],
+                    (const void *) x, qrow, (const void *) qtv->from_float);
+        }
+        ctor_n++;
+    }
     qtv->from_float(x, xq.data(), n_in);
 }
 
@@ -756,7 +775,8 @@ static void fused_head(const struct llama_model_qwen4exp & model,
 
     std::vector<float> xn(hc * n_embd), mixed(n_embd);
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
-        fprintf(stderr, "  head: norm=%p data=%p down=%p data=%p ne=[%lld,%lld] up=%p data=%p ne=[%lld,%lld] out=%p data=%p\n",
+        fprintf(stderr, "  head: res_hc=%p norm=%p data=%p down=%p data=%p ne=[%lld,%lld] up=%p data=%p ne=[%lld,%lld] out=%p data=%p\n",
+                (const void *) res_hc,
                 (const void *) model.hc_head_norm, (const void *) (model.hc_head_norm ? model.hc_head_norm->data : nullptr),
                 (const void *) model.hc_head_down, (const void *) (model.hc_head_down ? model.hc_head_down->data : nullptr),
                 model.hc_head_down ? (long long) model.hc_head_down->ne[0] : -1, model.hc_head_down ? (long long) model.hc_head_down->ne[1] : -1,
