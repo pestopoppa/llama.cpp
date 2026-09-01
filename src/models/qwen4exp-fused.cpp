@@ -35,6 +35,26 @@ struct ggml_compute_params {
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <chrono>
+
+// the feasibility profiler (GGML_FUSED_PROF; a non-claim instrument: the gemv
+// (vec_dot) time vs the total, per token)
+namespace {
+struct FusedProf {
+    double gemv_ms = 0.0;
+    bool on = false;
+    int depth = 0;
+    std::chrono::steady_clock::time_point t;
+    void start() { if (on) { if (depth == 0) t = std::chrono::steady_clock::now(); depth++; } }
+    void stop() { if (on && depth > 0) { depth--; if (depth == 0) gemv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } }
+    void reset() { gemv_ms = 0.0; depth = 0; }
+};
+static FusedProf g_prof;
+}
+#define FUSED_PROF_INIT() do { if (getenv("GGML_FUSED_PROF") != NULL) { g_prof.on = true; } } while (0)
+#define FUSED_PROF_RESET() do { g_prof.reset(); } while (0)
+#define FUSED_PROF_DOT_BEGIN() g_prof.start()
+#define FUSED_PROF_DOT_END() g_prof.stop()
 
 using ggml_type_traits_cpu = struct ggml_type_traits_cpu;
 
@@ -51,7 +71,9 @@ struct FusedMM {
 
     FusedMM(const struct ggml_tensor * w, const float * x, int n_threads);
     void dot(const struct ggml_tensor * w, int row, float * out) const {
+        FUSED_PROF_DOT_BEGIN();
         qt->vec_dot((int) n_in, out, 0, (const char *) w->data + (size_t) row * w->nb[1], 0, xq.data(), 0, 1);
+        FUSED_PROF_DOT_END();
     }
 };
 
@@ -264,6 +286,7 @@ static void fused_moe(
         const int32_t e = sel[j];
         const char * up_e = (const char *) L.ffn_up_exps->data + (size_t) e * nb_up_exp;
         const char * gt_e = (const char *) L.ffn_gate_exps->data + (size_t) e * nb_up_exp;
+        FUSED_PROF_DOT_BEGIN();
         for (int64_t r = 0; r < n_ff; r++) {
             qt_up->vec_dot((int) hp.n_embd, &up_tmp[j * n_ff + r], 0,
                            up_e + (size_t) r * L.ffn_up_exps->nb[1], 0, xq_up.data(), 0, 1);
@@ -272,6 +295,7 @@ static void fused_moe(
             const float g = gate_tmp[j * n_ff + r];
             glu[j * n_ff + r] = up_tmp[j * n_ff + r] * (g / (1.0f + expf(-g))); // silu(gate)*up
         }
+        FUSED_PROF_DOT_END();
     }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         static int up_n = 0;
@@ -336,6 +360,7 @@ static void fused_moe(
         const char * dn_e = (const char *) L.ffn_down_exps->data + (size_t) e * nb_dn_exp;
         for (int64_t r = 0; r < hp.n_embd; r++) {
             float v = 0.0f;
+            FUSED_PROF_DOT_BEGIN();
             if (dn_repacked) {
                 // the interleaved IQ4_NL dot for one row of its group
                 const int64_t g = r / rp_I, slot = r % rp_I;
@@ -382,6 +407,7 @@ static void fused_moe(
                 qt_dn->vec_dot((int) n_ff, &v, 0, dn_e + (size_t) r * L.ffn_down_exps->nb[1], 0,
                                glu_q.data() + j * glu_q_size, 0, 1);
             }
+            FUSED_PROF_DOT_END();
             down_acc[r] += v * w[j];
             if (dn_file) fwrite(&v, 4, 1, dn_file);
             if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && r < 2) {
@@ -1475,7 +1501,7 @@ void fused_ple(
     }
     // ---- the key/value projections ----
     std::vector<float> key(hc_dim), value(n_embd);
-    fprintf(stderr, "  ple w: key type=%s buf=%s extra=%p nb1=%zu nb2=%zu ne=[%lld,%lld,%lld] | val type=%s buf=%s extra=%p\n",
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  ple w: key type=%s buf=%s extra=%p nb1=%zu nb2=%zu ne=[%lld,%lld,%lld] | val type=%s buf=%s extra=%p\n",
             ggml_type_name(L.ple_key->type), L.ple_key->buffer ? ggml_backend_buffer_name(L.ple_key->buffer) : "-",
             (const void *) L.ple_key->extra, (size_t) L.ple_key->nb[1], (size_t) L.ple_key->nb[2],
             (long long) L.ple_key->ne[0], (long long) L.ple_key->ne[1], (long long) L.ple_key->ne[2],
@@ -1619,12 +1645,13 @@ void fused_ple(
 
 #include "llama-memory-hybrid-idx.h"
 #include "llama-kv-cache.h"
+#include <chrono>
 
 // the token embedding gather (the graph's build_inp_embd)
 static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float * out, int64_t n_embd) {
     const size_t row_bytes = ggml_row_size(tok_embd->type, n_embd);
     const char * row = (const char *) tok_embd->data + (size_t) tok * row_bytes;
-    fprintf(stderr, "fused_embd: name=%s type=%d ne=[%lld,%lld] rb=%zu buf=%s buft=%s extra=%p row0=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "fused_embd: name=%s type=%d ne=[%lld,%lld] rb=%zu buf=%s buft=%s extra=%p row0=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
             tok_embd->name, (int) tok_embd->type, (long long) tok_embd->ne[0], (long long) tok_embd->ne[1],
             row_bytes, tok_embd->buffer ? ggml_backend_buffer_name(tok_embd->buffer) : "-",
             tok_embd->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(tok_embd->buffer)) : "-",
@@ -1661,6 +1688,9 @@ bool llama_model_qwen4exp::fused_decode(
         class llm_graph_result * res,
         int n_threads,
         const struct ggml_tensor * const * prev_layer_inp) const {
+    FUSED_PROF_INIT();
+    FUSED_PROF_RESET();
+    const auto prof_t0 = std::chrono::steady_clock::now();
     if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
     if (ubatch.token == nullptr) return false;
 
@@ -1690,7 +1720,7 @@ bool llama_model_qwen4exp::fused_decode(
     {
         std::vector<float> emb(n_embd);
         fused_embd(tok_embd, tok, emb.data(), n_embd);
-        fprintf(stderr, "fused res_hc: hc=%lld n_embd=%lld hc_dim=%lld emb[0]=%.8f\n",
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "fused res_hc: hc=%lld n_embd=%lld hc_dim=%lld emb[0]=%.8f\n",
                 (long long) hc, (long long) n_embd, (long long) hc_dim, (double) emb[0]);
         for (int64_t c = 0; c < hc; c++) {
             memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
@@ -1857,5 +1887,17 @@ bool llama_model_qwen4exp::fused_decode(
     memcpy(t_logits->data, logits.data(), n_vocab * sizeof(float));
 
     ggml_free(vctx);
+    if (g_prof.on) {
+        const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prof_t0).count();
+        const double gemv_ms = g_prof.gemv_ms;
+        const double other_ms = total_ms - gemv_ms;
+        if (gemv_ms > total_ms || other_ms < 0.0 || total_ms <= 0.0 || gemv_ms < 0.0) {
+            fprintf(stderr, "FUSED_PROF: SANITY FAILED total=%.1f gemv=%.1f other=%.1f\n",
+                    total_ms, gemv_ms, other_ms);
+        } else {
+            fprintf(stderr, "FUSED_PROF: total=%.1f ms gemv=%.1f ms other=%.1f ms (gemv %.0f%%)\n",
+                    total_ms, gemv_ms, other_ms, 100.0 * gemv_ms / total_ms);
+        }
+    }
     return true;
 }
