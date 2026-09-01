@@ -558,9 +558,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q2_K:
                 return log_decision(ne11 <= 5);
             case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
                 return log_decision(ne11 <= 3);
+            case GGML_TYPE_Q4_K:
+                return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
             case GGML_TYPE_Q6_K:
                 return log_decision(ne11 <= 5);
             // MMVQ->MMQ campaign (mmvq experiment): force MMQ for Q8_0 at ne11>=2 so
