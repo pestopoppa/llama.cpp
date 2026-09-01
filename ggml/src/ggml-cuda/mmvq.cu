@@ -234,6 +234,94 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
 #endif
 }
 
+struct q4_K_b4_weight {
+    int q[2*QR4_K];
+    int sc[QR4_K];
+    int m[QR4_K];
+    float2 dm;
+};
+
+static __device__ __forceinline__ q4_K_b4_weight load_q4_K_b4_weight(
+        const block_q4_K * __restrict__ bq4_K, const int & iqs) {
+    q4_K_b4_weight weight;
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int q4_offset = 16 * bq8_offset + 4 * ((iqs/2)%4);
+    const int * q4 = (const int *) (bq4_K->qs + q4_offset);
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        weight.q[2*i + 0] = (v0 >> (4*i)) & 0x0F0F0F0F;
+        weight.q[2*i + 1] = (v1 >> (4*i)) & 0x0F0F0F0F;
+    }
+
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    const int j = bq8_offset/2;
+    uint32_t aux = 0;
+#if defined(GGML_USE_HIP)
+#if defined(__gfx90a__)
+    if ((threadIdx.x & 3) == 0) {
+#endif
+        const int is = j & 1;
+        const uint32_t s0 = scales[is + 0];
+        const uint32_t s1 = scales[is + 2];
+        const uint32_t s2 = scales[is + 4];
+        const uint32_t s01 = __builtin_amdgcn_perm(s1, s0, 0x05040100);
+        const uint32_t aux_low = s01 & 0x3f3f3f3f;
+        const uint32_t aux_high = (__builtin_amdgcn_perm(s2 >> 4, s2, 0x05040100) & 0x0f0f0f0f) |
+                                  ((s01 & 0xc0c0c0c0) >> 2);
+        aux = j < 2 ? aux_low : aux_high;
+#if defined(__gfx90a__)
+    }
+    aux = __builtin_amdgcn_mov_dpp(aux, 0x00, 0xf, 0xf, false);
+#endif
+#else
+    uint16_t aux16[2];
+    if (j < 2) {
+        aux16[0] = scales[j+0] & 0x3f3f;
+        aux16[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux16[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux16[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    aux = uint32_t(aux16[0]) | (uint32_t(aux16[1]) << 16);
+#endif
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        weight.sc[i] = (aux >> (8*i)) & 0xff;
+        weight.m[i] = (aux >> (8*(i + 2))) & 0xff;
+    }
+    weight.dm = __half22float2(bq4_K->dm);
+    return weight;
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_b4(
+        const q4_K_b4_weight & weight, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int q8_offset = (iqs/2)%4;
+    const bool sum_lane = iqs % QI8_1 == 0;
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        const int * q8 = (const int *) bq8i->qs + q8_offset;
+        const int dot = ggml_cuda_dp4a(
+            weight.q[2*i + 1], q8[4], ggml_cuda_dp4a(weight.q[2*i + 0], q8[0], 0));
+        const half2 ds8 = bq8i->ds;
+        sumf_d += __low2float(ds8) * (dot * weight.sc[i]);
+        if (sum_lane) {
+            sumf_m += __high2float(ds8) * weight.m[i];
+        }
+    }
+
+    return weight.dm.x*sumf_d - weight.dm.y*sumf_m;
+}
+
 static bool ggml_cuda_log_mmvq_route_enabled() {
     static const bool enabled = []() {
         const char * s = getenv("GGML_CUDA_LOG_MMVQ_ROUTE");
@@ -1110,26 +1198,40 @@ static __global__ void mul_mat_vec_q(
                     // x block quant index when casting the quants to int
                     const int kqs = vdr * (k_tid % (qi/vdr));
 
-#pragma unroll
-                    for (int j = 0; j < ncols_dst; ++j) {
+                    if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 4 && !has_fusion) {
 #pragma unroll
                         for (int i = 0; i < rows_per_thread; ++i) {
-                            const int row_i = converged_q4_K_dual && !row_in_bounds ? 0 : row + i;
-                            const int kbx_row = kbx_offset + row_i*stride_row_x + kbx;
-                            if constexpr (converged_q4_K_dual) {
-                                const float2 dots = vec_dot_q4_K_q8_1_dual(
-                                    vx, vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
-                                if (row_in_bounds) {
-                                    tmp[j][i][k_part] += dots.x;
-                                    tmp_gate[j][i][k_part] += dots.y;
-                                }
-                            } else {
-                                tmp[j][i][k_part] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_row, kqs);
-                                if constexpr (gate_only_swiglu) {
-                                    tmp_gate[j][i][k_part] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
-                                } else if constexpr (has_fusion && !bias_only) {
-                                    if (use_gate) {
+                            const int kbx_row = kbx_offset + (row + i)*stride_row_x + kbx;
+                            const q4_K_b4_weight weight = load_q4_K_b4_weight(
+                                (const block_q4_K *) vx + kbx_row, kqs);
+#pragma unroll
+                            for (int j = 0; j < ncols_dst; ++j) {
+                                tmp[j][i][k_part] += vec_dot_q4_K_q8_1_b4(
+                                    weight, &y[j*stride_col_y + kby], kqs);
+                            }
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                            for (int i = 0; i < rows_per_thread; ++i) {
+                                const int row_i = converged_q4_K_dual && !row_in_bounds ? 0 : row + i;
+                                const int kbx_row = kbx_offset + row_i*stride_row_x + kbx;
+                                if constexpr (converged_q4_K_dual) {
+                                    const float2 dots = vec_dot_q4_K_q8_1_dual(
+                                        vx, vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                                    if (row_in_bounds) {
+                                        tmp[j][i][k_part] += dots.x;
+                                        tmp_gate[j][i][k_part] += dots.y;
+                                    }
+                                } else {
+                                    tmp[j][i][k_part] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_row, kqs);
+                                    if constexpr (gate_only_swiglu) {
                                         tmp_gate[j][i][k_part] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                                    } else if constexpr (has_fusion && !bias_only) {
+                                        if (use_gate) {
+                                            tmp_gate[j][i][k_part] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_row, kqs);
+                                        }
                                     }
                                 }
                             }
