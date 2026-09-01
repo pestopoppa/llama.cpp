@@ -173,7 +173,7 @@ static void fused_moe(
     const int64_t n_used   = hp.n_expert_used;      // 10
     static int dn_call = 0;
     static FILE * dn_file = nullptr;
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && dn_call < 2 && !dn_file) {
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && dn_call >= 24 && dn_call <= 26 && !dn_file) {
         char fn[128];
         snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_dn_%d.bin", dn_call);
         dn_file = fopen(fn, "wb");
@@ -273,7 +273,7 @@ static void fused_moe(
     }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         static int up_n = 0;
-        if (up_n < 2) {
+        if (up_n >= 24 && up_n <= 26) {
             char fn[128];
             snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_up_%d.bin", up_n);
             FILE * f = fopen(fn, "wb");
@@ -381,13 +381,14 @@ static void fused_moe(
                                glu_q.data() + j * glu_q_size, 0, 1);
             }
             down_acc[r] += v * w[j];
-            if (dn_file && dn_call < 2) fwrite(&v, 4, 1, dn_file);
+            if (dn_file) fwrite(&v, 4, 1, dn_file);
             if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && r < 2) {
                 fprintf(stderr, "  moe dn j%lld r%lld: e=%d v=%.6g w=%.6g\n", (long long) j, (long long) r, e, (double) v, (double) w[j]);
             }
         }
     }
-    if (dn_file) { fclose(dn_file); dn_file = nullptr; dn_call++; }
+    if (dn_file) { fclose(dn_file); dn_file = nullptr; }
+    dn_call++;
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         int dn = 0; for (int64_t i = 0; i < hp.n_embd; i++) if (std::isnan(down_acc[i])) dn++;
         fprintf(stderr, "  moe dnacc: nan=%d [0]=%.6g\n", dn, (double) down_acc[0]);
