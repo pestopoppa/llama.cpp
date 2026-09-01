@@ -539,11 +539,9 @@ static_assert(get_VKQ_stride( 80, 1, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 2, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 4, 16) ==  16, "Test failed.");
 
-template <int D, int cols_per_block, typename KQ_acc_t>
+template <int D, int cols_per_block, typename KQ_acc_t, int nwarps = 4>
 void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
-
-    constexpr int nwarps = 4;
 
     constexpr int frag_m = cols_per_block == 8 && D % 32 == 0 ? 32 : 16;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -570,6 +568,19 @@ void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_ten
 
     const enum ggml_prec prec = ggml_flash_attn_ext_get_prec(KQV);
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_CDNA2 && Q->ne[0] == 128 && Q->ne[1] <= 8) {
+        constexpr int cols_per_block = 16;
+        constexpr int nwarps = 8;
+        if (prec != GGML_PREC_DEFAULT) {
+            ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, float, nwarps>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_wmma_f16_case<128, cols_per_block, half, nwarps>(ctx, dst);
+        }
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (prec != GGML_PREC_DEFAULT) {
         if (Q->ne[1] <= 32 || Q->ne[0] > 128) {
