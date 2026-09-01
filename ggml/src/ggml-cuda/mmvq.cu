@@ -49,6 +49,49 @@ static __device__ __forceinline__ void reduce_q4_K_halfwave_gfx90a(float & value
         "v_add_f32_dpp %1, %1, %1 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0"
         : "+v"(value), "+v"(gate));
 }
+
+static __device__ __forceinline__ float reduce_q6_K_wave_gfx90a(float value) {
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0"
+        : "+v"(value));
+
+    return value;
+}
+
+static __device__ __forceinline__ void reduce_q6_K_wave_gfx90a(float & value, float & gate) {
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0"
+        : "+v"(value), "+v"(gate));
+}
 #endif // defined(__gfx90a__)
 
 static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
@@ -892,10 +935,13 @@ static __global__ void mul_mat_vec_q(
     constexpr int k_part_count = halfwave_rows ? 2 : 1;
 #if defined(__gfx90a__)
     constexpr bool dpp_halfwave_reduce = halfwave_rows && ncols_x_fixed == 1536;
+    constexpr bool dpp_q6_K_reduce =
+        type == GGML_TYPE_Q6_K && ncols_dst == 1 && ncols_x_fixed == 1536 && rows_per_thread == 1;
 #else
     constexpr bool dpp_halfwave_reduce = false;
+    constexpr bool dpp_q6_K_reduce = false;
 #endif
-    constexpr int result_lane = dpp_halfwave_reduce ? reduction_width - 1 : 0;
+    constexpr int result_lane = dpp_halfwave_reduce ? reduction_width - 1 : dpp_q6_K_reduce ? warp_size - 1 : 0;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -1167,6 +1213,18 @@ static __global__ void mul_mat_vec_q(
                 } else {
                     tmp[j][i][0] = reduce_q4_K_halfwave_gfx90a(tmp[j][i][0]);
                 }
+            } else if constexpr (dpp_q6_K_reduce) {
+                if constexpr (gate_only_swiglu) {
+                    reduce_q6_K_wave_gfx90a(tmp[j][i][0], tmp_gate[j][i][0]);
+                } else if constexpr (has_fusion && !bias_only) {
+                    if (use_gate) {
+                        reduce_q6_K_wave_gfx90a(tmp[j][i][0], tmp_gate[j][i][0]);
+                    } else {
+                        tmp[j][i][0] = reduce_q6_K_wave_gfx90a(tmp[j][i][0]);
+                    }
+                } else {
+                    tmp[j][i][0] = reduce_q6_K_wave_gfx90a(tmp[j][i][0]);
+                }
             } else
 #endif // defined(__gfx90a__)
             {
@@ -1180,7 +1238,8 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (lane == result_lane + i && (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
+            if (lane == result_lane + (dpp_q6_K_reduce ? 0 : i) &&
+                    (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
                 float result = tmp[j][i][0];
                 if constexpr (bias_only) {
                     result += x_biases[j];
