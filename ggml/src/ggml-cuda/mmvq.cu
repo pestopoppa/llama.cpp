@@ -9,6 +9,48 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+#if defined(__gfx90a__)
+static __device__ __forceinline__ float reduce_q4_K_halfwave_gfx90a(float value) {
+    // DPP reads need two wait states after a VGPR write on gfx90a.
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0"
+        : "+v"(value));
+
+    return value;
+}
+
+static __device__ __forceinline__ void reduce_q4_K_halfwave_gfx90a(float & value, float & gate) {
+    // Interleave independent accumulators to provide the two DPP wait states.
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "s_nop 0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0"
+        : "+v"(value), "+v"(gate));
+}
+#endif // defined(__gfx90a__)
+
 static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
         const void * __restrict__ vbq, const void * __restrict__ vgate,
         const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -848,6 +890,12 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_thread = halfwave_rows ? 1 : rows_per_cuda_block;
     constexpr int reduction_width = halfwave_rows ? warp_size/2 : warp_size;
     constexpr int k_part_count = halfwave_rows ? 2 : 1;
+#if defined(__gfx90a__)
+    constexpr bool dpp_halfwave_reduce = halfwave_rows && ncols_x_fixed == 1536;
+#else
+    constexpr bool dpp_halfwave_reduce = false;
+#endif
+    constexpr int result_lane = dpp_halfwave_reduce ? reduction_width - 1 : 0;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -912,32 +960,34 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] float gate_scales = 1.0f;
     if constexpr (bias_only) {
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (lane < rows_per_thread && (halfwave_rows || threadIdx.y == 0) &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + row + lane) < stride_col_dst)) {
+        if (lane >= result_lane && lane < result_lane + rows_per_thread &&
+            (halfwave_rows || threadIdx.y == 0) &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + row + lane - result_lane) < stride_col_dst)) {
             x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
-                x_biases[j] = x_bias[j * stride_col_dst + row + lane];
+                x_biases[j] = x_bias[j * stride_col_dst + row + lane - result_lane];
             }
         }
     } else if constexpr (has_fusion && !gate_only_swiglu) {
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (lane < rows_per_thread && (halfwave_rows || threadIdx.y == 0) &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + row + lane) < stride_col_dst)) {
+        if (lane >= result_lane && lane < result_lane + rows_per_thread &&
+            (halfwave_rows || threadIdx.y == 0) &&
+            (rows_per_cuda_block == 1 || uint32_t(row0 + row + lane - result_lane) < stride_col_dst)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + row + lane];
+                    x_biases[j] = x_bias[j * stride_col_dst + row + lane - result_lane];
                 }
             }
             if (use_gate_bias) {
                 gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    gate_biases[j] = gate_bias[j * stride_col_dst + row + lane];
+                    gate_biases[j] = gate_bias[j * stride_col_dst + row + lane - result_lane];
                 }
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1104,16 +1154,33 @@ static __global__ void mul_mat_vec_q(
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_thread; ++i) {
-            tmp[j][i][0] = warp_reduce_sum<reduction_width>(tmp[j][i][0]);
-            if constexpr (gate_only_swiglu) {
-                tmp_gate[j][i][0] = warp_reduce_sum<reduction_width>(tmp_gate[j][i][0]);
-            } else if constexpr (has_fusion && !bias_only) {
-                if (use_gate) {
+#if defined(__gfx90a__)
+            if constexpr (dpp_halfwave_reduce) {
+                if constexpr (gate_only_swiglu) {
+                    reduce_q4_K_halfwave_gfx90a(tmp[j][i][0], tmp_gate[j][i][0]);
+                } else if constexpr (has_fusion && !bias_only) {
+                    if (use_gate) {
+                        reduce_q4_K_halfwave_gfx90a(tmp[j][i][0], tmp_gate[j][i][0]);
+                    } else {
+                        tmp[j][i][0] = reduce_q4_K_halfwave_gfx90a(tmp[j][i][0]);
+                    }
+                } else {
+                    tmp[j][i][0] = reduce_q4_K_halfwave_gfx90a(tmp[j][i][0]);
+                }
+            } else
+#endif // defined(__gfx90a__)
+            {
+                tmp[j][i][0] = warp_reduce_sum<reduction_width>(tmp[j][i][0]);
+                if constexpr (gate_only_swiglu) {
                     tmp_gate[j][i][0] = warp_reduce_sum<reduction_width>(tmp_gate[j][i][0]);
+                } else if constexpr (has_fusion && !bias_only) {
+                    if (use_gate) {
+                        tmp_gate[j][i][0] = warp_reduce_sum<reduction_width>(tmp_gate[j][i][0]);
+                    }
                 }
             }
 
-            if (lane == i && (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
+            if (lane == result_lane + i && (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
                 float result = tmp[j][i][0];
                 if constexpr (bias_only) {
                     result += x_biases[j];
