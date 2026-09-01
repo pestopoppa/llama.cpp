@@ -699,9 +699,17 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx);
+#endif
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+    ggml_cuda_mmvq_q8_1_graph_cache_clear(this);
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));

@@ -1716,24 +1716,57 @@ static void mul_mat_vec_q_switch_type(
 }
 
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
-struct mmvq_q8_1_graph_cache {
-    unsigned long long capture_id = 0;
-    hipGraphNode_t tail = nullptr;
-    const void * src1 = nullptr;
+struct mmvq_q8_1_graph_cache_entry {
+    const ggml_tensor * src1 = nullptr;
+    ggml_type type = GGML_TYPE_COUNT;
     int64_t ne[GGML_MAX_DIMS] = {};
     size_t nb[GGML_MAX_DIMS] = {};
-    void * q8_1 = nullptr;
-    bool valid = false;
+    int64_t ne10_padded = 0;
+    size_t q8_1_size = 0;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1;
 };
 
-static thread_local mmvq_q8_1_graph_cache q8_1_graph_cache;
+struct mmvq_q8_1_graph_cache {
+    ggml_backend_cuda_context * ctx = nullptr;
+    ggml_cuda_pool * pool = nullptr;
+    unsigned long long capture_id = 0;
+    std::vector<mmvq_q8_1_graph_cache_entry> entries;
 
-static bool mmvq_q8_1_graph_cache_matches(const ggml_tensor * src1) {
-    if (q8_1_graph_cache.src1 != src1->data) {
+    void clear() {
+        while (!entries.empty()) {
+            entries.pop_back();
+        }
+        ctx = nullptr;
+        pool = nullptr;
+        capture_id = 0;
+    }
+};
+
+struct mmvq_q8_1_graph_cache_registry {
+    std::mutex mutex;
+    std::unordered_map<ggml_backend_cuda_context *, std::unique_ptr<mmvq_q8_1_graph_cache>> caches;
+};
+
+static mmvq_q8_1_graph_cache_registry q8_1_graph_cache_registry;
+
+void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(q8_1_graph_cache_registry.mutex);
+    const auto it = q8_1_graph_cache_registry.caches.find(ctx);
+    if (it != q8_1_graph_cache_registry.caches.end()) {
+        it->second->clear();
+        q8_1_graph_cache_registry.caches.erase(it);
+    }
+}
+
+static bool mmvq_q8_1_graph_cache_matches(
+        const mmvq_q8_1_graph_cache_entry & entry, const ggml_tensor * src1,
+        const int64_t ne10_padded, const size_t q8_1_size) {
+    if (entry.src1 != src1 || entry.type != src1->type ||
+        entry.ne10_padded != ne10_padded || entry.q8_1_size != q8_1_size) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (q8_1_graph_cache.ne[i] != src1->ne[i] || q8_1_graph_cache.nb[i] != src1->nb[i]) {
+        if (entry.ne[i] != src1->ne[i] || entry.nb[i] != src1->nb[i]) {
             return false;
         }
     }
@@ -1819,7 +1852,9 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
+    void * src1_q8_1 = nullptr;
 
     bool reuse_src1_q8_1 = false;
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
@@ -1827,25 +1862,65 @@ void ggml_cuda_mul_mat_vec_q(
         (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && ne11 == 1 && ne12 == 1 && ne13 == 1;
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     unsigned long long capture_id = 0;
-    const hipGraphNode_t * dependencies = nullptr;
-    size_t dependency_count = 0;
     if (cache_eligible) {
         CUDA_CHECK(hipStreamGetCaptureInfo_v2(
-            stream, &capture_status, &capture_id, nullptr, &dependencies, &dependency_count));
+            stream, &capture_status, &capture_id, nullptr, nullptr, nullptr));
     }
     const bool capture_active = capture_status == hipStreamCaptureStatusActive;
-    const hipGraphNode_t capture_tail = dependency_count == 1 ? dependencies[0] : nullptr;
+    if (cache_eligible && capture_active) {
+        std::lock_guard<std::mutex> lock(q8_1_graph_cache_registry.mutex);
+        std::unique_ptr<mmvq_q8_1_graph_cache> & cache_ptr = q8_1_graph_cache_registry.caches[&ctx];
+        if (cache_ptr == nullptr) {
+            cache_ptr = std::make_unique<mmvq_q8_1_graph_cache>();
+        }
+        mmvq_q8_1_graph_cache & cache = *cache_ptr;
+        ggml_cuda_pool * const pool = &ctx.pool();
+        if (cache.ctx != &ctx || cache.pool != pool) {
+            cache.clear();
+            cache.ctx = &ctx;
+            cache.pool = pool;
+            cache.capture_id = capture_id;
+        } else if (cache.capture_id != capture_id) {
+            cache.clear();
+            cache.ctx = &ctx;
+            cache.pool = pool;
+            cache.capture_id = capture_id;
+        }
 
-    reuse_src1_q8_1 = cache_eligible && capture_active && q8_1_graph_cache.valid &&
-        q8_1_graph_cache.capture_id == capture_id && q8_1_graph_cache.tail == capture_tail &&
-        q8_1_graph_cache.q8_1 == src1_q8_1.get() && mmvq_q8_1_graph_cache_matches(src1);
+        for (const mmvq_q8_1_graph_cache_entry & entry : cache.entries) {
+            if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, src1_q8_1_size)) {
+                src1_q8_1 = entry.q8_1->get();
+                reuse_src1_q8_1 = true;
+                break;
+            }
+        }
+
+        if (!reuse_src1_q8_1) {
+            cache.entries.emplace_back();
+            mmvq_q8_1_graph_cache_entry & entry = cache.entries.back();
+            entry.src1 = src1;
+            entry.type = src1->type;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                entry.ne[i] = src1->ne[i];
+                entry.nb[i] = src1->nb[i];
+            }
+            entry.ne10_padded = ne10_padded;
+            entry.q8_1_size = src1_q8_1_size;
+            entry.q8_1 = std::make_unique<ggml_cuda_pool_alloc<char>>(*pool, src1_q8_1_size);
+            src1_q8_1 = entry.q8_1->get();
+        }
+    }
 #endif
+
+    if (src1_q8_1 == nullptr) {
+        src1_q8_1 = src1_q8_1_alloc.alloc(src1_q8_1_size);
+    }
 
     if (!reuse_src1_q8_1) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1871,35 +1946,10 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
-
-#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
-    q8_1_graph_cache.valid = false;
-    if (cache_eligible && capture_active) {
-        hipStreamCaptureStatus capture_status_after;
-        unsigned long long capture_id_after = 0;
-        const hipGraphNode_t * dependencies_after = nullptr;
-        size_t dependency_count_after = 0;
-        CUDA_CHECK(hipStreamGetCaptureInfo_v2(
-            stream, &capture_status_after, &capture_id_after, nullptr,
-            &dependencies_after, &dependency_count_after));
-        if (capture_status_after == hipStreamCaptureStatusActive && capture_id_after == capture_id &&
-            dependency_count_after == 1) {
-            q8_1_graph_cache.capture_id = capture_id;
-            q8_1_graph_cache.tail = dependencies_after[0];
-            q8_1_graph_cache.src1 = src1->data;
-            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-                q8_1_graph_cache.ne[i] = src1->ne[i];
-                q8_1_graph_cache.nb[i] = src1->nb[i];
-            }
-            q8_1_graph_cache.q8_1 = src1_q8_1.get();
-            q8_1_graph_cache.valid = true;
-        }
-    }
-#endif
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
