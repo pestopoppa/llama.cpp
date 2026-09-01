@@ -164,6 +164,16 @@ static void fused_moe(
                 (int) n_used);
     }
 
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        static int moe_n = 0;
+        if (moe_n < 2) {
+            char fn[128];
+            snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_logits_%d.bin", moe_n);
+            FILE * f = fopen(fn, "wb");
+            if (f) { fwrite(logits.data(), 4, n_expert, f); fclose(f); }
+        }
+        moe_n++;
+    }
     // softmax over the experts (max-subtract, sequential exp/sum — the
     // ggml_vec_soft_max_f32 contract)
     float maxv = -INFINITY;
