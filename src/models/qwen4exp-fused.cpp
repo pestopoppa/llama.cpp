@@ -710,6 +710,12 @@ void fused_gdn_layer(
     // ---- hc_mix (ffn side) + MoE again ----
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 12) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_gdn_ffnmixed_12.bin", "wb");
+        if (f) { fwrite(mixed.data(), 4, n_embd, f); fclose(f); }
+        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_gdn_ffnxn_12.bin", "wb");
+        if (f2) { fwrite(xn.data(), 4, hc * n_embd, f2); fclose(f2); }
+    }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         int mm = 0; for (int64_t i = 0; i < n_embd; i++) if (std::isnan(mixed[i])) mm++;
         fprintf(stderr, "  gdn ffn mixed nan=%d\n", mm);
