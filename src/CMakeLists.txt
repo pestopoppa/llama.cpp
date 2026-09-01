@@ -43,6 +43,7 @@ add_library(llama
             unicode.cpp
             unicode.h
             ${LLAMA_MODELS_SOURCES})
+set_source_files_properties(models/qwen4exp-fused.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_INSTALL_VERSION}
     SOVERSION 0
