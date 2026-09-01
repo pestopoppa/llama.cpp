@@ -13,6 +13,7 @@
 extern "C" {
 void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_vec_silu_f32(const int n, float * y, const float * x);
 }
 
 // ggml_compute_params lives in ggml-cpu-impl.h (not on the llama include path);
@@ -1579,9 +1580,10 @@ void fused_ple(
                 const int64_t pos = hist - (kern - 1 - k) * dil;
                 sumf += window[c * (hist + 1) + pos] * w[(size_t) k + c * 4];
             }
-            const float v = sumf;
-            conv_out[c] = v / (1.0f + expf(-v)); // silu
+            conv_out[c] = sumf;
         }
+        // the graph's SIMD silu (ggml_v_silu / ggml_v_expf), not the scalar expf
+        ggml_vec_silu_f32((int) hc_dim, conv_out.data(), conv_out.data());
         // the state update: keep the last hist taps (drop tap 0, append norm_conv)
         for (int64_t c = 0; c < hc_dim; c++) {
             for (int64_t j = 0; j < hist; j++) {
