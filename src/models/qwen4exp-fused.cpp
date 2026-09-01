@@ -576,9 +576,10 @@ void fused_gdn_layer(
         for (int64_t k = 0; k < d_conv; k++) {
             sumf += window[i * d_conv + k] * ((const float *) L.ssm_conv1d->data)[k + i * d_conv];
         }
-        const float v = sumf;
-        conv_out[i] = v / (1.0f + expf(-v)); // silu
+        conv_out[i] = sumf;
     }
+    // the graph's SIMD silu (ggml_v_silu / ggml_v_expf)
+    ggml_vec_silu_f32((int) n_ch, conv_out.data(), conv_out.data());
     // conv state update: keep the last d_conv-1 taps (drop tap 0, append qkv)
     for (int64_t i = 0; i < n_ch; i++) {
         for (int64_t k = 0; k < d_conv - 1; k++) {
