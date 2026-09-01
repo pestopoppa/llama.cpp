@@ -362,15 +362,18 @@ static void fused_moe(
                     const uint8_t * qs = (const uint8_t *) (bl + 2 * rp_I);
                     const ggml_fp16_t * ad = (const ggml_fp16_t *) (act + l * 34);
                     const int8_t * aqs = (const int8_t *) (act + l * 34 + 2);
-                    int sumi = 0;
+                    // the graph's kernel: sumf[j] += sumi_k * d * a per k (the
+                    // per-k products round separately — NOT one accumulated sumi)
+                    const float da = ggml_fp16_to_fp32(dsc[slot]) * ggml_fp16_to_fp32(ad[0]);
                     for (int64_t k = 0; k < 32 / (2 * rp_I); k++) {
+                        int sumi = 0;
                         for (int64_t i = 0; i < rp_I; i++) {
                             const uint8_t byte = qs[k * rp_I * rp_I + slot * rp_I + i];
                             sumi += kv_iq4nl[byte & 0xF] * aqs[k * rp_I + i]
                                  +  kv_iq4nl[byte >> 4] * aqs[k * rp_I + i + 16];
                         }
+                        dot += (float) sumi * da;
                     }
-                    dot += (float) sumi * ggml_fp16_to_fp32(dsc[slot]) * ggml_fp16_to_fp32(ad[0]);
                 }
                 v = dot;
             } else {
