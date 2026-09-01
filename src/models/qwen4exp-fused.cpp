@@ -75,9 +75,10 @@ FusedMM::FusedMM(const struct ggml_tensor * w, const float * x, int n_threads) {
         const bool lastish = ctor_n >= 285; // the last hc_mix layer + the head
         if (lastish || x == nullptr || ((uintptr_t) x) < 0x1000 || !ctor_hit) {
             ctor_hit = true;
-            fprintf(stderr, "  fused mm ctor: n=%d w=%p type=%s ne0=%lld x=%p qrow=%zu qtv=%p from_float=%p\n",
+            fprintf(stderr, "  fused mm ctor: n=%d w=%p type=%s ne0=%lld x=%p x[0..3]=%.6g %.6g %.6g %.6g qrow=%zu qtv=%p from_float=%p\n",
                     ctor_n, (const void *) w, ggml_type_name(w->type), (long long) w->ne[0],
-                    (const void *) x, qrow, (const void *) qtv, (const void *) qtv->from_float);
+                    (const void *) x, (double) x[0], (double) x[1], (double) x[2], (double) x[3],
+                    qrow, (const void *) qtv, (const void *) qtv->from_float);
         }
         ctor_n++;
     }
