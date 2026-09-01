@@ -82,7 +82,12 @@ FusedMM::FusedMM(const struct ggml_tensor * w, const float * x, int n_threads) {
         }
         ctor_n++;
     }
-    qtv->from_float(x, xq.data(), n_in);
+    {
+        static std::vector<float> x_cpy;
+        x_cpy.resize(n_in);
+        memcpy(x_cpy.data(), x, n_in * sizeof(float));
+        qtv->from_float(x_cpy.data(), xq.data(), n_in);
+    }
 }
 
 // the lora mm: the per-row dots, optionally multiplied elementwise by w_s
