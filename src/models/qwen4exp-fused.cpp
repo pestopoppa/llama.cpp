@@ -148,6 +148,13 @@ static void fused_moe(
 
     const int64_t n_expert = L.ffn_gate_inp->ne[1]; // 512
     const int64_t n_used   = hp.n_expert_used;      // 10
+    static int dn_call = 0;
+    static FILE * dn_file = nullptr;
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && dn_call < 2 && !dn_file) {
+        char fn[128];
+        snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_dn_%d.bin", dn_call);
+        dn_file = fopen(fn, "wb");
+    }
 
     // router logits
     std::vector<float> logits(n_expert);
@@ -242,6 +249,21 @@ static void fused_moe(
         }
     }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        static int up_n = 0;
+        if (up_n < 2) {
+            char fn[128];
+            snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_up_%d.bin", up_n);
+            FILE * f = fopen(fn, "wb");
+            if (f) {
+                fwrite(up_tmp.data(), 4, n_used * n_ff, f);
+                fwrite(gate_tmp.data(), 4, n_used * n_ff, f);
+                fwrite(glu.data(), 4, n_used * n_ff, f);
+                fclose(f);
+            }
+        }
+        up_n++;
+    }
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         int un = 0, gn = 0, gln = 0;
         for (int64_t i = 0; i < n_used * n_ff; i++) { if (std::isnan(up_tmp[i])) un++; if (std::isnan(gate_tmp[i])) gn++; if (std::isnan(glu[i])) gln++; }
         fprintf(stderr, "  moe updots: up nan=%d gate nan=%d glu nan=%d  up[0]=%.6g glu[0]=%.6g\n", un, gn, gln, (double) up_tmp[0], (double) glu[0]);
@@ -333,11 +355,13 @@ static void fused_moe(
                                glu_q.data() + j * glu_q_size, 0, 1);
             }
             down_acc[r] += v * w[j];
+            if (dn_file && dn_call < 2) fwrite(&v, 4, 1, dn_file);
             if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && r < 2) {
                 fprintf(stderr, "  moe dn j%lld r%lld: e=%d v=%.6g w=%.6g\n", (long long) j, (long long) r, e, (double) v, (double) w[j]);
             }
         }
     }
+    if (dn_file) { fclose(dn_file); dn_file = nullptr; dn_call++; }
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         int dn = 0; for (int64_t i = 0; i < hp.n_embd; i++) if (std::isnan(down_acc[i])) dn++;
         fprintf(stderr, "  moe dnacc: nan=%d [0]=%.6g\n", dn, (double) down_acc[0]);
