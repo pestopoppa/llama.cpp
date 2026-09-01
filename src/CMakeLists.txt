@@ -42,9 +42,7 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
-            ${LLAMA_MODELS_SOURCES}
-            )
-
+            ${LLAMA_MODELS_SOURCES})
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_INSTALL_VERSION}
     SOVERSION 0
