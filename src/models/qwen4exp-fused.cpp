@@ -141,6 +141,29 @@ static void hc_mix(const struct ggml_tensor * w_down, const struct ggml_tensor *
 
 // ---- the MoE (mirrors build_moe_ffn + build_layer_ffn's shared expert) -----
 
+// the graph's silu uses the SIMD ggml_v_expf approximation (1.45 ulps), not
+// expf — the scalar mirror of the AVX2 ggml_v_silu/ggml_v_expf path
+static float v_silu(float x) {
+    const float r = 12582912.0f;
+    const float z = fmaf(x, 1.4426950216293335f, r);
+    const float n = z - r;
+    const float b = fmaf(-n, 1.428606765330187e-06f,
+                         fmaf(-n, 0.693145751953125f, x));
+    uint32_t zu;
+    memcpy(&zu, &z, sizeof(zu));
+    const uint32_t e = zu << 23;
+    uint32_t kb = e + 1;
+    float k;
+    memcpy(&k, &kb, sizeof(k));
+    const float u = b * b;
+    float j = fmaf(fmaf(fmaf(0.008247390389442444f, b, 0.04189976677298546f), u,
+                        fmaf(0.16668395698070526f, b, 0.4999912679195404f)), u,
+                   0.9999994039535522f * b);
+    if (fabsf(n) <= 126.0f) return fmaf(j, k, k);
+    // the overflow/underflow tail (|n| > 126): fall back to the plain expf
+    return x / (1.0f + expf(-x));
+}
+
 static void fused_moe(
         const struct llama_layer & L,
         const struct llama_hparams & hp,
