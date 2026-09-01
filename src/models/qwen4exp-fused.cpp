@@ -1288,6 +1288,10 @@ bool fused_full_attn_layer(
         FILE * fm = fopen(fnm, "wb"); if (fm) { fwrite(moe_out.data(), 4, n_embd, fm); fclose(fm); }
     }
     hc_combine(res_in_out, layer_out.data(), inject.data(), hc, n_embd);
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 7) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/f_attn_res7.bin", "wb");
+        if (f) { fwrite(res_in_out, 4, hc * n_embd, f); fclose(f); }
+    }
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
