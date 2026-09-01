@@ -1529,7 +1529,10 @@ void fused_ple(
         const float inv = 1.0f / sqrtf((float) n_embd);
         for (int64_t c = 0; c < hc; c++) {
             float s = 0.0f;
-            for (int64_t i = 0; i < n_embd; i++) s += key_n[c * n_embd + i] * query_n[c * n_embd + i];
+            for (int64_t i = 0; i < n_embd; i++) {
+                const float p = key_n[c * n_embd + i] * query_n[c * n_embd + i];
+                s = s + p;
+            }
             s *= inv;
             const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
             gate[c] = 1.0f / (1.0f + expf(-(s >= 0.0f ? mag : -mag)));
