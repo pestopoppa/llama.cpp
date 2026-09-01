@@ -13,6 +13,7 @@
 extern "C" {
 void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_sigmoid(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
 }
 
