@@ -1337,12 +1337,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
-    // the fused decode fast path (INF-64): single-token decode on a fully
-    // CPU-resident model runs the fused layer functions instead of the graph;
-    // any failure falls through to the graph path below
-    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
+    // the fused decode fast path (INF-64/INF-70 A4): single-token decode on a
+    // fully CPU-resident model runs the fused layer functions instead of the
+    // graph; any failure falls through to the graph path below.
+    //
+    // A4 SAFETY CONTRACT: this path is OPT-IN. It is taken only when
+    // GGML_FUSED_DECODE is set in the environment. GGML_FUSED_DECODE_OFF is
+    // still honoured as a hard disable (compatibility with the INF-67 harnesses
+    // and with anything that sets it defensively); when both are set, OFF wins.
+    // supports_fused_decode() checks residency and the row-table layout; the
+    // fused_decode() preflight checks the cache types and the logits carrier
+    // BEFORE any persistent state is touched.
+    if (getenv("GGML_FUSED_DECODE") != NULL && getenv("GGML_FUSED_DECODE_OFF") == NULL &&
             gtype == LLM_GRAPH_TYPE_DEFAULT &&
-            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
+            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr &&
+            model.supports_fused_decode()) {
         // snapshot the previous graph's per-layer inputs (the fused path may
         // compare against them for layer-level isolation; the reset clears them)
         const int64_t n_layers = model.hparams.n_layer();

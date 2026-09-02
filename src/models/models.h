@@ -2059,7 +2059,11 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_qsa;
 
-    bool supports_fused_decode() const override { return true; }
+    // INF-70 A4: the fused decode is OPT-IN and this predicate must check what
+    // it claims — every model tensor on a CPU-device buffer, no repacked row
+    // table, the fused kernels' hparams in range. Memoised on first call.
+    bool supports_fused_decode() const override;
+    mutable int fused_decode_supported = -1; // -1 unknown, 0 no, 1 yes
     bool fused_decode(const llama_ubatch & ubatch, const struct llama_memory_context_i * mctx, class llm_graph_result * res, int n_threads, const struct ggml_tensor * const * prev_layer_inp) const override;
 
     void load_arch_hparams(llama_model_loader & ml) override;

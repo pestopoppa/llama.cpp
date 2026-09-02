@@ -1683,6 +1683,75 @@ static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float *
     }
 }
 
+// ---- A4: the residency / layout predicate ----------------------------------
+//
+// Before INF-70 A4 this returned `true` unconditionally, so the opt-out hook
+// would have run the fused kernels against GPU-resident or repacked weights.
+// It now checks what it claims:
+//   (1) every model tensor sits on a buffer whose device is a CPU device — the
+//       fused kernels dereference `tensor->data` directly and have no copy path;
+//   (2) no tensor is repacked except the MoE down-experts, and those only when
+//       they are IQ4_NL (the one interleaved layout `fused_moe` mirrors). The
+//       repack extra_buffer_type claims MUL_MAT / MUL_MAT_ID only, so a repacked
+//       weight read row-by-row by the plain vec_dot decodes silently wrong; the
+//       two tables the fused path gathers ROWS from (tok_embd,
+//       per_layer_tok_embd) must not be repacked at all;
+//   (3) the hparams the fused kernels hard-assume are present and in range.
+// Batch-1 / single-seq / DEFAULT-graph is checked at the hook (llama-context.cpp);
+// the memory-context cache types and the logits carrier are checked in
+// fused_decode()'s preflight, which runs before any persistent write.
+bool llama_model_qwen4exp::supports_fused_decode() const {
+    if (fused_decode_supported >= 0) {
+        return fused_decode_supported == 1;
+    }
+    fused_decode_supported = 0;
+
+    auto is_cpu_resident = [](const ggml_tensor * t) {
+        if (t == nullptr)         return false;
+        if (t->data == nullptr)   return false;
+        if (t->buffer == nullptr) return false;
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        if (buft == nullptr)      return false;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        // a buffer with no device is not something this path can reason about
+        if (dev == nullptr)       return false;
+        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    };
+
+    // (1) + (2) over every loaded tensor
+    for (const auto & kv : tensors_by_name) {
+        const ggml_tensor * t = kv.second;
+        if (!is_cpu_resident(t)) {
+            LLAMA_LOG_INFO("%s: fused decode unavailable: tensor '%s' is not CPU-resident\n",
+                    __func__, kv.first.c_str());
+            return false;
+        }
+        if (t->extra != nullptr) {
+            // repacked. Only the MoE down-experts have a mirrored layout here.
+            const bool is_down_exps = kv.first.find("ffn_down_exps") != std::string::npos;
+            if (!is_down_exps || t->type != GGML_TYPE_IQ4_NL) {
+                LLAMA_LOG_INFO("%s: fused decode unavailable: tensor '%s' (%s) is repacked and has no fused mirror\n",
+                        __func__, kv.first.c_str(), ggml_type_name(t->type));
+                return false;
+            }
+        }
+    }
+
+    // (2b) the row-gather tables: a raw row read cannot see any repacking
+    if (tok_embd == nullptr || tok_embd->extra != nullptr) return false;
+    if (per_layer_tok_embd == nullptr || per_layer_tok_embd->extra != nullptr) return false;
+    if (output == nullptr) return false;
+
+    // (3) the hparams the fused kernels hard-assume
+    if (hparams.dsv4_hc_mult <= 0)                                return false;
+    if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > 8) return false; // ctxv[8] on the stack
+    if (hparams.n_expert_used == 0)                               return false;
+    if (layers.size() != hparams.n_layer())                       return false;
+
+    fused_decode_supported = 1;
+    return true;
+}
+
 bool llama_model_qwen4exp::fused_decode(
         const llama_ubatch & ubatch,
         const struct llama_memory_context_i * mctx_in,
@@ -1697,7 +1766,95 @@ bool llama_model_qwen4exp::fused_decode(
 
     const int64_t n_layer_slot = hparams.n_layer() + 1;
     const auto * mctx = static_cast<const llama_memory_hybrid_idx_context *>(mctx_in);
-    if (mctx == nullptr || mctx->get_attn() == nullptr) return false;
+
+    // ================= A4 PREFLIGHT =================
+    // Everything that can refuse refuses HERE, before a single byte of
+    // persistent state is written. Combined with the staged commit below, a
+    // fall-through to the graph path from anywhere in this function leaves the
+    // memory context able to run the same token.
+    if (mctx == nullptr || mctx->get_attn() == nullptr || mctx->get_recr() == nullptr ||
+            mctx->get_idx() == nullptr) {
+        return false;
+    }
+
+    // the logits carrier. The fused path builds no graph, so it has no tensor of
+    // its own that the scheduler knows about; llama_context::decode() extracts
+    // through ggml_backend_sched_get_tensor_backend(res->get_logits()) and
+    // asserts that lookup is non-null. The previous graph's logits tensor is the
+    // only sched-known F32 buffer of the right size available here, so the fused
+    // path writes into it. That write is safe *because*:
+    //   - res->reset() has cleared the graph and the fused path allocates NO
+    //     graph, so nothing between this write and the extraction a few lines
+    //     later in decode() can re-assign those bytes (the gallocr only
+    //     re-partitions the compute buffer inside ggml_backend_sched_alloc_graph);
+    //   - the extraction happens in the same call, before any other decode;
+    //   - and the properties it relies on are now CHECKED rather than assumed:
+    //     existence, F32, contiguity, and capacity >= n_vocab floats. Before A4
+    //     none of these were checked and the failure mode (a null carrier on the
+    //     very first decode of a context) surfaced only AFTER the whole token had
+    //     been computed and the recurrent state advanced.
+    // The remaining coupling — that the carrier is another graph's tensor rather
+    // than one this path owns — is what a fully owned buffer would remove; doing
+    // that needs ggml_backend_sched_set_tensor_backend() (which clears the
+    // scheduler's is_reset flag) or a change to decode()'s extraction path.
+    const int64_t n_vocab_pf = vocab.n_tokens();
+    ggml_tensor * t_logits = const_cast<ggml_tensor *>(prev_layer_inp[n_layer_slot]);
+    if (t_logits == nullptr || t_logits->data == nullptr ||
+            t_logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_logits) ||
+            ggml_nbytes(t_logits) < (size_t) n_vocab_pf * sizeof(float)) {
+        return false;
+    }
+
+    // the cache views + their types, for every full-attention layer. These were
+    // checked inside fused_full_attn_layer() — i.e. after the GDN/PLE layers
+    // below it had already advanced the recurrent state — which is exactly the
+    // partial-write hazard A4 exists to remove.
+    ggml_init_params gip = { 64 << 20, nullptr, false };
+    ggml_context * vctx = ggml_init(gip);
+    if (vctx == nullptr) {
+        return false;
+    }
+    {
+        const auto * attn_pf = mctx->get_attn();
+        const auto * idx_pf  = mctx->get_idx();
+        const auto * recr_pf = mctx->get_recr();
+        bool ok = true;
+        for (int il = 0; ok && il < (int) hparams.n_layer(); il++) {
+            if (!hparams.is_recr(il)) {
+                ggml_tensor * tk = attn_pf->get_k(vctx, il);
+                ggml_tensor * tv = attn_pf->get_v(vctx, il);
+                ggml_tensor * ti = idx_pf->get_k(vctx, il);
+                if (tk == nullptr || tv == nullptr || ti == nullptr ||
+                        tk->data == nullptr || tv->data == nullptr || ti->data == nullptr) {
+                    ok = false;
+                    break;
+                }
+                if (!((tk->type == GGML_TYPE_F32 || tk->type == GGML_TYPE_F16) &&
+                       tv->type == tk->type &&
+                      (ti->type == GGML_TYPE_F32 || ti->type == GGML_TYPE_F16))) {
+                    LLAMA_LOG_INFO("%s: fused decode declined: cache types %s/%s/%s at layer %d\n",
+                            __func__, ggml_type_name(tk->type), ggml_type_name(tv->type),
+                            ggml_type_name(ti->type), il);
+                    ok = false;
+                    break;
+                }
+            } else {
+                const auto * rl = recr_pf->get_r_l(il);
+                const auto * sl = recr_pf->get_s_l(il);
+                if (rl == nullptr || sl == nullptr || rl->data == nullptr || sl->data == nullptr ||
+                        rl->type != GGML_TYPE_F32 || sl->type != GGML_TYPE_F32) { ok = false; break; }
+            }
+            if (hparams.is_ple_impl[il]) {
+                const auto * pl = recr_pf->get_p_l(il);
+                if (pl == nullptr || pl->data == nullptr || pl->type != GGML_TYPE_F32) { ok = false; break; }
+            }
+        }
+        if (!ok) {
+            ggml_free(vctx);
+            return false;
+        }
+    }
+    // ================= END A4 PREFLIGHT =================
 
     const int64_t n_embd = hparams.n_embd;
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -1736,10 +1893,18 @@ bool llama_model_qwen4exp::fused_decode(
         }
     }
 
-    // scratch ggml context for the cache views
-    ggml_init_params gip = { 64 << 20, nullptr, false };
-    ggml_context * vctx = ggml_init(gip);
     std::vector<float> layer_out(n_embd);
+
+    // A4 ATOMICITY: every write to persistent recurrent state (the PLE conv
+    // history and the GDN conv/ssm rows) is staged here and applied in one pass
+    // at end-of-token. Until that pass runs the memory context still holds the
+    // pre-token state, so ANY bail-out below leaves the graph path able to run
+    // the same token. (The KV / indexer cell writes are NOT staged: the cell was
+    // allocated by mctx->apply() for THIS token and is written with this token's
+    // k/v, so re-running the token through the graph rewrites the same cell with
+    // the same values — idempotent, unlike the recurrent state, which advances.)
+    struct PendingStateWrite { void * dst; std::vector<float> src; };
+    std::vector<PendingStateWrite> pending_state;
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && getenv("GGML_FUSED_LAYER_CMP") != NULL && prev_layer_inp && prev_layer_inp[0] && prev_layer_inp[0]->data) {
         const ggml_tensor * g0 = prev_layer_inp[0];
@@ -1804,8 +1969,9 @@ bool llama_model_qwen4exp::fused_decode(
                    hist * hc_dim * sizeof(float));
             fused_ple(*this, hparams, L, tok, prev, res_hc.data(), res_hc.data(),
                       ple_state_copy.data(), n_threads);
-            memcpy((void *) ((const char *) pl->data + (size_t) head * row_bytes),
-                   ple_state_copy.data(), hist * hc_dim * sizeof(float));
+            // A4: staged, not written (see PendingStateWrite above)
+            pending_state.push_back({ (void *) ((const char *) pl->data + (size_t) head * row_bytes),
+                                      std::move(ple_state_copy) });
         } 
         if (hparams.is_recr(il)) {
             // the GDN: the conv + ssm state rows at the current head
@@ -1824,8 +1990,9 @@ bool llama_model_qwen4exp::fused_decode(
             memcpy(ssm_c.data(), ssm_state, sl->ne[0] * sizeof(float));
             fused_gdn_layer(L, hparams, res_hc.data(), res_hc.data(), layer_out.data(),
                             conv_c.data(), ssm_c.data(), n_threads, il);
-            memcpy((void *) conv_state, conv_c.data(), rl->ne[0] * sizeof(float));
-            memcpy((void *) ssm_state, ssm_c.data(), sl->ne[0] * sizeof(float));
+            // A4: staged, not written (see PendingStateWrite above)
+            pending_state.push_back({ (void *) conv_state, std::move(conv_c) });
+            pending_state.push_back({ (void *) ssm_state,  std::move(ssm_c)  });
         }
         if (!hparams.is_recr(il)) {
             // the full-attn layer: the KV + indexer cache slices. The cell
@@ -1833,7 +2000,8 @@ bool llama_model_qwen4exp::fused_decode(
             // allocated, so the last used cell is this token's write target.
             const auto * attn = mctx->get_attn();
             const auto * idx = mctx->get_idx();
-            if (idx == nullptr) { fprintf(stderr, "  fused attn fallback: idx null\n"); return false; }
+            // unreachable after the A4 preflight; harmless if reached — no state committed yet
+            if (idx == nullptr) { ggml_free(vctx); return false; }
             const llama_seq_id seq = ubatch.seq_id[0][0];
             const auto & attn_cells = attn->get_cells(seq);
             const auto & idx_cells  = idx->get_cells(seq);
@@ -1856,7 +2024,7 @@ bool llama_model_qwen4exp::fused_decode(
                 }
                 fprintf(stderr, "\n");
             }
-            if (tk == nullptr || tv == nullptr || ti == nullptr) { fprintf(stderr, "  fused attn fallback: cache view null (tk=%p tv=%p ti=%p)\n", (const void*) tk, (const void*) tv, (const void*) ti); return false; }
+            if (tk == nullptr || tv == nullptr || ti == nullptr) { ggml_free(vctx); return false; }
             if (!fused_full_attn_layer(L, hparams, rp, (int32_t) pos,
                         res_hc.data(), res_hc.data(), layer_out.data(),
                         tk, tv, ti, n_used, n_visible, idx_n_used, n_threads, il)) {
@@ -1878,12 +2046,17 @@ bool llama_model_qwen4exp::fused_decode(
     std::vector<float> logits(n_vocab);
     fused_head(*this, hparams, res_hc.data(), logits.data(), n_threads);
 
-    // write into the previous graph's logits tensor (sched-known, so the
-    // post-decode extraction and llama_get_logits_ith see the values)
-    ggml_tensor * t_logits = const_cast<ggml_tensor *>(prev_layer_inp[n_layer_slot]);
-    if (t_logits == nullptr || t_logits->data == nullptr) {
-        return false;
+    // ================= A4 COMMIT =================
+    // The token is complete. Apply every staged recurrent-state write in one
+    // pass; only after this point has the model's persistent state advanced.
+    for (auto & pw : pending_state) {
+        memcpy(pw.dst, pw.src.data(), pw.src.size() * sizeof(float));
     }
+
+    // the logits carrier, validated in the preflight (see the note there for why
+    // writing into the previous graph's sched-known tensor is safe here)
+    GGML_ASSERT(t_logits != nullptr && t_logits->data != nullptr);
+    GGML_ASSERT(ggml_nbytes(t_logits) >= (size_t) n_vocab * sizeof(float));
     res->t_logits = t_logits;
     memcpy(t_logits->data, logits.data(), n_vocab * sizeof(float));
 

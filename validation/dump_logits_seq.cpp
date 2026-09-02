@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
 
 static int greedy_argmax(const float * logits, int n) {
     return (int) (std::max_element(logits, logits + n) - logits);
@@ -29,7 +30,9 @@ int main(int argc, char ** argv) {
     if (!model) { fprintf(stderr, "load failed\n"); return 1; }
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512; cp.n_threads = 48; cp.n_threads_batch = 48;
+    const int val_threads = getenv("VAL_THREADS") ? atoi(getenv("VAL_THREADS")) : 48;
+    cp.n_ctx = 512; cp.n_threads = val_threads; cp.n_threads_batch = val_threads;
+    fprintf(stderr, "val threads: %d\n", val_threads);
     llama_context * ctx_g = llama_new_context_with_model(model, cp);
     llama_context * ctx_f = llama_new_context_with_model(model, cp);
     if (!ctx_g || !ctx_f) { fprintf(stderr, "ctx failed\n"); return 1; }
@@ -54,6 +57,7 @@ int main(int argc, char ** argv) {
     batch.n_tokens = np;
 
     // step 0: prompt batch through the graph on BOTH contexts (sanity)
+    unsetenv("GGML_FUSED_DECODE");
     if (llama_decode(ctx_g, batch) != 0) { fprintf(stderr, "g batch decode failed\n"); return 1; }
     if (llama_decode(ctx_f, batch) != 0) { fprintf(stderr, "f batch decode failed\n"); return 1; }
     const float * lg = llama_get_logits_ith(ctx_g, np - 1);
@@ -91,10 +95,20 @@ int main(int argc, char ** argv) {
         const int tok = greedy_argmax(lg, n_vocab);
         sb.token[0] = tok; sb.pos[0] = np - 1 + s; sb.n_seq_id[0] = 1; sb.seq_id[0][0] = 0; sb.n_tokens = 1;
 
-        if (!ext_off) setenv("GGML_FUSED_DECODE_OFF", "1", 1);
+        // graph arm: hard-off + opt-in cleared (works with both the pre-A4
+        // opt-out hook and the A4 opt-in hook)
+        using clk = std::chrono::steady_clock;
+        if (!ext_off) { setenv("GGML_FUSED_DECODE_OFF", "1", 1); unsetenv("GGML_FUSED_DECODE"); }
+        const auto tg0 = clk::now();
         if (llama_decode(ctx_g, sb) != 0) { fprintf(stderr, "g step %d failed\n", s); return 1; }
-        if (!ext_off) unsetenv("GGML_FUSED_DECODE_OFF");
+        const double g_ms = std::chrono::duration<double, std::milli>(clk::now() - tg0).count();
+        // fused arm: opt-in set, hard-off cleared
+        if (!ext_off) { unsetenv("GGML_FUSED_DECODE_OFF"); setenv("GGML_FUSED_DECODE", "1", 1); }
+        const auto tf0 = clk::now();
         if (llama_decode(ctx_f, sb) != 0) { fprintf(stderr, "f step %d failed\n", s); return 1; }
+        const double f_ms = std::chrono::duration<double, std::milli>(clk::now() - tf0).count();
+        if (!ext_off) unsetenv("GGML_FUSED_DECODE");
+        fprintf(stderr, "TIMING step %3d: graph=%.1f ms fused=%.1f ms ratio=%.2f\n", s, g_ms, f_ms, f_ms / g_ms);
 
         lg = llama_get_logits_ith(ctx_g, 0);
         lf = llama_get_logits_ith(ctx_f, 0);
