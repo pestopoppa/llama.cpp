@@ -16,6 +16,11 @@ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * par
 void ggml_compute_forward_sigmoid(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// ggml-cpu/traits.h is not on the llama include path; these are the CPU backend's
+// extra-buffer-type hooks that ggml_compute_forward()/ggml_graph_plan() call before
+// the built-in kernel (they are what claims a CPU_REPACK / AMX weight).
+bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op);
+bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size);
 }
 
 // ggml_compute_params lives in ggml-cpu-impl.h (not on the llama include path);
@@ -62,6 +67,132 @@ using ggml_type_traits_cpu = struct ggml_type_traits_cpu;
 
 // ---- helpers mirroring the graph's batch-1 kernels -------------------------
 
+// ---- A1: the batched mul_mat ----------------------------------------------
+//
+// Every projection in the fused path used to be a per-row `vec_dot` loop. That
+// is the 2026-08-28 HC_MIX anti-pattern (785 us unbatched vs 150 us batched):
+// the graph's mul_mat is not a vec_dot loop, it is a dispatch — the CPU
+// backend's extra buffer types (the CPU_REPACK 4x4/8x8 gemv), the iqk GEMM
+// under GGML_IQK=1, llamafile's tinyBLAS, and only then the chunked
+// vec_dot fallback. A per-row call reaches none of them.
+//
+// fused_mm() stages a real GGML_OP_MUL_MAT on borrowed tensor headers and runs
+// the same two-step dispatch ggml_compute_forward() uses:
+//     ggml_cpu_extra_compute_forward()  ->  ggml_compute_forward_mul_mat()
+// src0 is a shallow copy of the weight header, so `buffer`, `extra`, `type` and
+// the row stride are the real ones — which is exactly what the repack traits key
+// on (`op->src[0]->buffer->buft == repack_buft` then `op->src[0]->extra`).
+//
+// Staging details the earlier attempt got wrong (it segfaulted here):
+//   - wdata. The kernel writes the quantized activation into params->wdata and
+//     asserts nothing about its size; iqk carves its own Q8_K-sized region and
+//     the repack traits have their own work_size. Sized below by asking
+//     ggml_cpu_extra_work_size() first (what ggml_graph_plan does) and taking
+//     the max with the built-in MUL_MAT formula and a Q8_K-shaped upper bound.
+//   - threadpool. mul_mat does an unconditional
+//     atomic_store(&threadpool->current_chunk) and ggml_barrier(threadpool), so
+//     the pointer must be valid even at nth=1. A persistent 1-thread pool, as
+//     the GDN and flash staging already do.
+//   - strides. dst must satisfy nb0 == sizeof(float) and nb0<=nb1<=nb2<=nb3;
+//     src1 must be contiguous F32; src0 must have nb00 == type_size and its
+//     ne[2]/ne[3] collapsed to 1 (an expert slab is sliced by moving `data`).
+//
+// NOTE (single-thread contract): at nth == 1 ggml_barrier() takes the
+// `#pragma omp barrier` branch, because a threadpool created by
+// ggml_threadpool_new() has n_graph == 0 rather than 1. Outside a parallel
+// region that barrier is a no-op, so this is correct in an OpenMP build — which
+// every build directory in this tree is. A GGML_OPENMP=OFF build would spin on
+// the atomic barrier instead; the fused path is single-threaded by construction
+// today, so that is recorded here rather than worked around.
+namespace {
+
+static struct ggml_threadpool * fused_mm_tp() {
+    static struct ggml_threadpool * tp = nullptr;
+    if (tp == nullptr) {
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
+        tpp.n_threads = 1;
+        tp = ggml_threadpool_new(&tpp);
+    }
+    return tp;
+}
+
+static std::vector<uint8_t> & fused_mm_wdata() {
+    static std::vector<uint8_t> buf;
+    return buf;
+}
+
+// dst[n_out] (f32) = w[n_in, n_out] . x[n_in] (f32)
+// `w_data` slices one expert out of a [ne0, ne1, n_expert] slab; pass w->data
+// for a plain 2-D weight.
+static void fused_mm_raw(const struct ggml_tensor * w, const void * w_data, float * out, const float * x) {
+    const int64_t n_in  = w->ne[0];
+    const int64_t n_out = w->ne[1];
+
+    struct ggml_tensor src0 = *w;                       // header copy: type/nb/buffer/extra
+    src0.data     = const_cast<void *>(w_data);
+    src0.ne[2]    = 1;
+    src0.ne[3]    = 1;
+    src0.nb[2]    = src0.nb[1] * n_out;
+    src0.nb[3]    = src0.nb[2];
+    src0.op       = GGML_OP_NONE;
+    src0.view_src = nullptr;
+    src0.view_offs = 0;
+    for (int i = 0; i < GGML_MAX_SRC; i++) src0.src[i] = nullptr;
+
+    struct ggml_tensor src1 = {};
+    src1.type  = GGML_TYPE_F32;
+    src1.ne[0] = n_in; src1.ne[1] = 1; src1.ne[2] = 1; src1.ne[3] = 1;
+    src1.nb[0] = sizeof(float);
+    src1.nb[1] = src1.nb[0] * n_in;
+    src1.nb[2] = src1.nb[1];
+    src1.nb[3] = src1.nb[2];
+    src1.data  = const_cast<float *>(x);
+    src1.op    = GGML_OP_NONE;
+
+    struct ggml_tensor dst = {};
+    dst.type  = GGML_TYPE_F32;
+    dst.ne[0] = n_out; dst.ne[1] = 1; dst.ne[2] = 1; dst.ne[3] = 1;
+    dst.nb[0] = sizeof(float);
+    dst.nb[1] = dst.nb[0] * n_out;
+    dst.nb[2] = dst.nb[1];
+    dst.nb[3] = dst.nb[2];
+    dst.data  = out;
+    dst.op    = GGML_OP_MUL_MAT;
+    dst.src[0] = &src0;
+    dst.src[1] = &src1;
+
+    // the work buffer, sized the way ggml_graph_plan sizes it
+    size_t need = 0;
+    if (!ggml_cpu_extra_work_size(1, &dst, &need)) {
+        const enum ggml_type vdt = ggml_get_type_traits_cpu(src0.type)->vec_dot_type;
+        need = (src1.type != vdt) ? ggml_row_size(vdt, n_in) : 0;
+    }
+    // iqk carves a Q8_K-sized activation region whatever the vec_dot_type is
+    // (iqk_dispatch.cpp), so keep an upper bound on top: Q8_K is ~1.15 B/elem.
+    const size_t upper = (size_t) n_in * 8 + 4096;
+    if (need < upper) need = upper;
+    std::vector<uint8_t> & wbuf = fused_mm_wdata();
+    if (wbuf.size() < need) wbuf.resize(need);
+
+    struct ggml_compute_params params;
+    params.ith        = 0;
+    params.nth        = 1;
+    params.wsize      = wbuf.size();
+    params.wdata      = wbuf.data();
+    params.threadpool = fused_mm_tp();
+    params.use_ref    = false;
+
+    if (!ggml_cpu_extra_compute_forward(&params, &dst)) {
+        ggml_compute_forward_mul_mat(&params, &dst);
+    }
+}
+
+// the A1 kill switch: `GGML_FUSED_MM_LEGACY=1` restores the per-row vec_dot loop
+// so the substitution can be measured as a same-build A/B. Read once per token.
+static bool g_mm_legacy = false;
+
+} // namespace
+
 // quantize the activation once to the weight's vec_dot_type, then per-row
 // vec_dot — identical to ggml_compute_forward_mul_mat_one_chunk at batch-1.
 struct FusedMM {
@@ -89,16 +220,25 @@ FusedMM::FusedMM(const struct ggml_tensor * w, const float * x, int n_threads) {
     qtv->from_float(x, xq.data(), n_in);
 }
 
-// the lora mm: the per-row dots, optionally multiplied elementwise by w_s
+// the lora mm: one batched mul_mat (A1), optionally multiplied elementwise by w_s
 static void lora_mm(const struct ggml_tensor * w, const float * x, const struct ggml_tensor * w_s, float * out, int n_threads) {
-    FusedMM mm(w, x, n_threads);
-    const int64_t n_out = w->ne[1];
     (void) n_threads;
-    for (int64_t j = 0; j < n_out; j++) {
-        mm.dot(w, (int) j, &out[j]);
-        if (w_s) {
-            const float s = ((const float *) w_s->data)[j % w_s->ne[0]];
-            out[j] *= s;
+    const int64_t n_out = w->ne[1];
+    if (g_mm_legacy) {
+        FusedMM mm(w, x, n_threads);
+        for (int64_t j = 0; j < n_out; j++) {
+            mm.dot(w, (int) j, &out[j]);
+        }
+    } else {
+        FUSED_PROF_DOT_BEGIN();
+        fused_mm_raw(w, w->data, out, x);
+        FUSED_PROF_DOT_END();
+    }
+    if (w_s) {
+        const float * s = (const float *) w_s->data;
+        const int64_t ns = w_s->ne[0];
+        for (int64_t j = 0; j < n_out; j++) {
+            out[j] *= s[j % ns];
         }
     }
 }
@@ -152,9 +292,8 @@ static void hc_mix(const struct ggml_tensor * w_down, const struct ggml_tensor *
     // the gate: sigmoid(mm(w_up, lo)); gated = xn*gate; mean over streams
     const int64_t hc_dim = w_up->ne[1];
     std::vector<float> gate(hc_dim);
-    FusedMM mm_up(w_up, lo.data(), n_threads);
+    lora_mm(w_up, lo.data(), nullptr, gate.data(), n_threads);
     for (int64_t i = 0; i < hc_dim; i++) {
-        mm_up.dot(w_up, (int) i, &gate[i]);
         gate[i] = 1.0f / (1.0f + expf(-gate[i]));
     }
     const int64_t n_embd2 = hc_dim / hc;
@@ -270,12 +409,17 @@ static void fused_moe(
         for (int64_t j = 0; j < n_used; j++) w[j] /= s;
     }
 
-    // the expert gemvs: up/gate [2560, 640, 512] IQ3_S with the Q8_K activation
+    // the expert gemvs: up/gate [n_embd, n_ff, n_expert] with the Q8_K activation.
+    // A1: one batched mul_mat per selected expert (a 2-D slice of the slab)
+    // instead of n_ff per-row vec_dots.
     const struct ggml_type_traits_cpu * qt_up = ggml_get_type_traits_cpu(L.ffn_up_exps->type);
     const struct ggml_type_traits_cpu * qt_upv = ggml_get_type_traits_cpu(qt_up->vec_dot_type);
     const size_t xq_up_size = ggml_row_size(qt_up->vec_dot_type, hp.n_embd);
-    std::vector<uint8_t> xq_up(xq_up_size);
-    qt_upv->from_float(x, xq_up.data(), hp.n_embd);
+    std::vector<uint8_t> xq_up;
+    if (g_mm_legacy) {
+        xq_up.resize(xq_up_size);
+        qt_upv->from_float(x, xq_up.data(), hp.n_embd);
+    }
 
     const int64_t n_ff = L.ffn_up_exps->ne[1]; // 640
     std::vector<float> glu(n_used * n_ff), up_tmp(n_used * n_ff), gate_tmp(n_used * n_ff);
@@ -289,17 +433,24 @@ static void fused_moe(
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
         const char * up_e = (const char *) L.ffn_up_exps->data + (size_t) e * nb_up_exp;
-        const char * gt_e = (const char *) L.ffn_gate_exps->data + (size_t) e * nb_up_exp;
+        const char * gt_e = (const char *) L.ffn_gate_exps->data + (size_t) e * L.ffn_gate_exps->nb[2];
         FUSED_PROF_DOT_BEGIN();
+        if (g_mm_legacy) {
+            for (int64_t r = 0; r < n_ff; r++) {
+                qt_up->vec_dot((int) hp.n_embd, &up_tmp[j * n_ff + r], 0,
+                               up_e + (size_t) r * L.ffn_up_exps->nb[1], 0, xq_up.data(), 0, 1);
+                qt_up->vec_dot((int) hp.n_embd, &gate_tmp[j * n_ff + r], 0,
+                               gt_e + (size_t) r * L.ffn_gate_exps->nb[1], 0, xq_up.data(), 0, 1);
+            }
+        } else {
+            fused_mm_raw(L.ffn_up_exps,   up_e, &up_tmp[j * n_ff],   x);
+            fused_mm_raw(L.ffn_gate_exps, gt_e, &gate_tmp[j * n_ff], x);
+        }
+        FUSED_PROF_DOT_END();
         for (int64_t r = 0; r < n_ff; r++) {
-            qt_up->vec_dot((int) hp.n_embd, &up_tmp[j * n_ff + r], 0,
-                           up_e + (size_t) r * L.ffn_up_exps->nb[1], 0, xq_up.data(), 0, 1);
-            qt_up->vec_dot((int) hp.n_embd, &gate_tmp[j * n_ff + r], 0,
-                           gt_e + (size_t) r * L.ffn_gate_exps->nb[1], 0, xq_up.data(), 0, 1);
             const float g = gate_tmp[j * n_ff + r];
             glu[j * n_ff + r] = up_tmp[j * n_ff + r] * (g / (1.0f + expf(-g))); // silu(gate)*up
         }
-        FUSED_PROF_DOT_END();
     }
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         static int up_n = 0;
@@ -332,12 +483,18 @@ static void fused_moe(
     const struct ggml_type_traits_cpu * qt_dn = ggml_get_type_traits_cpu(L.ffn_down_exps->type);
     const struct ggml_type_traits_cpu * qt_dnv = ggml_get_type_traits_cpu(qt_dn->vec_dot_type);
     const size_t glu_q_size = ggml_row_size(qt_dn->vec_dot_type, n_ff);
-    std::vector<uint8_t> glu_q(glu_q_size * n_used);
-    for (int64_t j = 0; j < n_used; j++) {
-        qt_dnv->from_float(glu.data() + j * n_ff, glu_q.data() + j * glu_q_size, n_ff);
-    }
     static const int8_t kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
     const bool dn_repacked = L.ffn_down_exps->extra != nullptr;
+    // the pre-quantized activation is only needed by the per-row paths (the
+    // legacy arm and the repacked IQ4_NL mirror); the batched mul_mat quantizes
+    // into its own wdata.
+    std::vector<uint8_t> glu_q;
+    if (g_mm_legacy || dn_repacked) {
+        glu_q.resize(glu_q_size * n_used);
+        for (int64_t j = 0; j < n_used; j++) {
+            qt_dnv->from_float(glu.data() + j * n_ff, glu_q.data() + j * glu_q_size, n_ff);
+        }
+    }
     const bool up_repacked = L.ffn_up_exps->extra != nullptr;
     const bool gt_repacked = L.ffn_gate_exps->extra != nullptr;
     const int64_t rp_I = dn_repacked ? (ggml_cpu_has_avx2() ? 8 : 4) : 0;
@@ -359,9 +516,21 @@ static void fused_moe(
         fprintf(stderr, "  moe up: type=%s buf=%s\n", ggml_type_name(L.ffn_up_exps->type),
                 L.ffn_up_exps->buffer ? ggml_backend_buffer_name(L.ffn_up_exps->buffer) : "none");
     }
+    std::vector<float> down_j;
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
         const char * dn_e = (const char *) L.ffn_down_exps->data + (size_t) e * nb_dn_exp;
+        if (!dn_repacked && !g_mm_legacy) {
+            // A1: one batched mul_mat over the expert's [n_ff, n_embd] slice
+            down_j.resize(hp.n_embd);
+            FUSED_PROF_DOT_BEGIN();
+            fused_mm_raw(L.ffn_down_exps, dn_e, down_j.data(), glu.data() + j * n_ff);
+            FUSED_PROF_DOT_END();
+            for (int64_t r = 0; r < hp.n_embd; r++) {
+                down_acc[r] += down_j[r] * w[j];
+            }
+            continue;
+        }
         for (int64_t r = 0; r < hp.n_embd; r++) {
             float v = 0.0f;
             FUSED_PROF_DOT_BEGIN();
@@ -442,10 +611,11 @@ static void fused_moe(
             glu_s[r] = up_s[r] * (g / (1.0f + expf(-g)));
         }
         lora_mm(L.ffn_down_shexp, glu_s.data(), nullptr, down_s.data(), n_threads);
-        float shg = 0.0f;
-        FusedMM mm_shg(L.ffn_gate_inp_shexp, x, n_threads);
-        mm_shg.dot(L.ffn_gate_inp_shexp, 0, &shg);
-        shg = 1.0f / (1.0f + expf(-shg));
+        // the shared-expert gate is a 1-row projection; size the destination from
+        // the tensor rather than assuming it (the batched mul_mat writes ne[1])
+        std::vector<float> shg_v(L.ffn_gate_inp_shexp->ne[1]);
+        lora_mm(L.ffn_gate_inp_shexp, x, nullptr, shg_v.data(), n_threads);
+        float shg = 1.0f / (1.0f + expf(-shg_v[0]));
 
         for (int64_t i = 0; i < hp.n_embd; i++) {
             down_acc[i] += down_s[i] * shg;
@@ -1727,6 +1897,8 @@ bool llama_model_qwen4exp::fused_decode(
         const struct ggml_tensor * const * prev_layer_inp) const {
     FUSED_PROF_INIT();
     FUSED_PROF_RESET();
+    // A1 kill switch, read once per token (never in an inner loop)
+    g_mm_legacy = getenv("GGML_FUSED_MM_LEGACY") != NULL;
     const auto prof_t0 = std::chrono::steady_clock::now();
     if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
     if (ubatch.token == nullptr) return false;
