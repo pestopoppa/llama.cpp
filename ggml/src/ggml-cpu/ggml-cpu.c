@@ -5,6 +5,8 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+
+
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -75,6 +77,23 @@
 
 #define UNUSED GGML_UNUSED
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
+
+#ifdef GGML_CPU_PROF
+// INF-70: the per-call [mm_prof]/[mmid_prof] lines are extremely noisy (797 + 144 lines per
+// decode token) and their fprintf cost dominates the measurement.  They now have their own
+// env switch, separate from the aggregate profiler.
+static int ggml_cpu_prof_mm_flag = -1;
+// INF-70 D0-b: sync events per token, MEASURED rather than derived from the node table.
+// Only thread 0 increments, so there is no shared-cacheline traffic on the barrier path.
+static uint64_t ggml_cpu_prof_barriers   = 0;   // ggml_barrier() calls seen by thread 0
+static int      ggml_cpu_prof_barrier_on = 0;   // set by thread 0 for accumulated graphs only
+static inline int ggml_cpu_prof_mm_enabled(void) {
+    if (ggml_cpu_prof_mm_flag < 0) {
+        ggml_cpu_prof_mm_flag = getenv("GGML_CPU_PROF_MM") != NULL ? 1 : 0;
+    }
+    return ggml_cpu_prof_mm_flag;
+}
+#endif
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
@@ -209,6 +228,8 @@ typedef pthread_t ggml_thread_t;
 #include <unistd.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
+
+
 #endif
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -574,6 +595,13 @@ static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+#ifdef GGML_CPU_PROF
+#ifdef GGML_USE_OPENMP
+    if (ggml_cpu_prof_barrier_on && omp_get_thread_num() == 0) {
+        ggml_cpu_prof_barriers++;
+    }
+#endif
+#endif
     if (n_threads == 1) {
         return;
     }
@@ -1292,7 +1320,7 @@ void ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
 #ifdef GGML_CPU_PROF
-    const int64_t mm_t0 = getenv("GGML_CPU_PROF") ? ggml_time_us() : 0;
+    const int64_t mm_t0 = ggml_cpu_prof_mm_enabled() ? ggml_time_us() : 0;
 #endif
 
 #if defined(GGML_USE_IQK_MULMAT)
@@ -1595,7 +1623,7 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_as  = ne02;       // n_expert
 
 #ifdef GGML_CPU_PROF
-    const int64_t mmid_t0 = ggml_time_us();
+    const int64_t mmid_t0 = ggml_cpu_prof_mm_enabled() ? ggml_time_us() : 0;
     int64_t mmid_t_quant = 0, mmid_t_map = 0, mmid_t_dots = 0;
 #endif
 
@@ -1653,7 +1681,7 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 #ifdef GGML_CPU_PROF
-    if (getenv("GGML_CPU_PROF")) mmid_t_quant = ggml_time_us();
+    if (mmid_t0 != 0) mmid_t_quant = ggml_time_us();
 #endif
 
     if (ith == 0) {
@@ -1686,7 +1714,7 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
 #ifdef GGML_CPU_PROF
-    if (getenv("GGML_CPU_PROF")) mmid_t_map = ggml_time_us();
+    if (mmid_t0 != 0) mmid_t_map = ggml_time_us();
 #endif
     ggml_barrier(params->threadpool);
 
@@ -1751,7 +1779,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 #ifdef GGML_CPU_PROF
-    if (getenv("GGML_CPU_PROF") && ith == 0) {
+    if (mmid_t0 != 0 && ith == 0) {
         mmid_t_dots = ggml_time_us();
         fprintf(stderr, "[mmid_prof] type=%-8s ne11=%lld n_as=%d quant=%.0fus map=%.0fus dots=%.0fus total=%.0fus\n",
                 ggml_type_name(type), (long long) ne11, n_as,
@@ -3120,12 +3148,71 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 
 #ifdef GGML_CPU_PROF
 // per-op wall-time profiling, profiling build only; enabled via GGML_CPU_PROF=1
+//
+// INF-70 D0-b/c + B1 extension (2026-09-02):
+//   The original profiler timed ONLY thread-0's compute call, which sits BEFORE the graph
+//   barrier at the bottom of the node loop -- so it could not see barrier wait or straggler
+//   imbalance.  We now take three thread-0 timestamps per node: before compute, after compute,
+//   and AFTER the graph barrier.  compute = t1-t0, wall = t2-t0, (wall-compute) = barrier +
+//   imbalance.  Sums are kept per op type, per node index (decode graphs are shape-stable, so
+//   node index is a stable identity across tokens) and per weight path (dense mul_mat /
+//   expert mul_mat_id / lm_head).  Everything is accumulated across graph evaluations and
+//   dumped once at exit, so prefill can be excluded with GGML_CPU_PROF_SKIP.
+//
+// Env:
+//   GGML_CPU_PROF            enable (any value)
+//   GGML_CPU_PROF_SKIP=N     do not accumulate the first N graph evaluations (prefill/warmup)
+//   GGML_CPU_PROF_NODES      dump the node table (ALL nodes, no 260 cap)
+//   GGML_CPU_PROF_NODES_FILE path for the node table (default stderr)
+//   GGML_CPU_PROF_MM         per-call [mm_prof]/[mmid_prof] in-function lines (very noisy)
 static uint64_t ggml_cpu_prof_ns[GGML_OP_COUNT];
 static uint64_t ggml_cpu_prof_cnt[GGML_OP_COUNT];
+static uint64_t ggml_cpu_prof_wall_ns[GGML_OP_COUNT];
+static uint64_t ggml_cpu_prof_t1_cnt[GGML_OP_COUNT];   // nodes of this op with n_tasks == 1
 static uint64_t ggml_cpu_prof_fused_ns = 0;
+static uint64_t ggml_cpu_prof_fused_wall_ns = 0;
 static uint64_t ggml_cpu_prof_fused_cnt = 0;
 static uint64_t ggml_cpu_prof_total_ns = 0;
+static uint64_t ggml_cpu_prof_total_wall_ns = 0;
 static int      ggml_cpu_prof_enabled = -1;
+
+// per-node-index accumulators (stable across shape-identical decode graphs)
+static uint64_t * ggml_cpu_prof_node_ns      = NULL;
+static uint64_t * ggml_cpu_prof_node_wall_ns = NULL;
+static uint64_t * ggml_cpu_prof_node_cnt     = NULL;
+static int        ggml_cpu_prof_node_cap     = 0;
+
+// weight-path totals: 0 = dense mul_mat, 1 = expert mul_mat_id, 2 = lm_head mul_mat
+#define GGML_CPU_PROF_NPATH 3
+static uint64_t ggml_cpu_prof_path_ns[GGML_CPU_PROF_NPATH];
+static uint64_t ggml_cpu_prof_path_wall_ns[GGML_CPU_PROF_NPATH];
+static uint64_t ggml_cpu_prof_path_bytes[GGML_CPU_PROF_NPATH];
+static uint64_t ggml_cpu_prof_path_cnt[GGML_CPU_PROF_NPATH];
+
+// INF-70 C2: the atexit dump must NEVER dereference the cgraph -- by then llama_free has
+// released the sched's context and the tensors are freed memory (this is the campaign's
+// "post-compute dump of freed memory" failure class, and it did segfault the first run).
+// Snapshot everything the dump needs, once, at setup time.
+struct ggml_cpu_prof_meta {
+    int     op;
+    int     s0_type;
+    int64_t s0_ne[3];
+    int64_t ne[3];
+    char    name[GGML_MAX_NAME];
+};
+static struct ggml_cpu_prof_meta * ggml_cpu_prof_meta = NULL;
+static int                         ggml_cpu_prof_meta_n = 0;
+
+static uint64_t ggml_cpu_prof_graph_idx     = 0;   // graph evaluations seen
+static uint64_t ggml_cpu_prof_graphs_acc    = 0;   // graph evaluations accumulated
+static int      ggml_cpu_prof_skip          = -1;
+static int      ggml_cpu_prof_nodes_written = 0;
+static int      ggml_cpu_prof_atexit_done   = 0;
+static int ggml_cpu_prof_last_nnodes = 0;
+
+// lm_head identification: the MUL_MAT whose src0 has ne[1] == the vocab size.  We do not
+// hardcode 248320: the widest MUL_MAT src0 ne[1] in the graph is the output projection.
+static int64_t ggml_cpu_prof_lm_head_ne1 = 0;
 
 static bool ggml_cpu_prof_is_enabled(void) {
     if (ggml_cpu_prof_enabled < 0) {
@@ -3134,54 +3221,267 @@ static bool ggml_cpu_prof_is_enabled(void) {
     return ggml_cpu_prof_enabled != 0;
 }
 
+static void ggml_cpu_prof_reset(void) __attribute__((unused));
 static void ggml_cpu_prof_reset(void) {
     memset(ggml_cpu_prof_ns, 0, sizeof(ggml_cpu_prof_ns));
     memset(ggml_cpu_prof_cnt, 0, sizeof(ggml_cpu_prof_cnt));
+    memset(ggml_cpu_prof_wall_ns, 0, sizeof(ggml_cpu_prof_wall_ns));
+    memset(ggml_cpu_prof_t1_cnt, 0, sizeof(ggml_cpu_prof_t1_cnt));
+    memset(ggml_cpu_prof_path_ns, 0, sizeof(ggml_cpu_prof_path_ns));
+    memset(ggml_cpu_prof_path_wall_ns, 0, sizeof(ggml_cpu_prof_path_wall_ns));
+    memset(ggml_cpu_prof_path_bytes, 0, sizeof(ggml_cpu_prof_path_bytes));
+    memset(ggml_cpu_prof_path_cnt, 0, sizeof(ggml_cpu_prof_path_cnt));
+    if (ggml_cpu_prof_node_cap > 0) {
+        memset(ggml_cpu_prof_node_ns,      0, ggml_cpu_prof_node_cap*sizeof(uint64_t));
+        memset(ggml_cpu_prof_node_wall_ns, 0, ggml_cpu_prof_node_cap*sizeof(uint64_t));
+        memset(ggml_cpu_prof_node_cnt,     0, ggml_cpu_prof_node_cap*sizeof(uint64_t));
+    }
     ggml_cpu_prof_fused_ns = 0;
+    ggml_cpu_prof_fused_wall_ns = 0;
     ggml_cpu_prof_fused_cnt = 0;
     ggml_cpu_prof_total_ns = 0;
+    ggml_cpu_prof_total_wall_ns = 0;
+    ggml_cpu_prof_graphs_acc = 0;
 }
 
-static void ggml_cpu_prof_dump(const struct ggml_cgraph * cgraph) {
-    if (ggml_cpu_prof_total_ns == 0) {
+static int ggml_cpu_prof_skip_graphs(void) {
+    if (ggml_cpu_prof_skip < 0) {
+        const char * e = getenv("GGML_CPU_PROF_SKIP");
+        ggml_cpu_prof_skip = e ? atoi(e) : 0;
+    }
+    return ggml_cpu_prof_skip;
+}
+
+static void ggml_cpu_prof_ensure_nodes(int n) {
+    if (n <= ggml_cpu_prof_node_cap) {
         return;
     }
-    fprintf(stderr, "[ggml_cpu_prof] graph n_nodes=%d n_tokens_ctx=%zu wall_total=%.1f ms (fused: %llu ops / %.1f ms)\n",
-            cgraph->n_nodes, (size_t) cgraph->nodes[0]->ne[0],
-            ggml_cpu_prof_total_ns/1e3, (unsigned long long) ggml_cpu_prof_fused_cnt, ggml_cpu_prof_fused_ns/1e3);
+    const int cap = n;
+    ggml_cpu_prof_node_ns      = (uint64_t *) realloc(ggml_cpu_prof_node_ns,      cap*sizeof(uint64_t));
+    ggml_cpu_prof_node_wall_ns = (uint64_t *) realloc(ggml_cpu_prof_node_wall_ns, cap*sizeof(uint64_t));
+    ggml_cpu_prof_node_cnt     = (uint64_t *) realloc(ggml_cpu_prof_node_cnt,     cap*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_ns      + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_wall_ns + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_cnt     + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    ggml_cpu_prof_node_cap = cap;
+}
 
-    if (getenv("GGML_CPU_PROF_NODES") != NULL) {
-        for (int i = 0; i < cgraph->n_nodes && i < 260; i++) {
-            struct ggml_tensor * node = cgraph->nodes[i];
-            fprintf(stderr, "[ggml_node_%04d] op=%-14s type=%-8s ne=[%zu x %zu x %zu x %zu] src0=%s src1=%s\n",
-                    i, ggml_op_name(node->op), ggml_type_name(node->type),
-                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
-                    node->src[0] ? ggml_op_name(node->src[0]->op) : "-",
-                    node->src[1] ? ggml_op_name(node->src[1]->op) : "-");
+static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
+    free(ggml_cpu_prof_meta);
+    ggml_cpu_prof_meta   = (struct ggml_cpu_prof_meta *) calloc(cgraph->n_nodes, sizeof(struct ggml_cpu_prof_meta));
+    ggml_cpu_prof_meta_n = ggml_cpu_prof_meta ? cgraph->n_nodes : 0;
+    for (int i = 0; i < ggml_cpu_prof_meta_n; i++) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        const struct ggml_tensor * s0 = nd->src[0];
+        struct ggml_cpu_prof_meta * m = &ggml_cpu_prof_meta[i];
+        m->op      = (int) nd->op;
+        m->s0_type = s0 ? (int) s0->type : -1;
+        for (int k = 0; k < 3; k++) {
+            m->s0_ne[k] = s0 ? s0->ne[k] : 0;
+            m->ne[k]    = nd->ne[k];
         }
+        snprintf(m->name, sizeof(m->name), "%s", nd->name);
+    }
+}
+
+// bytes of weight streamed by one node, 0 for ops that do not stream a weight slab
+static uint64_t ggml_cpu_prof_node_bytes(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT) {
+        return (uint64_t) ggml_nbytes(node->src[0]);
+    }
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const struct ggml_tensor * ids = node->src[2];
+        if (!ids) {
+            return 0;
+        }
+        // only the used experts' slabs are touched: n_expert_used * n_tokens * nb02
+        return (uint64_t) ids->ne[0] * (uint64_t) ids->ne[1] * (uint64_t) node->src[0]->nb[2];
+    }
+    return 0;
+}
+
+// path index for a node, or -1
+static int ggml_cpu_prof_node_path(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        return 1;
+    }
+    if (node->op == GGML_OP_MUL_MAT) {
+        if (ggml_cpu_prof_lm_head_ne1 != 0 && node->src[0]->ne[1] == ggml_cpu_prof_lm_head_ne1) {
+            return 2;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static void ggml_cpu_prof_write_nodes(const struct ggml_cgraph * cgraph, int n_threads) {
+    if (getenv("GGML_CPU_PROF_NODES") == NULL || ggml_cpu_prof_nodes_written) {
+        return;
+    }
+    ggml_cpu_prof_nodes_written = 1;
+
+    const char * path = getenv("GGML_CPU_PROF_NODES_FILE");
+    FILE * f = stderr;
+    if (path) {
+        f = fopen(path, "w");
+        if (!f) { f = stderr; }
     }
 
-    struct { int op; uint64_t ns; uint64_t cnt; } rows[GGML_OP_COUNT];
+    fprintf(f, "# INF-70 node table: one line per graph node, n_nodes=%d n_threads=%d\n", cgraph->n_nodes, n_threads);
+    fprintf(f, "# idx\top\tempty\tcompute\tn_tasks\tdst_type\tdst_ne\t"
+               "src0_op\tsrc0_type\tsrc0_ne\tsrc0_view\tsrc0_cont\t"
+               "src1_op\tsrc1_type\tsrc1_ne\tsrc1_view\tsrc1_cont\t"
+               "src2_ne0\tsrc2_ne1\tbytes\tname\n");
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        const struct ggml_tensor * s0 = n->src[0];
+        const struct ggml_tensor * s1 = n->src[1];
+        const struct ggml_tensor * s2 = n->src[2];
+        const int empty   = ggml_op_is_empty(n->op) ? 1 : 0;
+        const int compute = (n->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0;
+        fprintf(f,
+            "%d\t%s\t%d\t%d\t%d\t%s\t%lld,%lld,%lld,%lld\t"
+            "%s\t%s\t%lld,%lld,%lld,%lld\t%d\t%d\t"
+            "%s\t%s\t%lld,%lld,%lld,%lld\t%d\t%d\t"
+            "%lld\t%lld\t%llu\t%s\n",
+            i, ggml_op_name(n->op), empty, compute,
+            ggml_get_n_tasks((struct ggml_tensor *) n, n_threads),
+            ggml_type_name(n->type),
+            (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+            s0 ? ggml_op_name(s0->op) : "-", s0 ? ggml_type_name(s0->type) : "-",
+            s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0,
+            s0 ? (long long) s0->ne[2] : 0, s0 ? (long long) s0->ne[3] : 0,
+            s0 ? (s0->view_src != NULL) : 0, s0 ? ggml_is_contiguous(s0) : 0,
+            s1 ? ggml_op_name(s1->op) : "-", s1 ? ggml_type_name(s1->type) : "-",
+            s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0,
+            s1 ? (long long) s1->ne[2] : 0, s1 ? (long long) s1->ne[3] : 0,
+            s1 ? (s1->view_src != NULL) : 0, s1 ? ggml_is_contiguous(s1) : 0,
+            s2 ? (long long) s2->ne[0] : 0, s2 ? (long long) s2->ne[1] : 0,
+            (unsigned long long) ggml_cpu_prof_node_bytes(n),
+            n->name);
+    }
+    fflush(f);
+    if (f != stderr) {
+        fclose(f);
+    }
+}
+
+static void ggml_cpu_prof_dump(void) {
+    const uint64_t G = ggml_cpu_prof_graphs_acc;
+    if (G == 0 || ggml_cpu_prof_total_wall_ns == 0) {
+        return;
+    }
+    const double g = (double) G;
+
+    fprintf(stderr, "\n[cpu_prof] ==== INF-70 profile: %llu graph evals accumulated (skipped first %d) ====\n",
+            (unsigned long long) G, ggml_cpu_prof_skip_graphs());
+    fprintf(stderr, "[cpu_prof] per graph eval: thread0_compute %.3f ms | wall(compute+barrier) %.3f ms | n_nodes %d\n",
+            ggml_cpu_prof_total_ns/1e3/g, ggml_cpu_prof_total_wall_ns/1e3/g,
+            ggml_cpu_prof_last_nnodes);
+    fprintf(stderr, "[cpu_prof] fused (RMS_NORM+MUL): %.1f ops/eval  compute %.3f ms  wall %.3f ms\n",
+            ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/1e3/g, ggml_cpu_prof_fused_wall_ns/1e3/g);
+    fprintf(stderr, "[cpu_prof] SYNC measured ggml_barrier() calls per graph eval: %.1f\n",
+            ggml_cpu_prof_barriers/g);
+
+    // ---- per op type, sorted by wall ----
+    struct { int op; uint64_t ns; uint64_t wall; uint64_t cnt; uint64_t t1; } rows[GGML_OP_COUNT];
     int n_rows = 0;
     for (int i = 0; i < GGML_OP_COUNT; i++) {
         if (ggml_cpu_prof_cnt[i] > 0) {
-            rows[n_rows++] = (typeof(rows[0])) { i, ggml_cpu_prof_ns[i], ggml_cpu_prof_cnt[i] };
+            rows[n_rows].op   = i;
+            rows[n_rows].ns   = ggml_cpu_prof_ns[i];
+            rows[n_rows].wall = ggml_cpu_prof_wall_ns[i];
+            rows[n_rows].cnt  = ggml_cpu_prof_cnt[i];
+            rows[n_rows].t1   = ggml_cpu_prof_t1_cnt[i];
+            n_rows++;
         }
     }
     for (int i = 0; i < n_rows; i++) {
         for (int j = i + 1; j < n_rows; j++) {
-            if (rows[j].ns > rows[i].ns) {
+            if (rows[j].wall > rows[i].wall) {
                 typeof(rows[0]) tmp = rows[i]; rows[i] = rows[j]; rows[j] = tmp;
             }
         }
     }
-    for (int i = 0; i < n_rows && i < 25; i++) {
-        fprintf(stderr, "[ggml_cpu_prof] %6.2f%% %7.2f ms %8llu x %-24s (avg %7.2f us)\n",
-                100.0*rows[i].ns/ggml_cpu_prof_total_ns, rows[i].ns/1e3,
-                (unsigned long long) rows[i].cnt, ggml_op_name(rows[i].op),
-                (double) rows[i].ns / 1e3 / rows[i].cnt);
+    fprintf(stderr, "[cpu_prof] OPTABLE\top\tcount_per_eval\tcompute_ms\twall_ms\tdelta_ms\tpct_wall\tn_tasks1_count\tavg_wall_us\n");
+    for (int i = 0; i < n_rows; i++) {
+        fprintf(stderr, "[cpu_prof] OPROW\t%s\t%.1f\t%.4f\t%.4f\t%.4f\t%.2f\t%.1f\t%.2f\n",
+                ggml_op_name(rows[i].op), rows[i].cnt/g,
+                rows[i].ns/1e3/g,   /* ggml_time_us() -> counters are microseconds */
+                rows[i].wall/1e3/g,
+                (double)(rows[i].wall - rows[i].ns)/1e3/g,
+                100.0*rows[i].wall/ggml_cpu_prof_total_wall_ns,
+                rows[i].t1/g,
+                (double) rows[i].wall / rows[i].cnt);
+    }
+
+    // ---- per weight path ----
+    static const char * pname[GGML_CPU_PROF_NPATH] = { "dense_mul_mat", "expert_mul_mat_id", "lm_head" };
+    fprintf(stderr, "[cpu_prof] PATHTABLE\tpath\tcalls_per_eval\tcompute_ms\twall_ms\tbytes_per_eval\tGBs_on_compute\tGBs_on_wall\n");
+    for (int i = 0; i < GGML_CPU_PROF_NPATH; i++) {
+        if (ggml_cpu_prof_path_cnt[i] == 0) continue;
+        const double bytes = ggml_cpu_prof_path_bytes[i]/g;
+        const double cms   = ggml_cpu_prof_path_ns[i]/1e3/g;
+        const double wms   = ggml_cpu_prof_path_wall_ns[i]/1e3/g;
+        fprintf(stderr, "[cpu_prof] PATHROW\t%s\t%.1f\t%.4f\t%.4f\t%.0f\t%.2f\t%.2f\n",
+                pname[i], ggml_cpu_prof_path_cnt[i]/g, cms, wms, bytes,
+                cms > 0 ? bytes/1e9/(cms/1e3) : 0.0,
+                wms > 0 ? bytes/1e9/(wms/1e3) : 0.0);
+    }
+
+    // ---- per node index, sorted by wall, top 64 (from the SNAPSHOT, never the cgraph) ----
+    if (ggml_cpu_prof_meta_n > 0 && ggml_cpu_prof_node_cap > 0) {
+        int n = ggml_cpu_prof_meta_n < ggml_cpu_prof_node_cap ? ggml_cpu_prof_meta_n : ggml_cpu_prof_node_cap;
+        int * idx = (int *) malloc(n*sizeof(int));
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+            if (ggml_cpu_prof_node_cnt[i] > 0) idx[m++] = i;
+        }
+        for (int i = 0; i < m; i++) {
+            for (int j = i + 1; j < m; j++) {
+                if (ggml_cpu_prof_node_wall_ns[idx[j]] > ggml_cpu_prof_node_wall_ns[idx[i]]) {
+                    int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+                }
+            }
+        }
+        fprintf(stderr, "[cpu_prof] NODETABLE\tidx\top\tname\tsrc0_type\tsrc0_ne\tdst_ne\tcompute_us\twall_us\tdelta_us\n");
+        for (int i = 0; i < m && i < 64; i++) {
+            const int k = idx[i];
+            const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[k];
+            fprintf(stderr, "[cpu_prof] NODEROW\t%d\t%s\t%s\t%s\t%lld,%lld,%lld\t%lld,%lld,%lld\t%.2f\t%.2f\t%.2f\n",
+                    k, ggml_op_name((enum ggml_op) md->op), md->name,
+                    md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                    (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                    (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
+                    ggml_cpu_prof_node_ns[k]/g, ggml_cpu_prof_node_wall_ns[k]/g,
+                    (double)(ggml_cpu_prof_node_wall_ns[k] - ggml_cpu_prof_node_ns[k])/g);
+        }
+        const char * pf = getenv("GGML_CPU_PROF_PERNODE_FILE");
+        if (pf) {
+            FILE * f = fopen(pf, "w");
+            if (f) {
+                fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals\n");
+                for (int i = 0; i < n; i++) {
+                    if (ggml_cpu_prof_node_cnt[i] == 0) continue;
+                    const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[i];
+                    fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu\n",
+                            i, ggml_op_name((enum ggml_op) md->op), md->name,
+                            md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                            (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                            (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
+                            ggml_cpu_prof_node_ns[i]/g, ggml_cpu_prof_node_wall_ns[i]/g,
+                            (unsigned long long) ggml_cpu_prof_node_cnt[i]);
+                }
+                fclose(f);
+            }
+        }
+        free(idx);
     }
     fflush(stderr);
+}
+
+static void ggml_cpu_prof_atexit(void) {
+    ggml_cpu_prof_dump();
 }
 #endif
 
@@ -3247,6 +3547,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+#ifdef GGML_CPU_PROF
+    // INF-70: one-time-per-graph-eval setup, thread 0 only.  prof_acc says whether this
+    // evaluation is accumulated (GGML_CPU_PROF_SKIP excludes prefill/warmup graphs).
+    int prof_acc = 0;
+    if (state->ith == 0 && ggml_cpu_prof_is_enabled()) {
+        const uint64_t gi = ggml_cpu_prof_graph_idx++;
+        prof_acc = (gi >= (uint64_t) ggml_cpu_prof_skip_graphs()) ? 1 : 0;
+        ggml_cpu_prof_barrier_on = prof_acc;
+        if (prof_acc) {
+            if (ggml_cpu_prof_graphs_acc == 0) {
+                // widest MUL_MAT src0 ne[1] in the graph == the output projection (lm_head)
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const struct ggml_tensor * nd = cgraph->nodes[i];
+                    if (nd->op == GGML_OP_MUL_MAT && nd->src[0] &&
+                        nd->src[0]->ne[1] > ggml_cpu_prof_lm_head_ne1) {
+                        ggml_cpu_prof_lm_head_ne1 = nd->src[0]->ne[1];
+                    }
+                }
+                ggml_cpu_prof_snapshot_meta(cgraph);
+                ggml_cpu_prof_write_nodes(cgraph, params.nth);
+                if (!ggml_cpu_prof_atexit_done) {
+                    ggml_cpu_prof_atexit_done = 1;
+                    atexit(ggml_cpu_prof_atexit);
+                }
+            }
+            ggml_cpu_prof_ensure_nodes(cgraph->n_nodes);
+            ggml_cpu_prof_graphs_acc++;
+            ggml_cpu_prof_last_nnodes = cgraph->n_nodes;
+        }
+        fprintf(stderr, "[cpu_prof] graph_eval idx=%llu n_nodes=%d nth=%d acc=%d\n",
+                (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
+    }
+#endif
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3260,7 +3594,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
 #ifdef GGML_CPU_PROF
-        const int64_t t0 = (state->ith == 0 && ggml_cpu_prof_is_enabled()) ? ggml_time_us() : 0;
+        const int64_t t0 = (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) ? ggml_time_us() : 0;
+#endif
+
+#ifdef GGML_CPU_PROF
+        const int prof_node_idx = node_n;
 #endif
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -3273,17 +3611,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
 #ifdef GGML_CPU_PROF
-        if (t0 != 0) {
-            const uint64_t dt = ggml_time_us() - t0;
-            ggml_cpu_prof_total_ns += dt;
-            if (n_fused > 0) {
-                ggml_cpu_prof_fused_ns += dt;
-                ggml_cpu_prof_fused_cnt++;
-            } else {
-                ggml_cpu_prof_ns[node->op] += dt;
-                ggml_cpu_prof_cnt[node->op]++;
-            }
-        }
+        const int64_t t1 = (t0 != 0) ? ggml_time_us() : 0;
 #endif
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3295,14 +3623,44 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
-    }
 
 #ifdef GGML_CPU_PROF
-    if (state->ith == 0 && ggml_cpu_prof_is_enabled()) {
-        ggml_cpu_prof_dump(cgraph);
-        ggml_cpu_prof_reset();
-    }
+        // INF-70 D0-c: t2 is taken AFTER the graph barrier, so (t2-t0) is this node's
+        // wall cost including straggler wait and the barrier itself.  (t1-t0) is thread-0
+        // compute only -- what the pre-2026-09-02 profiler could see.
+        if (t0 != 0) {
+            const uint64_t dt   = (uint64_t)(t1 - t0);
+            const uint64_t wall = (uint64_t)(ggml_time_us() - t0);
+            ggml_cpu_prof_total_ns      += dt;
+            ggml_cpu_prof_total_wall_ns += wall;
+            if (prof_node_idx < ggml_cpu_prof_node_cap) {
+                ggml_cpu_prof_node_ns[prof_node_idx]      += dt;
+                ggml_cpu_prof_node_wall_ns[prof_node_idx] += wall;
+                ggml_cpu_prof_node_cnt[prof_node_idx]     += 1;
+            }
+            if (n_fused > 0) {
+                ggml_cpu_prof_fused_ns      += dt;
+                ggml_cpu_prof_fused_wall_ns += wall;
+                ggml_cpu_prof_fused_cnt++;
+            } else {
+                ggml_cpu_prof_ns[node->op]      += dt;
+                ggml_cpu_prof_wall_ns[node->op] += wall;
+                ggml_cpu_prof_cnt[node->op]++;
+                if (ggml_get_n_tasks(node, params.nth) == 1) {
+                    ggml_cpu_prof_t1_cnt[node->op]++;
+                }
+                const int path = ggml_cpu_prof_node_path(node);
+                if (path >= 0) {
+                    ggml_cpu_prof_path_ns[path]      += dt;
+                    ggml_cpu_prof_path_wall_ns[path] += wall;
+                    ggml_cpu_prof_path_bytes[path]   += ggml_cpu_prof_node_bytes(node);
+                    ggml_cpu_prof_path_cnt[path]++;
+                }
+            }
+        }
 #endif
+    }
+
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
