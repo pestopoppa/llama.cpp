@@ -1155,6 +1155,12 @@ void llama_context::set_embeddings(bool value) {
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
+    // INF-70 E2a diagnostic only: force the gathered (masked) nextn export so the
+    // arch graph keeps its normal last-layer inp_out_ids gather. Not a fix.
+    if (value && getenv("LLAMA_MTP_DIAG_FORCE_MASKED") != NULL) {
+        masked = true;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     cparams.embeddings_nextn        = value;
