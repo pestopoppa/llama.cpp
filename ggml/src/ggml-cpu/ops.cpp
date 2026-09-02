@@ -5072,6 +5072,60 @@ void ggml_compute_forward_cont(
 
 // ggml_compute_forward_get_rows
 
+// Work split for get_rows.
+//
+// The kernels below used to split only over the gathered rows. The hot get_rows nodes in
+// decode gather ONE very long row (e.g. 786432 f32 = 3 MB, the PLE n-gram table), so a
+// row-only split leaves the whole copy on thread 0 (measured: 9.34 ms/token, 9.7%, INF-70 D0).
+// Here the work is enumerated as (row, column-chunk) pairs and dealt out to the threads, so
+// every output element is written by exactly one thread from the same source bytes as the
+// single-threaded version -> bit-identical by construction (pure copies / per-row dequant).
+//
+// `align` is the element granularity a column chunk must respect (the block size for
+// quantized sources, so a chunk always starts on a block boundary).
+
+struct ggml_get_rows_split {
+    int64_t ncc;    // column chunks per row
+    int64_t cstep;  // elements per column chunk
+    int64_t t0;     // first (row, chunk) task of this thread
+    int64_t t1;     // one past the last
+};
+
+static struct ggml_get_rows_split ggml_get_rows_split_init(
+        int64_t nr, int64_t nc, int ith, int nth, int64_t align) {
+
+    // minimum useful chunk, in elements
+    const int64_t min_chunk = 64;
+
+    int64_t ncc   = 1;
+    int64_t cstep = nc;
+
+    if (nth > 1 && nr < nth && nc > min_chunk && align > 0) {
+        ncc = (nth + nr - 1)/nr;                              // enough chunks to occupy every thread
+        cstep = (nc + ncc - 1)/ncc;
+        cstep = ((cstep + align - 1)/align)*align;            // keep chunks block-aligned
+        if (cstep < align) {
+            cstep = align;
+        }
+        ncc = (nc + cstep - 1)/cstep;                         // drop chunks the rounding emptied
+        if (ncc < 1) {
+            ncc = 1;
+            cstep = nc;
+        }
+    }
+
+    const int64_t nt = nr*ncc;
+    const int64_t dt = (nt + nth - 1)/nth;
+
+    struct ggml_get_rows_split split;
+    split.ncc   = ncc;
+    split.cstep = cstep;
+    split.t0    = dt*ith;
+    split.t1    = MIN(split.t0 + dt, nt);
+
+    return split;
+}
+
 static void ggml_compute_forward_get_rows_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5095,14 +5149,19 @@ static void ggml_compute_forward_get_rows_q(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const int64_t blck = ggml_blck_size(type);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, blck);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        const int64_t i  = t/split.ncc;
+        const int64_t ic0 = (t - i*split.ncc)*split.cstep;
+        const int64_t ic1 = MIN(ic0 + split.cstep, nc);
+
+        if (ic0 >= ic1) {
+            continue;
+        }
+
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -5111,8 +5170,8 @@ static void ggml_compute_forward_get_rows_q(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03 + (ic0/blck)*nb00),
+                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0, ic1 - ic0);
     }
 }
 
@@ -5136,14 +5195,17 @@ static void ggml_compute_forward_get_rows_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        const int64_t i  = t/split.ncc;
+        const int64_t ic0 = (t - i*split.ncc)*split.cstep;
+        const int64_t ic1 = MIN(ic0 + split.cstep, nc);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
+        if (ic0 >= ic1) {
+            continue;
+        }
+
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -5152,8 +5214,8 @@ static void ggml_compute_forward_get_rows_f16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0,
+                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0, ic1 - ic0);
     }
 }
 
@@ -5177,14 +5239,17 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        const int64_t i  = t/split.ncc;
+        const int64_t ic0 = (t - i*split.ncc)*split.cstep;
+        const int64_t ic1 = MIN(ic0 + split.cstep, nc);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
+        if (ic0 >= ic1) {
+            continue;
+        }
+
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -5193,8 +5258,8 @@ static void ggml_compute_forward_get_rows_bf16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_bf16_to_fp32(
-            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0,
+                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0, ic1 - ic0);
     }
 }
 
@@ -5218,14 +5283,17 @@ static void ggml_compute_forward_get_rows_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        const int64_t i  = t/split.ncc;
+        const int64_t ic0 = (t - i*split.ncc)*split.cstep;
+        const int64_t ic1 = MIN(ic0 + split.cstep, nc);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
+        if (ic0 >= ic1) {
+            continue;
+        }
+
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -5233,9 +5301,9 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        ggml_vec_cpy_f32(ic1 - ic0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
     }
 }
 

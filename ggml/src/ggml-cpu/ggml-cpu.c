@@ -2280,6 +2280,19 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
+// minimum dst bytes for a multi-threaded get_rows; overridable for testing / tuning
+static int64_t ggml_get_rows_min_bytes(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_GET_ROWS_MIN_BYTES");
+        v = s ? atoll(s) : (64*1024);
+        if (v < 0) {
+            v = 0;
+        }
+    }
+    return v;
+}
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -2407,11 +2420,20 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+            {
+                // the CPU get_rows kernels split the work over (row, column-chunk) pairs, so they
+                // are correct for any n_tasks and bit-identical to the single-threaded result.
+                // Small gathers stay single-task: below ~64 KB of output the barrier and the
+                // thread wake-up cost more than the copy (this is what the old FIXME was about).
+                // INF-70 D8: 175 GET_ROWS/token cost 9.34 ms on one thread, 8.9 ms of it in 72
+                // nodes that gather a single 3 MB / 120 KB f32 row.
+                n_tasks = ggml_nbytes(node) >= ggml_get_rows_min_bytes() ? n_threads : 1;
+            } break;
         case GGML_OP_SET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
+                // NOT parallelised: set_rows splits over source rows, but two source rows may
+                // carry the SAME destination index, so threads are not provably disjoint on the
+                // destination. Measured cost is 0.011 ms/token (INF-70 D0) - nothing to win.
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
