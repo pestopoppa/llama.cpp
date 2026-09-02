@@ -1983,10 +1983,27 @@ bool llama_model_qwen4exp::supports_fused_decode() const {
         if (t->buffer == nullptr) return false;
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
         if (buft == nullptr)      return false;
+        // The device is usable only as a NEGATIVE test: ggml_backend_cpu_buffer_type()
+        // ships with `.device = NULL` behind an upstream FIXME
+        // (ggml/src/ggml-backend.cpp: "// FIXME ggml_backend_reg_dev_get(...)"), so
+        // requiring a CPU device here refuses every host tensor. Measured
+        // 2026-09-02: that is exactly what happened — "tensor 'token_embd.weight'
+        // is not CPU-resident" and all three fused arms silently fell back to the
+        // graph, at x1.00 and a bit-identical logit diff.
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        // a buffer with no device is not something this path can reason about
-        if (dev == nullptr)       return false;
-        return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+        // The positive test is host memory. The plain CPU buffer types implement
+        // is_host; CPU_REPACK does not implement it but IS host memory by
+        // construction (its own kernels dereference tensor->data directly), and
+        // since A1 the fused path dispatches those through
+        // ggml_cpu_extra_compute_forward() rather than reading their rows itself.
+        if (ggml_backend_buft_is_host(buft)) {
+            return true;
+        }
+        const char * bn = ggml_backend_buft_name(buft);
+        return bn != nullptr && strcmp(bn, "CPU_REPACK") == 0;
     };
 
     // (1) + (2) over every loaded tensor
