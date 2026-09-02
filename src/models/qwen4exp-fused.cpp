@@ -140,6 +140,28 @@ using ggml_type_traits_cpu = struct ggml_type_traits_cpu;
 
 // ---- helpers mirroring the graph's batch-1 kernels -------------------------
 
+// Read a small dense weight tensor into F32 regardless of its stored type.
+// The fused path dereferences several of these directly as `(const float *)
+// t->data`, which is only correct when the quantizer left them F32. On the
+// uniform IQ4_XS artifact blk.N.ple_conv1d is **F16** [4, 10240], so the PLE
+// depthwise conv was reading 160 KB of F16 pairs as 40,960 floats — running
+// 81 KB past the tensor into whatever followed it in the weight buffer. (In
+// bounds of the model buffer, hence no crash: a silent wrong result.)
+static const float * fused_weights_f32(const struct ggml_tensor * t, std::vector<float> & tmp) {
+    if (t->type == GGML_TYPE_F32) {
+        return (const float *) t->data;
+    }
+    const int64_t n = ggml_nelements(t);
+    tmp.resize((size_t) n);
+    if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * h = (const ggml_fp16_t *) t->data;
+        for (int64_t i = 0; i < n; i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
+    } else {
+        ggml_get_type_traits(t->type)->to_float(t->data, tmp.data(), n);
+    }
+    return tmp.data();
+}
+
 // ---- A1: the batched mul_mat ----------------------------------------------
 //
 // Every projection in the fused path used to be a per-row `vec_dot` loop. That
@@ -849,10 +871,12 @@ void fused_gdn_layer(
         window[i * d_conv + (d_conv - 1)] = qkv[i];
     }
     std::vector<float> conv_out(n_ch);
+    std::vector<float> ssm_cw_tmp;
+    const float * ssm_cw = fused_weights_f32(L.ssm_conv1d, ssm_cw_tmp);
     for (int64_t i = 0; i < n_ch; i++) {
         float sumf = 0.0f;
         for (int64_t k = 0; k < d_conv; k++) {
-            sumf += window[i * d_conv + k] * ((const float *) L.ssm_conv1d->data)[k + i * d_conv];
+            sumf += window[i * d_conv + k] * ssm_cw[k + i * d_conv];
         }
         conv_out[i] = sumf;
     }
@@ -1818,7 +1842,9 @@ void fused_ple(
     const int64_t kern = hp.ple_conv_kernel;
     const int64_t dil = hp.ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
-    const float * w = (const float *) L.ple_conv1d->data;
+    // BUGFIX (INF-70): ple_conv1d is F16 on the uniform IQ4_XS artifact
+    std::vector<float> ple_cw_tmp;
+    const float * w = fused_weights_f32(L.ple_conv1d, ple_cw_tmp);
     std::vector<float> conv_out(hc_dim);
     {
         // the window: state + the current norm_conv, in the graph's channel-major
