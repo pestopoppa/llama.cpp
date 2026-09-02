@@ -1340,8 +1340,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the fused decode fast path (INF-64): single-token decode on a fully
     // CPU-resident model runs the fused layer functions instead of the graph;
     // any failure falls through to the graph path below
+    // the fused path produces logits only; it exports no t_h_nextn, so an MTP
+    // draft target must stay on the graph path or the draft head sees no hidden state
     if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
-            gtype == LLM_GRAPH_TYPE_DEFAULT &&
+            gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
         // snapshot the previous graph's per-layer inputs (the fused path may
         // compare against them for layer-level isolation; the reset clears them)

@@ -2186,7 +2186,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen35 =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2439,6 +2439,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
