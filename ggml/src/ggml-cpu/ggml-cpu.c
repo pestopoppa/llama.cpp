@@ -1189,6 +1189,39 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// INF-70 D1: the mul_mat chunk plan, factored out unchanged so the batch-1 fast path
+// can decide *before* quantizing src1 whether the shared chunk counter is ever read.
+static inline void ggml_mul_mat_chunk_plan(
+        const int64_t nr0, const int64_t nr1, const int nth,
+        int64_t * nchunk0, int64_t * nchunk1) {
+
+    // Now select a reasonable chunk size.
+    int chunk_size = 16;
+
+    // We need to step up the size if it's small
+    if (nr0 == 1 || nr1 == 1) {
+        chunk_size = 64;
+    }
+
+    // distribute the work across the inner or outer loop based on which one is larger
+    // The number of chunks in the 0/1 dim.
+    // CEIL(nr0/chunk_size)
+    int64_t c0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t c1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
+    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
+    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
+    if (c0 * c1 < nth * 4 || ggml_is_numa()) {
+        // distribute the thread work across the inner or outer loop based on which one is larger
+        c0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+        c1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+    }
+
+    *nchunk0 = c0;
+    *nchunk1 = c1;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1197,7 +1230,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir0_start,
     const int64_t ir0_end,
     const int64_t ir1_start,
-    const int64_t ir1_end) {
+    const int64_t ir1_end,
+    const void * src1_wdata) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1220,7 +1254,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    // INF-70 D1: src1_wdata is params->wdata on the shared path and this thread's private
+    // slice on the batch-1 path; identical bytes either way.
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : src1_wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
@@ -1360,6 +1396,32 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
+    // INF-70 D1: batch-1 fast path — drop the internal barrier.
+    //
+    // With a single src1 row the stock code splits that row's blocks across all nth
+    // threads (10 Q8_K blocks for 48 threads: 38 threads quantize nothing) and then pays
+    // a full-team ggml_barrier. Instead every thread converts the WHOLE row into its own
+    // private slice of wdata and reads its own copy in the dot loop, so nothing has to be
+    // published between threads and the barrier disappears.
+    //
+    // The barrier also publishes threadpool->current_chunk, initialised by ith==0. It is
+    // only ever *read* when nth < nchunk0*nchunk1 (otherwise the chunk loop breaks after
+    // the first chunk), so the fast path additionally requires nth >= nchunk0*nchunk1 —
+    // then the counter is provably dead and needs no initialisation. Bit-exactness: same
+    // from_float over the same whole row, same chunk plan, same vec_dot call order.
+    const int64_t src1_nrows_total = ne11*ne12*ne13;
+
+    int64_t nchunk0 = 0, nchunk1 = 0;
+    ggml_mul_mat_chunk_plan(ne0, ne1*ne2*ne3, nth, &nchunk0, &nchunk1);
+
+    const bool mm_batch1 =
+        src1_nrows_total == 1 &&
+        nth >= nchunk0*nchunk1 &&
+        (src1->type == vec_dot_type ||
+         params->wsize >= (size_t) nth * ggml_row_size(vec_dot_type, ne10));
+
+    const void * src1_wdata = params->wdata;
+
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -1370,6 +1432,13 @@ UseGgmlGemm1:;
 
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        if (mm_batch1) {
+            // ne11 == ne12 == ne13 == 1, so the whole of src1 is one row at offset 0.
+            char * wdata_priv = wdata + (size_t) ith * nbw1;
+            from_float((const float *) src1->data, (void *) wdata_priv, ne10);
+            src1_wdata = wdata_priv;
+        } else {
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1395,18 +1464,21 @@ UseGgmlGemm1:;
             }
         }
     #endif
+        } // !mm_batch1
     }
 
-    if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
-    }
+    if (!mm_batch1) {
+        if (ith == 0) {
+            // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
+            atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        }
 
-    ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool);
+    }
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const void* wdata = (src1->type == vec_dot_type) ? src1->data : src1_wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
@@ -1434,28 +1506,9 @@ UseGgmlGemm2:;
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
 
-    // Now select a reasonable chunk size.
-    int chunk_size = 16;
-
-    // We need to step up the size if it's small
-    if (nr0 == 1 || nr1 == 1) {
-        chunk_size = 64;
-    }
-
-    // distribute the work across the inner or outer loop based on which one is larger
-    // The number of chunks in the 0/1 dim.
-    // CEIL(nr0/chunk_size)
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
-    }
+    // INF-70 D1: nchunk0/nchunk1 were computed above by ggml_mul_mat_chunk_plan(ne0, ne1*ne2*ne3, nth)
+    // — the identical formula, hoisted so the batch-1 decision can be made before quantizing.
+    GGML_ASSERT(nchunk0 > 0 && nchunk1 > 0);
 
     // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
@@ -1482,7 +1535,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end, src1_wdata);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -1621,6 +1674,137 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+
+    // ---------------------------------------------------------------------------
+    // INF-70 D1: single-token fast path — no internal barrier.
+    //
+    // At n_tokens == 1 the row->expert map is trivial (one row per used id), so every
+    // thread builds it itself in a few dozen bytes of stack, quantizes the activations
+    // into its own private slice of wdata, and iterates ONLY the used experts. That
+    // deletes, per call: the serial grouping pass by thread 0, the n_as-entry (512 here)
+    // scan by every thread, and the ggml_barrier that published them.
+    //
+    // Bit-exactness: the local insertion sort is stable and orders experts ascending,
+    // reproducing exactly the (cur_a ascending, row ascending-by-id) iteration of the
+    // shared path; the same from_float runs over the same whole rows; the chunk plan and
+    // the vec_dot call order inside each chunk are unchanged. dst rows are disjoint per
+    // id, so no accumulation is shared between experts.
+    //
+    // The per-expert chunk counter is only *read* when nth < nchunk0*nchunk1; the
+    // eligibility test below rejects the fast path in that case, so the counter (whose
+    // initialiser the barrier used to publish) is provably dead here.
+    // ---------------------------------------------------------------------------
+    #define GGML_MMID_B1_MAX_IDS 64
+
+    bool mmid_batch1 = ids->ne[1] == 1 && ne13 == 1 && n_ids > 0 && n_ids <= GGML_MMID_B1_MAX_IDS;
+
+    const size_t mmid_b1_region = ggml_row_size(vec_dot_type, ne10)*ne11*ne12*ne13;
+
+    if (mmid_batch1 && src1->type != vec_dot_type && params->wsize < (size_t) nth * mmid_b1_region) {
+        mmid_batch1 = false;
+    }
+    for (int64_t c = 1; mmid_batch1 && c <= n_ids; ++c) {
+        int64_t c0, c1;
+        ggml_mul_mat_chunk_plan(ne01, c, nth, &c0, &c1);
+        if (nth < c0*c1) {
+            mmid_batch1 = false;
+        }
+    }
+
+    if (mmid_batch1) {
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        const void * wdata_used = src1->data;
+
+        if (src1->type != vec_dot_type) {
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+            char * const wdata_priv = (char *) params->wdata + (size_t) ith * mmid_b1_region;
+
+            const size_t nbw1 = row_size;
+            const size_t nbw2 = nbw1*ne11;
+
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    from_float((const float *)((const char *) src1->data + i12*nb12 + i11*nb11),
+                               (void *)               (wdata_priv      + i12*nbw2 + i11*nbw1),
+                               ne10);
+                }
+            }
+
+            wdata_used = wdata_priv;
+        }
+
+        // build the trivial row map locally, experts ascending, ids ascending within an expert
+        int32_t                   b1_expert[GGML_MMID_B1_MAX_IDS];
+        struct mmid_row_mapping   b1_row   [GGML_MMID_B1_MAX_IDS];
+        int                       b1_n = 0;
+
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+
+            // Invalid expert IDs are inactive SER routes.  The output row is written by
+            // nobody else, so a single thread may zero it without synchronisation.
+            if (i02 < 0 || i02 >= n_as) {
+                if (ith == 0) {
+                    memset((char *) dst->data + id*nb1, 0, ne0*sizeof(float));
+                }
+                continue;
+            }
+
+            int pos = b1_n;
+            while (pos > 0 && b1_expert[pos-1] > i02) {
+                b1_expert[pos] = b1_expert[pos-1];
+                b1_row   [pos] = b1_row   [pos-1];
+                --pos;
+            }
+            b1_expert[pos] = i02;
+            b1_row   [pos] = (struct mmid_row_mapping) { id, 0 };
+            ++b1_n;
+        }
+
+        for (int i = 0; i < b1_n; ) {
+            int j = i;
+            while (j < b1_n && b1_expert[j] == b1_expert[i]) {
+                ++j;
+            }
+
+            const int64_t cur_a = b1_expert[i];
+            const int64_t cne1  = j - i;
+
+            const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+
+            int64_t nchunk0, nchunk1;
+            ggml_mul_mat_chunk_plan(ne01, cne1, nth, &nchunk0, &nchunk1);
+            GGML_ASSERT(nth >= nchunk0*nchunk1);
+
+            const int64_t dr0 = (ne01 + nchunk0 - 1) / nchunk0;
+            const int64_t dr1 = (cne1 + nchunk1 - 1) / nchunk1;
+
+            if (ith < nchunk0*nchunk1) {
+                const int64_t ith0 = ith % nchunk0;
+                const int64_t ith1 = ith / nchunk0;
+
+                const int64_t ir0_start = dr0 * ith0;
+                const int64_t ir0_end   = MIN(ir0_start + dr0, ne01);
+
+                const int64_t ir1_start = dr1 * ith1;
+                const int64_t ir1_end   = MIN(ir1_start + dr1, cne1);
+
+                // cur_a == 0 with a base pointing at this expert's rows reproduces
+                // MMID_MATRIX_ROW(cur_a, i1) of the shared map exactly.
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, /*cur_a =*/ 0,
+                    ir0_start, ir0_end, ir1_start, ir1_end,
+                    src0_cur, b1_row + i, row_size, src1_cont, wdata_used
+                );
+            }
+
+            i = j;
+        }
+
+        return;
+    }
 
 #ifdef GGML_CPU_PROF
     const int64_t mmid_t0 = ggml_cpu_prof_mm_enabled() ? ggml_time_us() : 0;
@@ -2974,6 +3158,13 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            // INF-70 D1: at a single src1 row every thread quantizes the whole row
+                            // into its own private slice (no internal barrier), so the buffer holds
+                            // n_tasks copies of it. This is a superset of the runtime predicate:
+                            // the forward falls back to the shared path if wsize is short.
+                            if (node->src[1]->ne[1]*node->src[1]->ne[2]*node->src[1]->ne[3] == 1) {
+                                cur *= n_tasks;
+                            }
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
@@ -2987,6 +3178,12 @@ struct ggml_cplan ggml_graph_plan(
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            // INF-70 D1: at a single token every thread quantizes the activations
+                            // into its own private slice (no internal barrier). Superset of the
+                            // runtime predicate: the forward falls back if wsize is short.
+                            if (ids->ne[1] == 1) {
+                                cur += (size_t) (n_tasks - 1) * ggml_row_size(vec_dot_type, ggml_nelements(src1));
+                            }
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);

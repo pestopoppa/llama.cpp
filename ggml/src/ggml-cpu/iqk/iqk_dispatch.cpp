@@ -188,17 +188,32 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
     if (params->wsize < (size_t) ne13 * nbw3) return false;
 
     char * wdata = (char *) params->wdata;
-    for (int64_t i13 = 0; i13 < ne13; ++i13) {
-        for (int64_t i12 = 0; i12 < ne12; ++i12) {
-            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                iqk_quantize_activation(
-                    activation_type,
-                    (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                    wdata + i13*nbw3 + i12*nbw2 + i11*nbw1, ne10);
+
+    // INF-70 D1: batch-1 fast path — at a single activation row the stock code has thread 0
+    // quantize it while nth-1 threads wait at a full-team barrier. Instead every thread
+    // quantizes the row into its own private slice and reads its own copy; iqk_mul_mat_4d
+    // partitions only over src0 rows / tiles and reads all of B, so the result is identical
+    // and no barrier is needed. wdata is sized nth * row bytes by ggml_graph_plan.
+    const bool iqk_batch1 =
+        ne11 * ne12 * ne13 == 1 &&
+        params->wsize >= (size_t) nth * nbw3;
+
+    if (iqk_batch1) {
+        wdata += (size_t) ith * nbw3;
+        iqk_quantize_activation(activation_type, (const float *) src1->data, wdata, ne10);
+    } else {
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    iqk_quantize_activation(
+                        activation_type,
+                        (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                        wdata + i13*nbw3 + i12*nbw2 + i11*nbw1, ne10);
+                }
             }
         }
+        ggml_barrier(params->threadpool);
     }
-    ggml_barrier(params->threadpool);
 
     const bool ok = iqk_mul_mat_4d(ne01, ne11, ne00,
             ne02, ne03, ne12, ne13,
@@ -268,6 +283,83 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
 
     // 1) quantize src1, row layout [i12*ne11 + i11]
     const size_t nbw1 = act_row, nbw2 = nbw1 * ne11;
+
+    // INF-70 D1: single-token fast path — no internal barrier. Every thread quantizes the
+    // whole activation block into its own private slice, builds the trivial row->expert map
+    // on the stack (experts ascending, ids ascending within an expert — exactly the shared
+    // pass's order) and calls iqk_mul_mat_moe only for the used experts, skipping the
+    // n_as-entry scan. iqk_mul_mat_moe splits only over src0 rows and reads all of B, so
+    // per-thread copies of B are bit-identical to the shared one.
+    constexpr int IQK_MMID_B1_MAX_IDS = 64;
+
+    const size_t b1_region = nbw2 * ne12;
+
+    const bool mmid_batch1 =
+        ids->ne[1] == 1 && n_ids > 0 && n_ids <= IQK_MMID_B1_MAX_IDS &&
+        params->wsize >= (size_t) nth * b1_region;
+
+    if (mmid_batch1) {
+        char * const qact_priv = base + (size_t) ith * b1_region;
+
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                iqk_quantize_activation(
+                        activation_type,
+                        (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
+                        qact_priv + i12*nbw2 + i11*nbw1, ne10);
+            }
+        }
+
+        int32_t    b1_expert[IQK_MMID_B1_MAX_IDS];
+        iqk_mmid   b1_row   [IQK_MMID_B1_MAX_IDS];
+        int        b1_n = 0;
+
+        for (int64_t id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *)((const char *) ids->data + id*ids->nb[0]);
+            if (i02 < 0 || i02 >= n_as) {
+                // inactive SER route: nobody else writes this dst row
+                if (ith == 0) {
+                    memset((char *) dst->data + id*dst->nb[1], 0, dst->ne[0]*sizeof(float));
+                }
+                continue;
+            }
+            int pos = b1_n;
+            while (pos > 0 && b1_expert[pos-1] > i02) {
+                b1_expert[pos] = b1_expert[pos-1];
+                b1_row   [pos] = b1_row   [pos-1];
+                --pos;
+            }
+            b1_expert[pos] = i02;
+            b1_row   [pos] = iqk_mmid{ (int32_t) id, 0 };
+            ++b1_n;
+        }
+
+        bool engaged_b1 = false;
+        for (int i = 0; i < b1_n; ) {
+            int j = i;
+            while (j < b1_n && b1_expert[j] == b1_expert[i]) ++j;
+            const int64_t cne1 = j - i;
+            const char * A = (const char *) src0->data + (size_t) b1_expert[i] * src0->nb[2];
+            engaged_b1 = true;
+            if (!iqk_mul_mat_moe(ne01, cne1, ne10, (int) ne11,
+                    tA, A, src0->nb[1],
+                    activation_type, qact_priv, act_row,
+                    (float *) dst->data, dst->nb[1], dst->nb[2],
+                    b1_row + i, ith, nth)) {
+                return false; // gating should preclude; native re-runs from scratch on false
+            }
+            i = j;
+        }
+        if (engaged_b1 && ith == 0) {
+            static std::atomic<uint64_t> logged_types_b1{0};
+            if (iqk_first_engagement(logged_types_b1, tA)) {
+                fprintf(stderr, "[iqk] ACTIVE: MoE mul_mat_id via ik kernels (type=%d activation=%d n_as=%d)\n",
+                        tA, activation_type, n_as);
+            }
+        }
+        return true;
+    }
+
     for (int64_t i12 = 0; i12 < ne12; ++i12) {
         for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
             iqk_quantize_activation(
