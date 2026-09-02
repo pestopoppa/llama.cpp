@@ -83,6 +83,10 @@
 // decode token) and their fprintf cost dominates the measurement.  They now have their own
 // env switch, separate from the aggregate profiler.
 static int ggml_cpu_prof_mm_flag = -1;
+// INF-70 D0-b: sync events per token, MEASURED rather than derived from the node table.
+// Only thread 0 increments, so there is no shared-cacheline traffic on the barrier path.
+static uint64_t ggml_cpu_prof_barriers   = 0;   // ggml_barrier() calls seen by thread 0
+static int      ggml_cpu_prof_barrier_on = 0;   // set by thread 0 for accumulated graphs only
 static inline int ggml_cpu_prof_mm_enabled(void) {
     if (ggml_cpu_prof_mm_flag < 0) {
         ggml_cpu_prof_mm_flag = getenv("GGML_CPU_PROF_MM") != NULL ? 1 : 0;
@@ -591,6 +595,13 @@ static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+#ifdef GGML_CPU_PROF
+#ifdef GGML_USE_OPENMP
+    if (ggml_cpu_prof_barrier_on && omp_get_thread_num() == 0) {
+        ggml_cpu_prof_barriers++;
+    }
+#endif
+#endif
     if (n_threads == 1) {
         return;
     }
@@ -3316,6 +3327,8 @@ static void ggml_cpu_prof_dump(void) {
             cgraph ? cgraph->n_nodes : -1);
     fprintf(stderr, "[cpu_prof] fused (RMS_NORM+MUL): %.1f ops/eval  compute %.3f ms  wall %.3f ms\n",
             ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/1e3/g, ggml_cpu_prof_fused_wall_ns/1e3/g);
+    fprintf(stderr, "[cpu_prof] SYNC measured ggml_barrier() calls per graph eval: %.1f\n",
+            ggml_cpu_prof_barriers/g);
 
     // ---- per op type, sorted by wall ----
     struct { int op; uint64_t ns; uint64_t wall; uint64_t cnt; uint64_t t1; } rows[GGML_OP_COUNT];
@@ -3491,6 +3504,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (state->ith == 0 && ggml_cpu_prof_is_enabled()) {
         const uint64_t gi = ggml_cpu_prof_graph_idx++;
         prof_acc = (gi >= (uint64_t) ggml_cpu_prof_skip_graphs()) ? 1 : 0;
+        ggml_cpu_prof_barrier_on = prof_acc;
         if (prof_acc) {
             if (ggml_cpu_prof_graphs_acc == 0) {
                 // widest MUL_MAT src0 ne[1] in the graph == the output projection (lm_head)
