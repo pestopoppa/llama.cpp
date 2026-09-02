@@ -29,6 +29,7 @@ struct ggml_compute_params {
 };
 
 #include "llama-impl.h"
+#include "llama-fused-debug.h"
 #include "llama-model.h"
 #include "llama-memory-hybrid.h"
 #include "models/models.h"
@@ -196,30 +197,32 @@ static void fused_moe(
 
     const int64_t n_expert = L.ffn_gate_inp->ne[1]; // 512
     const int64_t n_used   = hp.n_expert_used;      // 10
+#if FUSED_DBG_ON
     static int dn_call = 0;
     static FILE * dn_file = nullptr;
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && dn_call >= 24 && dn_call <= 26 && !dn_file) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && dn_call >= 24 && dn_call <= 26 && !dn_file) {
         char fn[128];
         snprintf(fn, sizeof(fn), "/tmp/qwen4exp-builds/f_moe_dn_%d.bin", dn_call);
         dn_file = fopen(fn, "wb");
     }
+#endif
 
     // router logits
     std::vector<float> logits(n_expert);
     lora_mm(L.ffn_gate_inp, x, nullptr, logits.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         extern float ggml_table_f32_f16[1 << 16];
         fprintf(stderr, "  moe f16table[0x3C00]=%.6g f16table[0]=%.6g\n",
                 (double) ggml_table_f32_f16[0x3C00], (double) ggml_table_f32_f16[0]);
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  moe router[0..5] = %.6g %.6g %.6g %.6g %.6g %.6g  (n_used=%d)\n",
                 (double) logits[0], (double) logits[1], (double) logits[2],
                 (double) logits[3], (double) logits[4], (double) logits[5],
                 (int) n_used);
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         static int moe_n = 0;
         if (moe_n < 2) {
             char fn[128];
@@ -278,7 +281,7 @@ static void fused_moe(
     std::vector<float> glu(n_used * n_ff), up_tmp(n_used * n_ff), gate_tmp(n_used * n_ff);
     const size_t nb_up_exp = L.ffn_up_exps->nb[2]; // expert stride
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  moe up: type=%s nb1=%zu nb2=%zu n_embd=%lld sel[0]=%d\n",
                 ggml_type_name(L.ffn_up_exps->type), (size_t) L.ffn_up_exps->nb[1],
                 (size_t) L.ffn_up_exps->nb[2], (long long) hp.n_embd, sel[0]);
@@ -298,7 +301,7 @@ static void fused_moe(
         }
         FUSED_PROF_DOT_END();
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         static int up_n = 0;
         if (up_n >= 24 && up_n <= 26) {
             char fn[128];
@@ -313,7 +316,7 @@ static void fused_moe(
         }
         up_n++;
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int un = 0, gn = 0, gln = 0;
         for (int64_t i = 0; i < n_used * n_ff; i++) { if (std::isnan(up_tmp[i])) un++; if (std::isnan(gate_tmp[i])) gn++; if (std::isnan(glu[i])) gln++; }
         fprintf(stderr, "  moe updots: up nan=%d gate nan=%d glu nan=%d  up[0]=%.6g glu[0]=%.6g\n", un, gn, gln, (double) up_tmp[0], (double) glu[0]);
@@ -338,7 +341,7 @@ static void fused_moe(
     const bool up_repacked = L.ffn_up_exps->extra != nullptr;
     const bool gt_repacked = L.ffn_gate_exps->extra != nullptr;
     const int64_t rp_I = dn_repacked ? (ggml_cpu_has_avx2() ? 8 : 4) : 0;
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  moe repack: up=%s extra=%d gt=%s extra=%d dn=%s extra=%d rp_I=%lld\n",
                 ggml_type_name(L.ffn_up_exps->type), (int) up_repacked,
                 ggml_type_name(L.ffn_gate_exps->type), (int) gt_repacked,
@@ -347,7 +350,7 @@ static void fused_moe(
     const int64_t rp_nblocks = n_ff / 32;
     const size_t nb_dn_exp = L.ffn_down_exps->nb[2];
     std::vector<float> down_acc(hp.n_embd, 0.0f);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  moe dn: type=%s vec_dot_type=%s nb1=%zu nb2=%zu glu_q_size=%zu buf=%s repacked=%d I=%lld\n",
                 ggml_type_name(L.ffn_down_exps->type), ggml_type_name(qt_dn->vec_dot_type),
                 (size_t) L.ffn_down_exps->nb[1], (size_t) L.ffn_down_exps->nb[2], glu_q_size,
@@ -366,7 +369,7 @@ static void fused_moe(
                 // the interleaved IQ4_NL dot for one row of its group
                 const int64_t g = r / rp_I, slot = r % rp_I;
                 const char * grp = dn_e + g * (rp_nblocks * 18 * rp_I);
-                if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && j == 0 && r < 3) {
+                if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && j == 0 && r < 3) {
                     const ggml_fp16_t * d0 = (const ggml_fp16_t *) grp;
                     const ggml_fp16_t * d1 = (const ggml_fp16_t *) (grp + 18 * rp_I);
                     fprintf(stderr, "  moe dn r%lld: slot=%lld d[0..2]=%.6g %.6g %.6g  l1d[0..2]=%.6g %.6g %.6g\n",
@@ -376,7 +379,7 @@ static void fused_moe(
                 }
                 const char * act = (const char *) glu_q.data() + j * glu_q_size;
                 float dot = 0.0f;
-                if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && j == 0 && r == 3) {
+                if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && j == 0 && r == 3) {
                     const char * bl0 = grp + 0 * (18 * rp_I);
                     const ggml_fp16_t * dsc0 = (const ggml_fp16_t *) bl0;
                     const uint8_t * qs0 = (const uint8_t *) (bl0 + 2 * rp_I);
@@ -410,15 +413,19 @@ static void fused_moe(
             }
             FUSED_PROF_DOT_END();
             down_acc[r] += v * w[j];
+#if FUSED_DBG_ON
             if (dn_file) fwrite(&v, 4, 1, dn_file);
-            if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && r < 2) {
+#endif
+            if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && r < 2) {
                 fprintf(stderr, "  moe dn j%lld r%lld: e=%d v=%.6g w=%.6g\n", (long long) j, (long long) r, e, (double) v, (double) w[j]);
             }
         }
     }
+#if FUSED_DBG_ON
     if (dn_file) { fclose(dn_file); dn_file = nullptr; }
     dn_call++;
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+#endif
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int dn = 0; for (int64_t i = 0; i < hp.n_embd; i++) if (std::isnan(down_acc[i])) dn++;
         fprintf(stderr, "  moe dnacc: nan=%d [0]=%.6g\n", dn, (double) down_acc[0]);
     }
@@ -527,7 +534,7 @@ void fused_gdn_layer(
     std::vector<float> xn(hc_dim), mixed(n_embd), inject(hc * n_embd), gate_hc(hc_dim);
 
     // ---- hc_mix (attn side) ----
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         const float * w0 = (const float *) L.hc_attn_norm->data;
         fprintf(stderr, "  gdn hc input: x[0..3]=%.6g %.6g %.6g %.6g w_norm type=%d ne=[%lld,%lld,%lld] w[0..3]=%.6g %.6g %.6g %.6g\n",
                 (double) x[0], (double) x[1], (double) x[2], (double) x[3],
@@ -536,26 +543,26 @@ void fused_gdn_layer(
                 (double) w0[0], (double) w0[1], (double) w0[2], (double) w0[3]);
     }
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  gdn hc xn: xn[0..3]=%.6g %.6g %.6g %.6g\n",
                 (double) xn[0], (double) xn[1], (double) xn[2], (double) xn[3]);
     }
     hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn hc_mix done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn hc_mix done\n");
     // ---- GDN body ----
     // the qkv span is the conv channels (q+k+v), not ssm_d_inner (the v span alone)
     const int64_t qkv_span = L.wqkv->ne[1];
     std::vector<float> qkv(qkv_span);
     std::vector<float> z(hp.ssm_d_inner);              // 6144 (v-dim)
     lora_mm(L.wqkv, mixed.data(), nullptr, qkv.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  gdn post-wqkv: xn[0..1]=%.6g %.6g mixed[0..1]=%.6g %.6g qkv[0..1]=%.6g %.6g (qkv_span=%lld wqkv ne=[%lld,%lld,%lld] type=%d)\n",
                 (double) xn[0], (double) xn[1], (double) mixed[0], (double) mixed[1],
                 (double) qkv[0], (double) qkv[1], (long long) qkv_span,
                 (long long) L.wqkv->ne[0], (long long) L.wqkv->ne[1], (long long) L.wqkv->ne[2], (int) L.wqkv->type);
     }
-    if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DUMP_FLAYERS") && FUSED_DBG("GGML_FUSED_ONCE")) {
         char fmix[128];
         snprintf(fmix, sizeof(fmix), "/tmp/qwen4exp-builds/f_mix_%d.bin", il);
         FILE * f = fopen(fmix, "wb");
@@ -625,7 +632,7 @@ void fused_gdn_layer(
     }
     memcpy(v.data(), conv_out.data() + v_off, S_v * H_v * sizeof(float));
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn conv done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn conv done\n");
     // GDN scan: the ggml_gated_delta_net kernel on scratch tensors (nth=1)
     // q/k [S_k, H_k, 1, 1]; v [S_v, H_v, 1, 1]; g/b [1, H_v, 1, 1]; s [S_v, S_v, H_v, 1]
     ggml_init_params gip = { 64 << 20, nullptr, false };
@@ -642,7 +649,7 @@ void fused_gdn_layer(
     memcpy(tg->data, gate.data(), H_v * sizeof(float));
     memcpy(tb->data, beta.data(), H_v * sizeof(float));
     memcpy(ts->data, ssm_state_row, S_v * S_v * H_v * sizeof(float));
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn qkv[0..2]=%.6g %.6g %.6g conv[0..2]=%.6g %.6g %.6g\n", (double)qkv[0],(double)qkv[1],(double)qkv[2],(double)conv_out[0],(double)conv_out[1],(double)conv_out[2]);
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn qkv[0..2]=%.6g %.6g %.6g conv[0..2]=%.6g %.6g %.6g\n", (double)qkv[0],(double)qkv[1],(double)qkv[2],(double)conv_out[0],(double)conv_out[1],(double)conv_out[2]);
     ggml_tensor * tgd = ggml_gated_delta_net(gctx, tq, tk, tv, tg, tb, ts, 1);
     // the kernel's K=1 output carries [attn (S_v*H_v) | new_state (S_v*S_v*H_v)],
     // written past the tensor's own ne-based allocation — point it at a full-size
@@ -651,7 +658,7 @@ void fused_gdn_layer(
     static std::vector<float> tgd_buf; // static: the kernel writes through the tensor's data pointer
     tgd_buf.resize(S_v * H_v + S_v * S_v * H_v);
     tgd->data = tgd_buf.data();
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         float gmin = 1e30f, gmax = -1e30f, bmin = 1e30f, bmax = -1e30f, smin = 1e30f, smax = -1e30f;
         for (int64_t i = 0; i < H_v; i++) { gmin = fminf(gmin, gate[i]); gmax = fmaxf(gmax, gate[i]); bmin = fminf(bmin, beta[i]); bmax = fmaxf(bmax, beta[i]); }
         for (int64_t i = 0; i < S_v*S_v*H_v; i++) { smin = fminf(smin, ((const float*)ts->data)[i]); smax = fmaxf(smax, ((const float*)ts->data)[i]); }
@@ -676,16 +683,16 @@ void fused_gdn_layer(
     gparams.use_ref = false;
     ggml_compute_forward_gated_delta_net(&gparams, tgd);
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn kernel done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn kernel done\n");
     // z-gated rms norm: rms_norm(output, ssm_norm) * sigmoid(z)
     std::vector<float> gdn_out(S_v * H_v);
     memcpy(gdn_out.data(), tgd->data, S_v * H_v * sizeof(float));
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         float omin = 1e30f, omax = -1e30f; int onn = 0, oni = 0;
         for (int64_t i = 0; i < S_v*H_v; i++) { if (std::isnan(gdn_out[i])) onn++; if (std::isinf(gdn_out[i])) oni++; omin = fminf(omin, gdn_out[i]); omax = fmaxf(omax, gdn_out[i]); }
         fprintf(stderr, "  gdn out: nan=%d inf=%d min=%.6g max=%.6g\n", onn, oni, (double)omin, (double)omax);
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn out[0..2]=%.6g %.6g %.6g z[0..2]=%.6g %.6g %.6g\n", (double)gdn_out[0],(double)gdn_out[1],(double)gdn_out[2],(double)z[0],(double)z[1],(double)z[2]);
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn out[0..2]=%.6g %.6g %.6g z[0..2]=%.6g %.6g %.6g\n", (double)gdn_out[0],(double)gdn_out[1],(double)gdn_out[2],(double)z[0],(double)z[1],(double)z[2]);
     // the kernel's K=1 output carries [attn | new_state]; the state advances
     // (ts holds the input state; copying it back would freeze the recurrence)
     memcpy(ssm_state_row, (const char *) tgd->data + S_v * H_v, S_v * S_v * H_v * sizeof(float));
@@ -708,7 +715,7 @@ void fused_gdn_layer(
 
     std::vector<float> attn_out(n_embd);
     lora_mm(L.ssm_out, final_in.data(), nullptr, attn_out.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int nn = 0, ni = 0;
         float mn = 1e30f, mx = -1e30f;
         for (int64_t i = 0; i < S_v * H_v; i++) {
@@ -722,17 +729,17 @@ void fused_gdn_layer(
                 nn, ni, (double) mn, (double) mx, ann, ain, (double) amn, (double) amx);
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn ssm_out done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn ssm_out done\n");
     // ---- MoE ----
     std::vector<float> moe_out(n_embd);
     fused_moe(L, hp, attn_out.data(), moe_out.data(), n_threads);
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn moe1 done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn moe1 done\n");
     // ---- hc_combine (attn side): res = res + repeat(attn_out) * (2*sigmoid(inject/hc)) ----
     hc_combine(res_in_out, attn_out.data(), inject.data(), hc, n_embd);
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn comb1 done\n");
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn comb1 done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int mn = 0; for (int64_t i = 0; i < n_embd; i++) if (std::isnan(moe_out[i])) mn++;
         int xn2 = 0; for (int64_t i = 0; i < hc*n_embd; i++) if (std::isnan(xn[i])) xn2++;
         fprintf(stderr, "  gdn moe1 out nan=%d xn(attn-side) nan=%d\n", mn, xn2);
@@ -740,21 +747,21 @@ void fused_gdn_layer(
     // ---- hc_mix (ffn side) + MoE again ----
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 12) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && il == 12) {
         FILE * f = fopen("/tmp/qwen4exp-builds/f_gdn_ffnmixed_12.bin", "wb");
         if (f) { fwrite(mixed.data(), 4, n_embd, f); fclose(f); }
         FILE * f2 = fopen("/tmp/qwen4exp-builds/f_gdn_ffnxn_12.bin", "wb");
         if (f2) { fwrite(xn.data(), 4, hc * n_embd, f2); fclose(f2); }
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int mm = 0; for (int64_t i = 0; i < n_embd; i++) if (std::isnan(mixed[i])) mm++;
         fprintf(stderr, "  gdn ffn mixed nan=%d\n", mm);
     }
     fused_moe(L, hp, mixed.data(), moe_out.data(), n_threads);
     hc_combine(res_in_out, moe_out.data(), inject.data(), hc, n_embd);
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  gdn moe2 done\n");
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn moe2 done\n");
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int rn = 0, mn = 0, in = 0;
         for (int64_t i = 0; i < hc*n_embd; i++) { if (std::isnan(res_in_out[i])) rn++; }
         for (int64_t i = 0; i < n_embd; i++) { if (std::isnan(moe_out[i])) mn++; }
@@ -762,7 +769,7 @@ void fused_gdn_layer(
         fprintf(stderr, "  gdn final: res nan=%d moe_out nan=%d inject nan=%d\n", rn, mn, in);
     }
     memcpy(out, res_in_out, n_embd * sizeof(float));
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fconv[128];
         snprintf(fconv, sizeof(fconv), "/tmp/qwen4exp-builds/f_conv_%d.bin", il);
         FILE * fc = fopen(fconv, "wb");
@@ -812,53 +819,9 @@ static void fused_head(const struct llama_model_qwen4exp & model,
     lora_mm(model.output, mixed.data(), model.output_s, logits, n_threads);
 }
 
-// the full fused decode for a single token: PLE + the layer loop + the head.
-// The PLE (layer 1) and the full-attention layers still need the memory-context
-// transcription; this skeleton runs the GDN layers and marks the rest.
-// Returns false until every layer type is wired.
-bool fused_decode_token(const struct llama_model_qwen4exp & model,
-                        const struct llama_hparams & hp,
-                        const float * tok_embd,
-                        float * logits,
-                        int n_threads) {
-    const int64_t hc = hp.dsv4_hc_mult;
-    const int64_t n_embd = hp.n_embd;
-    const int64_t hc_dim = hc * n_embd;
-
-    // the wide residual starts as hc identical copies of the embedding
-    std::vector<float> res_hc(hc_dim);
-    for (int64_t c = 0; c < hc; c++) {
-        memcpy(res_hc.data() + c * n_embd, tok_embd, n_embd * sizeof(float));
-    }
-
-    std::vector<float> layer_out(n_embd);
-
-    for (int il = 0; il < (int) hp.n_layer(); il++) {
-        const struct llama_layer & L = model.layers[il];
-
-        if (hp.is_ple_impl[il]) {
-            // TODO(INF-64): the PLE fused transcription (host-side n-gram hash +
-            // the 51GB-table gather + the conv + the gate)
-            return false;
-        }
-        if (hp.is_recr(il)) {
-            // TODO(INF-64): the conv/ssm state rows from the memory context
-            float * conv_state = nullptr;
-            float * ssm_state = nullptr;
-            if (conv_state == nullptr || ssm_state == nullptr) {
-                return false;
-            }
-            fused_gdn_layer(L, hp, res_hc.data(), res_hc.data(), layer_out.data(),
-                            conv_state, ssm_state, n_threads, il);
-        } else {
-            // TODO(INF-64): the full-attention layer fused transcription
-            return false;
-        }
-    }
-
-    fused_head(model, hp, res_hc.data(), logits, n_threads);
-    return true;
-}
+// (the INF-67 `fused_decode_token` skeleton lived here; it was never called —
+//  llama_model_qwen4exp::fused_decode below is the live entry point. Removed in
+//  INF-70 A3.)
 
 // ---- the fused full-attention layer ----------------------------------------
 
@@ -1047,13 +1010,13 @@ bool fused_full_attn_layer(
     const float eps = hp.f_norm_rms_eps;
     const int n_rot = (int) hp.n_rot();
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 3) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && il == 3) {
         fprintf(stderr, "  attn hparams: f_attention_scale=%.6f n_embd_head=%lld n_head=%lld n_head_kv=%lld n_rot=%d indexer_top_k=%d\n",
                 (double) hp.f_attention_scale, (long long) n_embd_head, (long long) n_head, (long long) n_head_kv, n_rot, (int) hp.indexer_top_k);
     }
 
     if (tk->type != GGML_TYPE_F32 && tk->type != GGML_TYPE_F16) {
-        fprintf(stderr, "  fused attn fallback: cache type %s %s %s\n",
+        LLAMA_LOG_INFO("%s: fused attn declined: cache types %s/%s/%s\n", __func__,
                 ggml_type_name(tk->type), ggml_type_name(tv->type), ggml_type_name(ti->type));
         return false;
     }
@@ -1086,7 +1049,7 @@ bool fused_full_attn_layer(
     std::vector<float> xn(hc * n_embd), mixed(n_embd), inject(hc * n_embd);
     hc_rms_norm_gamma(x, L.hc_attn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fn1[128], fn2[128], fn3[128];
         snprintf(fn1, sizeof(fn1), "/tmp/qwen4exp-builds/f_attn_mixed_%d.bin", il);
         snprintf(fn2, sizeof(fn2), "/tmp/qwen4exp-builds/f_attn_xn_%d.bin", il);
@@ -1232,7 +1195,7 @@ bool fused_full_attn_layer(
         }
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         FILE * fq = fopen("/tmp/qwen4exp-builds/f_attn_qpre_3.bin", "wb");
         if (fq) { fwrite(q.data(), 4, hdim2, fq); fclose(fq); }
         FILE * fk = fopen("/tmp/qwen4exp-builds/f_attn_kpre_3.bin", "wb");
@@ -1265,7 +1228,7 @@ bool fused_full_attn_layer(
     }
 
     std::vector<float> attn_out(hdim2);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  attn: n_used=%d n_visible=%d q[0..2]=%.6g %.6g %.6g\n", n_used, n_visible,
                 (double) q[0], (double) q[1], (double) q[2]);
         char fnq[128], fnk[128], fnv[128], fng[128];
@@ -1278,7 +1241,7 @@ bool fused_full_attn_layer(
         FILE * fv = fopen(fnv, "wb"); if (fv) { fwrite(v.data(), 4, n_embd_head * n_head_kv, fv); fclose(fv); }
         FILE * fg = fopen(fng, "wb"); if (fg) { fwrite(gate.data(), 4, hdim2, fg); fclose(fg); }
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fqnm[128];
         snprintf(fqnm, sizeof(fqnm), "/tmp/qwen4exp-builds/f_attn_q_in_%d.bin", il);
         FILE * fq = fopen(fqnm, "wb");
@@ -1289,12 +1252,12 @@ bool fused_full_attn_layer(
         memcpy(k_all.data(), k_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
         memcpy(v_all.data(), v_cache, n_embd_head * n_head_kv * n_used * sizeof(float));
         // a fused-side reference of the first head's scores (head 0, kv 0)
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 3) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && il == 3) {
             fprintf(stderr, "  attn ref h0: k_all[0..3]=%.6g %.6g %.6g %.6g k_all[512..515]=%.6g %.6g %.6g %.6g\n",
                     (double) k_all[0], (double) k_all[1], (double) k_all[2], (double) k_all[3],
                     (double) k_all[512], (double) k_all[513], (double) k_all[514], (double) k_all[515]);
         }
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
             char fk[128], fv[128], fii[128];
             snprintf(fk, sizeof(fk), "/tmp/qwen4exp-builds/f_attn_kall_%d.bin", il);
             snprintf(fv, sizeof(fv), "/tmp/qwen4exp-builds/f_attn_vall_%d.bin", il);
@@ -1307,7 +1270,7 @@ bool fused_full_attn_layer(
             if (fi) { fprintf(fi, "%lld %lld %lld %d\n", (long long) n_embd_head, (long long) n_head, (long long) n_head_kv, n_used); fclose(fi); }
         }
         // the QSA-masked attention via the graph's flash kernel (bit-exact)
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
             int kn = 0, vn = 0;
             for (int64_t i = 0; i < (int64_t) k_all.size(); i++) { if (std::isnan(k_all[i])) kn++; if (std::isnan(v_all[i])) vn++; }
             fprintf(stderr, "  attn flash in: k nan=%d v nan=%d k[0..2]=%.6g %.6g %.6g v[0..2]=%.6g %.6g %.6g mask[0..3]=%.6g %.6g %.6g %.6g\n",
@@ -1315,7 +1278,7 @@ bool fused_full_attn_layer(
                     (double) v_all[0], (double) v_all[1], (double) v_all[2],
                     (double) selected[0], (double) selected[1], (double) selected[2], (double) selected[3]);
         }
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
             FILE * fq = fopen("/tmp/qwen4exp-builds/flash_q.bin", "wb");
             fwrite(q.data(), 4, n_embd_head * n_head, fq); fclose(fq);
             FILE * fk = fopen("/tmp/qwen4exp-builds/flash_k.bin", "wb");
@@ -1337,11 +1300,11 @@ bool fused_full_attn_layer(
                          selected.data(), attn_out.data());
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int ann = 0; for (int64_t i = 0; i < hdim2; i++) if (std::isnan(attn_out[i])) ann++;
         fprintf(stderr, "  attn out: nan=%d [0..2]=%.6g %.6g %.6g\n", ann, (double) attn_out[0], (double) attn_out[1], (double) attn_out[2]);
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fna[128], fns[128];
         snprintf(fna, sizeof(fna), "/tmp/qwen4exp-builds/f_attn_out_pre_%d.bin", il);
         snprintf(fns, sizeof(fns), "/tmp/qwen4exp-builds/f_attn_selected_%d.bin", il);
@@ -1353,14 +1316,14 @@ bool fused_full_attn_layer(
         const float g = gate[i];
         attn_out[i] *= 1.0f / (1.0f + expf(-g));
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fng[128];
         snprintf(fng, sizeof(fng), "/tmp/qwen4exp-builds/f_attn_gated_%d.bin", il);
         FILE * fg2 = fopen(fng, "wb"); if (fg2) { fwrite(attn_out.data(), 4, hdim2, fg2); fclose(fg2); }
     }
     std::vector<float> layer_out(n_embd);
     lora_mm(L.wo, attn_out.data(), L.wo_s, layer_out.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fno[128];
         snprintf(fno, sizeof(fno), "/tmp/qwen4exp-builds/f_attn_out_%d.bin", il);
         FILE * fa = fopen(fno, "wb"); if (fa) { fwrite(layer_out.data(), 4, n_embd, fa); fclose(fa); }
@@ -1379,19 +1342,19 @@ bool fused_full_attn_layer(
     // the MoE + the hc combine (same as the GDN layers)
     std::vector<float> moe_out(n_embd);
     fused_moe(L, hp, layer_out.data(), moe_out.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fnm[128];
         snprintf(fnm, sizeof(fnm), "/tmp/qwen4exp-builds/f_attn_moe1_%d.bin", il);
         FILE * fm = fopen(fnm, "wb"); if (fm) { fwrite(moe_out.data(), 4, n_embd, fm); fclose(fm); }
     }
     hc_combine(res_in_out, layer_out.data(), inject.data(), hc, n_embd);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 7) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && il == 7) {
         FILE * f = fopen("/tmp/qwen4exp-builds/f_attn_res7.bin", "wb");
         if (f) { fwrite(res_in_out, 4, hc * n_embd, f); fclose(f); }
     }
     hc_rms_norm_gamma(res_in_out, L.hc_ffn_norm, xn.data(), n_embd, hc, eps);
     hc_mix(L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, hc, xn.data(), mixed.data(), inject.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fnm2[128], fnm3[128];
         snprintf(fnm2, sizeof(fnm2), "/tmp/qwen4exp-builds/f_attn_ffnmixed_%d.bin", il);
         FILE * fm2 = fopen(fnm2, "wb"); if (fm2) { fwrite(mixed.data(), 4, n_embd, fm2); fclose(fm2); }
@@ -1461,6 +1424,7 @@ void fused_ple(
     {
         const struct ggml_type_traits * qtt = ggml_get_type_traits(table->type);
         const size_t row_bytes = ggml_row_size(table->type, head_dim);
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  ple table: name=%s type=%d ne=[%lld,%lld] row_bytes=%zu buf=%s buft=%s to_float=%p\n",
                 table->name, (int) table->type, (long long) table->ne[0], (long long) table->ne[1], row_bytes,
                 table->buffer ? ggml_backend_buffer_name(table->buffer) : "-",
@@ -1478,6 +1442,7 @@ void fused_ple(
                 (unsigned char) r0[24], (unsigned char) r0[25], (unsigned char) r0[26], (unsigned char) r0[27],
                 (unsigned char) r0[28], (unsigned char) r0[29], (unsigned char) r0[30], (unsigned char) r0[31],
                 (unsigned char) r0[32], (unsigned char) r0[33], (unsigned char) r0[34], (unsigned char) r0[35]);
+        }
         for (int64_t h = 0; h < n_heads; h++) {
             const char * row = (const char *) table->data + (size_t) rows[h] * row_bytes;
             if (table->type == GGML_TYPE_F32) {
@@ -1488,7 +1453,7 @@ void fused_ple(
         }
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         fprintf(stderr, "  ple rows[0..2]=%d %d %d head_dim=%lld\n", rows[0], rows[1], rows[2], (long long)head_dim);
         fprintf(stderr, "  ple ctxv=[%lld %lld %lld] prev=[%d %d] n_gram=%lld per_gram=%lld n_heads=%lld\n",
                 (long long) ctxv[0], (long long) ctxv[1], (long long) ctxv[2],
@@ -1502,7 +1467,7 @@ void fused_ple(
     }
     // ---- the key/value projections ----
     std::vector<float> key(hc_dim), value(n_embd);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  ple w: key type=%s buf=%s extra=%p nb1=%zu nb2=%zu ne=[%lld,%lld,%lld] | val type=%s buf=%s extra=%p\n",
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  ple w: key type=%s buf=%s extra=%p nb1=%zu nb2=%zu ne=[%lld,%lld,%lld] | val type=%s buf=%s extra=%p\n",
             ggml_type_name(L.ple_key->type), L.ple_key->buffer ? ggml_backend_buffer_name(L.ple_key->buffer) : "-",
             (const void *) L.ple_key->extra, (size_t) L.ple_key->nb[1], (size_t) L.ple_key->nb[2],
             (long long) L.ple_key->ne[0], (long long) L.ple_key->ne[1], (long long) L.ple_key->ne[2],
@@ -1510,7 +1475,7 @@ void fused_ple(
             (const void *) L.ple_value->extra);
     lora_mm(L.ple_key, emb.data(), nullptr, key.data(), n_threads);
     lora_mm(L.ple_value, emb.data(), nullptr, value.data(), n_threads);
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_key.bin", "wb");
         if (f) { fwrite(key.data(), 4, key.size(), f); fclose(f); }
         FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_val.bin", "wb");
@@ -1537,13 +1502,14 @@ void fused_ple(
             double ss = 0.0;
             for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
             const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
+            if (FUSED_DBG("GGML_FUSED_DECODE_TRACE"))
             fprintf(stderr, "  fused query c=%lld: ss/n=%.6e sc=%.6f first=%.6g qn0=%.6g\n",
                     (long long) c, ss / n_embd, (double) sc, (double) (xc[0] * sc * qn[c * n_embd]), (double) qn[c * n_embd]);
             for (int64_t i = 0; i < n_embd; i++) query_n[c * n_embd + i] = xc[i] * sc * qn[c * n_embd + i];
         }
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_keyn.bin", "wb");
         if (f) { fwrite(key_n.data(), 4, key_n.size(), f); fclose(f); }
         FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_queryn.bin", "wb");
@@ -1597,7 +1563,7 @@ void fused_ple(
             }
             window[c * (hist + 1) + hist] = norm_conv[c];
         }
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
             FILE * f = fopen("/tmp/qwen4exp-builds/f_ple_normconv.bin", "wb");
             if (f) { fwrite(norm_conv.data(), 4, hc_dim, f); fclose(f); }
             FILE * f2 = fopen("/tmp/qwen4exp-builds/f_ple_win.bin", "wb");
@@ -1621,7 +1587,7 @@ void fused_ple(
         }
     }
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int nn = 0; for (int64_t i = 0; i < hc_dim; i++) if (std::isnan(conv_out[i])) nn++;
         fprintf(stderr, "  ple key nan=%d value nan=%d conv_out nan=%d gate[0]=%.6g gate[1]=%.6g\n",
                 (int) std::isnan(key[0]), (int) std::isnan(value[0]), nn, (double)gate[0], (double)gate[1]);
@@ -1634,7 +1600,7 @@ void fused_ple(
     for (int64_t i = 0; i < hc_dim; i++) {
         res[i] = hidden[i] + gated[i] + conv_out[i];
     }
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         int nn = 0, gn = 0, vn = 0;
         for (int64_t i = 0; i < hc_dim; i++) { if (std::isnan(res[i])) nn++; if (std::isnan(gated[i])) gn++; }
         for (int64_t i = 0; i < n_embd; i++) if (std::isnan(value[i])) vn++;
@@ -1652,7 +1618,7 @@ void fused_ple(
 static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float * out, int64_t n_embd) {
     const size_t row_bytes = ggml_row_size(tok_embd->type, n_embd);
     const char * row = (const char *) tok_embd->data + (size_t) tok * row_bytes;
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "fused_embd: name=%s type=%d ne=[%lld,%lld] rb=%zu buf=%s buft=%s extra=%p row0=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "fused_embd: name=%s type=%d ne=[%lld,%lld] rb=%zu buf=%s buft=%s extra=%p row0=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
             tok_embd->name, (int) tok_embd->type, (long long) tok_embd->ne[0], (long long) tok_embd->ne[1],
             row_bytes, tok_embd->buffer ? ggml_backend_buffer_name(tok_embd->buffer) : "-",
             tok_embd->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(tok_embd->buffer)) : "-",
@@ -1661,6 +1627,7 @@ static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float *
             (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
             (unsigned char) row[8], (unsigned char) row[9], (unsigned char) row[10], (unsigned char) row[11],
             (unsigned char) row[12], (unsigned char) row[13], (unsigned char) row[14], (unsigned char) row[15]);
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE"))
     fprintf(stderr, "fused_embd row40: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
             (unsigned char) row[0], (unsigned char) row[1], (unsigned char) row[2], (unsigned char) row[3],
             (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
@@ -1878,16 +1845,18 @@ bool llama_model_qwen4exp::fused_decode(
     {
         std::vector<float> emb(n_embd);
         fused_embd(tok_embd, tok, emb.data(), n_embd);
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "fused res_hc: hc=%lld n_embd=%lld hc_dim=%lld emb[0]=%.8f\n",
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "fused res_hc: hc=%lld n_embd=%lld hc_dim=%lld emb[0]=%.8f\n",
                 (long long) hc, (long long) n_embd, (long long) hc_dim, (double) emb[0]);
         for (int64_t c = 0; c < hc; c++) {
             memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
         }
-        FILE * f = fopen("/tmp/qwen4exp-builds/f_res_hc.bin", "wb");
-        if (f) { fwrite(res_hc.data(), 4, res_hc.size(), f); fclose(f); }
-        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_embd_tok.bin", "wb");
-        if (f2) { fwrite(emb.data(), 4, emb.size(), f2); fclose(f2); }
-        if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/f_res_hc.bin", "wb");
+            if (f) { fwrite(res_hc.data(), 4, res_hc.size(), f); fclose(f); }
+            FILE * f2 = fopen("/tmp/qwen4exp-builds/f_embd_tok.bin", "wb");
+            if (f2) { fwrite(emb.data(), 4, emb.size(), f2); fclose(f2); }
+        }
+        if (FUSED_DBG("GGML_FUSED_DUMP_FLAYERS") && FUSED_DBG("GGML_FUSED_ONCE")) {
             FILE * f = fopen("/tmp/qwen4exp-builds/f_embd.bin", "wb");
             if (f) { fwrite(emb.data(), 4, n_embd, f); fclose(f); }
         }
@@ -1906,7 +1875,7 @@ bool llama_model_qwen4exp::fused_decode(
     struct PendingStateWrite { void * dst; std::vector<float> src; };
     std::vector<PendingStateWrite> pending_state;
 
-    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && getenv("GGML_FUSED_LAYER_CMP") != NULL && prev_layer_inp && prev_layer_inp[0] && prev_layer_inp[0]->data) {
+    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && FUSED_DBG("GGML_FUSED_LAYER_CMP") && prev_layer_inp && prev_layer_inp[0] && prev_layer_inp[0]->data) {
         const ggml_tensor * g0 = prev_layer_inp[0];
         const int64_t nt = g0->ne[1];
         const float * gp = (const float *) g0->data + (nt - 1) * g0->ne[0];
@@ -1916,21 +1885,21 @@ bool llama_model_qwen4exp::fused_decode(
     }
     for (int il = 0; il < (int) hparams.n_layer(); il++) {
         const struct llama_layer & L = layers[il];
-        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+        if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
             fprintf(stderr, "fused layer %2d: %s (ple=%d recr=%d)\n", il,
                     hparams.is_ple_impl[il] ? "PLE" : (hparams.is_recr(il) ? "GDN" : "ATTN"),
                     (int) hparams.is_ple_impl[il], (int) hparams.is_recr(il));
         }
 
-        if (getenv("GGML_FUSED_SKIP_PLE") != NULL && hparams.is_ple_impl[il]) {
+        if (FUSED_DBG("GGML_FUSED_SKIP_PLE") && hparams.is_ple_impl[il]) {
             continue;
         }
-        if (getenv("GGML_FUSED_SKIP_ATTN") != NULL && !hparams.is_ple_impl[il] && !hparams.is_recr(il)) {
+        if (FUSED_DBG("GGML_FUSED_SKIP_ATTN") && !hparams.is_ple_impl[il] && !hparams.is_recr(il)) {
             continue;
         }
         if (hparams.is_ple_impl[il]) {
             // the PLE: the predecessors from the attention cells
-            if (getenv("GGML_FUSED_LAYER_CMP") != NULL && prev_layer_inp && prev_layer_inp[il] && prev_layer_inp[il]->data) {
+            if (FUSED_DBG("GGML_FUSED_LAYER_CMP") && prev_layer_inp && prev_layer_inp[il] && prev_layer_inp[il]->data) {
                 const ggml_tensor * g0 = prev_layer_inp[il];
                 const int64_t nt = g0->ne[2] > 1 ? g0->ne[2] : 1;
                 const float * gp = (const float *) g0->data + (nt - 1) * g0->ne[0] * g0->ne[1];
@@ -2014,7 +1983,7 @@ bool llama_model_qwen4exp::fused_decode(
             ggml_tensor * tk = attn->get_k(vctx, il);
             ggml_tensor * tv = attn->get_v(vctx, il);
             ggml_tensor * ti = idx->get_k(vctx, il);
-            if (getenv("GGML_FUSED_DECODE_TRACE") != NULL && il == 3) {
+            if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && il == 3) {
                 fprintf(stderr, "  fused cache: tk type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n", ggml_type_name(tk->type), (long long)tk->ne[0],(long long)tk->ne[1],(long long)tk->ne[2],(long long)tk->ne[3],(size_t)tk->nb[0],(size_t)tk->nb[1],(size_t)tk->nb[2],(size_t)tk->nb[3]);
                 fprintf(stderr, "  fused cache: tv type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n", ggml_type_name(tv->type), (long long)tv->ne[0],(long long)tv->ne[1],(long long)tv->ne[2],(long long)tv->ne[3],(size_t)tv->nb[0],(size_t)tv->nb[1],(size_t)tv->nb[2],(size_t)tv->nb[3]);
                 fprintf(stderr, "  fused cache: n_used=%d n_visible=%d cell pos: ", n_used, n_visible);
@@ -2032,7 +2001,7 @@ bool llama_model_qwen4exp::fused_decode(
                 return false;
             }
         }
-        if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && il + 1 < (int64_t) hparams.n_layer()) {
+        if (FUSED_DBG("GGML_FUSED_DUMP_FLAYERS") && il + 1 < (int64_t) hparams.n_layer()) {
             FILE * f = fopen("/tmp/qwen4exp-builds/f_layers.bin", "ab");
             if (f) {
                 fwrite(res_hc.data(), 4, res_hc.size(), f);
