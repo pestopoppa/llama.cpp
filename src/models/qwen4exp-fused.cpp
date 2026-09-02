@@ -1962,10 +1962,21 @@ bool llama_model_qwen4exp::supports_fused_decode() const {
             return false;
         }
         if (t->extra != nullptr) {
-            // repacked. Only the MoE down-experts have a mirrored layout here.
+            // Repacked (CPU_REPACK: 4x4/8x8-interleaved rows). Since A1 the dense
+            // projections go through ggml_cpu_extra_compute_forward(), which is
+            // exactly the hook that claims these, so a repacked MUL_MAT weight is
+            // handled correctly and needs no guard. Measured on the uniform IQ4_XS
+            // artifact with GGML_IQK=1: hc_attn_up / hc_ffn_up are IQ4_NL
+            // [320, 10240] and ARE repacked (IQ4_NL is not in the iqk exclusion
+            // list and ne[1] % 8 == 0), so the pre-A1 per-row vec_dot was reading
+            // an interleaved layout as if it were plain rows, on every layer.
+            //
+            // The routed down-experts are the exception: fused_moe still walks
+            // them by hand, and that mirror only implements the IQ4_NL 4x4/8x8
+            // layout.
             const bool is_down_exps = kv.first.find("ffn_down_exps") != std::string::npos;
-            if (!is_down_exps || t->type != GGML_TYPE_IQ4_NL) {
-                LLAMA_LOG_INFO("%s: fused decode unavailable: tensor '%s' (%s) is repacked and has no fused mirror\n",
+            if (is_down_exps && t->type != GGML_TYPE_IQ4_NL) {
+                LLAMA_LOG_INFO("%s: fused decode unavailable: '%s' (%s) is repacked and fused_moe mirrors IQ4_NL only\n",
                         __func__, kv.first.c_str(), ggml_type_name(t->type));
                 return false;
             }
