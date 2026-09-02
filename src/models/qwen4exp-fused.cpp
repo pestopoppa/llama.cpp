@@ -58,6 +58,79 @@ struct FusedProf {
 };
 static FusedProf g_prof;
 }
+// ---- A2: the scratch arena --------------------------------------------------
+//
+// Every ggml_init() in this file asked for a fresh 16-64 MB block and freed it
+// again: one per token for the cache views, one per GDN layer (x36), one per
+// full-attention layer for the flash staging (x12), and one per fused_rope call
+// (2 per attention layer in the dense-QSA case, one per pooled block otherwise).
+// glibc serves a request that size with mmap, so each pair is an mmap + munmap
+// plus a page fault for every page the context actually touches — and the GDN
+// context touches 3.1 MB of them (the [S_v, S_v, H_v] recurrent state tensor).
+//
+// The arena keeps one buffer per nesting slot, hands it to ggml_init() as
+// `mem_buffer` (ggml then neither allocates nor frees it; only the small
+// ggml_context header is malloc'd), and grows it on demand. The slots are
+// distinct because the contexts nest: the token-scoped cache-view context is
+// live while a layer context is, and a rope context is live inside the
+// attention layer.
+//
+// The counters are the A2 measurement: they record what the churn WAS, per
+// token, so the report carries a number rather than the retired "~2.5 GB"
+// code-reading estimate. They are printed by the GGML_FUSED_PROF line.
+namespace {
+
+enum fused_arena_slot {
+    FUSED_ARENA_VIEWS = 0,   // token-scoped: the KV / indexer cache views
+    FUSED_ARENA_LAYER = 1,   // layer-scoped: the GDN scan tensors
+    FUSED_ARENA_ATTN  = 2,   // the flash-attention staging
+    FUSED_ARENA_ROPE  = 3,   // the rope staging (nested inside ATTN's caller)
+    FUSED_ARENA_N     = 4,
+};
+
+struct FusedArenaStats {
+    uint64_t ctx_calls  = 0;  // ggml_init calls this token
+    uint64_t ctx_bytes  = 0;  // bytes those calls need this token
+    uint64_t churn_was  = 0;  // bytes the SAME calls asked for before A2 (the mmap churn)
+    uint64_t stage_bytes = 0; // the staged-state bytes this token (was a malloc per layer)
+    uint64_t arena_bytes = 0; // bytes the arenas actually hold (allocated once)
+    void reset() { ctx_calls = 0; ctx_bytes = 0; churn_was = 0; stage_bytes = 0; }
+};
+static FusedArenaStats g_arena;
+
+// the A2 kill switch: `GGML_FUSED_ARENA_OFF=1` restores the per-call
+// ggml_init(mem_buffer = NULL) at its original request size, so the arena is
+// measurable as a same-build A/B. Read once per token, never in a loop.
+static bool g_arena_off = false;
+
+static struct ggml_context * fused_arena_init(int slot, size_t need, size_t was) {
+    static std::vector<uint8_t> arenas[FUSED_ARENA_N];
+    if (g_arena_off) {
+        g_arena.ctx_calls++;
+        g_arena.ctx_bytes += need;
+        g_arena.churn_was += was;
+        struct ggml_init_params ip = { was, nullptr, false };
+        return ggml_init(ip);
+    }
+    std::vector<uint8_t> & a = arenas[slot];
+    // + 64 so the buffer can be aligned up without losing capacity
+    if (a.size() < need + 64) {
+        a.resize(need + 64);
+        g_arena.arena_bytes = 0;
+        for (int i = 0; i < FUSED_ARENA_N; i++) g_arena.arena_bytes += arenas[i].size();
+    }
+    uint8_t * base = a.data();
+    uint8_t * aligned = (uint8_t *) ((((uintptr_t) base) + 63) & ~(uintptr_t) 63);
+    const size_t usable = a.size() - (size_t) (aligned - base);
+    g_arena.ctx_calls++;
+    g_arena.ctx_bytes += need;
+    g_arena.churn_was += was;
+    struct ggml_init_params ip = { usable, aligned, false };
+    return ggml_init(ip);
+}
+
+} // namespace
+
 #define FUSED_PROF_INIT() do { if (getenv("GGML_FUSED_PROF") != NULL) { g_prof.on = true; } } while (0)
 #define FUSED_PROF_RESET() do { g_prof.reset(); } while (0)
 #define FUSED_PROF_DOT_BEGIN() g_prof.start()
@@ -805,8 +878,13 @@ void fused_gdn_layer(
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn conv done\n");
     // GDN scan: the ggml_gated_delta_net kernel on scratch tensors (nth=1)
     // q/k [S_k, H_k, 1, 1]; v [S_v, H_v, 1, 1]; g/b [1, H_v, 1, 1]; s [S_v, S_v, H_v, 1]
-    ggml_init_params gip = { 64 << 20, nullptr, false };
-    ggml_context * gctx = ggml_init(gip);
+    // A2: the arena, sized from the tensors this context actually creates
+    // (the [S_v, S_v, H_v] state is the 3.1 MB term) plus the kernel's own
+    // ne-sized output tensor and the object headers.
+    const size_t gdn_need = (size_t) (2 * S_k * H_k + 2 * S_v * H_v + 2 * H_v +
+                                      S_v * S_v * H_v) * sizeof(float)
+                          + 16 * ggml_tensor_overhead() + (1u << 16);
+    ggml_context * gctx = fused_arena_init(FUSED_ARENA_LAYER, gdn_need, 64u << 20);
     ggml_tensor * tq = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
     ggml_tensor * tk = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
     ggml_tensor * tv = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, S_v, H_v, 1, 1);
@@ -1014,8 +1092,12 @@ struct FusedRopeParams {
 static void fused_rope(const FusedRopeParams & rp, float * x, int64_t n_rot,
                        int64_t n_embd_head, int64_t n_head, int32_t pos, int * sections,
                        const int64_t n_stream) {
-    ggml_init_params gip = { 16 << 20, nullptr, false };
-    ggml_context * gctx = ggml_init(gip);
+    // A2: the arena (this was a 16 MB mmap per call, and the QSA block path calls
+    // it once per pooled block per index head)
+    const size_t rope_need = (size_t) (2 * n_embd_head * n_head * n_stream) * sizeof(float)
+                           + (size_t) (4 * n_stream) * sizeof(int32_t)
+                           + 8 * ggml_tensor_overhead() + (1u << 14);
+    ggml_context * gctx = fused_arena_init(FUSED_ARENA_ROPE, rope_need, 16u << 20);
     ggml_tensor * a = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_embd_head, n_head, n_stream);
     memcpy(a->data, x, n_embd_head * n_head * n_stream * sizeof(float));
     // IMROPE: 4 positions per token (text tokens: [pos, pos, pos, 0])
@@ -1051,8 +1133,12 @@ static void fused_attn_flash(
         const float * q, const float * k, const float * v,
         const int64_t n_embd_head, const int64_t n_head, const int64_t n_head_kv,
         const int64_t n_kv, const float * selected_cells, float * out) {
-    ggml_init_params gip = { 64 << 20, nullptr, false };
-    ggml_context * gctx = ggml_init(gip);
+    // A2: the arena, sized from n_kv (the K/V F16 stages dominate)
+    const size_t fa_need = (size_t) (n_embd_head * n_head) * sizeof(float) * 2
+                         + (size_t) (2 * n_embd_head * n_head_kv * n_kv) * sizeof(uint16_t)
+                         + (size_t) n_kv * sizeof(uint16_t)
+                         + 16 * ggml_tensor_overhead() + (1u << 16);
+    ggml_context * gctx = fused_arena_init(FUSED_ARENA_ATTN, fa_need, 64u << 20);
     // the graph casts the F32 activations to F16 for the flash and permutes the
     // heads/kv dims (build_attn_mha) before the op; mirror that exactly. The Q
     // stays F32 (the CPU kernel reads Q as const float* unconditionally — the
@@ -1899,6 +1985,8 @@ bool llama_model_qwen4exp::fused_decode(
     FUSED_PROF_RESET();
     // A1 kill switch, read once per token (never in an inner loop)
     g_mm_legacy = getenv("GGML_FUSED_MM_LEGACY") != NULL;
+    g_arena_off = getenv("GGML_FUSED_ARENA_OFF") != NULL;
+    g_arena.reset();
     const auto prof_t0 = std::chrono::steady_clock::now();
     if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
     if (ubatch.token == nullptr) return false;
@@ -1948,8 +2036,10 @@ bool llama_model_qwen4exp::fused_decode(
     // checked inside fused_full_attn_layer() — i.e. after the GDN/PLE layers
     // below it had already advanced the recurrent state — which is exactly the
     // partial-write hazard A4 exists to remove.
-    ggml_init_params gip = { 64 << 20, nullptr, false };
-    ggml_context * vctx = ggml_init(gip);
+    // A2: the arena. This context only holds cache VIEWS (no data), so a few
+    // hundred tensor headers is the whole requirement — it was asking for 64 MB.
+    ggml_context * vctx = fused_arena_init(FUSED_ARENA_VIEWS,
+            (size_t) (8 * hparams.n_layer() + 64) * ggml_tensor_overhead() + (1u << 16), 64u << 20);
     if (vctx == nullptr) {
         return false;
     }
@@ -2044,8 +2134,21 @@ bool llama_model_qwen4exp::fused_decode(
     // allocated by mctx->apply() for THIS token and is written with this token's
     // k/v, so re-running the token through the graph rewrites the same cell with
     // the same values — idempotent, unlike the recurrent state, which advances.)
-    struct PendingStateWrite { void * dst; std::vector<float> src; };
-    std::vector<PendingStateWrite> pending_state;
+    // A2: the staging lives in ONE buffer reused across tokens rather than a
+    // fresh std::vector per layer — the GDN [S_v, S_v, H_v] row alone is 3.1 MB,
+    // so this was ~113 MB of malloc/free (and first-touch page faults) per token.
+    // Function-static: the fused path is single-threaded by construction.
+    struct PendingStateWrite { void * dst; size_t off; size_t n; };
+    static std::vector<float> stage_buf;
+    static std::vector<PendingStateWrite> pending_state;
+    pending_state.clear();
+    size_t stage_used = 0;
+    auto stage_alloc = [&](size_t n) -> size_t {
+        const size_t off = stage_used;
+        stage_used += n;
+        if (stage_buf.size() < stage_used) stage_buf.resize(stage_used);
+        return off;
+    };
 
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE") && FUSED_DBG("GGML_FUSED_LAYER_CMP") && prev_layer_inp && prev_layer_inp[0] && prev_layer_inp[0]->data) {
         const ggml_tensor * g0 = prev_layer_inp[0];
@@ -2104,15 +2207,16 @@ bool llama_model_qwen4exp::fused_decode(
             const size_t row_bytes = ggml_row_size(pl->type, pl->ne[0]);
             const int head = (int) recr->get_head();
             const int64_t hist = (hparams.ple_conv_kernel - 1) * hparams.ple_ngram_size;
-            std::vector<float> ple_state_copy(hist * hc_dim);
-            memcpy(ple_state_copy.data(),
+            const size_t ple_n   = (size_t) (hist * hc_dim);
+            const size_t ple_off = stage_alloc(ple_n);
+            memcpy(stage_buf.data() + ple_off,
                    (const char *) pl->data + (size_t) head * row_bytes,
-                   hist * hc_dim * sizeof(float));
+                   ple_n * sizeof(float));
             fused_ple(*this, hparams, L, tok, prev, res_hc.data(), res_hc.data(),
-                      ple_state_copy.data(), n_threads);
+                      stage_buf.data() + ple_off, n_threads);
             // A4: staged, not written (see PendingStateWrite above)
             pending_state.push_back({ (void *) ((const char *) pl->data + (size_t) head * row_bytes),
-                                      std::move(ple_state_copy) });
+                                      ple_off, ple_n });
         } 
         if (hparams.is_recr(il)) {
             // the GDN: the conv + ssm state rows at the current head
@@ -2126,14 +2230,17 @@ bool llama_model_qwen4exp::fused_decode(
             const float * ssm_state  = (const float *) ((const char *) sl->data + (size_t) head * srow);
             // the fused layer works on copies for the state (in-place safety);
             // the conv row width is (d_conv-1)*conv_channels == rl->ne[0]
-            std::vector<float> conv_c(rl->ne[0]), ssm_c(sl->ne[0]);
-            memcpy(conv_c.data(), conv_state, rl->ne[0] * sizeof(float));
-            memcpy(ssm_c.data(), ssm_state, sl->ne[0] * sizeof(float));
+            const size_t conv_n = (size_t) rl->ne[0];
+            const size_t ssm_n  = (size_t) sl->ne[0];
+            const size_t conv_off = stage_alloc(conv_n);
+            const size_t ssm_off  = stage_alloc(ssm_n);
+            memcpy(stage_buf.data() + conv_off, conv_state, conv_n * sizeof(float));
+            memcpy(stage_buf.data() + ssm_off,  ssm_state,  ssm_n  * sizeof(float));
             fused_gdn_layer(L, hparams, res_hc.data(), res_hc.data(), layer_out.data(),
-                            conv_c.data(), ssm_c.data(), n_threads, il);
+                            stage_buf.data() + conv_off, stage_buf.data() + ssm_off, n_threads, il);
             // A4: staged, not written (see PendingStateWrite above)
-            pending_state.push_back({ (void *) conv_state, std::move(conv_c) });
-            pending_state.push_back({ (void *) ssm_state,  std::move(ssm_c)  });
+            pending_state.push_back({ (void *) conv_state, conv_off, conv_n });
+            pending_state.push_back({ (void *) ssm_state,  ssm_off,  ssm_n  });
         }
         if (!hparams.is_recr(il)) {
             // the full-attn layer: the KV + indexer cache slices. The cell
@@ -2190,9 +2297,10 @@ bool llama_model_qwen4exp::fused_decode(
     // ================= A4 COMMIT =================
     // The token is complete. Apply every staged recurrent-state write in one
     // pass; only after this point has the model's persistent state advanced.
-    for (auto & pw : pending_state) {
-        memcpy(pw.dst, pw.src.data(), pw.src.size() * sizeof(float));
+    for (const auto & pw : pending_state) {
+        memcpy(pw.dst, stage_buf.data() + pw.off, pw.n * sizeof(float));
     }
+    g_arena.stage_bytes = stage_used * sizeof(float);
 
     // the logits carrier, validated in the preflight (see the note there for why
     // writing into the previous graph's sched-known tensor is safe here)
@@ -2210,8 +2318,15 @@ bool llama_model_qwen4exp::fused_decode(
             fprintf(stderr, "FUSED_PROF: SANITY FAILED total=%.1f gemv=%.1f other=%.1f\n",
                     total_ms, gemv_ms, other_ms);
         } else {
-            fprintf(stderr, "FUSED_PROF: total=%.1f ms gemv=%.1f ms other=%.1f ms (gemv %.0f%%)\n",
-                    total_ms, gemv_ms, other_ms, 100.0 * gemv_ms / total_ms);
+            fprintf(stderr, "FUSED_PROF: total=%.1f ms gemv=%.1f ms other=%.1f ms (gemv %.0f%%)"
+                    " | ctx_init=%llu calls: pre-A2 churn %.0f MB/token -> need %.1f MB,"
+                    " staged state %.1f MB/token, arenas %.1f MB resident\n",
+                    total_ms, gemv_ms, other_ms, 100.0 * gemv_ms / total_ms,
+                    (unsigned long long) g_arena.ctx_calls,
+                    (double) g_arena.churn_was / (1024.0 * 1024.0),
+                    (double) g_arena.ctx_bytes / (1024.0 * 1024.0),
+                    (double) g_arena.stage_bytes / (1024.0 * 1024.0),
+                    (double) g_arena.arena_bytes / (1024.0 * 1024.0));
         }
     }
     return true;
