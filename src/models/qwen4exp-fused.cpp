@@ -942,8 +942,20 @@ void fused_gdn_layer(
     }
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn out[0..2]=%.6g %.6g %.6g z[0..2]=%.6g %.6g %.6g\n", (double)gdn_out[0],(double)gdn_out[1],(double)gdn_out[2],(double)z[0],(double)z[1],(double)z[2]);
     // the kernel's K=1 output carries [attn | new_state]; the state advances
-    // (ts holds the input state; copying it back would freeze the recurrence)
-    memcpy(ssm_state_row, (const char *) tgd->data + S_v * H_v, S_v * S_v * H_v * sizeof(float));
+    // (ts holds the input state; copying it back would freeze the recurrence).
+    //
+    // BUGFIX (INF-70 A1/A2 pass): the offset was `(const char *) tgd->data +
+    // S_v * H_v`, i.e. 6144 BYTES into the buffer, where the state actually
+    // starts 6144 FLOATS in. ggml_gated_delta_net's result is
+    // [S_v*H, n_tokens + K*S_v] and row 0 is the attention output, so the state
+    // begins at float index S_v*H_v. The old expression read from float index
+    // 1536 and stayed in bounds (hence no crash), but every GDN layer's
+    // recurrent state was shifted by 4608 floats from step 2 onward — invisible
+    // at step 1, where the incoming state comes from the prompt batch and is
+    // identical on both A/B arms, which is why the INF-67 per-layer
+    // bit-exactness checks did not see it.
+    memcpy(ssm_state_row, (const float *) tgd->data + (size_t) S_v * H_v,
+           (size_t) S_v * S_v * H_v * sizeof(float));
     ggml_free(gctx);
 
     const float * znorm = (const float *) L.ssm_norm->data;
