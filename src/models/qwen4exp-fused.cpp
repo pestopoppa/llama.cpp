@@ -222,12 +222,27 @@ static std::vector<uint8_t> & fused_mm_wdata() {
     return buf;
 }
 
+// A-GATE diagnostic: the per-token mul_mat call census. Answers whether the fused
+// path's gemv cost is structural (it issues more calls / touches more bytes than
+// the graph) or mechanical (same shape of work, slower per call).
+struct FusedMMCensus {
+    // 0 = dense/lora, 1 = routed expert, 2 = lm_head
+    uint64_t calls[3] = {0, 0, 0};
+    uint64_t bytes[3] = {0, 0, 0};
+    double   us[3]    = {0.0, 0.0, 0.0};
+    void reset() { for (int i = 0; i < 3; i++) { calls[i] = 0; bytes[i] = 0; us[i] = 0.0; } }
+};
+static FusedMMCensus g_census;
+
 // dst[n_out] (f32) = w[n_in, n_out] . x[n_in] (f32)
 // `w_data` slices one expert out of a [ne0, ne1, n_expert] slab; pass w->data
 // for a plain 2-D weight.
 static void fused_mm_raw(const struct ggml_tensor * w, const void * w_data, float * out, const float * x) {
     const int64_t n_in  = w->ne[0];
     const int64_t n_out = w->ne[1];
+    // census bucket, decided from the ORIGINAL tensor (ne[2] > 1 means an expert slab)
+    const int cbucket = (w->ne[2] > 1) ? 1 : (n_out > 100000 ? 2 : 0);
+    const auto c_t0 = std::chrono::steady_clock::now();
 
     struct ggml_tensor src0 = *w;                       // header copy: type/nb/buffer/extra
     src0.data     = const_cast<void *>(w_data);
@@ -286,6 +301,9 @@ static void fused_mm_raw(const struct ggml_tensor * w, const void * w_data, floa
     if (!ggml_cpu_extra_compute_forward(&params, &dst)) {
         ggml_compute_forward_mul_mat(&params, &dst);
     }
+    g_census.calls[cbucket]++;
+    g_census.bytes[cbucket] += (size_t) src0.nb[1] * (size_t) n_out;   // the src0 slice actually walked
+    g_census.us[cbucket] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - c_t0).count();
 }
 
 // the A1 kill switch: `GGML_FUSED_MM_LEGACY=1` restores the per-row vec_dot loop
@@ -2063,6 +2081,7 @@ bool llama_model_qwen4exp::fused_decode(
     g_mm_legacy = getenv("GGML_FUSED_MM_LEGACY") != NULL;
     g_arena_off = getenv("GGML_FUSED_ARENA_OFF") != NULL;
     g_arena.reset();
+    g_census.reset();
     const auto prof_t0 = std::chrono::steady_clock::now();
     if (ubatch.n_tokens != 1 || ubatch.n_seqs != 1) return false;
     if (ubatch.token == nullptr) return false;
@@ -2403,6 +2422,20 @@ bool llama_model_qwen4exp::fused_decode(
                     (double) g_arena.ctx_bytes / (1024.0 * 1024.0),
                     (double) g_arena.stage_bytes / (1024.0 * 1024.0),
                     (double) g_arena.arena_bytes / (1024.0 * 1024.0));
+            static const char * cn[3] = { "dense/lora", "experts", "lm_head" };
+            uint64_t tc = 0; double tb = 0.0, tu = 0.0;
+            for (int i = 0; i < 3; i++) {
+                fprintf(stderr, "FUSED_MM_CENSUS: %-11s calls=%-6llu bytes=%8.1f MB  mean=%8.1f us  total=%8.1f ms\n",
+                        cn[i], (unsigned long long) g_census.calls[i],
+                        (double) g_census.bytes[i] / (1024.0 * 1024.0),
+                        g_census.calls[i] ? g_census.us[i] / (double) g_census.calls[i] : 0.0,
+                        g_census.us[i] / 1000.0);
+                tc += g_census.calls[i]; tb += (double) g_census.bytes[i]; tu += g_census.us[i];
+            }
+            fprintf(stderr, "FUSED_MM_CENSUS: TOTAL       calls=%-6llu bytes=%8.1f MB  mean=%8.1f us  total=%8.1f ms"
+                    "   (graph reference: 797 mul_mat + 144 mul_mat_id, ~4.16 GB/token)\n",
+                    (unsigned long long) tc, tb / (1024.0 * 1024.0),
+                    tc ? tu / (double) tc : 0.0, tu / 1000.0);
         }
     }
     return true;
