@@ -639,8 +639,19 @@ static void fused_moe(
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
         const char * dn_e = (const char *) L.ffn_down_exps->data + (size_t) e * nb_dn_exp;
-        if (!dn_repacked && !g_mm_legacy) {
-            // A1: one batched mul_mat over the expert's [n_ff, n_embd] slice
+        if (!g_mm_legacy) {
+            // A1: one batched mul_mat over the expert's [n_ff, n_embd] slice.
+            //
+            // This used to exclude repacked down-experts and fall through to the
+            // hand-rolled interleaved IQ4_NL mirror below. The census
+            // (2026-09-02) showed why that mattered: 42 of the 48
+            // ffn_down_exps tensors ARE in CPU_REPACK, so 84 of the 96 MoE
+            // invocations per token walked 2560 rows x 10 experts by hand —
+            // 2.15 M scalar dots, ~598 ms of the 801 ms "gemv" column, while the
+            // 3,053 genuinely batched mul_mats cost only 203 ms in total.
+            // ggml_cpu_extra_compute_forward() dispatches a repacked src0 to the
+            // repack 8x8 gemv, which is the kernel the graph itself uses, so the
+            // mirror is not needed here — it stays only for the legacy arm.
             down_j.resize(hp.n_embd);
             FUSED_PROF_DOT_BEGIN();
             fused_mm_raw(L.ffn_down_exps, dn_e, down_j.data(), glu.data() + j * n_ff);
