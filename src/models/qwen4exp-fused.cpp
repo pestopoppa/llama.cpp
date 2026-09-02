@@ -113,6 +113,12 @@ static struct ggml_context * fused_arena_init(int slot, size_t need, size_t was)
         return ggml_init(ip);
     }
     std::vector<uint8_t> & a = arenas[slot];
+    const size_t need_raw = need;
+    // Slack. An arena one object short does not degrade — ggml_new_tensor calls
+    // GGML_ABORT("not enough space in the context's memory pool"), i.e. it takes
+    // the process down. 25% + 1 MB is cheap insurance against a shape this
+    // sizing did not anticipate; the request itself is still what gets counted.
+    need += need / 4 + (1u << 20);
     // + 64 so the buffer can be aligned up without losing capacity
     if (a.size() < need + 64) {
         a.resize(need + 64);
@@ -123,7 +129,7 @@ static struct ggml_context * fused_arena_init(int slot, size_t need, size_t was)
     uint8_t * aligned = (uint8_t *) ((((uintptr_t) base) + 63) & ~(uintptr_t) 63);
     const size_t usable = a.size() - (size_t) (aligned - base);
     g_arena.ctx_calls++;
-    g_arena.ctx_bytes += need;
+    g_arena.ctx_bytes += need_raw;
     g_arena.churn_was += was;
     struct ggml_init_params ip = { usable, aligned, false };
     return ggml_init(ip);
@@ -905,9 +911,13 @@ void fused_gdn_layer(
     // A2: the arena, sized from the tensors this context actually creates
     // (the [S_v, S_v, H_v] state is the 3.1 MB term) plus the kernel's own
     // ne-sized output tensor and the object headers.
-    const size_t gdn_need = (size_t) (2 * S_k * H_k + 2 * S_v * H_v + 2 * H_v +
-                                      S_v * S_v * H_v) * sizeof(float)
-                          + 16 * ggml_tensor_overhead() + (1u << 16);
+    // tq + tk (S_k*H_k each), tv (S_v*H_v), tg + tb (H_v each), ts (S_v*S_v*H_v)
+    // and — the term that is easy to miss — the kernel's OWN result tensor, which
+    // ggml_gated_delta_net allocates as [S_v*H, n_tokens + K*S_v] = S_v*H_v*(1+S_v).
+    const size_t gdn_need = (size_t) (2 * S_k * H_k + S_v * H_v + 2 * H_v +
+                                      S_v * S_v * H_v +
+                                      S_v * H_v * (1 + S_v)) * sizeof(float)
+                          + 32 * ggml_tensor_overhead() + (1u << 16);
     ggml_context * gctx = fused_arena_init(FUSED_ARENA_LAYER, gdn_need, 64u << 20);
     ggml_tensor * tq = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
     ggml_tensor * tk = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
