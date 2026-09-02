@@ -294,6 +294,20 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 
     const std::string name = ggml_get_name(tensor);
 
+    // INF-70/B4: an explicit --tensor-type / --tensor-type-file pattern that names this tensor wins
+    // over the built-in POLICY exclusions below (notably `ffn_gate_inp`, the MoE router, which is
+    // hard-kept at F32). Without this the override is silently ignored: llama_tensor_get_type()
+    // returns early on !tensor_allows_quantization() before it ever consults the pattern list.
+    // The hard checks above (--pure/COPY, tensor rank) still apply, so a pattern can never make a
+    // 1-D tensor or a COPY run quantize anything.
+    if (params->tt_overrides) {
+        for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+            if (std::regex_search(name, std::regex(p->pattern))) {
+                return true;
+            }
+        }
+    }
+
     // This used to be a regex, but <regex> has an extreme cost to compile times.
     bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
 
