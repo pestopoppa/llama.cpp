@@ -2899,6 +2899,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
+        mparams_dft.model_shared = model_tgt;
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams_dft);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
