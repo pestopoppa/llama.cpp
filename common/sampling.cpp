@@ -640,9 +640,30 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // INF-70 E2a diagnostic only
+    static const bool diag_accept = getenv("LLAMA_SPEC_DIAG_ACCEPT") != NULL;
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (diag_accept) {
+            const llama_model * mdl = llama_get_model(ctx);
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mdl));
+            const float * lg = llama_get_logits_ith(ctx, idxs[i]);
+            int   arg = -1;
+            float best = -INFINITY;
+            if (lg) {
+                for (int t = 0; t < n_vocab; ++t) {
+                    if (lg[t] > best) { best = lg[t]; arg = t; }
+                }
+            }
+            fprintf(stderr,
+                "[spec_diag] pos=%zu idx=%d tgt_sampled=%d tgt_argmax=%d tgt_argmax_logit=%.6f "
+                "draft=%d draft_logit=%.6f match=%d\n",
+                i, idxs[i], id, arg, (double) best, draft[i],
+                lg ? (double) lg[draft[i]] : 0.0, (int) (draft[i] == id));
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
