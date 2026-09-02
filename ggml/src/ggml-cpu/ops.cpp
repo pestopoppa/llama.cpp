@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -2032,10 +2033,26 @@ void ggml_compute_forward_repeat_back(
 
 // ggml_compute_forward_concat
 
+// Dim-0 concat row partition. Default ON since INF-70 D7a (2026-09-02): the stock concat kernels
+// shard over ne2, so a dim-0 concat with a small ne2 runs entirely on thread 0. qwen4exp's GDN conv
+// concat is [4, 10240, 1] (ne2 == 1), 37 nodes/token, and serializing it cost 1.318 ms/token at 48
+// threads versus 0.112 ms/token partitioned. The partition is bit-exact (it only changes which worker
+// copies which row), and greedy output was verified identical with it on and off.
+//
+// GGML_CPU_CONCAT_DIM0_ROWS is now an explicit opt-OUT, kept for bisecting:
+//   unset            -> enabled  (default)
+//   =0 / =false / "" -> disabled (falls back to the stock ne2-sharded kernels)
+//   any other value  -> enabled
 static bool ggml_cpu_concat_dim0_rows_enabled(void) {
     static const bool enabled = []() {
         const char * env = getenv("GGML_CPU_CONCAT_DIM0_ROWS");
-        return env && atoi(env) != 0;
+        if (env == nullptr) {
+            return true;
+        }
+        if (env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "false") == 0) {
+            return false;
+        }
+        return true;
     }();
 
     return enabled;
