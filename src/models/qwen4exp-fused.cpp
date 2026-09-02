@@ -1053,11 +1053,19 @@ void fused_gdn_layer(
     }
 
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn ssm_out done\n");
-    // ---- MoE ----
     std::vector<float> moe_out(n_embd);
-    fused_moe(L, hp, attn_out.data(), moe_out.data(), n_threads);
-
-    if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) fprintf(stderr, "  gdn moe1 done\n");
+    // NOTE (INF-70, 2026-09-02): there is NO routed MoE on the attention side.
+    // The graph's layer body is
+    //   build_hc_mix(attn) -> build_layer_attn{_linear} -> build_hc_combine
+    //   -> build_hc_mix(ffn) -> build_layer_ffn -> build_hc_combine
+    // (qwen4exp.cpp:322-359) and `build_moe_ffn` is called from exactly ONE place
+    // in the whole file (qwen4exp.cpp:901, inside build_layer_ffn), i.e. once per
+    // layer, on the ffn side. This transcription used to call fused_moe here as
+    // well, on attn_out — 96 MoE invocations per token for 48 layers instead of
+    // 48, worth 1,177 MB and ~105 ms/token by the mul_mat census.
+    // It was also DEAD: hc_combine below consumes attn_out, not moe_out, and the
+    // ffn-side fused_moe overwrites moe_out before anything reads it. So removing
+    // it is expected to be bit-neutral, not gate-moving.
     // ---- hc_combine (attn side): res = res + repeat(attn_out) * (2*sigmoid(inject/hc)) ----
     hc_combine(res_in_out, attn_out.data(), inject.data(), hc, n_embd);
 
@@ -1670,9 +1678,12 @@ bool fused_full_attn_layer(
         }
     }
 
-    // the MoE + the hc combine (same as the GDN layers)
+    // the hc combine (same as the GDN layers). As in fused_gdn_layer there is NO
+    // routed MoE on the attention side — the graph goes straight from the
+    // attention output into build_hc_combine — and the fused_moe call that used
+    // to sit here was dead as well (hc_combine consumes layer_out, and the
+    // ffn-side call overwrites moe_out). Removed 2026-09-02, INF-70.
     std::vector<float> moe_out(n_embd);
-    fused_moe(L, hp, layer_out.data(), moe_out.data(), n_threads);
     if (FUSED_DBG("GGML_FUSED_DECODE_TRACE")) {
         char fnm[128];
         snprintf(fnm, sizeof(fnm), "/tmp/qwen4exp-builds/f_attn_moe1_%d.bin", il);
