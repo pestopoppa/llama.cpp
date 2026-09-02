@@ -62,10 +62,13 @@ int main(int argc, char ** argv) {
     cp.n_ctx = 512; cp.n_threads = nthr; cp.n_threads_batch = nthr;
 
     llama_context * ctx_g = llama_init_from_model(model, cp);
+    // Order matters: the pre-A1 arm restores the per-row reads (including the
+    // misread of the repacked IQ4_NL hc loras) and is the one most likely to
+    // abort, so it runs LAST — a crash there still leaves A and B measured.
     std::vector<Arm> arms = {
-        { "C_pre_A1A2", true,  true  },
-        { "B_arena",    true,  false },
         { "A_batched",  false, false },
+        { "B_arena",    true,  false },
+        { "C_pre_A1A2", true,  true  },
     };
     if (const char * only = getenv("VAL_ONLY_ARM")) {
         std::vector<Arm> keep;
@@ -135,6 +138,7 @@ int main(int argc, char ** argv) {
             const int tf = (int) (std::max_element(lf, lf + n_vocab) - lf);
             fprintf(stderr, "step %2d          %-11s %9.1f ms  x%.2f  max_abs=%.3e nmse=%.3e greedy=%d %s\n",
                     s, a.name, ms, ms / g_ms, md, sq / n_vocab, tf, tf == tg ? "" : "<- DIVERGE");
+            fflush(stderr);
         }
     }
     set_graph_env();
