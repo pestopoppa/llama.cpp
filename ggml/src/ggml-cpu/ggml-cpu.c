@@ -3167,12 +3167,26 @@ static uint64_t ggml_cpu_prof_path_wall_ns[GGML_CPU_PROF_NPATH];
 static uint64_t ggml_cpu_prof_path_bytes[GGML_CPU_PROF_NPATH];
 static uint64_t ggml_cpu_prof_path_cnt[GGML_CPU_PROF_NPATH];
 
+// INF-70 C2: the atexit dump must NEVER dereference the cgraph -- by then llama_free has
+// released the sched's context and the tensors are freed memory (this is the campaign's
+// "post-compute dump of freed memory" failure class, and it did segfault the first run).
+// Snapshot everything the dump needs, once, at setup time.
+struct ggml_cpu_prof_meta {
+    int     op;
+    int     s0_type;
+    int64_t s0_ne[3];
+    int64_t ne[3];
+    char    name[GGML_MAX_NAME];
+};
+static struct ggml_cpu_prof_meta * ggml_cpu_prof_meta = NULL;
+static int                         ggml_cpu_prof_meta_n = 0;
+
 static uint64_t ggml_cpu_prof_graph_idx     = 0;   // graph evaluations seen
 static uint64_t ggml_cpu_prof_graphs_acc    = 0;   // graph evaluations accumulated
 static int      ggml_cpu_prof_skip          = -1;
 static int      ggml_cpu_prof_nodes_written = 0;
 static int      ggml_cpu_prof_atexit_done   = 0;
-static const struct ggml_cgraph * ggml_cpu_prof_last_graph = NULL;
+static int ggml_cpu_prof_last_nnodes = 0;
 
 // lm_head identification: the MUL_MAT whose src0 has ne[1] == the vocab size.  We do not
 // hardcode 248320: the widest MUL_MAT src0 ne[1] in the graph is the output projection.
@@ -3228,6 +3242,24 @@ static void ggml_cpu_prof_ensure_nodes(int n) {
     memset(ggml_cpu_prof_node_wall_ns + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
     memset(ggml_cpu_prof_node_cnt     + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
     ggml_cpu_prof_node_cap = cap;
+}
+
+static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
+    free(ggml_cpu_prof_meta);
+    ggml_cpu_prof_meta   = (struct ggml_cpu_prof_meta *) calloc(cgraph->n_nodes, sizeof(struct ggml_cpu_prof_meta));
+    ggml_cpu_prof_meta_n = ggml_cpu_prof_meta ? cgraph->n_nodes : 0;
+    for (int i = 0; i < ggml_cpu_prof_meta_n; i++) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        const struct ggml_tensor * s0 = nd->src[0];
+        struct ggml_cpu_prof_meta * m = &ggml_cpu_prof_meta[i];
+        m->op      = (int) nd->op;
+        m->s0_type = s0 ? (int) s0->type : -1;
+        for (int k = 0; k < 3; k++) {
+            m->s0_ne[k] = s0 ? s0->ne[k] : 0;
+            m->ne[k]    = nd->ne[k];
+        }
+        snprintf(m->name, sizeof(m->name), "%s", nd->name);
+    }
 }
 
 // bytes of weight streamed by one node, 0 for ops that do not stream a weight slab
@@ -3318,13 +3350,12 @@ static void ggml_cpu_prof_dump(void) {
         return;
     }
     const double g = (double) G;
-    const struct ggml_cgraph * cgraph = ggml_cpu_prof_last_graph;
 
     fprintf(stderr, "\n[cpu_prof] ==== INF-70 profile: %llu graph evals accumulated (skipped first %d) ====\n",
             (unsigned long long) G, ggml_cpu_prof_skip_graphs());
     fprintf(stderr, "[cpu_prof] per graph eval: thread0_compute %.3f ms | wall(compute+barrier) %.3f ms | n_nodes %d\n",
             ggml_cpu_prof_total_ns/1e3/g, ggml_cpu_prof_total_wall_ns/1e3/g,
-            cgraph ? cgraph->n_nodes : -1);
+            ggml_cpu_prof_last_nnodes);
     fprintf(stderr, "[cpu_prof] fused (RMS_NORM+MUL): %.1f ops/eval  compute %.3f ms  wall %.3f ms\n",
             ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/1e3/g, ggml_cpu_prof_fused_wall_ns/1e3/g);
     fprintf(stderr, "[cpu_prof] SYNC measured ggml_barrier() calls per graph eval: %.1f\n",
@@ -3376,9 +3407,9 @@ static void ggml_cpu_prof_dump(void) {
                 wms > 0 ? bytes/1e9/(wms/1e3) : 0.0);
     }
 
-    // ---- per node index, sorted by wall, top 64 ----
-    if (cgraph && ggml_cpu_prof_node_cap > 0) {
-        int n = cgraph->n_nodes < ggml_cpu_prof_node_cap ? cgraph->n_nodes : ggml_cpu_prof_node_cap;
+    // ---- per node index, sorted by wall, top 64 (from the SNAPSHOT, never the cgraph) ----
+    if (ggml_cpu_prof_meta_n > 0 && ggml_cpu_prof_node_cap > 0) {
+        int n = ggml_cpu_prof_meta_n < ggml_cpu_prof_node_cap ? ggml_cpu_prof_meta_n : ggml_cpu_prof_node_cap;
         int * idx = (int *) malloc(n*sizeof(int));
         int m = 0;
         for (int i = 0; i < n; i++) {
@@ -3394,17 +3425,15 @@ static void ggml_cpu_prof_dump(void) {
         fprintf(stderr, "[cpu_prof] NODETABLE\tidx\top\tname\tsrc0_type\tsrc0_ne\tdst_ne\tcompute_us\twall_us\tdelta_us\n");
         for (int i = 0; i < m && i < 64; i++) {
             const int k = idx[i];
-            const struct ggml_tensor * nd = cgraph->nodes[k];
-            const struct ggml_tensor * s0 = nd->src[0];
+            const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[k];
             fprintf(stderr, "[cpu_prof] NODEROW\t%d\t%s\t%s\t%s\t%lld,%lld,%lld\t%lld,%lld,%lld\t%.2f\t%.2f\t%.2f\n",
-                    k, ggml_op_name(nd->op), nd->name,
-                    s0 ? ggml_type_name(s0->type) : "-",
-                    s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
-                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
+                    k, ggml_op_name((enum ggml_op) md->op), md->name,
+                    md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                    (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                    (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
                     ggml_cpu_prof_node_ns[k]/g, ggml_cpu_prof_node_wall_ns[k]/g,
                     (double)(ggml_cpu_prof_node_wall_ns[k] - ggml_cpu_prof_node_ns[k])/g);
         }
-        // full per-node CSV, if asked
         const char * pf = getenv("GGML_CPU_PROF_PERNODE_FILE");
         if (pf) {
             FILE * f = fopen(pf, "w");
@@ -3412,13 +3441,12 @@ static void ggml_cpu_prof_dump(void) {
                 fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals\n");
                 for (int i = 0; i < n; i++) {
                     if (ggml_cpu_prof_node_cnt[i] == 0) continue;
-                    const struct ggml_tensor * nd = cgraph->nodes[i];
-                    const struct ggml_tensor * s0 = nd->src[0];
+                    const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[i];
                     fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu\n",
-                            i, ggml_op_name(nd->op), nd->name,
-                            s0 ? ggml_type_name(s0->type) : "-",
-                            s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
-                            (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
+                            i, ggml_op_name((enum ggml_op) md->op), md->name,
+                            md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                            (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                            (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
                             ggml_cpu_prof_node_ns[i]/g, ggml_cpu_prof_node_wall_ns[i]/g,
                             (unsigned long long) ggml_cpu_prof_node_cnt[i]);
                 }
@@ -3515,6 +3543,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                         ggml_cpu_prof_lm_head_ne1 = nd->src[0]->ne[1];
                     }
                 }
+                ggml_cpu_prof_snapshot_meta(cgraph);
                 ggml_cpu_prof_write_nodes(cgraph, params.nth);
                 if (!ggml_cpu_prof_atexit_done) {
                     ggml_cpu_prof_atexit_done = 1;
@@ -3523,7 +3552,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
             ggml_cpu_prof_ensure_nodes(cgraph->n_nodes);
             ggml_cpu_prof_graphs_acc++;
-            ggml_cpu_prof_last_graph = cgraph;
+            ggml_cpu_prof_last_nnodes = cgraph->n_nodes;
         }
         fprintf(stderr, "[cpu_prof] graph_eval idx=%llu n_nodes=%d nth=%d acc=%d\n",
                 (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
