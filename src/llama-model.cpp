@@ -1169,6 +1169,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer(), false);
 
+    // NextN/MTP layers (il >= n_layer()) are not covered by the per-layer reads above, which run over
+    // n_layer() now that n_layer_nextn is known this early. A draft-only MTP context builds a KV cache
+    // for exactly those layers and a zero head count gives it a zero-byte buffer ("failed to allocate
+    // buffer for kv cache"). Inherit the last trunk layer's values where nothing was read.
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
+        const uint32_t il_last = hparams.n_layer() - 1;
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            if (hparams.n_ff_arr[il]      == 0) { hparams.n_ff_arr[il]      = hparams.n_ff_arr[il_last]; }
+            if (hparams.n_head_arr[il]    == 0) { hparams.n_head_arr[il]    = hparams.n_head_arr[il_last]; }
+            if (hparams.n_head_kv_arr[il] == 0) { hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[il_last]; }
+        }
+    }
+
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
