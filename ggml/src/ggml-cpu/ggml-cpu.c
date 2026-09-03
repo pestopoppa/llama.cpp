@@ -95,6 +95,24 @@ static inline int ggml_cpu_prof_mm_enabled(void) {
 }
 #endif
 
+// INF-70 D6a: minimum src0 rows per chunk for a dense mul_mat that parallelises by src0 rows
+// (the batch-1 gemv).  Under the NUMA rechunk every thread gets nr0/nth rows -- for a 320- or
+// 512-row gemv that is 7-11 short streams per thread and the per-call ramp dominates.  A value
+// of n caps nchunk0 at nr0/n so each working thread streams at least n rows; the remaining
+// threads have no work in this op.  GGML_MM_MIN_ROWS=<n>; 0 (default) = the historical split.
+static int64_t ggml_mul_mat_min_rows(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_MM_MIN_ROWS");
+        int64_t x = s ? atoll(s) : 0;
+        if (x < 0) {
+            x = 0;
+        }
+        v = x;
+    }
+    return v;
+}
+
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
@@ -1455,6 +1473,23 @@ UseGgmlGemm2:;
         // distribute the thread work across the inner or outer loop based on which one is larger
         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+    }
+
+    // INF-70 D6a: row floor per chunk for the src0-row split (see ggml_mul_mat_min_rows)
+    {
+        const int64_t min_rows = ggml_mul_mat_min_rows();
+        if (min_rows > 0 && nchunk1 == 1 && nchunk0 > 1) {
+            const int64_t max_chunks = MAX((int64_t) 1, nr0 / min_rows);
+            if (nchunk0 > max_chunks) {
+                static atomic_int logged = 0;
+                if (ith == 0 && atomic_exchange_explicit(&logged, 1, memory_order_relaxed) == 0) {
+                    fprintf(stderr, "[mm_min_rows] generic mul_mat: type=%s nr0=%lld nr1=%lld nth=%d nchunk0 %lld -> %lld (>= %lld rows/chunk)\n",
+                            ggml_type_name(src0->type), (long long) nr0, (long long) nr1, nth,
+                            (long long) nchunk0, (long long) max_chunks, (long long) min_rows);
+                }
+                nchunk0 = max_chunks;
+            }
+        }
     }
 
     // The number of elements in each chunk

@@ -1666,6 +1666,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // derived tensors that are assembled from loaded weights (INF-70 D6b: qwen4exp hc down|inject)
+    post_load_arch_tensors(ml);
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

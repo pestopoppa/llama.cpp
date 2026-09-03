@@ -536,6 +536,10 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
+    // INF-70 D6b: load-time row concatenation [down | inject] so one mul_mat per HC site feeds both
+    // the lora and the scatter weights (both consume the same normed input); nullptr = unfused
+    struct ggml_tensor * hc_attn_down_inject = nullptr;
+    struct ggml_tensor * hc_ffn_down_inject  = nullptr;
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
@@ -726,6 +730,9 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+
+    // optional: runs once after every weight has been read (derived / fused tensors are filled here)
+    virtual void post_load_arch_tensors(llama_model_loader & ml) { GGML_UNUSED(ml); }
 
 protected:
     llama_model_params params;

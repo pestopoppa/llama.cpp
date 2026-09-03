@@ -12,6 +12,9 @@
 #if defined IQK_IMPLEMENT
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <type_traits>
 #include <vector>
 #include <algorithm>
@@ -526,6 +529,18 @@ extern "C" IQK_API int iqk_dequant_type(int type, int Ny) {
     return MulMat::is_dequant_better(ggml_type(type), Ny);
 }
 
+namespace {
+// INF-70 D6a: shared with ggml-cpu.c's ggml_mul_mat_min_rows (same env var, cached once)
+inline int iqk_gemv_min_rows() {
+    static const int v = []() {
+        const char * s = getenv("GGML_MM_MIN_ROWS");
+        int x = s ? atoi(s) : 0;
+        return x < 0 ? 0 : x;
+    }();
+    return v;
+}
+}
+
 extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
@@ -542,7 +557,16 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
             return false;
         }
-        const int min_step = Ny <= 16 ? 16 : 32;
+        // INF-70 D6a: GGML_MM_MIN_ROWS raises the 16-row tile floor for the batch-1 gemv
+        // (Ny <= 16), so fewer threads each stream a longer run of rows.  0 = the 16-row default.
+        const int min_step = Ny <= 16 ? std::max(16, iqk_gemv_min_rows()) : 32;
+        if (Ny <= 16 && min_step > 16) {
+            static std::atomic<int> logged{0};
+            if (ith == 0 && logged.exchange(1, std::memory_order_relaxed) == 0) {
+                fprintf(stderr, "[mm_min_rows] iqk gemv tile: typeA=%s Nx=%ld Ny=%ld nth=%d min_step 16 -> %d (ntile_x %ld -> %d)\n",
+                        ggml_type_name(ggml_type(typeA)), Nx, Ny, nth, min_step, (Nx + 15)/16, (int)((Nx + min_step - 1)/min_step));
+            }
+        }
         int ntile_x = (Nx + min_step - 1)/min_step;
         int ntile_y = (Ny + min_step - 1)/min_step;
         int ntile   = ntile_x * ntile_y;

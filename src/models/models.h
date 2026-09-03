@@ -2064,17 +2064,21 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void post_load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
+        // w_down_inject (optional): the load-time [down | inject] row concatenation; when set and
+        // inject is requested, one mul_mat produces both and the two results are views of it
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
                     ggml_tensor * w_norm,
                     ggml_tensor * w_down,
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
+                    ggml_tensor * w_down_inject,
                     ggml_tensor ** inject,
                             int   il);
 

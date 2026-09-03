@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <vector>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -105,6 +107,75 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
+// INF-70 D6b: the HC down lora [hc_dim, hc_lr] and the HC inject [hc_dim, hc] both multiply the
+// same normed input, so their rows can be concatenated at load into one [hc_dim, hc_lr + hc]
+// weight and computed by one mul_mat per HC site (96 sites/token).  Row-wise concatenation keeps
+// every per-row dot product identical; only the tensor that carries the row changes.
+// LLAMA_HC_FUSE_INJECT=0 disables it (A/B handle).  Skipped under mmap (the derived tensor needs
+// an allocated buffer) and when the two tensors are not the same type / row length.
+static bool qwen4exp_hc_fuse_inject_enabled() {
+    static const bool v = []() {
+        const char * s = getenv("LLAMA_HC_FUSE_INJECT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return v;
+}
+
+static ggml_tensor * qwen4exp_make_fused_down_inject(llama_model_loader & ml, ggml_tensor * down, ggml_tensor * inject, const char * name) {
+    if (!down || !inject) {
+        return nullptr;
+    }
+    if (down->type != inject->type || down->ne[0] != inject->ne[0] || down->ne[2] != 1 || inject->ne[2] != 1) {
+        LLAMA_LOG_INFO("%s: not fusing %s (%s %s vs %s %s)\n", __func__, name,
+                ggml_get_name(down), ggml_type_name(down->type), ggml_get_name(inject), ggml_type_name(inject->type));
+        return nullptr;
+    }
+    ggml_context * ctx = nullptr;
+    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+        if (ggml_get_tensor(ctx_ptr.get(), ggml_get_name(down)) == down) {
+            ctx = ctx_ptr.get();
+            break;
+        }
+    }
+    if (!ctx) {
+        return nullptr;
+    }
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, down->type, down->ne[0], down->ne[1] + inject->ne[1]);
+    ggml_set_name(t, name);
+    return t;
+}
+
+void llama_model_qwen4exp::post_load_arch_tensors(llama_model_loader & ml) {
+    GGML_UNUSED(ml);
+    int n_fused = 0;
+    std::vector<uint8_t> buf;
+    auto fill = [&](ggml_tensor * fused, const ggml_tensor * down, const ggml_tensor * inject) {
+        if (!fused) {
+            return;
+        }
+        GGML_ASSERT(fused->data && down->data && inject->data);
+        GGML_ASSERT(ggml_is_contiguous(fused) && ggml_is_contiguous(down) && ggml_is_contiguous(inject));
+        const size_t nb_down = ggml_nbytes(down);
+        const size_t nb_inj  = ggml_nbytes(inject);
+        GGML_ASSERT(nb_down + nb_inj == ggml_nbytes(fused));
+        GGML_ASSERT(fused->nb[1] == down->nb[1] && fused->nb[1] == inject->nb[1]);
+        buf.resize(std::max(nb_down, nb_inj));
+        ggml_backend_tensor_get(down,   buf.data(), 0, nb_down);
+        ggml_backend_tensor_set(fused,  buf.data(), 0, nb_down);
+        ggml_backend_tensor_get(inject, buf.data(), 0, nb_inj);
+        ggml_backend_tensor_set(fused,  buf.data(), nb_down, nb_inj);
+        n_fused++;
+    };
+    for (auto & layer : layers) {
+        fill(layer.hc_attn_down_inject, layer.hc_attn_down, layer.hc_attn_inject);
+        fill(layer.hc_ffn_down_inject,  layer.hc_ffn_down,  layer.hc_ffn_inject);
+    }
+    if (n_fused > 0 || qwen4exp_hc_fuse_inject_enabled()) {
+        LLAMA_LOG_INFO("%s: hc down|inject fusion: %d of %d sites fused (LLAMA_HC_FUSE_INJECT=%s, mmap=%d)\n", __func__,
+                n_fused, 2 * (int) layers.size(), qwen4exp_hc_fuse_inject_enabled() ? "1" : "0", ml.use_mmap ? 1 : 0);
+    }
+}
+
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
@@ -164,6 +235,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, 0);
         layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, 0);
 
+        // INF-70 D6b: one [hc_dim, hc_lr + hc] tensor per HC site holding the down rows then the
+        // inject rows; filled in post_load_arch_tensors, consumed by build_hc_mix as one mul_mat
+        if (qwen4exp_hc_fuse_inject_enabled() && !ml.use_mmap) {
+            layer.hc_attn_down_inject = qwen4exp_make_fused_down_inject(ml, layer.hc_attn_down, layer.hc_attn_inject,
+                    format("blk.%d.hc_attn_down_inject.weight", il).c_str());
+            layer.hc_ffn_down_inject  = qwen4exp_make_fused_down_inject(ml, layer.hc_ffn_down,  layer.hc_ffn_inject,
+                    format("blk.%d.hc_ffn_down_inject.weight", il).c_str());
+        }
+
         if (!hparams.is_recr(il)) {
             // full attention: wq holds [q|gate] interleaved per head
             create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
@@ -221,6 +301,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  w_down,
         ggml_tensor *  w_up,
         ggml_tensor *  w_inject,
+        ggml_tensor *  w_down_inject,
         ggml_tensor ** inject,
         int            il) {
     const int64_t hc     = hparams.dsv4_hc_mult;
@@ -234,7 +315,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    ggml_tensor * lo = nullptr;
+    ggml_tensor * inj = nullptr;
+    // INF-70 D6b: one mul_mat for [down | inject]; LoRA adapters are keyed on the original weights,
+    // so an active adapter set keeps the two-op form
+    if (inject && w_down_inject && loras->empty()) {
+        const int64_t hc_lr = w_down->ne[1];
+        GGML_ASSERT(w_down_inject->ne[1] == hc_lr + hc);
+        ggml_tensor * di = build_lora_mm(w_down_inject, xn);   // [hc_lr + hc, nt]
+        cb(di, "hc_down_inject", il);
+        lo  = ggml_view_2d(ctx0, di, hc_lr, nt, di->nb[1], 0);
+        inj = ggml_view_2d(ctx0, di, hc,    nt, di->nb[1], hc_lr * ggml_element_size(di));
+        if (nt > 1) {
+            // the row-strided views are only contiguous for a single token; scale/silu need contiguous
+            lo  = ggml_cont(ctx0, lo);
+            inj = ggml_cont(ctx0, inj);
+        }
+    } else {
+        lo = build_lora_mm(w_down, xn);
+    }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
@@ -249,7 +348,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        *inject = inj ? inj : build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
     }
 
@@ -324,6 +423,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_down,
                 model.layers[il].hc_attn_up,
                 model.layers[il].hc_attn_inject,
+                model.layers[il].hc_attn_down_inject,
                 &inject, il);
 
         ggml_build_forward_expand(gf, cur);
@@ -351,6 +451,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_down,
                 model.layers[il].hc_ffn_up,
                 model.layers[il].hc_ffn_inject,
+                model.layers[il].hc_ffn_down_inject,
                 &inject, il);
 
         cur = build_layer_ffn(cur, il);
@@ -365,7 +466,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-            nullptr, nullptr, -1);
+            nullptr, nullptr, nullptr, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
