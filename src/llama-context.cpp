@@ -102,7 +102,7 @@ llama_context::llama_context(
 
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
-        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
@@ -1155,6 +1155,12 @@ void llama_context::set_embeddings(bool value) {
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
+    // INF-70 E2a diagnostic only: force the gathered (masked) nextn export so the
+    // arch graph keeps its normal last-layer inp_out_ids gather. Not a fix.
+    if (value && getenv("LLAMA_MTP_DIAG_FORCE_MASKED") != NULL) {
+        masked = true;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     cparams.embeddings_nextn        = value;
@@ -1340,8 +1346,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the fused decode fast path (INF-64): single-token decode on a fully
     // CPU-resident model runs the fused layer functions instead of the graph;
     // any failure falls through to the graph path below
+    // the fused path produces logits only; it exports no t_h_nextn, so an MTP
+    // draft target must stay on the graph path or the draft head sees no hidden state
     if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
-            gtype == LLM_GRAPH_TYPE_DEFAULT &&
+            gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
         // snapshot the previous graph's per-layer inputs (the fused path may
         // compare against them for layer-level isolation; the reset clears them)

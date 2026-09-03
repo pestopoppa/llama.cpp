@@ -1102,6 +1102,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -1166,6 +1168,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer(), false);
+
+    // NextN/MTP layers (il >= n_layer()) are not covered by the per-layer reads above, which run over
+    // n_layer() now that n_layer_nextn is known this early. A draft-only MTP context builds a KV cache
+    // for exactly those layers and a zero head count gives it a zero-byte buffer ("failed to allocate
+    // buffer for kv cache"). Inherit the last trunk layer's values where nothing was read.
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
+        const uint32_t il_last = hparams.n_layer() - 1;
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            if (hparams.n_ff_arr[il]      == 0) { hparams.n_ff_arr[il]      = hparams.n_ff_arr[il_last]; }
+            if (hparams.n_head_arr[il]    == 0) { hparams.n_head_arr[il]    = hparams.n_head_arr[il_last]; }
+            if (hparams.n_head_kv_arr[il] == 0) { hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[il_last]; }
+        }
+    }
 
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
@@ -2186,7 +2201,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen35 =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2439,6 +2454,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

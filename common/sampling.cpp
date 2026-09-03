@@ -640,9 +640,39 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // INF-70 E2a diagnostic only: per verification row, the target's argmax, its top-2 margin,
+    // the draft token and the row's role. The bonus row (i == draft.size()) is reported too, so the
+    // log carries every batched row an emitted token can come from.
+    static const bool diag_accept = getenv("LLAMA_SPEC_DIAG_ACCEPT") != NULL;
+
+    auto diag_row = [&](const char * role, size_t i, llama_token id, llama_token draft_tok) {
+        if (!diag_accept) {
+            return;
+        }
+        const llama_model * mdl = llama_get_model(ctx);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mdl));
+        const float * lg = llama_get_logits_ith(ctx, idxs[i]);
+        int   arg = -1, arg2 = -1;
+        float best = -INFINITY, best2 = -INFINITY;
+        if (lg) {
+            for (int t = 0; t < n_vocab; ++t) {
+                if (lg[t] > best) { best2 = best; arg2 = arg; best = lg[t]; arg = t; }
+                else if (lg[t] > best2) { best2 = lg[t]; arg2 = t; }
+            }
+        }
+        fprintf(stderr,
+            "[spec_diag] role=%s row=%zu idx=%d n_rows=%zu tgt_sampled=%d tgt_argmax=%d tgt_argmax_logit=%.6f "
+            "top2=%d margin=%.6f draft=%d draft_logit=%.6f match=%d\n",
+            role, i, idxs[i], idxs.size(), id, arg, (double) best, arg2, (double) (best - best2),
+            draft_tok, (lg && draft_tok >= 0) ? (double) lg[draft_tok] : 0.0,
+            (int) (draft_tok == id));
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        diag_row("verify", i, id, draft[i]);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -655,6 +685,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        diag_row("bonus", i, id, -1);
 
         common_sampler_accept(gsmpl, id, true);
 
