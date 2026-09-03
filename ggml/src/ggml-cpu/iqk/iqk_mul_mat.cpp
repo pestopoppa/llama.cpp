@@ -12,6 +12,7 @@
 #if defined IQK_IMPLEMENT
 
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 #include <algorithm>
@@ -54,6 +55,25 @@
 
 namespace {
 
+// INF-70 GDN-ROWEXACT: small-batch row-exact mode. For 1 < Ny <= N the Ny activation rows are
+// multiplied one at a time with the Ny=1 kernel (funcs[0]) inside the existing 64-row x tiles, so
+// every output element is produced by exactly the instruction sequence the single-token decode
+// uses (bit-equal to n separate GEMVs) while each weight tile is streamed from memory once and
+// re-read from cache Ny-1 times. Ny > N keeps the ny-specialised GEMM kernels.
+// GGML_IQK_ROWEXACT_N overrides the threshold (0 disables).
+#ifndef IQK_ROWEXACT_DEFAULT_N
+#define IQK_ROWEXACT_DEFAULT_N 0
+#endif
+static inline int iqk_rowexact_n() {
+    static int n = -1;
+    if (n < 0) {
+        const char * s = getenv("GGML_IQK_ROWEXACT_N");
+        n = s ? atoi(s) : IQK_ROWEXACT_DEFAULT_N;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
@@ -63,6 +83,19 @@ struct MulMat {
 #else
         constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
 #endif
+        if (const int n_y = nrc_y - info.cur_y; n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_y; ++iy) {
+                    funcs[0](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                    this_info.cur_y += 1;
+                }
+            }
+            info.cur_y = nrc_y;
+            return;
+        }
         if (func16 && nrc_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
@@ -171,6 +204,19 @@ struct MulMat {
                 for (int j = 0; j < this_nrc_x; ++j) result[j] *= tmp[ky*xstep + j];
             }
         };
+        if (const int n_y = nrc_y - info.cur_y; n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_y; ++iy) {
+                    process(funcs[0], this_info, ix, this_nrc_x, 1);
+                    this_info.cur_y += 1;
+                }
+            }
+            info.cur_y = nrc_y;
+            return;
+        }
         if (func16 && nrc_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
