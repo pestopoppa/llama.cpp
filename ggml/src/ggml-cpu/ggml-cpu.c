@@ -1556,6 +1556,18 @@ UseGgmlGemm2:;
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
+// INF-70 B3-k: flat (expert, row) slab partition of the single-token mul_mat_id — on by
+// default; GGML_MMID_SLAB=0 restores D1's per-expert 1/nth row stripes (same-binary A/B).
+// Same knob as the iqk dispatch hook, which is what GGML_IQK=1 actually runs.
+static int ggml_mmid_slab_enabled(void) {
+    static int flag = -1;
+    if (flag < 0) {
+        const char * s = getenv("GGML_MMID_SLAB");
+        flag = (s == NULL || atoi(s) != 0) ? 1 : 0;
+    }
+    return flag;
+}
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1761,6 +1773,61 @@ static void ggml_compute_forward_mul_mat_id(
             b1_expert[pos] = i02;
             b1_row   [pos] = (struct mmid_row_mapping) { id, 0 };
             ++b1_n;
+        }
+
+        // ------------------------------------------------------------------------------
+        // INF-70 B3-k: flat slab partition. The per-expert chunk plan below gives every
+        // thread a 1/nth row stripe of EVERY used expert (14–54 rows, 19–26 KB, ten short
+        // streams per op at 48 threads). Instead treat the used experts' rows as ONE flat
+        // space of n_groups*ne01 rows (experts ascending — the order the loop below
+        // iterates) and give thread ith the contiguous range [total*ith/nth,
+        // total*(ith+1)/nth): one long run of at most two adjacent expert slabs, balanced
+        // to ±1 row. Bit-identical: _one_chunk computes each output row with one vec_dot
+        // over the whole row whatever the chunk bounds, and dst rows stay disjoint per
+        // (id, row). Taken only for distinct experts (cne1 == 1 everywhere — the top-k
+        // decode case); anything else keeps the per-expert chunk plan.
+        // ------------------------------------------------------------------------------
+        {
+            int  grp_start[GGML_MMID_B1_MAX_IDS];
+            int  n_groups = 0;
+            bool slab_ok  = ggml_mmid_slab_enabled() && b1_n > 0;
+            for (int i = 0; i < b1_n; ) {
+                int j = i;
+                while (j < b1_n && b1_expert[j] == b1_expert[i]) {
+                    ++j;
+                }
+                if (j - i != 1) {
+                    slab_ok = false;
+                }
+                grp_start[n_groups++] = i;
+                i = j;
+            }
+
+            if (slab_ok) {
+                const int64_t rows_total = (int64_t) n_groups * ne01;
+                const int64_t r0 = (rows_total * ith) / nth;
+                const int64_t r1 = (rows_total * (ith + 1)) / nth;
+
+                for (int64_t r = r0; r < r1; ) {
+                    const int     g  = (int) (r / ne01);
+                    const int64_t g0 = (int64_t) g * ne01;
+                    const int64_t re = MIN(r1, g0 + ne01);
+
+                    const char * src0_cur = (const char *) src0->data + b1_expert[grp_start[g]]*nb02;
+
+                    // cur_a == 0 with a base pointing at this expert's rows and at its
+                    // single row-map entry reproduces MMID_MATRIX_ROW(cur_a, 0) exactly.
+                    ggml_compute_forward_mul_mat_id_one_chunk(
+                        dst, src0, src1, ids, /*cur_a =*/ 0,
+                        r - g0, re - g0, /*ir1_start =*/ 0, /*ir1_end =*/ 1,
+                        src0_cur, b1_row + grp_start[g], row_size, src1_cont, wdata_used
+                    );
+
+                    r = re;
+                }
+
+                return;
+            }
         }
 
         for (int i = 0; i < b1_n; ) {

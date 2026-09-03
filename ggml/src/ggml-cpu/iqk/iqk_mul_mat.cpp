@@ -808,6 +808,53 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     return true;
 }
 
+// INF-70 B3-k: one contiguous row range [first_x, first_x + nrc_x) of ONE expert, with no
+// thread split — the caller partitions the flat (expert, row) space so that each thread
+// streams one long contiguous run of an expert slab instead of a thin 1/nth stripe of
+// every expert. Bit-identical to iqk_mul_mat_moe over the same rows: the same kernel is
+// selected (same typeA/typeB/ne00/Ny) and every kernel reachable here accumulates each
+// output row independently (per-row accumulators, the same block order), so which thread
+// computes a row, and where the 64-row tile boundaries fall, cannot change its value.
+// Only the direct-kernel path is served: callers check iqk_dequant_type(typeA, Ny) ==
+// typeA first; the dequant/repack path (Ny >= 32) keeps using iqk_mul_mat_moe.
+extern "C" IQK_API int iqk_mul_mat_moe_row_granularity(int typeA) {
+    return MulMat::num_rows(ggml_type(typeA));
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe_rows(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, long first_x, long nrc_x) {
+    const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
+    assert(row_mapping != nullptr);
+
+    auto etypeA = ggml_type(typeA);
+    if (MulMat::is_dequant_better(etypeA, Ny) != etypeA) {
+        return false;
+    }
+
+    // kernel selection first, before the empty-range return, so that every thread of a
+    // partition observes the same verdict for the same (typeA, typeB, ne00, Ny)
+    MulMat mm;
+    if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+        return false;
+    }
+
+    const auto num_rows = MulMat::num_rows(etypeA);
+    GGML_ASSERT(Nx % num_rows == 0 && first_x % num_rows == 0 && nrc_x % num_rows == 0);
+    GGML_ASSERT(first_x >= 0 && nrc_x >= 0 && first_x + nrc_x <= Nx);
+    if (nrc_x == 0) {
+        return true;
+    }
+
+    const size_t row_size_qx = strideA;
+    const size_t row_size_qy = strideB;
+    DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
+        row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
+    mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, (int) nrc_x, (int) Ny);
+    return true;
+}
+
 extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,
@@ -1791,6 +1838,17 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long /*Nx*/, long /*Ny*/, long /*ne00*/,
 
 extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
         const void *, int, int) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+
+extern "C" IQK_API int iqk_mul_mat_moe_row_granularity(int) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return 1;
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe_rows(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
+        const void *, long, long) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
