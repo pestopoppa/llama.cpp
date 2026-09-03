@@ -807,7 +807,16 @@ static constexpr __host__ __device__ int calc_nwarps(
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    // akm-cdna2-q8-b4-y-stream-amortize: at ncols_dst=4 the 4-column Q8_1 activation row does not
+    // depend on the row index, so each block re-reads it from L2/L1 once per row group. 4 rows per
+    // block halves that y re-read traffic versus 2 (y ~1.06x of the weight bytes at 4 rows vs
+    // ~2.1x at 2), raising the kernel's L2 read ceiling toward the ncols_dst=1 kernel's. GCN
+    // (CDNA2) only; the small_k instantiation keeps rows_per_cuda_block=2 as the host-side
+    // fallback for row counts that are not multiples of 4.
+    if (table_id == MMVQ_PARAMETERS_GCN && type == GGML_TYPE_Q8_0 && ncols_dst == 4 && !small_k) {
+        return 4;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
         switch (ncols_dst) {
             case 1:
@@ -1020,7 +1029,7 @@ static __global__ void mul_mat_vec_q(
 #else
     constexpr bool halfwave_rows = false;
 #endif
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps) *
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps) *
         (halfwave_rows ? 2 : 1);
     constexpr int rows_per_thread = halfwave_rows ? 1 : rows_per_cuda_block;
     constexpr int reduction_width = halfwave_rows ? warp_size/2 : warp_size;
@@ -1473,7 +1482,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false,
         const bool halfwave_rows = false, const bool fixed_1536_cdna2 = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, fixed_1536_cdna2);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps) * (halfwave_rows ? 2 : 1);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps) * (halfwave_rows ? 2 : 1);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1757,6 +1766,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
+            const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+            const int rpb = calc_rows_per_block(type, c_ncols_dst, table_id, false, nwarps);
+            if (rpb == 4 && nrows_x % rpb != 0) {
+                if constexpr (type == GGML_TYPE_Q8_0) {
+                    // akm-cdna2-q8-b4-y-stream-amortize: R=4 row tiling needs nrows_x % 4 == 0;
+                    // launch the small_k instantiation (rows_per_cuda_block=2) instead, so a
+                    // non-multiple row count never reads past the last row of x.
+                    constexpr bool r2_fallback = true;
+                    std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, r2_fallback);
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, r2_fallback>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                         dims.first, dims.second, 0, ids_stride, stream);
+                    break;
+                }
+            }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
