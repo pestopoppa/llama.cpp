@@ -18,6 +18,7 @@
 #include <algorithm>
 
 #include "ggml-impl.h"
+#include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "iqk_mul_mat.h"
 #include "iqk_quantize.h"
@@ -60,18 +61,19 @@ namespace {
 // every output element is produced by exactly the instruction sequence the single-token decode
 // uses (bit-equal to n separate GEMVs) while each weight tile is streamed from memory once and
 // re-read from cache Ny-1 times. Ny > N keeps the ny-specialised GEMM kernels.
-// GGML_IQK_ROWEXACT_N overrides the threshold (0 disables).
-#ifndef IQK_ROWEXACT_DEFAULT_N
-#define IQK_ROWEXACT_DEFAULT_N 0
-#endif
-static inline int iqk_rowexact_n() {
-    static int n = -1;
-    if (n < 0) {
-        const char * s = getenv("GGML_IQK_ROWEXACT_N");
-        n = s ? atoi(s) : IQK_ROWEXACT_DEFAULT_N;
-        if (n < 0) n = 0;
+// GGML_ROWEXACT_N overrides the threshold (0 disables).
+static inline int iqk_rowexact_n() { return ggml_cpu_rowexact_n(); }
+
+// GGML_IQK_DEQUANT=0 keeps every type on its direct kernel (no weight requantisation to Q8 at
+// large Ny). Diagnostic/serving knob; default on (upstream behaviour) except for the types
+// excluded below.
+static inline bool iqk_dequant_enabled() {
+    static int f = -1;
+    if (f < 0) {
+        const char * s = getenv("GGML_IQK_DEQUANT");
+        f = (s == nullptr || atoi(s) != 0) ? 1 : 0;
     }
-    return n;
+    return f != 0;
 }
 
 struct MulMat {
@@ -288,17 +290,21 @@ struct MulMat {
 #else
         auto q8_k_type = GGML_TYPE_Q8_K_R8;
 #endif
+        if (!iqk_dequant_enabled()) return type;
         switch (int(type)) {
             // The native iquant-to-repacked-Q8 converters produce incorrect
             // results for some large-Ny dense and MoE shapes on Zen 4. Keep
             // these five newly enabled families on their direct IQK kernels.
+            // INF-70 GDN-ROWEXACT: IQ4_XS joins them — its Q8_K_R16 repack at Ny >= 32
+            // returns garbage (attn_gate/ssm_out on qwen4exp: max abs error ~1e3 on
+            // every element; prompts >= ~32 tokens degenerate to token salad).
+            case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:
                 return type;
-            case GGML_TYPE_IQ4_XS : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? q8_k_type : type;

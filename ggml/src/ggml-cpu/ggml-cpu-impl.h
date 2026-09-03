@@ -15,6 +15,10 @@
 extern "C" {
 #endif
 
+// INF-70 GDN-ROWEXACT: small-batch row-exact threshold (see ggml-cpu.c)
+int ggml_cpu_rowexact_n(void);
+
+
 struct ggml_compute_params {
     // ith = thread index, nth = number of threads
     int ith, nth;
