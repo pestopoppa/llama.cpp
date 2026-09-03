@@ -123,6 +123,8 @@ static diff_stat compare(const rec & a, const int64_t fixa[4], const rec & b, co
     return d;
 }
 
+static double g_min_abs = 0.0;
+
 static std::string ne_str(const rec & r) {
     char buf[96]; snprintf(buf, sizeof buf, "[%lld,%lld,%lld,%lld]", (long long)r.ne[0], (long long)r.ne[1], (long long)r.ne[2], (long long)r.ne[3]); return buf;
 }
@@ -140,6 +142,8 @@ struct opts {
     int fa = -1;           // -1 = auto, 0 off, 1 on
     int rs_seq = 0;
     int show = 12;
+    double min_abs = 0.0;       // only list nodes whose max|diff| >= min_abs (bitwise counts are unaffected)
+    std::string text_file;      // prompt text from a file (overrides the built-in prompt A)
     std::string mode = "batch";
     int prompt_a = 0, prompt_b = 1;
 };
@@ -291,7 +295,7 @@ static void cmp_nodes(const std::vector<rec> & batch, int N, int S, int i,
         if (!d.ok) {
             n_bad++;
             if (first_bad.empty()) first_bad = rb.name;
-            if (n_shown < show) {
+            if (n_shown < show && d.max_abs >= g_min_abs) {
                 n_shown++;
                 printf("    #%-5zu %-36s %-14s %-22s %-4s diff %lld/%lld max|d|=%.3e first@%lld\n",
                        k, rb.name.c_str(), ggml_op_name(rb.op), ne_str(rb).c_str(), ggml_type_name(rb.type),
@@ -320,8 +324,11 @@ int main(int argc, char ** argv) {
         else if (a == "--rs-seq")    o.rs_seq = atoi(next().c_str());
         else if (a == "--show")      o.show = atoi(next().c_str());
         else if (a == "--prompt")    o.prompt_a = atoi(next().c_str());
+        else if (a == "--min-abs")   o.min_abs = atof(next().c_str());
+        else if (a == "--text")      o.text_file = next();
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
+    g_min_abs = o.min_abs;
     if (o.model.empty()) { fprintf(stderr, "usage: -m model [-t 48] [-n 3] [--prefix 8] [--mode batch|multi] [--seqs 2] [--n-seq-max 4] [--unified 0|1] [--fa 0|1] [--rs-seq K]\n"); return 1; }
 
     llama_backend_init();
@@ -336,8 +343,17 @@ int main(int argc, char ** argv) {
     printf("rowexact: mode=%s n=%d prefix=%d seqs=%d n_seq_max=%d unified=%d fa=%d rs_seq=%d threads=%d\n",
            o.mode.c_str(), o.n, o.prefix, o.seqs, o.n_seq_max, o.unified, o.fa, o.rs_seq, o.n_threads);
 
+    std::string text_buf;
+    if (!o.text_file.empty()) {
+        FILE * f = fopen(o.text_file.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", o.text_file.c_str()); return 1; }
+        char buf[4096]; size_t k;
+        while ((k = fread(buf, 1, sizeof buf, f)) > 0) text_buf.append(buf, k);
+        fclose(f);
+    }
+    const char * prompt_a_text = text_buf.empty() ? PROMPTS[o.prompt_a % 4] : text_buf.c_str();
     if (o.mode == "batch") {
-        auto toks = tokenize(vocab, PROMPTS[o.prompt_a % 4], want);
+        auto toks = tokenize(vocab, prompt_a_text, want);
         printf("tokens:"); for (auto t : toks) printf(" %d", t); printf("\n");
         printf("== reference: %d single-token decodes\n", o.n); fflush(stdout);
         run_result ref = run_single(model, o, toks, n_vocab);

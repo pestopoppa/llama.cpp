@@ -606,7 +606,8 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     int npt = (Nx + nth - 1)/nth;
 
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); npt >= 16 &&
+    const bool rowexact = Ny > 1 && Ny <= iqk_rowexact_n();   // INF-70 GDN-ROWEXACT: stay on the Ny=1 kernel path
+    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); !rowexact && npt >= 16 &&
              dequant_type != etypeA && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny) &&
              Nx%MulMat::num_rows(ggml_type(dequant_type)) == 0) {
 
@@ -793,7 +794,8 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
 
     auto etypeA = ggml_type(typeA);
     //auto etypeB = ggml_type(typeB);
-    auto dequant_type = MulMat::is_dequant_better(etypeA, Ny);
+    // INF-70 GDN-ROWEXACT: the small-batch exact mode stays on the direct-kernel (Ny=1) path
+    auto dequant_type = (Ny > 1 && Ny <= iqk_rowexact_n()) ? etypeA : MulMat::is_dequant_better(etypeA, Ny);
     //if (etypeB != GGML_TYPE_F32) {
     //    if (ith == 0) printf("%s: typeA = %s, typeB = %s, dequant_type = %s\n", __func__, ggml_type_name(etypeA), ggml_type_name(etypeB), ggml_type_name(dequant_type));
     //}
@@ -915,7 +917,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     MulMat mm;
 
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
+    if (auto dequant_type = (Ny > 1 && Ny <= iqk_rowexact_n()) ? etypeA : MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
             constexpr int k_x_step = 64;
