@@ -7,7 +7,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-t n_threads] [-mmp 0|1] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
     printf("\n");
 }
 
@@ -22,6 +22,9 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
+    // INF-70: thread count and mmap control, so llama-simple can run the canonical recipe
+    int n_threads = -1;
+    bool use_mmap = true;
 
     // parse command line arguments
 
@@ -39,6 +42,30 @@ int main(int argc, char ** argv) {
                 if (i + 1 < argc) {
                     try {
                         n_predict = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-t") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_threads = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-mmp") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        use_mmap = std::stoi(argv[++i]) != 0;
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -85,6 +112,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
+    model_params.use_mmap     = use_mmap;
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
@@ -115,6 +143,10 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = n_prompt;
     // enable performance counters
     ctx_params.no_perf = false;
+    if (n_threads > 0) {
+        ctx_params.n_threads       = n_threads;
+        ctx_params.n_threads_batch = n_threads;
+    }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
