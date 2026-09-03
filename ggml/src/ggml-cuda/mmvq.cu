@@ -652,10 +652,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
             case GGML_TYPE_Q6_K:
                 return log_decision(ne11 <= 5);
-            // MMVQ->MMQ campaign (mmvq experiment): force MMQ for Q8_0 at ne11>=2 so
-            // MTP verify blocks (4-col batch) use batched mul_mat_q instead of per-column mul_mat_vec_q.
+            // akm-cdna2-q8-b4-mmvq-route: route Q8_0 at ne11<=4 (MTP verify width) through the
+            // ncols_dst<=4 mul_mat_vec_q templates instead of mul_mat_q. At ne11=4 MMQ pads to
+            // J=8 and runs occupancy-1 128-row stream-k tiles for 4 real columns, leaving the
+            // dec-b4 surface at ~29% of HBM bandwidth; the multi-column MMVQ shares each weight
+            // read across 4 register accumulators. ne11>=5 stays on MMQ (the July crossover).
             case GGML_TYPE_Q8_0:
-                return log_decision(ne11 <= 1);
+                return log_decision(ne11 <= 4);
             default:
                 return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
         }
