@@ -20,12 +20,60 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
 #include <fstream>
+
+// INF-70 E2a: exactness modes for greedy speculative verification, read once from LLAMA_SPEC_EXACT.
+// On a target whose multi-token forward is not row-exact against its single-token forward (qwen4exp:
+// the 36 GDN layers run the chunked kernel for n_seq_tokens > 1 and the autoregressive kernel for
+// == 1, so no row of a verification batch is computed the way plain decode computes it), a batched
+// row can put a different token first than plain decode would. The three shapes trade speculative
+// throughput for exactness in different amounts:
+//   drop     - emit the verified tokens only, never the batch's bonus row; the last verified token is
+//              re-decoded as the next round's first row. On a FULL-rollback context this costs a
+//              checkpoint restore plus a prefix re-decode per fully accepted round.
+//   redecode - as drop, then decode the last verified token alone and take the bonus token from that
+//              single-token row (one more target pass per round).
+//   serial   - verify every draft token with its own single-token decode (the DSpark serial path,
+//              opened to every drafter at temp 0). Exact by construction; no batching benefit.
+enum spec_exact_mode {
+    SPEC_EXACT_OFF = 0,
+    SPEC_EXACT_DROP,
+    SPEC_EXACT_REDECODE,
+    SPEC_EXACT_SERIAL,
+};
+
+static const char * spec_exact_mode_name(spec_exact_mode m) {
+    switch (m) {
+        case SPEC_EXACT_DROP:     return "drop";
+        case SPEC_EXACT_REDECODE: return "redecode";
+        case SPEC_EXACT_SERIAL:   return "serial";
+        default:                  return "off";
+    }
+}
+
+static spec_exact_mode spec_exact_mode_from_env() {
+    const char * v = getenv("LLAMA_SPEC_EXACT");
+    if (v == nullptr || *v == 0 || strcmp(v, "off") == 0) {
+        return SPEC_EXACT_OFF;
+    }
+    if (strcmp(v, "drop") == 0) {
+        return SPEC_EXACT_DROP;
+    }
+    if (strcmp(v, "redecode") == 0) {
+        return SPEC_EXACT_REDECODE;
+    }
+    if (strcmp(v, "serial") == 0) {
+        return SPEC_EXACT_SERIAL;
+    }
+    LOG_WRN("unknown LLAMA_SPEC_EXACT=%s (expected off|drop|redecode|serial), ignoring\n", v);
+    return SPEC_EXACT_OFF;
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -293,6 +341,7 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    int32_t n_spec_exact_extra = 0;  // INF-70 E2a: extra target tokens decoded by LLAMA_SPEC_EXACT drop/redecode
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
     void reset() {
@@ -322,6 +371,7 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
+        n_spec_exact_extra = 0;
         n_accepted_per_pos.clear();
 
         task_prev = std::move(task);
@@ -636,6 +686,11 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (n_spec_exact_extra > 0) {
+                SLT_INF(*this,
+                    "spec_exact extra target tokens = %5d (re-decoded after %5d verification steps)\n",
+                    n_spec_exact_extra, n_draft_verif_steps);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -910,6 +965,10 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // INF-70 E2a
+    spec_exact_mode spec_exact        = spec_exact_mode_from_env();
+    bool            spec_exact_warned = false;
 
     common_speculative_ptr spec;
 
@@ -1271,6 +1330,11 @@ private:
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        if (spec_exact != SPEC_EXACT_OFF) {
+            SRV_INF("speculative exactness mode (LLAMA_SPEC_EXACT) = %s, target seq_rm type = %d\n",
+                    spec_exact_mode_name(spec_exact), (int) ctx_tgt_seq_rm_type);
         }
 
         // setup slots
@@ -2900,6 +2964,12 @@ private:
     }
 
     bool use_serial_speculative_verify(const server_slot & slot) const {
+        // INF-70 E2a: LLAMA_SPEC_EXACT=serial opens the serial path to every drafter at temp 0. It never
+        // decodes a rejected token, so it needs no rollback and works on every seq_rm type.
+        if (spec_exact == SPEC_EXACT_SERIAL && slot.task->params.sampling.temp <= 0.0f) {
+            return true;
+        }
+
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                 slot.task->params.sampling.temp > 0.0f) {
             return false;
@@ -3092,9 +3162,10 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool use_ckpt_tgt =
+                // a serially verified round never needs a rollback, so it needs no checkpoint either
+                const bool use_ckpt_tgt = !use_serial_speculative_verify(slot) && (
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)));
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -3775,6 +3846,8 @@ private:
     // therefore verifies greedy recurrent requests serially until the kernels
     // can prove the stronger batch-invariance property.  Only accepted draft
     // tokens are decoded, so rejected tokens never enter recurrent state.
+    // INF-70 E2a: LLAMA_SPEC_EXACT=serial routes every drafter through this path
+    // at temp 0 (see use_serial_speculative_verify); nothing here is DSpark-specific.
     llama_tokens sample_and_accept_dspark_serial(server_slot & slot, int32_t off) {
         GGML_ASSERT(use_serial_speculative_verify(slot));
         GGML_ASSERT(!slot.spec_draft.empty());
@@ -3828,6 +3901,97 @@ private:
 
         slot.spec_i_batch.clear();
         return accepted;
+    }
+
+    // INF-70 E2a: the literal "option (a)" shapes, LLAMA_SPEC_EXACT=drop|redecode. Runs after a batched
+    // verification that accepted every draft token and took its bonus from the batch's last row. On a
+    // FULL-rollback context the only way to obtain a row that was not computed inside a multi-token batch
+    // is to restore the pre-round checkpoint and decode again, so both shapes pay a restore plus a
+    // prefix re-decode per fully accepted round; 'redecode' adds one single-token decode for the bonus.
+    // Returns false and leaves the round untouched when it cannot handle it (the caller proceeds as stock).
+    // Like the serial path, this decodes inside post_decode and therefore assumes -np 1.
+    bool spec_exact_bonus(server_slot & slot, llama_tokens & accepted, common_sampler_ptr & smpl_save) {
+        const auto & draft = slot.spec_draft;
+        const size_t n_draft = draft.size();
+
+        if (accepted.size() != n_draft + 1) {
+            return false; // a rejection round: the batched path's own rollback handles it
+        }
+
+        if (slot.spec_ckpt.empty() || params_base.n_parallel != 1 || !smpl_save) {
+            if (!spec_exact_warned) {
+                SLT_WRN(slot, "%s", "LLAMA_SPEC_EXACT drop/redecode needs a speculative checkpoint and -np 1; using the stock bonus row\n");
+                spec_exact_warned = true;
+            }
+            return false;
+        }
+
+        const auto & ckpt = slot.spec_ckpt;
+        const llama_pos pos_first = slot.prompt.tokens.pos_next() - (llama_pos) n_draft - 1; // position of slot.sampled
+
+        GGML_ASSERT(ckpt.pos_max + 1 == pos_first && "speculative checkpoint does not end right before the sampled token");
+
+        // 1. back to the state before this round's verification batch, target and draft contexts alike
+        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+        if (slot.ctx_dft) {
+            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+        }
+
+        auto decode = [&](server_batch & sb, const char * what) {
+            sb.render();
+            const int ret = llama_decode(slot.ctx_tgt, sb.batch);
+            metrics.on_decoded(slots);
+            if (ret != 0) {
+                throw std::runtime_error(string_format("LLAMA_SPEC_EXACT %s decode failed: llama_decode returned %d", what, ret));
+            }
+            if (!common_speculative_process(spec.get(), sb.batch)) {
+                throw std::runtime_error(string_format("LLAMA_SPEC_EXACT %s: failed to process speculative batch", what));
+            }
+            slot.n_spec_exact_extra += sb.size();
+        };
+
+        // 2. the sampled token and all but the last verified draft token, again, as one batch
+        {
+            server_batch b;
+            b.init((int32_t) n_draft + 1);
+            bool add_ok = b.add(slot.id, slot.sampled, pos_first, true);
+            for (size_t i = 0; i + 1 < n_draft; ++i) {
+                add_ok &= b.add(slot.id, draft[i], pos_first + (llama_pos) i + 1, true);
+            }
+            GGML_ASSERT(add_ok);
+            decode(b, "prefix");
+        }
+
+        // the sampler saw the batched bonus: rewind to the pre-round clone and replay the kept tokens
+        slot.smpl = std::move(smpl_save);
+        accepted.pop_back(); // the batched bonus row is never emitted
+        for (const llama_token id : accepted) {
+            common_sampler_accept(slot.smpl.get(), id, true);
+        }
+
+        if (spec_exact == SPEC_EXACT_REDECODE) {
+            // 3. the last verified token alone: the bonus row is now a single-token decode
+            server_batch b1;
+            b1.init(1);
+            const bool add_ok = b1.add(slot.id, draft[n_draft - 1], pos_first + (llama_pos) n_draft, true);
+            GGML_ASSERT(add_ok);
+            decode(b1, "bonus");
+
+            llama_token id;
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, 0);
+            }
+            common_sampler_accept(slot.smpl.get(), id, true);
+            accepted.push_back(id);
+        }
+
+        SLT_DBG(slot, "spec_exact %s: n_draft = %zu, emitted this round = %zu, extra target tokens so far = %d\n",
+                spec_exact_mode_name(spec_exact), n_draft, accepted.size(), slot.n_spec_exact_extra);
+
+        return true;
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
@@ -3961,6 +4125,7 @@ private:
             {
                 const bool serial_verify = use_serial_speculative_verify(slot);
                 llama_tokens accepted;
+                bool exact_handled = false; // INF-70 E2a: drop/redecode already restored and re-decoded
 
                 // save the sampler state only for the parallel path, where a
                 // checkpoint restore may need to replay verification.
@@ -3981,6 +4146,10 @@ private:
                         : common_sampler_sample_and_accept_n(
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
+
+                    if (spec_exact == SPEC_EXACT_DROP || spec_exact == SPEC_EXACT_REDECODE) {
+                        exact_handled = spec_exact_bonus(slot, accepted, smpl_save);
+                    }
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3993,7 +4162,7 @@ private:
                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)));
 
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
+                if (n_rollback > 0 && !exact_handled) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
