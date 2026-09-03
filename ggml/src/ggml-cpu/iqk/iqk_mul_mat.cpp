@@ -284,13 +284,15 @@ struct MulMat {
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
+        // INF-70: the GGML_IQK_DEQUANT=0 kill-switch must gate BOTH SIMD arms, not just
+        // __AVX2__. Lifted above the #ifdef so there is exactly one guard, no duplication.
+        if (!iqk_dequant_enabled()) return type;
 #ifdef __AVX2__
 #ifdef HAVE_FANCY_SIMD
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
 #else
         auto q8_k_type = GGML_TYPE_Q8_K_R8;
 #endif
-        if (!iqk_dequant_enabled()) return type;
         switch (int(type)) {
             // The native iquant-to-repacked-Q8 converters produce incorrect
             // results for some large-Ny dense and MoE shapes on Zen 4. Keep
