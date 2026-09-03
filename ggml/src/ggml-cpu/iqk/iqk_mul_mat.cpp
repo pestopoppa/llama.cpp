@@ -12,11 +12,13 @@
 #if defined IQK_IMPLEMENT
 
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 #include <algorithm>
 
 #include "ggml-impl.h"
+#include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "iqk_mul_mat.h"
 #include "iqk_quantize.h"
@@ -54,6 +56,26 @@
 
 namespace {
 
+// INF-70 GDN-ROWEXACT: small-batch row-exact mode. For 1 < Ny <= N the Ny activation rows are
+// multiplied one at a time with the Ny=1 kernel (funcs[0]) inside the existing 64-row x tiles, so
+// every output element is produced by exactly the instruction sequence the single-token decode
+// uses (bit-equal to n separate GEMVs) while each weight tile is streamed from memory once and
+// re-read from cache Ny-1 times. Ny > N keeps the ny-specialised GEMM kernels.
+// GGML_ROWEXACT_N overrides the threshold (0 disables).
+static inline int iqk_rowexact_n() { return ggml_cpu_rowexact_n(); }
+
+// GGML_IQK_DEQUANT=0 keeps every type on its direct kernel (no weight requantisation to Q8 at
+// large Ny). Diagnostic/serving knob; default on (upstream behaviour) except for the types
+// excluded below.
+static inline bool iqk_dequant_enabled() {
+    static int f = -1;
+    if (f < 0) {
+        const char * s = getenv("GGML_IQK_DEQUANT");
+        f = (s == nullptr || atoi(s) != 0) ? 1 : 0;
+    }
+    return f != 0;
+}
+
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
@@ -63,6 +85,19 @@ struct MulMat {
 #else
         constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
 #endif
+        if (const int n_y = nrc_y - info.cur_y; n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_y; ++iy) {
+                    funcs[0](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                    this_info.cur_y += 1;
+                }
+            }
+            info.cur_y = nrc_y;
+            return;
+        }
         if (func16 && nrc_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
@@ -171,6 +206,19 @@ struct MulMat {
                 for (int j = 0; j < this_nrc_x; ++j) result[j] *= tmp[ky*xstep + j];
             }
         };
+        if (const int n_y = nrc_y - info.cur_y; n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_y; ++iy) {
+                    process(funcs[0], this_info, ix, this_nrc_x, 1);
+                    this_info.cur_y += 1;
+                }
+            }
+            info.cur_y = nrc_y;
+            return;
+        }
         if (func16 && nrc_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
@@ -236,6 +284,9 @@ struct MulMat {
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
+        // INF-70: the GGML_IQK_DEQUANT=0 kill-switch must gate BOTH SIMD arms, not just
+        // __AVX2__. Lifted above the #ifdef so there is exactly one guard, no duplication.
+        if (!iqk_dequant_enabled()) return type;
 #ifdef __AVX2__
 #ifdef HAVE_FANCY_SIMD
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
@@ -246,13 +297,16 @@ struct MulMat {
             // The native iquant-to-repacked-Q8 converters produce incorrect
             // results for some large-Ny dense and MoE shapes on Zen 4. Keep
             // these five newly enabled families on their direct IQK kernels.
+            // INF-70 GDN-ROWEXACT: IQ4_XS joins them — its Q8_K_R16 repack at Ny >= 32
+            // returns garbage (attn_gate/ssm_out on qwen4exp: max abs error ~1e3 on
+            // every element; prompts >= ~32 tokens degenerate to token salad).
+            case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:
                 return type;
-            case GGML_TYPE_IQ4_XS : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q2_K   : return nrc_y >= 32 ? q8_k_type : type;
@@ -560,7 +614,8 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     int npt = (Nx + nth - 1)/nth;
 
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); npt >= 16 &&
+    const bool rowexact = Ny > 1 && Ny <= iqk_rowexact_n();   // INF-70 GDN-ROWEXACT: stay on the Ny=1 kernel path
+    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); !rowexact && npt >= 16 &&
              dequant_type != etypeA && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny) &&
              Nx%MulMat::num_rows(ggml_type(dequant_type)) == 0) {
 
@@ -747,7 +802,8 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
 
     auto etypeA = ggml_type(typeA);
     //auto etypeB = ggml_type(typeB);
-    auto dequant_type = MulMat::is_dequant_better(etypeA, Ny);
+    // INF-70 GDN-ROWEXACT: the small-batch exact mode stays on the direct-kernel (Ny=1) path
+    auto dequant_type = (Ny > 1 && Ny <= iqk_rowexact_n()) ? etypeA : MulMat::is_dequant_better(etypeA, Ny);
     //if (etypeB != GGML_TYPE_F32) {
     //    if (ith == 0) printf("%s: typeA = %s, typeB = %s, dequant_type = %s\n", __func__, ggml_type_name(etypeA), ggml_type_name(etypeB), ggml_type_name(dequant_type));
     //}
@@ -869,7 +925,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     MulMat mm;
 
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
+    if (auto dequant_type = (Ny > 1 && Ny <= iqk_rowexact_n()) ? etypeA : MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
             constexpr int k_x_step = 64;

@@ -1376,6 +1376,32 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
+    // INF-70 GDN-ROWEXACT: for 1 < ne11 <= GGML_ROWEXACT_N run the tinyBLAS GEMM one src1
+    // column at a time, i.e. exactly the ne11 == 1 call the single-token decode makes, so
+    // every output row of a small batch is bit-equal to the corresponding single-token
+    // result (the tiled kernels pick a different accumulation order per tile shape).
+    if (src1_cont && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n()) {
+        bool ok = true;
+        for (int64_t i13 = 0; i13 < ne13 && ok; i13++)
+            for (int64_t i12 = 0; i12 < ne12 && ok; i12++)
+                for (int64_t i11 = 0; i11 < ne11 && ok; i11++)
+                    ok = llamafile_sgemm(params,
+                                     ne01, 1, ne00/ggml_blck_size(src0->type),
+                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     nb01/ggml_type_size(src0->type),
+                                     (const char *)src1->data + i11*nb11 + i12*nb12 + i13*nb13,
+                                     nb11/ggml_type_size(src1->type),
+                                     (char *)dst->data + i11*nb1 + i12*nb2 + i13*nb3,
+                                     nb1/ggml_type_size(dst->type),
+                                     src0->type,
+                                     src1->type,
+                                     dst->type);
+        if (ok) {
+            return;
+        }
+        // a column failed part-way: fall through to the generic path, which recomputes everything
+    }
+
     if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
@@ -1559,6 +1585,22 @@ UseGgmlGemm2:;
 // INF-70 B3-k: flat (expert, row) slab partition of the single-token mul_mat_id — on by
 // default; GGML_MMID_SLAB=0 restores D1's per-expert 1/nth row stripes (same-binary A/B).
 // Same knob as the iqk dispatch hook, which is what GGML_IQK=1 actually runs.
+// INF-70 GDN-ROWEXACT: batches of up to this many src1 rows are computed with the
+// single-row kernels, one row at a time (bit-equal to single-token decode); GGML_ROWEXACT_N
+// overrides the compiled default, 0 disables. Shared with the iqk dispatch (same env name).
+#ifndef GGML_ROWEXACT_DEFAULT_N
+#define GGML_ROWEXACT_DEFAULT_N 0
+#endif
+int ggml_cpu_rowexact_n(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * s = getenv("GGML_ROWEXACT_N");
+        n = s ? atoi(s) : GGML_ROWEXACT_DEFAULT_N;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
 static int ggml_mmid_slab_enabled(void) {
     static int flag = -1;
     if (flag < 0) {
