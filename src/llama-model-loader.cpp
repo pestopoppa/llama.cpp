@@ -1,5 +1,10 @@
 #include "llama-model-loader.h"
 
+#include <cstdlib>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1568,6 +1573,43 @@ bool llama_model_loader::load_all_data(
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
+    }
+
+    // INF-70 D6: weight placement granularity.  Under `numactl --interleave=all` with THP the buffer is
+    // interleaved 2 MB at a time, so every tensor smaller than ~2 MB sits on ONE NUMA node and is read at
+    // that node's bandwidth (~35-55 GB/s here) instead of the machine's (~150 GB/s); the D0-b profile shows
+    // 608 of the 797 dense gemvs/token in that regime (504 MB/token at 20-29 GB/s).  LLAMA_WEIGHT_NOHUGE_MAX=<bytes>
+    // marks every host-resident weight up to that size MADV_NOHUGEPAGE *before its first touch*, so it is
+    // faulted in 4 KB pages that the interleave policy spreads over all nodes.  0 (default) = unchanged;
+    // a very large value covers every weight (the expert slabs live inside 445 MB tensors).  no-mmap only.
+    if (!use_mmap) {
+        static const size_t nohuge_max = []() {
+            const char * s = getenv("LLAMA_WEIGHT_NOHUGE_MAX");
+            return s ? (size_t) strtoull(s, nullptr, 10) : (size_t) 0;
+        }();
+        if (nohuge_max > 0) {
+            size_t n_marked = 0, bytes_marked = 0, n_fail = 0;
+            const uintptr_t pg = 4096;
+            for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (cur->data == nullptr || cur->buffer == nullptr || !ggml_backend_buffer_is_host(cur->buffer)) {
+                    continue;
+                }
+                const size_t n = ggml_nbytes(cur);
+                if (n == 0 || n > nohuge_max) {
+                    continue;
+                }
+                const uintptr_t a = ((uintptr_t) cur->data) & ~(pg - 1);
+                const uintptr_t b = (((uintptr_t) cur->data) + n + pg - 1) & ~(pg - 1);
+                if (madvise((void *) a, b - a, MADV_NOHUGEPAGE) == 0) {
+                    n_marked++;
+                    bytes_marked += n;
+                } else {
+                    n_fail++;
+                }
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_WEIGHT_NOHUGE_MAX=%zu: %zu tensors (%.1f MiB) marked MADV_NOHUGEPAGE before load, %zu failed\n",
+                    __func__, nohuge_max, n_marked, bytes_marked / 1024.0 / 1024.0, n_fail);
+        }
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
