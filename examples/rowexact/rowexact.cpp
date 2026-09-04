@@ -157,7 +157,11 @@ static const char * PROMPTS[] = {
 };
 
 static std::vector<llama_token> tokenize(const llama_vocab * vocab, const char * text, int want) {
-    std::vector<llama_token> toks(512);
+    // INF-70 be3-dsa: the old fixed 512-slot buffer hard-capped prefix+n at 512 tokens, which is
+    // BELOW the QSA top-k width (indexer_top_k + compress_ratio - 1 = 2051 for this model). Every
+    // run under that cap selects every cell, so no indexer perturbation can ever change a
+    // selection. Size the buffer from the request instead.
+    std::vector<llama_token> toks(std::max<size_t>(512, strlen(text) + 64));
     int n = llama_tokenize(vocab, text, strlen(text), toks.data(), toks.size(), /*add_special*/ true, /*parse_special*/ false);
     if (n < 0) { fprintf(stderr, "tokenize failed\n"); exit(1); }
     toks.resize(n);
