@@ -1315,6 +1315,12 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// INF-70 BE-1: true when this mul_mat is a small batch that must be computed row-exactly,
+// i.e. every output row bit-equal to the corresponding single-token (ne11 == 1) decode.
+static inline bool ggml_cpu_rowexact_batch(int64_t ne11) {
+    return ne11 > 1 && ne11 <= ggml_cpu_rowexact_n();
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1376,30 +1382,22 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    // INF-70 GDN-ROWEXACT: for 1 < ne11 <= GGML_ROWEXACT_N run the tinyBLAS GEMM one src1
-    // column at a time, i.e. exactly the ne11 == 1 call the single-token decode makes, so
-    // every output row of a small batch is bit-equal to the corresponding single-token
-    // result (the tiled kernels pick a different accumulation order per tile shape).
-    if (src1_cont && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n()) {
-        bool ok = true;
-        for (int64_t i13 = 0; i13 < ne13 && ok; i13++)
-            for (int64_t i12 = 0; i12 < ne12 && ok; i12++)
-                for (int64_t i11 = 0; i11 < ne11 && ok; i11++)
-                    ok = llamafile_sgemm(params,
-                                     ne01, 1, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
-                                     (const char *)src1->data + i11*nb11 + i12*nb12 + i13*nb13,
-                                     nb11/ggml_type_size(src1->type),
-                                     (char *)dst->data + i11*nb1 + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     src1->type,
-                                     dst->type);
-        if (ok) {
-            return;
-        }
-        // a column failed part-way: fall through to the generic path, which recomputes everything
+    // INF-70 GDN-ROWEXACT / BE-1: for 1 < ne11 <= GGML_ROWEXACT_N every output row must be
+    // bit-equal to the corresponding ne11 == 1 single-token decode (the tiled kernels pick a
+    // different accumulation order per tile shape, a 1-ulp difference that MoE top-k amplifies
+    // into different expert selections).
+    //
+    // The original attempt ran the tinyBLAS GEMM one src1 column at a time. That could never
+    // work: llamafile_sgemm hard-refuses n < 2 ("only enable sgemm for prompt processing",
+    // llamafile/sgemm.cpp), so the loop failed on its FIRST column and fell straight through
+    // into the full-batch tinyBLAS GEMM below -- GGML_ROWEXACT_N was a silent no-op for every
+    // tinyBLAS mul_mat, including the F32 MoE router ffn_gate_inp (INF-70 batch-envelope).
+    //
+    // The correct answer is to skip the tinyBLAS section entirely: the single-token decode is
+    // refused by llamafile_sgemm for exactly these shapes too and runs the generic vec_dot
+    // mul_mat below, so the generic path IS the row-exact reference, not an approximation of it.
+    if (src1_cont && ggml_cpu_rowexact_batch(ne11)) {
+        goto UseGgmlGemm1;
     }
 
     if (src1_cont) {
@@ -1503,7 +1501,8 @@ UseGgmlGemm1:;
     }
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    // INF-70 BE-1: same row-exactness guard as the first tinyBLAS block above.
+    if (src1->type != vec_dot_type && !ggml_cpu_rowexact_batch(ne11)) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : src1_wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1588,6 +1587,25 @@ UseGgmlGemm2:;
 // INF-70 GDN-ROWEXACT: batches of up to this many src1 rows are computed with the
 // single-row kernels, one row at a time (bit-equal to single-token decode); GGML_ROWEXACT_N
 // overrides the compiled default, 0 disables. Shared with the iqk dispatch (same env name).
+// INF-70 BE-1: the compiled default is 0 (OFF). Row-exactness is a LOSSLESSNESS feature,
+// not a speed feature: it costs 4-6% of decode on the MTP arms and buys no throughput, so
+// it must not be switched on silently. Measured on the 24-prompt production mix:
+// plain 12.484 (N=0) vs 12.516 (N=8) -- free on the trunk; MTP n-max 4 22.93 (N=0) vs
+// 21.56 (N=8) -- a real cost. It is opt-in.
+//
+// CHOOSING A VALUE. ne11 is NOT the token count for every node. This model has 12 F32
+// [128x64] mul_mat nodes per graph whose ne11 is 4*n_tokens (measured: ne11=4 on a
+// single-token decode, ne11=12 on a 3-token batch; INF-70 batch-envelope dispatch trace).
+// Two consequences, both counter-intuitive:
+//   * any N >= 4 changes SINGLE-TOKEN decode numerics, because those nodes present ne11=4
+//     at batch 1 -- so the served stream moves even with no batching anywhere;
+//   * a value that covers the router (ne11 = n_tokens) can still MISS those nodes on the
+//     verify batch. N=8 is exactly this trap: it catches ne11=4 at batch 1 but not the
+//     ne11=20 of a 5-row verify batch, so it perturbs single decodes AND leaves the batch
+//     non-row-exact. It is the worst of both and must not be used.
+// For batch <= T rows to be row-exact, use N >= 4*T, i.e. N >= 4*(n_max+1) for MTP
+// (n_max=4 -> N >= 20; 24 or 32 is a safe setting). Prefill is still never touched: a 512
+// -row ubatch presents ne11=2048 at those nodes and ne11=512 at the rest.
 #ifndef GGML_ROWEXACT_DEFAULT_N
 #define GGML_ROWEXACT_DEFAULT_N 0
 #endif
