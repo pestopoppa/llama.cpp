@@ -1694,6 +1694,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                // akm-cdna2-q8-b1-four-row-cta: dense (ids==null) bs=1 Q8_0 GEMV on CDNA2 runs one
+                // output row per 256-thread CTA (rows_per_cuda_block=1), each CTA re-reading the
+                // full Q8_1 activation row (y ~1.06x of the weight bytes per row at ne00=5120) and
+                // paying the launch/reduce fixed cost once per row. Force the small_k instantiation
+                // (rows_per_cuda_block = nwarps = 4), which for Q8_0 changes nothing else in the
+                // kernel body, so 4 independent weight rows share one y read and one CTA. Rows are
+                // independent and per-row thread->kbx mapping, accumulation order and cross-warp
+                // reduction order are untouched, so results are bit-identical to rpb=1. The 4-row
+                // unrolled weight loads are unbounded, so require nrows_x % 4 == 0 and keep
+                // rows_per_cuda_block=1 otherwise.
+                if (cc == GGML_CUDA_CC_CDNA2 && !has_ids && nrows_x % 4 == 0) {
+                    use_small_k = true;
+                }
+            }
+
 #ifdef GGML_USE_HIP
             if constexpr (type == GGML_TYPE_Q4_K) {
                 if (ncols_x == 1536 && cc == GGML_CUDA_CC_CDNA2) {
