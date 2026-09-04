@@ -9422,7 +9422,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+
+    // INF-70 be2-fa: GGML_FA_SPLIT_KV=0 disables the neq1==1 split-across-KV fast path
+    // (upstream #19209). That path is taken ONLY by single-row decode at nek1 >= 512, so a
+    // 1-row decode and an n-row verify batch run DIFFERENT reduction orders -> not row-exact.
+    static const bool fa_split_kv_enabled = [](){
+        const char * e = getenv("GGML_FA_SPLIT_KV");
+        return e ? (atoi(e) != 0) : true;
+    }();
+    const bool use_split_kv_path = fa_split_kv_enabled && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
