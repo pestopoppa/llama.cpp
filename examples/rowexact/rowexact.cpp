@@ -141,6 +141,7 @@ struct opts {
     int unified = -1;      // -1 = default
     int fa = -1;           // -1 = auto, 0 off, 1 on
     int rs_seq = 0;
+    int n_ctx = 1024;
     int show = 12;
     double min_abs = 0.0;       // only list nodes whose max|diff| >= min_abs (bitwise counts are unaffected)
     std::string text_file;      // prompt text from a file (overrides the built-in prompt A)
@@ -167,7 +168,7 @@ static std::vector<llama_token> tokenize(const llama_vocab * vocab, const char *
 
 static llama_context * make_ctx(llama_model * model, const opts & o, capture * cap) {
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx      = 1024;
+    cp.n_ctx      = o.n_ctx;
     cp.n_batch    = 512;
     cp.n_ubatch   = 512;
     cp.n_seq_max  = o.n_seq_max;
@@ -322,6 +323,7 @@ int main(int argc, char ** argv) {
         else if (a == "--unified")   o.unified = atoi(next().c_str());
         else if (a == "--fa")        o.fa = atoi(next().c_str());
         else if (a == "--rs-seq")    o.rs_seq = atoi(next().c_str());
+        else if (a == "--n-ctx")     o.n_ctx = atoi(next().c_str());
         else if (a == "--show")      o.show = atoi(next().c_str());
         else if (a == "--prompt")    o.prompt_a = atoi(next().c_str());
         else if (a == "--min-abs")   o.min_abs = atof(next().c_str());
