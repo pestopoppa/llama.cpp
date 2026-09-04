@@ -1315,6 +1315,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+
+int ggml_cpu_rowexact_generic(void);
+
+// INF-70 batch-envelope: mul_mat branch tracer (GGML_MM_TRACE=1). ith==0 only, stderr.
+static inline void mm_trace(const struct ggml_tensor * dst, int64_t ne11, const char * branch, int ith) {
+    static int on = -1;
+    if (on < 0) { const char * s = getenv("GGML_MM_TRACE"); on = (s && atoi(s) != 0) ? 1 : 0; }
+    if (!on || ith != 0) return;
+    const struct ggml_tensor * s0 = dst->src[0];
+    fprintf(stderr, "MMT %-28s op=%-11s t0=%-8s ne00=%lld ne01=%lld ne11=%lld branch=%s\n",
+            dst->name, ggml_op_name(dst->op), ggml_type_name(s0->type),
+            (long long) s0->ne[0], (long long) s0->ne[1], (long long) ne11, branch);
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1364,6 +1378,7 @@ void ggml_compute_forward_mul_mat(
     // Runtime-gated by env GGML_IQK=1; returns false (falls through) otherwise or
     // for unsupported types/dims. Handles its own src1 quantization + barrier.
     if (ggml_iqk_try_mul_mat(params, dst)) {
+        mm_trace(dst, ne11, "iqk", params->ith);
         return;
     }
 #endif
@@ -1380,7 +1395,13 @@ void ggml_compute_forward_mul_mat(
     // column at a time, i.e. exactly the ne11 == 1 call the single-token decode makes, so
     // every output row of a small batch is bit-equal to the corresponding single-token
     // result (the tiled kernels pick a different accumulation order per tile shape).
-    if (src1_cont && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n()) {
+    // INF-70 batch-envelope FIX: llamafile_sgemm hard-refuses n < 2 (sgemm.cpp:3714 "only enable
+    // sgemm for prompt processing"), so the per-column loop below ALWAYS failed on its first column
+    // and the code then fell into the FULL-batch tinyBLAS call underneath — i.e. GGML_ROWEXACT_N was
+    // a silent no-op for every tinyBLAS mul_mat. The single-token decode does not use tinyBLAS for
+    // those shapes either (it gets refused the same way and runs the generic vec_dot path), so the
+    // row-exact answer is to skip the tinyBLAS section entirely and take the generic path.
+    if (src1_cont && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n() && !ggml_cpu_rowexact_generic()) {
         bool ok = true;
         for (int64_t i13 = 0; i13 < ne13 && ok; i13++)
             for (int64_t i12 = 0; i12 < ne12 && ok; i12++)
@@ -1397,12 +1418,15 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type);
         if (ok) {
+            mm_trace(dst, ne11, "tinyblas-rowexact", params->ith);
             return;
         }
-        // a column failed part-way: fall through to the generic path, which recomputes everything
+        mm_trace(dst, ne11, "tinyblas-rowexact-FAILED", params->ith);
+        goto UseGgmlGemm1; // a column failed: the generic path recomputes everything, row-exactly
+
     }
 
-    if (src1_cont) {
+    if (src1_cont && !(ne11 > 1 && ne11 <= ggml_cpu_rowexact_n() && ggml_cpu_rowexact_generic())) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1417,6 +1441,7 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type))
                     goto UseGgmlGemm1;
+        mm_trace(dst, ne11, "tinyblas1", params->ith);
         return;
     }
 UseGgmlGemm1:;
@@ -1503,7 +1528,7 @@ UseGgmlGemm1:;
     }
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (src1->type != vec_dot_type && !(ne11 > 1 && ne11 <= ggml_cpu_rowexact_n() && ggml_cpu_rowexact_generic())) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : src1_wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1521,6 +1546,7 @@ UseGgmlGemm1:;
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
+        mm_trace(dst, ne11, "tinyblas2", params->ith);
         return;
     }
 UseGgmlGemm2:;
@@ -1535,6 +1561,7 @@ UseGgmlGemm2:;
     // INF-70 D1: nchunk0/nchunk1 were computed above by ggml_mul_mat_chunk_plan(ne0, ne1*ne2*ne3, nth)
     // — the identical formula, hoisted so the batch-1 decision can be made before quantizing.
     GGML_ASSERT(nchunk0 > 0 && nchunk1 > 0);
+    mm_trace(dst, ne11, mm_batch1 ? "generic-batch1" : "generic", params->ith);
 
     // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
@@ -1596,6 +1623,19 @@ int ggml_cpu_rowexact_n(void) {
     if (n < 0) {
         const char * s = getenv("GGML_ROWEXACT_N");
         n = s ? atoi(s) : GGML_ROWEXACT_DEFAULT_N;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+// INF-70 batch-envelope: GGML_ROWEXACT_GENERIC=1 sends 1 < ne11 <= GGML_ROWEXACT_N straight to the
+// generic vec_dot mul_mat (skipping tinyBLAS entirely), which is what the single-token decode runs
+// for the same shapes. Default ON whenever GGML_ROWEXACT_N is set; 0 restores the old per-column try.
+int ggml_cpu_rowexact_generic(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * s = getenv("GGML_ROWEXACT_GENERIC");
+        n = s ? atoi(s) : 1;
         if (n < 0) n = 0;
     }
     return n;
@@ -1721,8 +1761,10 @@ static void ggml_compute_forward_mul_mat_id(
     // env GGML_IQK=1; owns its own Q8_2_X4 src1 quantization + row-mapping + per-expert
     // iqk_mul_mat_moe. Returns true if handled (then we're done), false to fall through.
     if (ggml_iqk_try_mul_mat_id(params, dst)) {
+        mm_trace(dst, src1->ne[1], "mmid-iqk", params->ith);
         return;
     }
+    mm_trace(dst, src1->ne[1], "mmid-native", params->ith);
 #endif
 
     // row groups
