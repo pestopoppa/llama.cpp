@@ -4201,7 +4201,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // skip_barrier is only ever set by a pass that wrote nothing at all, and every thread
         // reaches the same decision (fusion-pass invariant 1), so the barriers stay matched.
-        if (node_n + 1 < cgraph->n_nodes && !skip_barrier) {
+        // Suppressed when an abort_callback is installed: thread 0 stores tp->abort between the
+        // compute and the barrier, and the barrier is what lets the other threads observe it
+        // before the next loop-condition read.
+        const bool drop_barrier = skip_barrier && cplan->abort_callback == NULL;
+        if (node_n + 1 < cgraph->n_nodes && !drop_barrier) {
             ggml_barrier(state->threadpool);
         }
 
