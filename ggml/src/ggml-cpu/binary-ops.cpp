@@ -34,13 +34,13 @@ static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const sr
 }
 
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
-static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t ne10, const int64_t nb10, dst_t * z, const src0_t * x, const src1_t * y) {
+static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t ne10, const int64_t nb10, dst_t * z, const src0_t * x, const src1_t * y, const int64_t i0_off = 0) {
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
     for (int i = 0; i < n; i++) {
-        int i10 = i % ne10;
+        int i10 = (int)((i + i0_off) % ne10);
         const src1_t * y_ptr = (const src1_t *)((const char *)y + i10*nb10);
         z[i] = f32_to_dst(op(src0_to_f32(x[i]), src1_to_f32(*y_ptr)));
     }
@@ -58,7 +58,10 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
-    const auto [ir0, ir1] = get_thread_range(params, src0);
+    // INF-70 SYNC-10: split over (row, column-chunk), not rows alone -- at batch 1
+    // nr == 1 and a row-only split leaves every element on thread 0.
+    const int64_t nrows = ggml_nrows(src0);
+    const ggml_rowcol_split split = get_rowcol_split(params, nrows, ne0, MAX(sizeof(dst_t), sizeof(src0_t)));
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
 
 #ifdef GGML_USE_ACCELERATE
@@ -77,7 +80,13 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     }
 #endif
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        int64_t ir, gc0, gc1;
+        split.unpack(t, ne0, ir, gc0, gc1);
+        if (gc0 >= gc1) {
+            continue;
+        }
+
         const int64_t i03 = ir/(ne02*ne01);
         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
         const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
@@ -91,22 +100,28 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
 
         if (is_src1_contiguous_rows) {
-            // src1 is broadcastable across src0 and dst in i1, i2, i3
-            const int64_t nr0 = ne00 / ne10;
+            // src1 is broadcastable across src0 and dst in i1, i2, i3.
+            // The row is nr0 = ne00/ne10 consecutive copies of the src1 row; the column
+            // chunk [gc0,gc1) may straddle several of them, so walk the intersection.
+            const int64_t r_first = gc0/ne10;
+            const int64_t r_last  = (gc1 - 1)/ne10;
 
-            for (int64_t r = 0; r < nr0; ++r) {
+            for (int64_t r = r_first; r <= r_last; ++r) {
+                const int64_t c0 = MAX(gc0, r*ne10) - r*ne10;      // within the src1 row
+                const int64_t c1 = MIN(gc1, (r + 1)*ne10) - r*ne10;
+                const int64_t n  = c1 - c0;
 #ifdef GGML_USE_ACCELERATE
                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
                     if (vDSP_op != nullptr) {
-                        vDSP_op(src1_ptr, 1, src0_ptr + r*ne10, 1, dst_ptr + r*ne10, 1, ne10);
+                        vDSP_op(src1_ptr + c0, 1, src0_ptr + r*ne10 + c0, 1, dst_ptr + r*ne10 + c0, 1, n);
                         continue;
                     }
                 }
 #endif
-                vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+                vec_binary_op_contiguous<op>(n, dst_ptr + r*ne10 + c0, src0_ptr + r*ne10 + c0, src1_ptr + c0);
             }
         } else {
-            vec_binary_op_non_contiguous<op>(ne0, ne10, nb10, dst_ptr, src0_ptr, src1_ptr);
+            vec_binary_op_non_contiguous<op>(gc1 - gc0, ne10, nb10, dst_ptr + gc0, src0_ptr + gc0, src1_ptr, gc0);
         }
     }
 }
