@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
@@ -552,10 +554,32 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        ggml_tensor * cache_dst =
+            ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+        // [TAG_GDN_STATE_DIRECT] env knob, default OFF. The fused GDN op already produces the
+        // updated recurrent state; the CPY below then re-reads it (3 MB) and writes it into the
+        // cache (3 MB) for every one of the 36 GDN layers, every token. Hand the cache slot to
+        // the op as src[6] and it writes the state there directly, so the CPY node disappears.
+        // Only legal for the K==1 (no-rollback) path and an F32 state cache.
+        static const int gdn_state_direct = [] {
+            const char * e = getenv("GGML_GDN_STATE_DIRECT");
+            return (e && *e && *e != '0') ? 1 : 0;
+        }();
+
+        ggml_tensor * gdn = new_state->view_src;
+        if (gdn_state_direct &&
+            gdn != nullptr &&
+            gdn->op == GGML_OP_GATED_DELTA_NET &&
+            gdn->src[6] == nullptr &&
+            gdn->type == GGML_TYPE_F32 &&
+            ssm_states_all->type == GGML_TYPE_F32) {
+            gdn->src[6] = cache_dst;
+            ggml_build_forward_expand(gf, gdn);
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, cache_dst));
+        }
 
         // [TAG_GDN_STATE_BF16] when the recurrent state is BF16, result (and thus the attn view)
         // is BF16; the gated norm downstream needs F32, so narrow-cast the tiny attn output back.

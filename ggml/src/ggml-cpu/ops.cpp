@@ -11060,6 +11060,18 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 }
 
 // ggml_compute_forward_gated_delta_net
+
+// [TAG_GDN_NO_INNER_BARRIER] env knob, default OFF: skip the op-internal barrier + dynamic
+// chunk counter when the chunk count does not exceed the thread count.
+static bool ggml_gdn_no_inner_barrier(void) {
+    static int flag = -1;
+    if (flag < 0) {
+        const char * e = getenv("GGML_GDN_NO_INNER_BARRIER");
+        flag = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return flag != 0;
+}
+
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
@@ -11120,6 +11132,21 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
 
+    // [TAG_GDN_STATE_DIRECT] optional external destination for the new state (K==1 only).
+    // When src[6] is present the op writes the updated recurrent state straight into the
+    // recurrent-state cache instead of into dst, and the graph drops the separate
+    // new_state -> cache_s_l* CPY node (3 MB read + 3 MB write per layer per token).
+    const ggml_tensor * ext_state = dst->src[6];
+    int64_t state_out_seq_stride = H * S_v * S_v;   // per-seq stride inside dst
+    if (ext_state) {
+        GGML_ASSERT(K == 1);
+        GGML_ASSERT(ext_state->type == GGML_TYPE_F32);
+        GGML_ASSERT(ext_state->ne[0] == H * S_v * S_v);
+        GGML_ASSERT(ext_state->ne[1] >= n_seqs);
+        state_out_base       = (float *)ext_state->data;
+        state_out_seq_stride = (int64_t)(ext_state->nb[1] / sizeof(float));
+    }
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
@@ -11146,7 +11173,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : state_out_base + iv3 * state_out_seq_stride + iv1 * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
@@ -11234,6 +11261,22 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
     if (nth == 1 || nchunk < nth || disable_chunking) {
       nchunk = nth;
+    }
+
+    // [TAG_GDN_NO_INNER_BARRIER] when nchunk <= nth every thread runs exactly its own chunk
+    // (current_chunk = ith) and never needs the shared counter, so the counter store, the
+    // 48-way barrier that publishes it and the atomic chunk_add are all pure overhead.
+    // Same chunk -> thread mapping as the general path, so results are bit-identical.
+    if (nchunk <= nth && ggml_gdn_no_inner_barrier()) {
+        const int64_t dr0 = (nr + nchunk - 1) / nchunk;
+        if (ith < nchunk) {
+            const int64_t ir0 = dr0 * ith;
+            const int64_t ir1 = MIN(ir0 + dr0, nr);
+            if (ir0 < ir1) {
+                ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+            }
+        }
+        return;
     }
 
     if (ith == 0) {
