@@ -86,6 +86,8 @@ static int ggml_cpu_prof_mm_flag = -1;
 // INF-70 D0-b: sync events per token, MEASURED rather than derived from the node table.
 // Only thread 0 increments, so there is no shared-cacheline traffic on the barrier path.
 static uint64_t ggml_cpu_prof_barriers   = 0;   // ggml_barrier() calls seen by thread 0
+static uint64_t ggml_cpu_prof_solo_runs  = 0;   // INF-70 SYNC-2 collapsed tiny-op runs
+static uint64_t ggml_cpu_prof_solo_nodes = 0;   // nodes inside those runs
 static int      ggml_cpu_prof_barrier_on = 0;   // set by thread 0 for accumulated graphs only
 static inline int ggml_cpu_prof_mm_enabled(void) {
     if (ggml_cpu_prof_mm_flag < 0) {
@@ -2632,6 +2634,97 @@ static int64_t ggml_get_rows_min_bytes(void) {
     return v;
 }
 
+
+// ---------------------------------------------------------------------------
+// INF-70 SYNC-2: tiny-op barrier elision ("solo runs").
+//
+// The CPU graph loop pays ONE ggml_barrier() per executed node, unconditionally and
+// independently of ggml_get_n_tasks() -- every thread walks every node, and threads with no
+// work still arrive at the barrier.  Measured on qwen4exp at t48: ~2.4 us per node of
+// barrier+straggler, so 1,631 nodes of the small-op family (ADD/SCALE/CONT/MEAN_D1/RMS_NORM/
+// SET_ROWS/L2_NORM) burn 4.34 ms of a 96.3 ms token while computing ~0.7 ms.
+//
+// A barrier after node k exists to publish k's writes to the threads that read them.  If node k
+// is executed by thread 0 ALONE, and node k+1 is also executed by thread 0 alone, no other
+// thread can observe either result before the next barrier, so the barrier between them is
+// dead.  We therefore detect maximal runs of "solo" nodes, run the whole run on thread 0 with
+// (ith=0, nth=1), and emit a single barrier at the end of the run.
+//
+// Solo eligibility is deliberately narrow so that this is BIT-IDENTICAL by construction rather
+// than by argument: the whitelisted kernels all partition by rows via get_thread_range(), and
+// we require ggml_nrows(dst) == 1, which means thread 0 was already doing 100% of the work with
+// nth=48.  Passing nth=1 therefore changes neither the arithmetic nor its order, and adds no
+// work.  Column-partitioned ops (MEAN_D1) and ops that call ggml_barrier() internally (SET,
+// ACC, OUT_PROD, FLASH_ATTN_EXT, GATED_DELTA_NET, MUL_MAT*, ...) are excluded -- running the
+// latter on one thread would deadlock.
+//
+// Zero-element nodes (219/token here: the recurrent-state rollback SCALE/GET_ROWS/CPY triples)
+// write nothing at all, so they are solo-eligible for any op and also serve as run glue.
+//
+// Off by default; enable with GGML_TINY_SOLO=1.  GGML_TINY_SOLO_MAX caps dst elements.
+static bool    ggml_cpu_tiny_solo     = false;  // set once in ggml_cpu_init(), read-only after
+static int64_t ggml_cpu_tiny_solo_max = 65536;
+
+static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
+    // a node with no elements writes nothing: no publication, no barrier needed
+    if (ggml_nelements(node) == 0) {
+        return true;
+    }
+
+    if (node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i] && node->src[i]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    // thread 0 must already be the only writer under the row-range split
+    if (ggml_nrows(node) != 1) {
+        return false;
+    }
+    if (ggml_nelements(node) > ggml_cpu_tiny_solo_max) {
+        return false;
+    }
+
+    switch (node->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+        case GGML_OP_FILL:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_SUM_ROWS:   // kernel is already ith==0 only
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+            return true;
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            return ggml_is_contiguous(node) && node->src[0] && ggml_is_contiguous(node->src[0]);
+        default:
+            return false;
+    }
+}
+
+// index of the next node the graph loop would actually execute, or n_nodes
+static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) {
+    int i = from;
+    while (i < cgraph->n_nodes &&
+           (ggml_op_is_empty(cgraph->nodes[i]->op) ||
+            (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+        i++;
+    }
+    return i;
+}
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -3704,6 +3797,8 @@ static void ggml_cpu_prof_dump(void) {
             ggml_cpu_prof_last_nnodes);
     fprintf(stderr, "[cpu_prof] fused (RMS_NORM+MUL): %.1f ops/eval  compute %.3f ms  wall %.3f ms\n",
             ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/1e3/g, ggml_cpu_prof_fused_wall_ns/1e3/g);
+    fprintf(stderr, "[cpu_prof] SOLO (INF-70 SYNC-2): %.1f runs/eval covering %.1f nodes/eval\n",
+            ggml_cpu_prof_solo_runs/g, ggml_cpu_prof_solo_nodes/g);
     fprintf(stderr, "[cpu_prof] SYNC measured ggml_barrier() calls per graph eval: %.1f\n",
             ggml_cpu_prof_barriers/g);
 
@@ -3915,6 +4010,70 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        // INF-70 SYNC-2: collapse a maximal run of solo nodes into ONE barrier.  Every thread
+        // computes the same run bounds from graph metadata, so the number of ggml_barrier()
+        // calls stays identical across the team.
+        if (ggml_cpu_tiny_solo && params.nth > 1 && ggml_cpu_node_is_solo(node)) {
+            int last = node_n;
+            for (;;) {
+                const int nx = ggml_cpu_next_exec_node(cgraph, last + 1);
+                if (nx >= cgraph->n_nodes || !ggml_cpu_node_is_solo(cgraph->nodes[nx])) {
+                    break;
+                }
+                last = nx;
+            }
+
+            if (last > node_n) {
+#ifdef GGML_CPU_PROF
+                const int64_t st0 = (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) ? ggml_time_us() : 0;
+                int solo_n = 0;
+#endif
+                if (state->ith == 0) {
+                    struct ggml_compute_params sp = params;
+                    sp.ith = 0;
+                    sp.nth = 1;
+                    for (int k = node_n; k <= last; k++) {
+                        struct ggml_tensor * nk = cgraph->nodes[k];
+                        if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                            continue;
+                        }
+                        ggml_compute_forward(&sp, nk);
+#ifdef GGML_CPU_PROF
+                        solo_n++;
+#endif
+                    }
+                }
+#ifdef GGML_CPU_PROF
+                const int64_t st1 = (st0 != 0) ? ggml_time_us() : 0;
+#endif
+                if (state->ith == 0 && cplan->abort_callback &&
+                        cplan->abort_callback(cplan->abort_callback_data)) {
+                    atomic_store_explicit(&tp->abort, last + 1, memory_order_relaxed);
+                    tp->ec    = GGML_STATUS_ABORTED;
+                }
+
+                node_n = last;
+
+                if (node_n + 1 < cgraph->n_nodes) {
+                    ggml_barrier(state->threadpool);
+                }
+#ifdef GGML_CPU_PROF
+                if (st0 != 0) {
+                    const uint64_t dt   = (uint64_t)(st1 - st0);
+                    const uint64_t wall = (uint64_t)(ggml_time_us() - st0);
+                    ggml_cpu_prof_total_ns      += dt;
+                    ggml_cpu_prof_total_wall_ns += wall;
+                    ggml_cpu_prof_ns[node->op]      += dt;
+                    ggml_cpu_prof_wall_ns[node->op] += wall;
+                    ggml_cpu_prof_cnt[node->op]     += solo_n;
+                    ggml_cpu_prof_solo_runs++;
+                    ggml_cpu_prof_solo_nodes += solo_n;
+                }
+#endif
+                continue;
+            }
         }
 
 #ifdef GGML_CPU_PROF
@@ -4747,6 +4906,20 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            // INF-70 SYNC-2 tiny-op barrier elision, opt-in
+            const char * env = getenv("GGML_TINY_SOLO");
+            ggml_cpu_tiny_solo = (env != NULL && atoi(env) == 1);
+
+            const char * envm = getenv("GGML_TINY_SOLO_MAX");
+            if (envm != NULL) {
+                const long long v = atoll(envm);
+                if (v > 0) {
+                    ggml_cpu_tiny_solo_max = (int64_t) v;
+                }
+            }
         }
 
         is_first_call = false;
