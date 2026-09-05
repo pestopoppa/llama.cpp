@@ -5108,8 +5108,40 @@ struct ggml_get_rows_split {
     int64_t t1;     // one past the last
 };
 
+// Minimum dst bytes for a multi-threaded get_rows.
+//
+// INF-70 SYNC-4: the threshold has to live HERE, in the kernel. `ggml_get_n_tasks()` is ADVISORY on
+// this backend -- `ggml_graph_compute_thread()` hands EVERY node `params.nth = <full thread count>`
+// and consults `n_tasks` only to size the plan's work buffer, so the `n_tasks = 1` in
+// `ggml_get_n_tasks()` never reached the kernel (INF-70 D8x: D8's "OFF" arm was running the parallel
+// path, which is why its A/B read +0.97% instead of the real +13.8%).
+//
+// Default 0 == always split: that is exactly the behaviour D8x measured at 11.87 t/s, so the default
+// is a no-op against the current tip. A positive value keeps small gathers on thread 0; a huge value
+// recovers a genuinely serial reference arm for A/B and for correctness gates (without which
+// `test-backend-ops -o GET_ROWS` can only ever exercise one of the two paths).
+static int64_t ggml_get_rows_min_bytes(void) {
+    // C++11 guarantees this initialiser runs once even though all worker threads reach it.
+    static const int64_t v = [] {
+        const char * s = getenv("GGML_GET_ROWS_MIN_BYTES");
+        const int64_t x = s ? atoll(s) : 0;
+        return x < 0 ? (int64_t) 0 : x;
+    }();
+    return v;
+}
+
 static struct ggml_get_rows_split ggml_get_rows_split_init(
-        int64_t nr, int64_t nc, int ith, int nth, int64_t align) {
+        int64_t nr, int64_t nc, int ith, int nth, int64_t align, int64_t dst_bytes) {
+
+    if (dst_bytes < ggml_get_rows_min_bytes()) {
+        // below the threshold: thread 0 does the whole gather, the rest fall through to the barrier
+        struct ggml_get_rows_split s1;
+        s1.ncc   = 1;
+        s1.cstep = nc;
+        s1.t0    = ith == 0 ? 0 : nr;
+        s1.t1    = nr;
+        return s1;
+    }
 
     // minimum useful chunk, in elements
     const int64_t min_chunk = 64;
@@ -5168,7 +5200,7 @@ static void ggml_compute_forward_get_rows_q(
 
     const int64_t blck = ggml_blck_size(type);
 
-    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, blck);
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, blck, ggml_nbytes(dst));
 
     for (int64_t t = split.t0; t < split.t1; ++t) {
         const int64_t i  = t/split.ncc;
@@ -5212,7 +5244,7 @@ static void ggml_compute_forward_get_rows_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16, ggml_nbytes(dst));
 
     for (int64_t t = split.t0; t < split.t1; ++t) {
         const int64_t i  = t/split.ncc;
@@ -5256,7 +5288,7 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16, ggml_nbytes(dst));
 
     for (int64_t t = split.t0; t < split.t1; ++t) {
         const int64_t i  = t/split.ncc;
@@ -5300,7 +5332,7 @@ static void ggml_compute_forward_get_rows_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16);
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 16, ggml_nbytes(dst));
 
     for (int64_t t = split.t0; t < split.t1; ++t) {
         const int64_t i  = t/split.ncc;

@@ -2619,12 +2619,15 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
-// minimum dst bytes for a multi-threaded get_rows; overridable for testing / tuning
+// minimum dst bytes for a multi-threaded get_rows; overridable for testing / tuning.
+// INF-70 SYNC-4: this is the PLANNER's copy and it only sizes the work buffer -- the gate that
+// actually decides how many threads touch a get_rows node lives in ggml_get_rows_split_init()
+// (ggml-cpu/ops.cpp). Keep the default in sync with that one (0 == always split).
 static int64_t ggml_get_rows_min_bytes(void) {
     static int64_t v = -1;
     if (v < 0) {
         const char * s = getenv("GGML_GET_ROWS_MIN_BYTES");
-        v = s ? atoll(s) : (64*1024);
+        v = s ? atoll(s) : 0;
         if (v < 0) {
             v = 0;
         }
@@ -2762,10 +2765,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 // the CPU get_rows kernels split the work over (row, column-chunk) pairs, so they
                 // are correct for any n_tasks and bit-identical to the single-threaded result.
-                // Small gathers stay single-task: below ~64 KB of output the barrier and the
-                // thread wake-up cost more than the copy (this is what the old FIXME was about).
                 // INF-70 D8: 175 GET_ROWS/token cost 9.34 ms on one thread, 8.9 ms of it in 72
                 // nodes that gather a single 3 MB / 120 KB f32 row.
+                // NOTE (SYNC-4): n_tasks is ADVISORY -- ggml_graph_compute_thread() passes every node
+                // params.nth = n_threads regardless. This line only keeps the plan and the profiler's
+                // single-task counter honest; the real gate is in ggml_get_rows_split_init().
                 n_tasks = ggml_nbytes(node) >= ggml_get_rows_min_bytes() ? n_threads : 1;
             } break;
         case GGML_OP_SET_ROWS:
