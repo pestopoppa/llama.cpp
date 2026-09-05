@@ -88,6 +88,7 @@ static int ggml_cpu_prof_mm_flag = -1;
 static uint64_t ggml_cpu_prof_barriers   = 0;   // ggml_barrier() calls seen by thread 0
 static uint64_t ggml_cpu_prof_solo_runs  = 0;   // INF-70 SYNC-2 collapsed tiny-op runs
 static uint64_t ggml_cpu_prof_solo_nodes = 0;   // nodes inside those runs
+static uint64_t ggml_cpu_prof_empty_skipped = 0; // zero-element nodes skipped with their barrier
 static int      ggml_cpu_prof_barrier_on = 0;   // set by thread 0 for accumulated graphs only
 static inline int ggml_cpu_prof_mm_enabled(void) {
     if (ggml_cpu_prof_mm_flag < 0) {
@@ -2719,12 +2720,15 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     }
 }
 
-// index of the next node the graph loop would actually execute, or n_nodes
+// index of the next node the graph loop would actually execute and barrier on, or n_nodes.
+// Nodes the loop skips -- empty ops, non-COMPUTE nodes, and (with the knob on) zero-element
+// nodes -- are transparent, so a solo run may span them.
 static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) {
     int i = from;
     while (i < cgraph->n_nodes &&
            (ggml_op_is_empty(cgraph->nodes[i]->op) ||
-            (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+            (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            ggml_nelements(cgraph->nodes[i]) == 0)) {
         i++;
     }
     return i;
@@ -3804,6 +3808,8 @@ static void ggml_cpu_prof_dump(void) {
             ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/1e3/g, ggml_cpu_prof_fused_wall_ns/1e3/g);
     fprintf(stderr, "[cpu_prof] SOLO (INF-70 SYNC-2): %.1f runs/eval covering %.1f nodes/eval\n",
             ggml_cpu_prof_solo_runs/g, ggml_cpu_prof_solo_nodes/g);
+    fprintf(stderr, "[cpu_prof] EMPTY-SKIP (INF-70 SYNC-2): %.1f zero-element nodes+barriers dropped/eval\n",
+            ggml_cpu_prof_empty_skipped/g);
     fprintf(stderr, "[cpu_prof] SYNC measured ggml_barrier() calls per graph eval: %.1f\n",
             ggml_cpu_prof_barriers/g);
 
@@ -4017,6 +4023,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // INF-70 SYNC-2: a node with zero elements writes nothing at all -- ggml_compute_forward()
+        // already returns immediately on ggml_is_empty() -- yet it still pays a full graph barrier.
+        // 219/token here (the recurrent-state rollback SCALE/GET_ROWS/CPY triples and SYNC-3's 72
+        // zero-sized build_rs nodes), ~2.4 us each.  There is no publication to order, so drop the
+        // barrier outright.  Every thread evaluates the same predicate, so the team stays in step.
+        if (ggml_cpu_tiny_solo && ggml_nelements(node) == 0) {
+#ifdef GGML_CPU_PROF
+            if (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) {
+                ggml_cpu_prof_empty_skipped++;
+            }
+#endif
+            continue;
+        }
+
         // INF-70 SYNC-2: collapse a maximal run of solo nodes into ONE barrier.  Every thread
         // computes the same run bounds from graph metadata, so the number of ggml_barrier()
         // calls stays identical across the team.
@@ -4041,7 +4061,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     sp.nth = 1;
                     for (int k = node_n; k <= last; k++) {
                         struct ggml_tensor * nk = cgraph->nodes[k];
-                        if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                            ggml_nelements(nk) == 0) {
                             continue;
                         }
                         ggml_compute_forward(&sp, nk);
