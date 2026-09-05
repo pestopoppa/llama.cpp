@@ -123,6 +123,17 @@ static inline int64_t ggml_rowcol_min_elems(void) {
     return v;
 }
 
+// INF-70 SYNC-10: route sigmoid through the SIMD ggml_vec_sigmoid_f32 instead of a scalar
+// libm expf per element. Separate knob from GGML_ROWCOL_SPLIT so the vectorisation and the
+// threading can be attributed independently. NOT bit-identical to libm expf -- default OFF.
+static inline bool ggml_vec_sigmoid_enabled(void) {
+    static const bool v = [] {
+        const char * s = getenv("GGML_VEC_SIGMOID");
+        return s != NULL && atoi(s) != 0;
+    }();
+    return v;
+}
+
 struct ggml_rowcol_split {
     int64_t ncc;    // column chunks per row
     int64_t cstep;  // elements per column chunk

@@ -377,6 +377,49 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
     *s = sumf;
 }
 
+// INF-70 SYNC-10: sigmoid was a scalar libm expf per element, while the identically shaped
+// silu nodes already went through the SIMD ggml_v_expf. Measured on qwen4exp decode
+// (SYNC-1 per-(node,thread) census, tip c51e4dabf, -t 48): 97 `hc_gate` sigmoid nodes of
+// [10240,1,1] cost 50.0 us each = 4.85 ms/token, against 4.0 us for the same-shape
+// `conv_output_silu` -- a 12.5x gap that is entirely the missing vectorisation.
+// Same expf kernel as ggml_vec_silu_f32, which production already ships.
+void ggml_vec_sigmoid_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_sigmoid(_mm512_loadu_ps(x + i)));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_sigmoid(_mm256_loadu_ps(x + i)));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, ggml_v_sigmoid(_mm_loadu_ps(x + i)));
+    }
+#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    const int vlen = svcntw();
+    for (; i < n; i += vlen) {
+        const svbool_t pg = svwhilelt_b32_s32(i, n);
+        svst1_f32(pg, y + i, ggml_v_sigmoid(pg, svld1_f32(pg, x + i)));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_sigmoid(vld1q_f32(x + i)));
+    }
+#elif defined(__riscv_v_intrinsic)
+    for (int vl; i < n; i += vl) {
+        vl = __riscv_vsetvl_e32m2(n - i);
+        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
+        vfloat32m2_t vy = ggml_v_sigmoid_m2(vx, vl);
+        __riscv_vse32_v_f32m2(&y[i], vy, vl);
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = 1.f / (1.f + expf(-x[i]));
+    }
+}
+
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     int i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
