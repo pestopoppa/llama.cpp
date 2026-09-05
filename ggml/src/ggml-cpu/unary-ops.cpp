@@ -118,6 +118,15 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
+    // INF-70 SYNC-2: one row -> split by columns instead of idling 47 threads (bit-identical)
+    if (ggml_elem_colsplit_applies(params, src0, dst)) {
+        const auto [c0, c1] = get_col_range(params, ne0);
+        if (c1 > c0) {
+            vec_unary_op<op>(c1 - c0, (dst_t *) dst->data + c0, (const src0_t *) src0->data + c0);
+        }
+        return;
+    }
+
     const auto [ir0, ir1] = get_thread_range(params, src0);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
