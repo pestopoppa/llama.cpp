@@ -3466,9 +3466,40 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
-// Try to fuse the current node with subsequent nodes for better performance.
-// Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+// ---------------------------------------------------------------------------------------------
+// ggml-cpu backend-local fusion passes  (INF-70 SYNC-12)
+//
+// A fusion pass observes the ALREADY-BUILT graph from inside the CPU node loop and, when its
+// pattern matches, performs the work of several graph nodes itself.  It NEVER mutates the graph
+// and adds nothing to the ggml op/tensor ABI.
+//
+// Backend safety is structural, not defensive: a pass exists only inside ggml-cpu.c, so a graph
+// carrying a fusable pattern is byte-identical to one that does not, and CUDA / Metal / SYCL /
+// Vulkan simply execute the unfused nodes.  There is no flag for another backend to ignore and
+// therefore no silent-wrong-answer path.  (Contrast: encoding the fusion in the graph -- e.g. an
+// extra src slot only the CPU kernel reads -- makes every backend that ignores it silently skip
+// the write-back.  Do not do that.)  This mirrors ggml_cuda_try_fuse() in ggml-cuda.cu.
+//
+// INVARIANTS a pass must satisfy:
+//  1. PURE MATCH.  The matcher must be a deterministic function of the graph alone.  Every one of
+//     the nth threads runs it independently and they must all reach the same decision, or the
+//     graph barriers at the bottom of the node loop stop being matched and the threadpool
+//     deadlocks or races.  No RNG, no time, no per-thread state, no writes from the matcher.
+//  2. NO GRAPH WRITES.  Matchers take a const cgraph.
+//  3. HANDLED means the pass produced every byte the elided nodes would have produced.
+//  4. skip_barrier may be set ONLY when the pass wrote nothing at all (a pure elision).  It drops
+//     the trailing graph barrier for that node, which is sound precisely because no data
+//     dependency crosses a node that touched no memory.
+//  5. Anything not strictly a no-op is gated by its own env knob, default OFF, resolved once in
+//     ggml_cpu_init().
+// ---------------------------------------------------------------------------------------------
+
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+
+// pass enables, resolved once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_fuse_gdn_state = false;  // GGML_CPU_FUSE_GDN_STATE
+static bool ggml_cpu_fuse_empty     = false;  // GGML_CPU_FUSE_EMPTY
+static bool ggml_cpu_fuse_debug     = false;  // GGML_CPU_FUSE_DEBUG -- dump per-pass hit counts at exit
 
 #ifdef GGML_CPU_PROF
 // per-op wall-time profiling, profiling build only; enabled via GGML_CPU_PROF=1
@@ -3809,35 +3840,257 @@ static void ggml_cpu_prof_atexit(void) {
 }
 #endif
 
+// O(1) use count for an arbitrary tensor in the graph (ggml_node_get_use_count only takes a
+// node index; the tensors we must prove single-use here are views, which are not nodes).
+// Returns -1 when the tensor is not in the graph's hash set.
+static int32_t ggml_cpu_tensor_use_count(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
+    const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (hash_pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+        return -1;
+    }
+    return cgraph->use_counts[hash_pos];
+}
+
+// index of the first node after node_n that actually computes something, or -1
+static int ggml_cpu_next_real_node(const struct ggml_cgraph * cgraph, int node_n) {
+    for (int j = node_n + 1; j < cgraph->n_nodes; ++j) {
+        const struct ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_op_is_empty(n->op) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        return j;
+    }
+    return -1;
+}
+
+// -------------------------------------------------------------------------------------------
+// pass: rms_norm_mul   (always on; pre-existing behaviour)
+// -------------------------------------------------------------------------------------------
+static bool ggml_cpu_fuse_pass_rms_norm_mul(
+        const struct ggml_cgraph * cgraph, int node_n,
+        const struct ggml_compute_params * params,
+        int * n_extra, bool * skip_barrier) {
+    GGML_UNUSED(skip_barrier);
+
+    struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+    if (!ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+        return false;
+    }
+
+    struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * mul_w = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+
+    if (node->src[0]->type != GGML_TYPE_F32 || mul_node->type != GGML_TYPE_F32 ||
+        mul_w->type != GGML_TYPE_F32 || mul_w->ne[0] != node->ne[0] || mul_w->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
+    *n_extra = 1;
+    return true;
+}
+
+// -------------------------------------------------------------------------------------------
+// pass: gdn_state_cache   (GGML_CPU_FUSE_GDN_STATE=1, default OFF)
+//
+//   GATED_DELTA_NET(K==1) -> [views/no-ops] -> CPY( view(gdn, tail_off) -> cache_view )
+//
+// The op already computes the final recurrent state; it merely writes it into its own dst tail,
+// from where the graph copies it into the recurrent-state cache slot.  The pass hands the cache
+// slot to the kernel, which writes it in place, and the CPY node is not executed.
+//
+// This is the K==1 counterpart of ggml_cuda_try_gdn_cache_fusion(), which bails at K<=1 -- see
+// tmp/inf70/agents/sync12/REPORT.md: the CUDA kernel's !keep_rs epilogue is already the fused
+// form, so that guard is scope, not soundness.
+// -------------------------------------------------------------------------------------------
+static bool ggml_cpu_fuse_pass_gdn_state_cache(
+        const struct ggml_cgraph * cgraph, int node_n,
+        const struct ggml_compute_params * params,
+        int * n_extra, bool * skip_barrier) {
+    GGML_UNUSED(skip_barrier);
+
+    struct ggml_tensor * gdn = cgraph->nodes[node_n];
+
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (gdn->src[0] == NULL || gdn->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // this pass implements only the K==1 (no rollback snapshots) shape
+    if (ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+
+    const struct ggml_tensor * src_v    = gdn->src[2];
+    const struct ggml_tensor * src_st   = gdn->src[5];
+    if (src_v == NULL || src_st == NULL) {
+        return false;
+    }
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t D        = S_v * S_v * H;
+
+    // the state read source must be a distinct buffer from the cache we are about to write:
+    // the kernel reads s_in for (head, seq) then writes s_out for the same (head, seq).  The
+    // graph feeds src[5] from a GET_ROWS gather, never from the cache tensor itself; require it.
+    if (src_st->op == GGML_OP_NONE && src_st->view_src == NULL) {
+        return false;
+    }
+
+    // snapshot tail starts right after the attention scores
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    const int j = ggml_cpu_next_real_node(cgraph, node_n);
+    if (j < 0) {
+        return false;
+    }
+    const struct ggml_tensor * cpy = cgraph->nodes[j];
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const struct ggml_tensor * src = cpy->src[0]; // view of the gdn state tail
+    const struct ggml_tensor * dst = cpy->src[1]; // cache view the kernel will write to
+    if (src == NULL || dst == NULL) {
+        return false;
+    }
+
+    // src must be exactly this gdn's state tail, and nothing else may read it
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        ggml_nelements(src) != D * n_seqs ||
+        ggml_cpu_tensor_use_count(cgraph, src) != 1) {
+        return false;
+    }
+
+    // dst is the [D, n_seqs] cache view; nb[1] is the per-seq stride the kernel will use
+    if (dst->type != GGML_TYPE_F32 || dst->data == NULL || cpy->type != GGML_TYPE_F32 ||
+        dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        dst->nb[1] < (size_t) ggml_row_size(GGML_TYPE_F32, D) ||
+        dst->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+
+    ggml_compute_forward_gated_delta_net_fused_cache(
+            params, gdn, (float *) dst->data, (int64_t) (dst->nb[1] / sizeof(float)));
+
+    *n_extra = j - node_n;
+    return true;
+}
+
+// -------------------------------------------------------------------------------------------
+// pass: empty   (GGML_CPU_FUSE_EMPTY=1, default OFF)
+//
+// A node whose dst has zero elements produces nothing.  Its ggml_compute_forward is already a
+// no-op for every such op, but the node still costs a full nth-way graph barrier.  Elide the
+// node AND its barrier -- sound because no data dependency can cross a node that wrote nothing,
+// and safe because every thread reaches the identical decision (invariant 1).
+//
+// This is the second consumer of the entry point, and the one that shows it generalises past
+// "two ops become one": a pass may also delete work outright.
+// -------------------------------------------------------------------------------------------
+static bool ggml_cpu_fuse_pass_empty(
+        const struct ggml_cgraph * cgraph, int node_n,
+        const struct ggml_compute_params * params,
+        int * n_extra, bool * skip_barrier) {
+    GGML_UNUSED(params);
+
+    const struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (ggml_nelements(node) != 0 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    *n_extra      = 0;
+    *skip_barrier = true;
+    return true;
+}
+
+// -------------------------------------------------------------------------------------------
+// the registry
+// -------------------------------------------------------------------------------------------
+struct ggml_cpu_fusion_pass {
+    const char * name;
+    // op of cgraph->nodes[node_n] that arms this pass; GGML_OP_COUNT = any op
+    enum ggml_op trigger;
+    // NULL = always enabled, else a pointer to the pass's resolved enable flag
+    const bool * enabled;
+    bool (*run)(const struct ggml_cgraph * cgraph, int node_n,
+                const struct ggml_compute_params * params,
+                int * n_extra, bool * skip_barrier);
+};
+
+static const struct ggml_cpu_fusion_pass ggml_cpu_fusion_passes[] = {
+    { "rms_norm_mul",   GGML_OP_RMS_NORM,        NULL,                     ggml_cpu_fuse_pass_rms_norm_mul   },
+    { "gdn_state_cache",GGML_OP_GATED_DELTA_NET, &ggml_cpu_fuse_gdn_state, ggml_cpu_fuse_pass_gdn_state_cache},
+    { "empty",          GGML_OP_COUNT,           &ggml_cpu_fuse_empty,     ggml_cpu_fuse_pass_empty          },
+};
+
+#define GGML_CPU_N_FUSION_PASSES (sizeof(ggml_cpu_fusion_passes)/sizeof(ggml_cpu_fusion_passes[0]))
+
+// hit counters, incremented by thread 0 only (so no atomics); diagnostic, GGML_CPU_FUSE_DEBUG=1
+static uint64_t ggml_cpu_fusion_hits[GGML_CPU_N_FUSION_PASSES] = { 0 };
+static bool     ggml_cpu_fusion_atexit_done = false;
+
+static void ggml_cpu_fusion_dump(void) {
+    for (size_t p = 0; p < GGML_CPU_N_FUSION_PASSES; ++p) {
+        fprintf(stderr, "[cpu_fuse] pass=%-16s enabled=%d hits_thread0=%llu\n",
+                ggml_cpu_fusion_passes[p].name,
+                ggml_cpu_fusion_passes[p].enabled == NULL ? 1 : (int) *ggml_cpu_fusion_passes[p].enabled,
+                (unsigned long long) ggml_cpu_fusion_hits[p]);
+    }
+    fflush(stderr);
+}
+
+// Try the registered fusion passes against cgraph->nodes[node_n].
+// Returns 1 when a pass handled the node (do NOT call ggml_compute_forward), else 0.
+//   *n_extra      = additional graph nodes consumed by the pass (0 for a pure elision)
+//   *skip_barrier = the pass wrote nothing; the trailing graph barrier may be dropped
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
         const struct ggml_compute_params * params,
-        const struct ggml_cplan * cplan) {
+        const struct ggml_cplan * cplan,
+        int * n_extra,
+        bool * skip_barrier) {
+
+    *n_extra      = 0;
+    *skip_barrier = false;
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
         return 0;
     }
 
-    struct ggml_tensor * node = cgraph->nodes[node_n];
+    const struct ggml_tensor * node = cgraph->nodes[node_n];
 
-    if (node->op == GGML_OP_RMS_NORM) {
-        // RMS_NORM + MUL fusion
-        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
-        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
-            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
-            const struct ggml_tensor * mul_w = (mul_node->src[0] == node)
-                ? mul_node->src[1] : mul_node->src[0];
-            if (node->src[0]->type  == GGML_TYPE_F32 &&
-                mul_node->type      == GGML_TYPE_F32 &&
-                mul_w->type         == GGML_TYPE_F32 &&
-                mul_w->ne[0]        == node->ne[0]   &&
-                mul_w->nb[0]        == sizeof(float)) {
+    for (size_t p = 0; p < sizeof(ggml_cpu_fusion_passes)/sizeof(ggml_cpu_fusion_passes[0]); ++p) {
+        const struct ggml_cpu_fusion_pass * pass = &ggml_cpu_fusion_passes[p];
 
-                ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
-                return 1;
-            }
+        if (pass->enabled != NULL && !*pass->enabled) {
+            continue;
         }
+        if (pass->trigger != GGML_OP_COUNT && node->op != pass->trigger) {
+            continue;
+        }
+        if (pass->run(cgraph, node_n, params, n_extra, skip_barrier)) {
+            if (ggml_cpu_fuse_debug && params->ith == 0) {
+                ggml_cpu_fusion_hits[p]++;
+                if (!ggml_cpu_fusion_atexit_done) {
+                    ggml_cpu_fusion_atexit_done = true;
+                    atexit(ggml_cpu_fusion_dump);
+                }
+            }
+            return 1;
+        }
+        *n_extra      = 0;
+        *skip_barrier = false;
     }
 
     return 0;
@@ -3926,10 +4179,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        // Try the backend-local fusion passes, fall back to normal compute
+        int  fuse_extra   = 0;
+        bool skip_barrier = false;
+        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan, &fuse_extra, &skip_barrier);
         if (n_fused > 0) {
-            node_n += n_fused;
+            node_n += fuse_extra;
         } else {
             ggml_compute_forward(&params, node);
         }
@@ -3944,7 +4199,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        // skip_barrier is only ever set by a pass that wrote nothing at all, and every thread
+        // reaches the same decision (fusion-pass invariant 1), so the barriers stay matched.
+        if (node_n + 1 < cgraph->n_nodes && !skip_barrier) {
             ggml_barrier(state->threadpool);
         }
 
@@ -4747,6 +5004,20 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        // INF-70 SYNC-12: opt-in ggml-cpu fusion passes, default OFF
+        {
+            const char * env = getenv("GGML_CPU_FUSE_GDN_STATE");
+            ggml_cpu_fuse_gdn_state = (env != NULL && atoi(env) == 1);
+        }
+        {
+            const char * env = getenv("GGML_CPU_FUSE_EMPTY");
+            ggml_cpu_fuse_empty = (env != NULL && atoi(env) == 1);
+        }
+        {
+            const char * env = getenv("GGML_CPU_FUSE_DEBUG");
+            ggml_cpu_fuse_debug = (env != NULL && atoi(env) == 1);
         }
 
         is_first_call = false;

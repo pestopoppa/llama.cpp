@@ -11064,7 +11064,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
     int64_t ir0,
-    int64_t ir1) {
+    int64_t ir1,
+    // INF-70 SYNC-12: when non-null, the K==1 final recurrent state is written straight into
+    // the recurrent cache slot instead of into dst's snapshot tail, and the graph's
+    // `cpy(new_state -> cache)` node is elided by the ggml-cpu fusion pass.
+    // cache_seq_stride is the per-sequence stride of the cache view, in floats.
+    float * cache_data,
+    int64_t cache_seq_stride) {
 
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
@@ -11119,6 +11125,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
+    // per-sequence stride of the state destination, in floats (dst tail is packed [.., n_seqs])
+    int64_t state_out_seq_stride = (int64_t) H * S_v * S_v;
+    if (cache_data != nullptr) {
+        GGML_ASSERT(K == 1);
+        state_out_base       = cache_data;
+        state_out_seq_stride = cache_seq_stride;
+    }
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11146,7 +11159,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : state_out_base + iv3 * state_out_seq_stride + iv1 * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
@@ -11216,7 +11229,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
 static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        float * cache_data,
+        int64_t cache_seq_stride) {
 
     ggml_tensor * V = dst->src[2];
     int64_t nr = V->ne[1] * V->ne[3];
@@ -11250,7 +11265,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir0 = dr * current_chunk;
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, cache_data, cache_seq_stride);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
@@ -11263,13 +11278,29 @@ void ggml_compute_forward_gated_delta_net(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_gated_delta_net_f32(params, dst);
+                ggml_compute_forward_gated_delta_net_f32(params, dst, nullptr, 0);
             } break;
         default:
             {
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+// INF-70 SYNC-12: same op, but the K==1 final state is written into the recurrent cache slot
+// instead of dst's snapshot tail.  Selected by the ggml-cpu backend-local fusion pass
+// `gdn_state_cache` (see ggml_cpu_try_fuse_ops); the graph itself is never modified, so no
+// other backend can observe or be broken by this path.
+void ggml_compute_forward_gated_delta_net_fused_cache(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        float * cache_data,
+        int64_t cache_seq_stride) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(cache_data != nullptr);
+    ggml_compute_forward_gated_delta_net_f32(params, dst, cache_data, cache_seq_stride);
 }
 
 
