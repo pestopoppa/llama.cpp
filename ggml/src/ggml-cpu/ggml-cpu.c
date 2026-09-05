@@ -2664,6 +2664,7 @@ static int64_t ggml_get_rows_min_bytes(void) {
 //
 // Off by default; enable with GGML_TINY_SOLO=1.  GGML_TINY_SOLO_MAX caps dst elements.
 static bool    ggml_cpu_tiny_solo     = false;  // set once in ggml_cpu_init(), read-only after
+static bool    ggml_cpu_empty_skip    = false;  // INF-70 SYNC-9: drop zero-element nodes + their barrier
 static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ELEM_COLSPLIT
 
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
@@ -2728,7 +2729,7 @@ static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) 
     while (i < cgraph->n_nodes &&
            (ggml_op_is_empty(cgraph->nodes[i]->op) ||
             (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            ggml_nelements(cgraph->nodes[i]) == 0)) {
+            (ggml_cpu_empty_skip && ggml_nelements(cgraph->nodes[i]) == 0))) {
         i++;
     }
     return i;
@@ -4028,7 +4029,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // 219/token here (the recurrent-state rollback SCALE/GET_ROWS/CPY triples and SYNC-3's 72
         // zero-sized build_rs nodes), ~2.4 us each.  There is no publication to order, so drop the
         // barrier outright.  Every thread evaluates the same predicate, so the team stays in step.
-        if (ggml_cpu_tiny_solo && ggml_nelements(node) == 0) {
+        if (ggml_cpu_empty_skip && ggml_nelements(node) == 0) {
 #ifdef GGML_CPU_PROF
             if (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) {
                 ggml_cpu_prof_empty_skipped++;
@@ -4062,7 +4063,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     for (int k = node_n; k <= last; k++) {
                         struct ggml_tensor * nk = cgraph->nodes[k];
                         if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                            ggml_nelements(nk) == 0) {
+                            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0)) {
                             continue;
                         }
                         ggml_compute_forward(&sp, nk);
@@ -4938,6 +4939,9 @@ void ggml_cpu_init(void) {
             // INF-70 SYNC-2 tiny-op barrier elision, opt-in
             const char * env = getenv("GGML_TINY_SOLO");
             ggml_cpu_tiny_solo = (env != NULL && atoi(env) == 1);
+
+            const char * enve = getenv("GGML_EMPTY_SKIP");
+            ggml_cpu_empty_skip = (enve != NULL && atoi(enve) == 1);
 
             const char * envm = getenv("GGML_TINY_SOLO_MAX");
             if (envm != NULL) {
