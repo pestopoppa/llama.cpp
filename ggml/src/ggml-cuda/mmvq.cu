@@ -2132,7 +2132,8 @@ void ggml_cuda_mul_mat_vec_q(
     bool reuse_src1_q8_1 = false;
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
     const bool cache_eligible = ctx.curr_stream_no == 0 && ids == nullptr &&
-        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && ne11 == 1 && ne12 == 1 && ne13 == 1;
+        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0) &&
+        ne11 == 1 && ne12 == 1 && ne13 == 1;
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     unsigned long long capture_id = 0;
     if (cache_eligible) {
