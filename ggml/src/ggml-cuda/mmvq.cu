@@ -92,6 +92,101 @@ static __device__ __forceinline__ void reduce_q6_K_wave_gfx90a(float & value, fl
         "v_add_f32_dpp %1, %1, %1 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0"
         : "+v"(value), "+v"(gate));
 }
+
+// akm-cdna2-q8-b1-dpp-final-reduce: the dense bs=1 Q8_0 small_k CTA runs four rows per block and
+// sums them over all 64 lanes of warp 0 after the tmp_shared cross-warp reduction. Each row's
+// final 64-lane reduction is one gfx90a DPP tree of the reduce_q6_K_wave_gfx90a shape (all four
+// totals land on lane 63). Interleaving the independent per-row chains supplies the two wait
+// states a DPP read needs after a VGPR write, so no s_nop padding is required between stages.
+static __device__ __forceinline__ void reduce_q8_0_quadrow_gfx90a(
+        float & v0, float & v1, float & v2, float & v3) {
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0"
+        : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3));
+}
+
+static __device__ __forceinline__ void reduce_q8_0_quadrow_gfx90a(
+        float & v0, float & v1, float & v2, float & v3,
+        float & g0, float & g1, float & g2, float & g3) {
+    // Fused-gate variant: the four gate chains interleave with the value chains, doubling the
+    // spacing between dependent DPP reads of the same chain.
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %0, %0, %0 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %1, %1, %1 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %2, %2, %2 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %3, %3, %3 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %4, %4, %4 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %5, %5, %5 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %6, %6, %6 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0\n\t"
+        "v_add_f32_dpp %7, %7, %7 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:0"
+        : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3),
+          "+v"(g0), "+v"(g1), "+v"(g2), "+v"(g3));
+}
 #endif // defined(__gfx90a__)
 
 static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
@@ -1038,11 +1133,19 @@ static __global__ void mul_mat_vec_q(
     constexpr bool dpp_halfwave_reduce = halfwave_rows && ncols_x_fixed == 1536;
     constexpr bool dpp_q6_K_reduce =
         type == GGML_TYPE_Q6_K && ncols_dst == 1 && ncols_x_fixed == 1536 && rows_per_thread == 1;
+    // akm-cdna2-q8-b1-dpp-final-reduce: the CDNA2 dense bs=1 Q8_0 small_k CTA (rows_per_cuda_block
+    // = rows_per_thread = nwarps = 4) reduces each row over the full 64 lanes of warp 0 after the
+    // tmp_shared cross-warp sum; the four per-row butterflies (plus the four fused gate rows)
+    // become interleaved DPP trees that deposit all totals on lane warp_size-1.
+    constexpr bool dpp_q8_0_quadrow_reduce =
+        type == GGML_TYPE_Q8_0 && ncols_dst == 1 && rows_per_thread == 4;
 #else
     constexpr bool dpp_halfwave_reduce = false;
     constexpr bool dpp_q6_K_reduce = false;
+    constexpr bool dpp_q8_0_quadrow_reduce = false;
 #endif
-    constexpr int result_lane = dpp_halfwave_reduce ? reduction_width - 1 : dpp_q6_K_reduce ? warp_size - 1 : 0;
+    constexpr int result_lane = dpp_halfwave_reduce ? reduction_width - 1 :
+        (dpp_q6_K_reduce || dpp_q8_0_quadrow_reduce) ? warp_size - 1 : 0;
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -1310,6 +1413,31 @@ static __global__ void mul_mat_vec_q(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
+#if defined(__gfx90a__)
+    if constexpr (dpp_q8_0_quadrow_reduce) {
+        // akm-cdna2-q8-b1-dpp-final-reduce: batch the rows_per_thread rows' final 64-lane
+        // reductions as interleaved DPP trees (four, or eight with the fused gate rows); each
+        // tree deposits its total on lane result_lane = warp_size-1, which stores all rows
+        // below. The interleaved chains supply gfx90a's two DPP wait states, so no s_nop
+        // padding is needed between stages. Only fp32 summation order inside a row changes.
+        if constexpr (gate_only_swiglu) {
+            reduce_q8_0_quadrow_gfx90a(
+                tmp[0][0][0], tmp[0][1][0], tmp[0][2][0], tmp[0][3][0],
+                tmp_gate[0][0][0], tmp_gate[0][1][0], tmp_gate[0][2][0], tmp_gate[0][3][0]);
+        } else if constexpr (has_fusion && !bias_only) {
+            if (use_gate) {
+                reduce_q8_0_quadrow_gfx90a(
+                    tmp[0][0][0], tmp[0][1][0], tmp[0][2][0], tmp[0][3][0],
+                    tmp_gate[0][0][0], tmp_gate[0][1][0], tmp_gate[0][2][0], tmp_gate[0][3][0]);
+            } else {
+                reduce_q8_0_quadrow_gfx90a(tmp[0][0][0], tmp[0][1][0], tmp[0][2][0], tmp[0][3][0]);
+            }
+        } else {
+            reduce_q8_0_quadrow_gfx90a(tmp[0][0][0], tmp[0][1][0], tmp[0][2][0], tmp[0][3][0]);
+        }
+    }
+#endif // defined(__gfx90a__)
+
     // finish the per-row reduction and write back result
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
@@ -1340,6 +1468,8 @@ static __global__ void mul_mat_vec_q(
                 } else {
                     tmp[j][i][0] = reduce_q6_K_wave_gfx90a(tmp[j][i][0]);
                 }
+            } else if constexpr (dpp_q8_0_quadrow_reduce) {
+                // all rows were reduced together in the batched block above
             } else
 #endif // defined(__gfx90a__)
             {
@@ -1353,7 +1483,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (lane == result_lane + (dpp_q6_K_reduce ? 0 : i) &&
+            if (lane == result_lane + ((dpp_q6_K_reduce || dpp_q8_0_quadrow_reduce) ? 0 : i) &&
                     (rows_per_cuda_block == 1 || uint32_t(row0 + row + i) < stride_col_dst)) {
                 float result = tmp[j][i][0];
                 if constexpr (bias_only) {
@@ -1364,13 +1494,22 @@ static __global__ void mul_mat_vec_q(
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
                     }
-                    result += x_biases[j];
+                    if constexpr (dpp_q8_0_quadrow_reduce) {
+                        // bias prefetch covers only lane result_lane's row; reload per row here
+                        result += use_bias ? x_bias[row + i] : 0.0f;
+                    } else {
+                        result += x_biases[j];
+                    }
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i][0];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
                         }
-                        gate_value += gate_biases[j];
+                        if constexpr (dpp_q8_0_quadrow_reduce) {
+                            gate_value += use_gate_bias ? gate_bias[row + i] : 0.0f;
+                        } else {
+                            gate_value += gate_biases[j];
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
