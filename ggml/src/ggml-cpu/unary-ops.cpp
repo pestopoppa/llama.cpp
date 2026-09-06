@@ -1,4 +1,5 @@
 #include "unary-ops.h"
+#include "vec.h"
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -118,9 +119,18 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
-    const auto [ir0, ir1] = get_thread_range(params, src0);
+    // INF-70 SYNC-10: split over (row, column-chunk), not rows alone -- at batch 1
+    // nr == 1 and a row-only split leaves every element on thread 0.
+    const int64_t nrows = ggml_nrows(src0);
+    const ggml_rowcol_split split = get_rowcol_split(params, nrows, ne0, MAX(sizeof(dst_t), sizeof(src0_t)));
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        int64_t ir, c0, c1;
+        split.unpack(t, ne0, ir, c0, c1);
+        if (c0 >= c1) {
+            continue;
+        }
+
         const int64_t i03 = ir/(ne02*ne01);
         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
         const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
@@ -128,7 +138,7 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
 
-        vec_unary_op<op>(ne0, dst_ptr, src0_ptr);
+        vec_unary_op<op>(c1 - c0, dst_ptr + c0, src0_ptr + c0);
     }
 }
 
@@ -198,9 +208,17 @@ static void apply_unary_op_functor(const ggml_compute_params * params, ggml_tens
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
-    const auto [ir0, ir1] = get_thread_range(params, src0);
+    // INF-70 SYNC-10: see apply_unary_op above.
+    const int64_t nrows = ggml_nrows(src0);
+    const ggml_rowcol_split split = get_rowcol_split(params, nrows, ne0, MAX(sizeof(dst_t), sizeof(src0_t)));
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        int64_t ir, c0, c1;
+        split.unpack(t, ne0, ir, c0, c1);
+        if (c0 >= c1) {
+            continue;
+        }
+
         const int64_t i03 = ir/(ne02*ne01);
         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
         const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
@@ -208,7 +226,7 @@ static void apply_unary_op_functor(const ggml_compute_params * params, ggml_tens
         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
 
-        vec_unary_op_functor(ne0, dst_ptr, src0_ptr, op);
+        vec_unary_op_functor(c1 - c0, dst_ptr + c0, src0_ptr + c0, op);
     }
 }
 
@@ -262,7 +280,48 @@ void ggml_compute_forward_relu(const ggml_compute_params * params, ggml_tensor *
     unary_op<op_relu>(params, dst);
 }
 
+// INF-70 SYNC-10: same (row, column-chunk) enumeration as apply_unary_op, but the inner
+// loop is a whole-row SIMD kernel instead of a per-element functor.
+template <void (*rowfn)(const int, float *, const float *)>
+static void apply_unary_op_rowfn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst) && ggml_are_same_shape(src0, dst));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT( nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    const int64_t nrows = ggml_nrows(src0);
+    const ggml_rowcol_split split = get_rowcol_split(params, nrows, ne0, sizeof(float));
+
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        int64_t ir, c0, c1;
+        split.unpack(t, ne0, ir, c0, c1);
+        if (c0 >= c1) {
+            continue;
+        }
+
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        float       * dst_ptr  = (float *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+        const float * src0_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+
+        rowfn((int) (c1 - c0), dst_ptr + c0, src0_ptr + c0);
+    }
+}
+
 void ggml_compute_forward_sigmoid(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (ggml_vec_sigmoid_enabled() && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        apply_unary_op_rowfn<ggml_vec_sigmoid_f32>(params, dst);
+        return;
+    }
+
     unary_op<op_sigmoid>(params, dst);
 }
 

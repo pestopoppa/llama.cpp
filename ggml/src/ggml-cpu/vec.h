@@ -933,7 +933,8 @@ inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const 
         y[i] = GGML_CPU_FP32_TO_FP16(((v > 0.f) ? v : 0.f) + ns * ((v < 0.0f) ? v : 0.f));
     }
 }
-inline static void ggml_vec_sigmoid_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = 1.f / (1.f + expf(-x[i])); }
+// INF-70 SYNC-10: vectorised in vec.cpp (was a scalar libm expf loop with no callers).
+void ggml_vec_sigmoid_f32(const int n, float * y, const float * x);
 inline static void ggml_vec_sigmoid_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(1.f / (1.f + expf(-GGML_CPU_FP16_TO_FP32(x[i]))));
@@ -1115,6 +1116,16 @@ inline static svfloat32_t ggml_v_expf(svbool_t pg, svfloat32_t x) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static svfloat32_t ggml_v_sigmoid(svbool_t pg, svfloat32_t x) {
+    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
+    const svfloat32_t zero = svdup_n_f32_x(pg, 0.0f);
+    const svfloat32_t neg_x = svsub_f32_x(pg, zero, x);
+    const svfloat32_t exp_neg_x = ggml_v_expf(pg, neg_x);
+    const svfloat32_t one_plus_exp_neg_x = svadd_f32_x(pg, one, exp_neg_x);
+    return svdiv_f32_x(pg, one, one_plus_exp_neg_x);
+}
+
 inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
     const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
     const svfloat32_t zero = svdup_n_f32_x(pg, 0.0f);
@@ -1154,6 +1165,16 @@ inline static float32x4_t ggml_v_expf(float32x4_t x) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static float32x4_t ggml_v_sigmoid(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t neg_x = vsubq_f32(zero, x);
+    const float32x4_t exp_neg_x = ggml_v_expf(neg_x);
+    const float32x4_t one_plus_exp_neg_x = vaddq_f32(one, exp_neg_x);
+    return vdivq_f32(one, one_plus_exp_neg_x);
+}
+
 inline static float32x4_t ggml_v_silu(float32x4_t x) {
     const float32x4_t one = vdupq_n_f32(1.0f);
     const float32x4_t zero = vdupq_n_f32(0.0f);
@@ -1197,6 +1218,16 @@ inline static __m512 ggml_v_expf(__m512 x) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static __m512 ggml_v_sigmoid(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 neg_x = _mm512_sub_ps(zero, x);
+    const __m512 exp_neg_x = ggml_v_expf(neg_x);
+    const __m512 one_plus_exp_neg_x = _mm512_add_ps(one, exp_neg_x);
+    return _mm512_div_ps(one, one_plus_exp_neg_x);
+}
+
 inline static __m512 ggml_v_silu(__m512 x) {
     const __m512 one = _mm512_set1_ps(1);
     const __m512 zero = _mm512_setzero_ps();
@@ -1252,6 +1283,16 @@ inline static __m256 ggml_v_expf(__m256 x) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static __m256 ggml_v_sigmoid(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 neg_x = _mm256_sub_ps(zero, x);
+    const __m256 exp_neg_x = ggml_v_expf(neg_x);
+    const __m256 one_plus_exp_neg_x = _mm256_add_ps(one, exp_neg_x);
+    return _mm256_div_ps(one, one_plus_exp_neg_x);
+}
+
 inline static __m256 ggml_v_silu(__m256 x) {
     const __m256 one = _mm256_set1_ps(1);
     const __m256 zero = _mm256_setzero_ps();
@@ -1306,6 +1347,16 @@ inline static __m128 ggml_v_expf(__m128 x) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static __m128 ggml_v_sigmoid(__m128 x) {
+    const __m128 one = _mm_set1_ps(1);
+    const __m128 zero = _mm_setzero_ps();
+    const __m128 neg_x = _mm_sub_ps(zero, x);
+    const __m128 exp_neg_x = ggml_v_expf(neg_x);
+    const __m128 one_plus_exp_neg_x = _mm_add_ps(one, exp_neg_x);
+    return _mm_div_ps(one, one_plus_exp_neg_x);
+}
+
 inline static __m128 ggml_v_silu(__m128 x) {
     const __m128 one = _mm_set1_ps(1);
     const __m128 zero = _mm_setzero_ps();
@@ -1360,6 +1411,14 @@ inline static vfloat32m2_t ggml_v_expf_m2(vfloat32m2_t x, int vl) {
 }
 
 // computes silu x/(1+exp(-x)) in single precision vector
+// computes sigmoid 1/(1+exp(-x)) in single precision vector -- same expf kernel as ggml_v_silu
+inline static vfloat32m2_t ggml_v_sigmoid_m2(vfloat32m2_t x, int vl) {
+    vfloat32m2_t neg_x = __riscv_vfneg_v_f32m2(x, vl);
+    vfloat32m2_t exp_neg_x = ggml_v_expf_m2(neg_x, vl);
+    vfloat32m2_t one_plus_exp_neg_x = __riscv_vfadd_vf_f32m2(exp_neg_x, 1.0f, vl);
+    return __riscv_vfrdiv_vf_f32m2(one_plus_exp_neg_x, 1.0f, vl);
+}
+
 inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
     const vfloat32m2_t neg_x = __riscv_vfneg_v_f32m2(x, vl);
     const vfloat32m2_t exp_neg_x = ggml_v_expf_m2(neg_x, vl);

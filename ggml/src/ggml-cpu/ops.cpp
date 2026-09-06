@@ -1837,10 +1837,6 @@ static void ggml_compute_forward_repeat_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(ggml_can_repeat(src0, dst));
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -1854,6 +1850,41 @@ static void ggml_compute_forward_repeat_f32(
     // TODO: support for transposed / permuted tensors
     GGML_ASSERT(nb0  == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
+
+    // INF-70 SYNC-10: this kernel was single-threaded outright (`if (ith != 0) return;`).
+    // Every destination copy is disjoint, so dealing the (copy, column-chunk) pairs out to
+    // the threads is bit-identical. Gated by GGML_ROWCOL_SPLIT; when it is off the original
+    // thread-0-only path below runs unchanged.
+    if (ggml_rowcol_split_enabled()) {
+        const int64_t nu = (int64_t) nr3*ne03*nr2*ne02*nr1*ne01*nr0;
+        const ggml_rowcol_split split = get_rowcol_split(params, nu, ne00, sizeof(float));
+
+        for (int64_t t = split.t0; t < split.t1; ++t) {
+            int64_t u, c0, c1;
+            split.unpack(t, ne00, u, c0, c1);
+            if (c0 >= c1) {
+                continue;
+            }
+
+            const int64_t i0 =  u % nr0;  u /= nr0;
+            const int64_t k1 =  u % ne01; u /= ne01;
+            const int64_t i1 =  u % nr1;  u /= nr1;
+            const int64_t k2 =  u % ne02; u /= ne02;
+            const int64_t i2 =  u % nr2;  u /= nr2;
+            const int64_t k3 =  u % ne03; u /= ne03;
+            const int64_t i3 =  u;
+
+            ggml_vec_cpy_f32(c1 - c0,
+                    (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0) + c0,
+                    (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01) + c0);
+        }
+
+        return;
+    }
+
+    if (params->ith != 0) {
+        return;
+    }
 
     // TODO: maybe this is not optimal?
     for                         (int i3 = 0; i3 < nr3;  i3++) {
