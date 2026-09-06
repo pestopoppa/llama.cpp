@@ -2662,10 +2662,17 @@ static int64_t ggml_get_rows_min_bytes(void) {
 // Zero-element nodes (219/token here: the recurrent-state rollback SCALE/GET_ROWS/CPY triples)
 // write nothing at all, so they are solo-eligible for any op and also serve as run glue.
 //
-// Off by default; enable with GGML_TINY_SOLO=1.  GGML_TINY_SOLO_MAX caps dst elements.
-static bool    ggml_cpu_tiny_solo     = false;  // set once in ggml_cpu_init(), read-only after
-static bool    ggml_cpu_empty_skip    = false;  // INF-70 SYNC-9: drop zero-element nodes + their barrier
+// INF-70 CHAMPION-1: both DEFAULT ON (bit-identical; +3.86% and +0.87% plain).
+// Escape hatches: GGML_TINY_SOLO=0 / GGML_EMPTY_SKIP=0 restore upstream barrier behaviour
+// with no rebuild.  GGML_TINY_SOLO_MAX caps dst elements.
+static bool    ggml_cpu_tiny_solo     = true;   // set once in ggml_cpu_init(), read-only after
+static bool    ggml_cpu_empty_skip    = true;   // INF-70 SYNC-9: drop zero-element nodes + their barrier
 static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ROWCOL_SPLIT
+
+// INF-70 CHAMPION-1 build marker (see ggml.c).
+__attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
+    "INF70_CHAMPION_CPU_DEFAULT_ON=GGML_ROWCOL_SPLIT,GGML_TINY_SOLO,GGML_EMPTY_SKIP"
+    ";DEFAULT_OFF=GGML_VEC_SIGMOID";
 
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // a node with no elements writes nothing: no publication, no barrier needed
@@ -5044,12 +5051,12 @@ void ggml_cpu_init(void) {
         }
 
         {
-            // INF-70 SYNC-2 tiny-op barrier elision, opt-in
+            // INF-70 CHAMPION-1: tiny-op barrier elision, DEFAULT ON; set the var to 0 to disable
             const char * env = getenv("GGML_TINY_SOLO");
-            ggml_cpu_tiny_solo = (env != NULL && atoi(env) == 1);
+            ggml_cpu_tiny_solo = (env == NULL || *env == '\0') ? true : (atoi(env) != 0);
 
             const char * enve = getenv("GGML_EMPTY_SKIP");
-            ggml_cpu_empty_skip = (enve != NULL && atoi(enve) == 1);
+            ggml_cpu_empty_skip = (enve == NULL || *enve == '\0') ? true : (atoi(enve) != 0);
 
             const char * envm = getenv("GGML_TINY_SOLO_MAX");
             if (envm != NULL) {

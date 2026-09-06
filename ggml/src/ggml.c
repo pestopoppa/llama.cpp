@@ -333,6 +333,11 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 #include <unistd.h>
 #endif
 
+// INF-70 CHAMPION-1 build marker: greppable with `strings` so a binary can be proven to
+// carry the champion defaults without running it.
+__attribute__((used)) static const char ggml_inf70_champion_marker[] =
+    "INF70_CHAMPION_BASE_DEFAULT_ON=GGML_NOHUGEPAGE";
+
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
@@ -376,12 +381,14 @@ void * ggml_aligned_malloc(size_t size) {
     // `numactl --interleave=all` from 4 KiB to 2 MiB. A weight tensor that spans fewer
     // than a few huge pages is then served by ONE memory controller instead of four:
     // measured marginal read bandwidth 53 GB/s (one node's share) vs 362 GB/s with 4 KiB
-    // pages. Opt in with GGML_NOHUGEPAGE=1. Placement only - never changes any result bit.
+    // pages. INF-70 CHAMPION-1: DEFAULT ON (+35.21% served). Placement only - madvise()
+    // never changes any result bit. Escape hatch: GGML_NOHUGEPAGE=0 restores THP-backed
+    // allocations with no rebuild.
     if (result == 0 && aligned_memory != NULL) {
         static int nohugepage = -1;
         if (nohugepage < 0) {
             const char * e = getenv("GGML_NOHUGEPAGE");
-            nohugepage = (e != NULL && *e != '\0' && *e != '0') ? 1 : 0;
+            nohugepage = (e == NULL || *e == '\0') ? 1 : (atoi(e) != 0);
         }
         if (nohugepage) {
             const uintptr_t ps    = (uintptr_t) sysconf(_SC_PAGESIZE);

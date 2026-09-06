@@ -103,13 +103,14 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
 // pairs out to the threads is BIT-IDENTICAL to the single-threaded result by
 // construction. This is the same shape as the D8 GET_ROWS fix (bc2834a9b).
 //
-// Gated by GGML_ROWCOL_SPLIT (default OFF). GGML_ROWCOL_MIN_ELEMS sets the
-// smallest row that is worth cutting up.
+// INF-70 CHAMPION-1: DEFAULT ON. Bit-identical by construction (see above), measured
+// +3.05% served / +8.42% plain. Escape hatch: GGML_ROWCOL_SPLIT=0 restores the upstream
+// row-only split with no rebuild. GGML_ROWCOL_MIN_ELEMS sets the smallest row worth cutting.
 
 static inline bool ggml_rowcol_split_enabled(void) {
     static const bool v = [] {
         const char * s = getenv("GGML_ROWCOL_SPLIT");
-        return s != NULL && atoi(s) != 0;
+        return (s == NULL || *s == '\0') ? true : (atoi(s) != 0);
     }();
     return v;
 }
