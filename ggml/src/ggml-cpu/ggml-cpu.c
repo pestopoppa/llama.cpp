@@ -3609,6 +3609,61 @@ static uint64_t * ggml_cpu_prof_node_wall_ns = NULL;
 static uint64_t * ggml_cpu_prof_node_cnt     = NULL;
 static int        ggml_cpu_prof_node_cap     = 0;
 
+// INF-70 SYNC-1 additions.
+//  (a) per-node wall MAX + the eval index it happened on + a spike counter.  A node whose
+//      per-token MEAN is huge is either uniformly slow (real structural defect) or was hit
+//      once by a multi-ms stall that the mean amortised (artefact).  max/argmax separates them.
+//  (b) optional per-(node,thread) compute accumulation (GGML_CPU_PROF_THREADS=1).  thread 0's
+//      compute is not the node's compute: dead = wall(t0) - compute(t0) mixes the barrier with
+//      straggler imbalance.  With per-thread compute we can split it:
+//         imbalance = max_over_threads(compute) - mean_over_threads(compute)
+//         barrier   = wall(t0) - max_over_threads(compute)   (approx; ignores t0 skew)
+static uint64_t * ggml_cpu_prof_node_wall_max  = NULL;   // us
+static uint64_t * ggml_cpu_prof_node_wall_max_ev = NULL; // accumulated-eval index of the max
+static uint64_t * ggml_cpu_prof_node_spikes    = NULL;   // evals with wall > spike threshold
+static uint64_t * ggml_cpu_prof_nt_ns          = NULL;   // [node*nth + ith] compute us
+static int        ggml_cpu_prof_nt_nth         = 0;
+static int        ggml_cpu_prof_threads        = -1;
+static int        ggml_cpu_prof_spike_us       = -1;
+
+static int ggml_cpu_prof_threads_on(void) {
+    if (ggml_cpu_prof_threads < 0) {
+        ggml_cpu_prof_threads = getenv("GGML_CPU_PROF_THREADS") != NULL ? 1 : 0;
+    }
+    return ggml_cpu_prof_threads;
+}
+// SYNC-1: with speculative decoding two graph SHAPES interleave (the ~144-node MTP draft graph
+// and the trunk graph at batch 1+n_draft).  Per-node-index accumulators are only meaningful
+// within one shape, so GGML_CPU_PROF_NNODES_EQ=N restricts accumulation to graphs of exactly
+// N nodes.  The per-eval "[cpu_prof] graph_eval" stderr line still reports every shape seen.
+static int ggml_cpu_prof_nnodes_eq  = -2;
+static int ggml_cpu_prof_nnodes_min = -2;
+static int ggml_cpu_prof_nnodes_max = -2;
+static int ggml_cpu_prof_envint(const char * name, int * cache, int dflt) {
+    if (*cache == -2) {
+        const char * e = getenv(name);
+        *cache = e ? atoi(e) : dflt;
+    }
+    return *cache;
+}
+// true if this graph's shape passes the accumulate filter
+static int ggml_cpu_prof_shape_ok(int n_nodes) {
+    const int eq = ggml_cpu_prof_envint("GGML_CPU_PROF_NNODES_EQ",  &ggml_cpu_prof_nnodes_eq,  -1);
+    const int lo = ggml_cpu_prof_envint("GGML_CPU_PROF_NNODES_MIN", &ggml_cpu_prof_nnodes_min, -1);
+    const int hi = ggml_cpu_prof_envint("GGML_CPU_PROF_NNODES_MAX", &ggml_cpu_prof_nnodes_max, -1);
+    if (eq >= 0 && n_nodes != eq) return 0;
+    if (lo >= 0 && n_nodes <  lo) return 0;
+    if (hi >= 0 && n_nodes >  hi) return 0;
+    return 1;
+}
+static int ggml_cpu_prof_spike_thresh(void) {
+    if (ggml_cpu_prof_spike_us < 0) {
+        const char * e = getenv("GGML_CPU_PROF_SPIKE_US");
+        ggml_cpu_prof_spike_us = e ? atoi(e) : 500;
+    }
+    return ggml_cpu_prof_spike_us;
+}
+
 // weight-path totals: 0 = dense mul_mat, 1 = expert mul_mat_id, 2 = lm_head mul_mat
 #define GGML_CPU_PROF_NPATH 3
 static uint64_t ggml_cpu_prof_path_ns[GGML_CPU_PROF_NPATH];
@@ -3690,7 +3745,22 @@ static void ggml_cpu_prof_ensure_nodes(int n) {
     memset(ggml_cpu_prof_node_ns      + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
     memset(ggml_cpu_prof_node_wall_ns + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
     memset(ggml_cpu_prof_node_cnt     + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    ggml_cpu_prof_node_wall_max    = (uint64_t *) realloc(ggml_cpu_prof_node_wall_max,    cap*sizeof(uint64_t));
+    ggml_cpu_prof_node_wall_max_ev = (uint64_t *) realloc(ggml_cpu_prof_node_wall_max_ev, cap*sizeof(uint64_t));
+    ggml_cpu_prof_node_spikes      = (uint64_t *) realloc(ggml_cpu_prof_node_spikes,      cap*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_wall_max    + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_wall_max_ev + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
+    memset(ggml_cpu_prof_node_spikes      + ggml_cpu_prof_node_cap, 0, (cap - ggml_cpu_prof_node_cap)*sizeof(uint64_t));
     ggml_cpu_prof_node_cap = cap;
+}
+
+// per-(node,thread) compute accumulator; allocated once, thread 0 only, before any use
+static void ggml_cpu_prof_ensure_nt(int n_nodes, int nth) {
+    if (!ggml_cpu_prof_threads_on() || ggml_cpu_prof_nt_ns != NULL) {
+        return;
+    }
+    ggml_cpu_prof_nt_nth = nth;
+    ggml_cpu_prof_nt_ns  = (uint64_t *) calloc((size_t) n_nodes * (size_t) nth, sizeof(uint64_t));
 }
 
 static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
@@ -3891,17 +3961,36 @@ static void ggml_cpu_prof_dump(void) {
         if (pf) {
             FILE * f = fopen(pf, "w");
             if (f) {
-                fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals\n");
+                fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals"
+                           "\twall_max_us\twall_max_ev\tspikes\tthr_max_us\tthr_mean_us\tthr_min_us\n");
                 for (int i = 0; i < n; i++) {
                     if (ggml_cpu_prof_node_cnt[i] == 0) continue;
                     const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[i];
-                    fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu\n",
+                    double thr_max = 0, thr_sum = 0, thr_min = 0;
+                    if (ggml_cpu_prof_nt_ns && ggml_cpu_prof_nt_nth > 0) {
+                        const uint64_t * row = &ggml_cpu_prof_nt_ns[(size_t) i * (size_t) ggml_cpu_prof_nt_nth];
+                        uint64_t mx = 0, mn = UINT64_MAX, sm = 0;
+                        for (int t = 0; t < ggml_cpu_prof_nt_nth; t++) {
+                            if (row[t] > mx) mx = row[t];
+                            if (row[t] < mn) mn = row[t];
+                            sm += row[t];
+                        }
+                        const double gg = (double) ggml_cpu_prof_node_cnt[i];
+                        thr_max = mx/gg; thr_min = (mn==UINT64_MAX?0:mn)/gg;
+                        thr_sum = (double) sm / (double) ggml_cpu_prof_nt_nth / gg;
+                    }
+                    fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu"
+                               "\t%llu\t%llu\t%llu\t%.3f\t%.3f\t%.3f\n",
                             i, ggml_op_name((enum ggml_op) md->op), md->name,
                             md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
                             (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
                             (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
                             ggml_cpu_prof_node_ns[i]/g, ggml_cpu_prof_node_wall_ns[i]/g,
-                            (unsigned long long) ggml_cpu_prof_node_cnt[i]);
+                            (unsigned long long) ggml_cpu_prof_node_cnt[i],
+                            (unsigned long long) ggml_cpu_prof_node_wall_max[i],
+                            (unsigned long long) ggml_cpu_prof_node_wall_max_ev[i],
+                            (unsigned long long) ggml_cpu_prof_node_spikes[i],
+                            thr_max, thr_sum, thr_min);
                 }
                 fclose(f);
             }
@@ -3985,6 +4074,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (state->ith == 0 && ggml_cpu_prof_is_enabled()) {
         const uint64_t gi = ggml_cpu_prof_graph_idx++;
         prof_acc = (gi >= (uint64_t) ggml_cpu_prof_skip_graphs()) ? 1 : 0;
+        if (!ggml_cpu_prof_shape_ok(cgraph->n_nodes)) {
+            prof_acc = 0;
+        }
         ggml_cpu_prof_barrier_on = prof_acc;
         if (prof_acc) {
             if (ggml_cpu_prof_graphs_acc == 0) {
@@ -4004,6 +4096,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
             }
             ggml_cpu_prof_ensure_nodes(cgraph->n_nodes);
+            ggml_cpu_prof_ensure_nt(cgraph->n_nodes, params.nth);
             ggml_cpu_prof_graphs_acc++;
             ggml_cpu_prof_last_nnodes = cgraph->n_nodes;
         }
@@ -4105,6 +4198,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #ifdef GGML_CPU_PROF
         const int64_t t0 = (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) ? ggml_time_us() : 0;
+        // SYNC-1: every thread times its own compute when GGML_CPU_PROF_THREADS is set.
+        // ggml_cpu_prof_barrier_on is thread 0's prof_acc, published at graph start; a
+        // one-eval race at a graph boundary is possible and is <= 1.5% of a 69-eval run.
+        const int64_t tt0 = (ggml_cpu_prof_nt_ns != NULL && ggml_cpu_prof_barrier_on) ? ggml_time_us() : 0;
 #endif
 
 #ifdef GGML_CPU_PROF
@@ -4122,6 +4219,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #ifdef GGML_CPU_PROF
         const int64_t t1 = (t0 != 0) ? ggml_time_us() : 0;
+        if (tt0 != 0 && node_n < ggml_cpu_prof_node_cap && state->ith < ggml_cpu_prof_nt_nth) {
+            ggml_cpu_prof_nt_ns[(size_t) node_n * (size_t) ggml_cpu_prof_nt_nth + state->ith] +=
+                (uint64_t)(ggml_time_us() - tt0);
+        }
 #endif
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -4147,6 +4248,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 ggml_cpu_prof_node_ns[prof_node_idx]      += dt;
                 ggml_cpu_prof_node_wall_ns[prof_node_idx] += wall;
                 ggml_cpu_prof_node_cnt[prof_node_idx]     += 1;
+                if (wall > ggml_cpu_prof_node_wall_max[prof_node_idx]) {
+                    ggml_cpu_prof_node_wall_max[prof_node_idx]    = wall;
+                    ggml_cpu_prof_node_wall_max_ev[prof_node_idx] = ggml_cpu_prof_graphs_acc;
+                }
+                if (wall > (uint64_t) ggml_cpu_prof_spike_thresh()) {
+                    ggml_cpu_prof_node_spikes[prof_node_idx] += 1;
+                }
             }
             if (n_fused > 0) {
                 ggml_cpu_prof_fused_ns      += dt;
