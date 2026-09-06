@@ -784,7 +784,8 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(
-        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool fixed_1536_cdna2 = false) {
+        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool fixed_1536_cdna2 = false,
+        bool eight_warp_q8_cdna2 = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -809,9 +810,19 @@ static constexpr __host__ __device__ int calc_nwarps(
         // weight-load requests in flight (Little's law). RDNA4 already uses nwarps=8 for Q8_0. Same
         // dp4a math, but the fp cross-warp reduction is split more ways, so numerically-valid-not-
         // bit-exact (test-backend-ops MUL_MAT 1103/1103 pass). Measured +4.6% (28.99->30.32 t/s, 27B
-        // Q8) single-stream tg128; nwarps=4 beat 2 (baseline) and 8 (reduction-overhead-bound).
+        // Q8) single-stream tg128; nwarps=4 beat 2 (baseline). nwarps=8 was rejected only at
+        // rows_per_cuda_block=1, where each row's cross-warp reduction overhead grows with nwarps.
+        // akm-cdna2-q8-b1-eight-warp-four-row: nwarps=8 is confined to the CDNA2 dense bs=1 Q8_0
+        // four-row small_k cell. The caller passes eight_warp_q8_cdna2=true only at the four-row
+        // forcing site in mul_mat_vec_q_switch_ncols_dst (cc == CDNA2 && !has_ids && nrows_x % 4 == 0),
+        // so every other route on this shared GCN/CDNA table keeps nwarps=4 and its existing
+        // geometry: non-small_k fallbacks, MUL_MAT_ID/has_ids launches, shape-triggered small_k,
+        // and other GCN/CDNA architectures. With the four-row CTA (akm-cdna2-q8-b1-four-row-cta)
+        // holding rows_per_cuda_block=rows_per_thread=4 via calc_rows_per_block, the per-row
+        // cross-warp reduction is paid once per 4 rows and is unchanged, so nwarps=8 only widens
+        // the k-split (160 Q8_0 blocks/row at ne00=5120: 3 k-loop iters of 64 blocks -> 2 of 128).
         if (ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
-            return 4;
+            return eight_warp_q8_cdna2 ? 8 : 4;
         }
         switch (ncols_dst) {
             case 1:
@@ -910,6 +921,16 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     // (CDNA2) only; the small_k instantiation keeps rows_per_cuda_block=2 as the host-side
     // fallback for row counts that are not multiples of 4.
     if (table_id == MMVQ_PARAMETERS_GCN && type == GGML_TYPE_Q8_0 && ncols_dst == 4 && !small_k) {
+        return 4;
+    }
+    // akm-cdna2-q8-b1-eight-warp-four-row: for the Q8_0 bs=1 small_k cell, rows-per-CTA stays 4 (4
+    // value chains per thread, 8 with the fused GLU gate chain) regardless of nwarps: only the
+    // k-split widens to 8 warps on the CDNA2 dense four-row route (see calc_nwarps
+    // eight_warp_q8_cdna2). rpb==nwarps would make rows_per_thread 8 and rows_per_cuda_block 8,
+    // changing the epilogue geometry this cell's keeps depend on. For every route where
+    // eight_warp_q8_cdna2 is false, nwarps is 4 and this returns the same 4 the generic
+    // 'small_k ? nwarps : 1' clause below would.
+    if (table_id == MMVQ_PARAMETERS_GCN && type == GGML_TYPE_Q8_0 && ncols_dst == 1 && small_k) {
         return 4;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
@@ -1092,8 +1113,8 @@ static __global__ void mul_mat_vec_q8_0_prefetch(
 #endif // GGML_USE_HIP
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int ncols_x_fixed = 0,
-          bool gate_only_swiglu = false, bool bias_only = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), ncols_x_fixed == 1536)*ggml_cuda_get_physical_warp_size(), 1)
+          bool gate_only_swiglu = false, bool bias_only = false, bool eight_warp_q8_cdna2 = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), ncols_x_fixed == 1536, eight_warp_q8_cdna2)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1107,6 +1128,8 @@ static __global__ void mul_mat_vec_q(
     static_assert(ncols_x_fixed == 0 ||
         (ncols_x_fixed == 1536 && ncols_dst == 1 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)),
         "fixed-width MMVQ specialization is only available for Q4_K/Q6_K batch-1 at 1536 columns");
+    static_assert(!eight_warp_q8_cdna2 || (type == GGML_TYPE_Q8_0 && ncols_dst == 1 && small_k),
+        "eight-warp Q8_0 geometry is only valid for the bs=1 small_k instantiation");
 
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
@@ -1117,7 +1140,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, ncols_x_fixed == 1536);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, ncols_x_fixed == 1536, eight_warp_q8_cdna2);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 #if defined(CDNA2)
     constexpr bool halfwave_rows = type == GGML_TYPE_Q4_K && ncols_dst == 1 && small_k && nwarps >= 2;
@@ -1134,9 +1157,11 @@ static __global__ void mul_mat_vec_q(
     constexpr bool dpp_q6_K_reduce =
         type == GGML_TYPE_Q6_K && ncols_dst == 1 && ncols_x_fixed == 1536 && rows_per_thread == 1;
     // akm-cdna2-q8-b1-dpp-final-reduce: the CDNA2 dense bs=1 Q8_0 small_k CTA (rows_per_cuda_block
-    // = rows_per_thread = nwarps = 4) reduces each row over the full 64 lanes of warp 0 after the
-    // tmp_shared cross-warp sum; the four per-row butterflies (plus the four fused gate rows)
-    // become interleaved DPP trees that deposit all totals on lane warp_size-1.
+    // = rows_per_thread = 4; the k-split is nwarps=8 on the eight_warp_q8_cdna2 route of
+    // akm-cdna2-q8-b1-eight-warp-four-row and nwarps=4 everywhere else) reduces each row over the
+    // full 64 lanes of warp 0 after the tmp_shared cross-warp sum; the four per-row butterflies
+    // (plus the four fused gate rows) become interleaved DPP trees that deposit all totals on
+    // lane warp_size-1.
     constexpr bool dpp_q8_0_quadrow_reduce =
         type == GGML_TYPE_Q8_0 && ncols_dst == 1 && rows_per_thread == 4;
 #else
@@ -1619,8 +1644,9 @@ template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false,
-        const bool halfwave_rows = false, const bool fixed_1536_cdna2 = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, fixed_1536_cdna2);
+        const bool halfwave_rows = false, const bool fixed_1536_cdna2 = false,
+        const bool eight_warp_q8_cdna2 = false) {
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, fixed_1536_cdna2, eight_warp_q8_cdna2);
     const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps) * (halfwave_rows ? 2 : 1);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -1659,7 +1685,8 @@ static void mul_mat_vec_q8_0_prefetch_launch(
 }
 #endif // Q8_LDS_PREFETCH_COMPILED
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, int ncols_x_fixed = 0>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, int ncols_x_fixed = 0,
+          bool eight_warp_q8_cdna2 = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1678,7 +1705,7 @@ static void mul_mat_vec_q_switch_fusion(
                 const bool use_bias_only = fusion.gate == nullptr && fusion.x_bias != nullptr &&
                     fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
                 if (use_bias_only) {
-                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed, false, true>, launch_params,
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed, false, true, eight_warp_q8_cdna2>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                          channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1688,14 +1715,14 @@ static void mul_mat_vec_q_switch_fusion(
                     fusion.gate_bias == nullptr && fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
                     fusion.glu_op == GGML_GLU_OP_SWIGLU;
                 if (use_gate_only_swiglu) {
-                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed, true>, launch_params,
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed, true, false, eight_warp_q8_cdna2>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                          channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
                     return;
                 }
             }
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, ncols_x_fixed, false, false, eight_warp_q8_cdna2>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1706,7 +1733,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, ncols_x_fixed>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, ncols_x_fixed, false, false, eight_warp_q8_cdna2>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1833,19 +1860,27 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
+            // akm-cdna2-q8-b1-four-row-cta: dense (ids==null) bs=1 Q8_0 GEMV on CDNA2 runs one
+            // output row per CTA (rows_per_cuda_block=1), each CTA re-reading the full Q8_1
+            // activation row (y ~1.06x of the weight bytes per row at ne00=5120) and paying the
+            // launch/reduce fixed cost once per row. Force the small_k instantiation
+            // (rows_per_cuda_block = rows_per_thread = 4), so 4 independent weight rows share one
+            // y read and one CTA. Rows are independent and the per-row thread->kbx mapping,
+            // accumulation order and cross-warp reduction order are untouched, so results are
+            // bit-identical to rpb=1. The 4-row unrolled weight loads are unbounded, so require
+            // nrows_x % 4 == 0 and keep rows_per_cuda_block=1 otherwise.
+            // akm-cdna2-q8-b1-eight-warp-four-row: this forcing site is exactly the CDNA2 dense
+            // Q8_0 small_k path, so it also raises the k-split to nwarps=8 (512-thread CTA) by
+            // passing eight_warp_q8_cdna2 to calc_launch_params and mul_mat_vec_q_switch_fusion;
+            // rows_per_thread stays 4 because calc_rows_per_block keeps rows_per_cuda_block at 4.
+            // The gate is host-runtime (cc == CDNA2 && !has_ids && nrows_x % 4 == 0), so MUL_MAT_ID/
+            // has_ids routes, shape-triggered small_k with nrows_x % 4 != 0, other GCN/CDNA
+            // architectures and the non-small_k fallback all keep nwarps=4 and their geometry.
+            bool q8_0_cdna2_four_row = false;
             if constexpr (type == GGML_TYPE_Q8_0) {
-                // akm-cdna2-q8-b1-four-row-cta: dense (ids==null) bs=1 Q8_0 GEMV on CDNA2 runs one
-                // output row per 256-thread CTA (rows_per_cuda_block=1), each CTA re-reading the
-                // full Q8_1 activation row (y ~1.06x of the weight bytes per row at ne00=5120) and
-                // paying the launch/reduce fixed cost once per row. Force the small_k instantiation
-                // (rows_per_cuda_block = nwarps = 4), which for Q8_0 changes nothing else in the
-                // kernel body, so 4 independent weight rows share one y read and one CTA. Rows are
-                // independent and per-row thread->kbx mapping, accumulation order and cross-warp
-                // reduction order are untouched, so results are bit-identical to rpb=1. The 4-row
-                // unrolled weight loads are unbounded, so require nrows_x % 4 == 0 and keep
-                // rows_per_cuda_block=1 otherwise.
                 if (cc == GGML_CUDA_CC_CDNA2 && !has_ids && nrows_x % 4 == 0) {
                     use_small_k = true;
+                    q8_0_cdna2_four_row = true;
                 }
             }
 
@@ -1887,7 +1922,23 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                     nsamples_dst, warp_size, table_id, true,
                     type == GGML_TYPE_Q4_K && c_ncols_dst == 1 &&
-                        calc_nwarps(type, c_ncols_dst, table_id) == 2 && cc == GGML_CUDA_CC_CDNA2);
+                        calc_nwarps(type, c_ncols_dst, table_id) == 2 && cc == GGML_CUDA_CC_CDNA2,
+                    false, q8_0_cdna2_four_row);
+                if constexpr (type == GGML_TYPE_Q8_0) {
+                    // akm-cdna2-q8-b1-eight-warp-four-row: the CDNA2 dense four-row cell takes the
+                    // eight-warp small_k instantiation (the dims above already carry its nwarps=8
+                    // geometry); every other small_k route below keeps the nwarps=4 geometry:
+                    // MUL_MAT_ID/has_ids launches, shape-triggered small_k with nrows_x % 4 != 0,
+                    // and other architectures.
+                    if (q8_0_cdna2_four_row) {
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, 0, true>(
+                            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                            stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                            stream);
+                        break;
+                    }
+                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
