@@ -58,18 +58,6 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
-    // INF-70 SYNC-2: one row and no in-row broadcast -> split by columns (bit-identical)
-    if (ne10 == ne00 && ggml_is_contiguous(src1) && ggml_elem_colsplit_applies(params, src0, dst)) {
-        const auto [c0, c1] = get_col_range(params, ne00);
-        if (c1 > c0) {
-            vec_binary_op_contiguous<op>(c1 - c0,
-                    (dst_t *) dst->data + c0,
-                    (const src0_t *) src0->data + c0,
-                    (const src1_t *) src1->data + c0);
-        }
-        return;
-    }
-
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
 

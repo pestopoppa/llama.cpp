@@ -2665,7 +2665,7 @@ static int64_t ggml_get_rows_min_bytes(void) {
 // Off by default; enable with GGML_TINY_SOLO=1.  GGML_TINY_SOLO_MAX caps dst elements.
 static bool    ggml_cpu_tiny_solo     = false;  // set once in ggml_cpu_init(), read-only after
 static bool    ggml_cpu_empty_skip    = false;  // INF-70 SYNC-9: drop zero-element nodes + their barrier
-static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ELEM_COLSPLIT
+static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ROWCOL_SPLIT
 
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // a node with no elements writes nothing: no publication, no barrier needed
