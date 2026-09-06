@@ -328,6 +328,11 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 #endif
 
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
@@ -366,6 +371,30 @@ void * ggml_aligned_malloc(size_t size) {
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
   #endif
+#if defined(__linux__)
+    // INF-70 D6-PLACE: transparent huge pages raise the effective granularity of
+    // `numactl --interleave=all` from 4 KiB to 2 MiB. A weight tensor that spans fewer
+    // than a few huge pages is then served by ONE memory controller instead of four:
+    // measured marginal read bandwidth 53 GB/s (one node's share) vs 362 GB/s with 4 KiB
+    // pages. Opt in with GGML_NOHUGEPAGE=1. Placement only - never changes any result bit.
+    if (result == 0 && aligned_memory != NULL) {
+        static int nohugepage = -1;
+        if (nohugepage < 0) {
+            const char * e = getenv("GGML_NOHUGEPAGE");
+            nohugepage = (e != NULL && *e != '\0' && *e != '0') ? 1 : 0;
+        }
+        if (nohugepage) {
+            const uintptr_t ps    = (uintptr_t) sysconf(_SC_PAGESIZE);
+            const uintptr_t start = ((uintptr_t) aligned_memory + ps - 1) & ~(ps - 1);
+            const uintptr_t end   = ((uintptr_t) aligned_memory + size) & ~(ps - 1);
+            if (end > start) {
+                // must run BEFORE the pages are first touched, which is the case here
+                (void) madvise((void *) start, (size_t) (end - start), MADV_NOHUGEPAGE);
+            }
+        }
+    }
+#endif
+
     if (result != 0) {
         // Handle allocation failure
         const char *error_desc = "unknown allocation error";
