@@ -1138,7 +1138,20 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    // akm-cdna2-q8-b1-singlepass-vdr4: the CDNA2 dense bs=1 Q8_0 four-row cell
+    // (eight_warp_q8_cdna2, 512-thread CTA, rows_per_thread=4) runs its k-loop at vdr=4 instead
+    // of 2, so blocks_per_iter = vdr*nwarps*warp_size/qi = 4*8*64/8 = 256 >= 160 (the Q8_0
+    // blocks of a 5120-wide row) and the whole row is consumed in one k-pass. The vdr=2 second
+    // pass only covered the 32-block remainder with 128 of 512 lanes live while 384 lanes spun
+    // on loop control; vdr=4 halves the per-row loop trips and parks 192 lanes once from the
+    // start instead. Per-thread dp4a width doubles 2->4 and threads per 32-int8 block halve
+    // (qi/vdr 4->2), so the per-block f32 scale application regroups 4 threads to 2: results
+    // are numerically-valid-not-bit-exact, same class as the eight-warp nwarps=8 keep. Confined
+    // to this cell: eight_warp_q8_cdna2 is host-gated to the CDNA2 dense bs=1 Q8_0 route with
+    // nrows_x % 4 == 0 (forcing site in mul_mat_vec_q_switch_ncols_dst), so dec-b* wide batch,
+    // has_ids, shape-triggered small_k and non-CDNA2 routes all keep vdr=2, and rows with
+    // blocks_per_row_x > 256 remain multi-pass at any vdr.
+    constexpr int vdr = eight_warp_q8_cdna2 ? 4 : get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, ncols_x_fixed == 1536, eight_warp_q8_cdna2);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -1363,6 +1376,33 @@ static __global__ void mul_mat_vec_q(
                                     if (row_in_bounds) {
                                         tmp[j][i][k_part] += dots.x;
                                         tmp_gate[j][i][k_part] += dots.y;
+                                    }
+                                } else if constexpr (eight_warp_q8_cdna2) {
+                                    // vdr=4 cell: vec_dot_q8_0_q8_1 bakes vdr=2 into its loads, so
+                                    // load v/u at this kernel's vdr and apply the impl directly
+                                    // (same pattern as the mul_mat_vec_q8_0_prefetch loop above)
+                                    const block_q8_1 * bq8_1 = &y[j*stride_col_y + kby];
+                                    const block_q8_0 * bq8_0 = (const block_q8_0 *) vx + kbx_row;
+                                    int v[vdr];
+                                    int u[vdr];
+#pragma unroll
+                                    for (int l = 0; l < vdr; ++l) {
+                                        v[l] = get_int_b2(bq8_0->qs, kqs + l);
+                                        u[l] = get_int_b4(bq8_1->qs, kqs + l);
+                                    }
+                                    tmp[j][i][k_part] += vec_dot_q8_0_q8_1_impl<float, vdr>(
+                                        v, u, bq8_0->d, __low2half(bq8_1->ds));
+                                    if constexpr (has_fusion && !bias_only) {
+                                        if (use_gate) {
+                                            const block_q8_0 * gq8_0 = (const block_q8_0 *) vgate + kbx_row;
+                                            int gv[vdr];
+#pragma unroll
+                                            for (int l = 0; l < vdr; ++l) {
+                                                gv[l] = get_int_b2(gq8_0->qs, kqs + l);
+                                            }
+                                            tmp_gate[j][i][k_part] += vec_dot_q8_0_q8_1_impl<float, vdr>(
+                                                gv, u, gq8_0->d, __low2half(bq8_1->ds));
+                                        }
                                     }
                                 } else {
                                     tmp[j][i][k_part] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_row, kqs);
