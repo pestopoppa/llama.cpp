@@ -62,6 +62,63 @@ inline bool iqk_q8_0_enabled() {
     }();
     return e;
 }
+
+// INF-70 SYNC-15: GGML_QSPLIT / GGML_QSPLIT_MIN — the activation-quantization split.
+//
+// D1's batch-1 fast path has EVERY thread quantize the WHOLE activation row into its own
+// private wdata slice so the publishing barrier can be dropped.  That is a good trade only
+// while the row is cheap to quantize: the cost is paid nth times over (once on each thread,
+// all on the critical path) to save one ~3.1 us barrier.  For ne00 = 10240 with a Q8_K
+// activation the whole-row quantization measures ~15 us, so the fast path pays ~15 us where
+// a block-split + barrier would pay ~15/nth + 3.1 us.
+//
+// GGML_QSPLIT=1 turns the lever on (default OFF -> D1's behaviour, exactly).  GGML_QSPLIT_MIN
+// is the smallest ne00 (in elements) at which a SINGLE activation row is split across the team
+// at block granularity and published with one barrier; with more than one row the stock path
+// already pays that barrier, so the split is unconditional there.
+//
+// Bit-identity: both Q8_K and Q8_2_X4 quantize block-locally (256- and 32-element blocks,
+// the latter packed in groups of 4).  Segments start at multiples of 256 / 128 elements and
+// the final segment carries any remainder, so every block is produced by the identical
+// computation over the identical inputs and lands at the identical byte offset.
+inline bool iqk_qsplit_enabled() {
+    static const bool e = []() { const char * s = getenv("GGML_QSPLIT"); return s && atoi(s) != 0; }();
+    return e;
+}
+// Only consulted when there is exactly ONE activation row, i.e. when the split has to BUY the
+// barrier that D1's private-row path avoids.  With more than one row the stock path already
+// pays that barrier, so the split is free there and the threshold does not apply.
+inline int64_t iqk_qsplit_min() {
+    static const int64_t v = []() -> int64_t {
+        const char * s = getenv("GGML_QSPLIT_MIN");
+        return (s && *s) ? (int64_t) atoll(s) : 4096;
+    }();
+    return v;
+}
+
+#ifdef GGML_CPU_PROF
+// INF-70 SYNC-15 instrumentation (profiling builds only, and only with GGML_IQK_PROF=1):
+// separate the activation-quantization phase from the GEMM phase, bucketed by whether the
+// node is "skinny" (fewer output rows than threads).  Thread 0 only, so no shared traffic.
+std::atomic<uint64_t> iqk_prof_quant_ns{0}, iqk_prof_gemm_ns{0}, iqk_prof_n{0};
+std::atomic<uint64_t> iqk_prof_sk_quant_ns{0}, iqk_prof_sk_gemm_ns{0}, iqk_prof_sk_n{0};
+inline bool iqk_prof_enabled() {
+    static const bool e = []() { const char * s = getenv("GGML_IQK_PROF"); return s && atoi(s) != 0; }();
+    return e;
+}
+struct IqkProfDump {
+    ~IqkProfDump() {
+        if (!iqk_prof_enabled()) return;
+        fprintf(stderr, "[iqk_prof] mul_mat calls(thread0)=%llu  quant=%.3f ms  gemm=%.3f ms\n",
+                (unsigned long long) iqk_prof_n.load(),
+                iqk_prof_quant_ns.load()/1e3, iqk_prof_gemm_ns.load()/1e3);
+        fprintf(stderr, "[iqk_prof]   of which SKINNY (ne01 < nth): calls=%llu  quant=%.3f ms  gemm=%.3f ms\n",
+                (unsigned long long) iqk_prof_sk_n.load(),
+                iqk_prof_sk_quant_ns.load()/1e3, iqk_prof_sk_gemm_ns.load()/1e3);
+    }
+};
+IqkProfDump iqk_prof_dump_;
+#endif
 constexpr bool iqk_typeA_supported(int t) {
     switch (t) {
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
@@ -200,13 +257,62 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
     // quantizes the row into its own private slice and reads its own copy; iqk_mul_mat_4d
     // partitions only over src0 rows / tiles and reads all of B, so the result is identical
     // and no barrier is needed. wdata is sized nth * row bytes by ggml_graph_plan.
+    const int64_t rows_total = ne11 * ne12 * ne13;
+
+    // INF-70 SYNC-15: activation-quantization grain split.  See iqk_qsplit_min() above.
+    // Both the D1 private-row fast path (rows_total == 1) and the stock row-parallel path
+    // (i11 += nth) leave the quantization of a wide activation row on far fewer threads than
+    // the team has: the fast path replicates the WHOLE row on all nth threads, and the stock
+    // path hands one whole row to each of rows_total threads while nth - rows_total idle.
+    // When there are fewer activation rows than threads, split the (row, block) space instead.
+    // Default OFF (GGML_QSPLIT unset).
+    const int64_t grain      = (activation_type == GGML_TYPE_Q8_K) ? QK_K : 128;
+    const int64_t ngrain_row = (ne10 + grain - 1) / grain;
+    const bool iqk_qsplit =
+        iqk_qsplit_enabled() && nth > 1 && rows_total < nth &&
+        (rows_total > 1 || ne10 >= iqk_qsplit_min());
+
     const bool iqk_batch1 =
-        ne11 * ne12 * ne13 == 1 &&
+        rows_total == 1 && !iqk_qsplit &&
         params->wsize >= (size_t) nth * nbw3;
+
+#ifdef GGML_CPU_PROF
+    const bool  prof   = iqk_prof_enabled() && ith == 0;
+    const int64_t p_t0 = prof ? ggml_time_us() : 0;
+#endif
 
     if (iqk_batch1) {
         wdata += (size_t) ith * nbw3;
         iqk_quantize_activation(activation_type, (const float *) src1->data, wdata, ne10);
+    } else if (iqk_qsplit) {
+        // Grain: Q8_K quantizes 256 elements per block; Q8_2_X4 quantizes 32 and packs them in
+        // groups of 4, so a segment must start on a 128-element boundary for the packed layout
+        // to be byte-identical to the whole-row call.  Every block is therefore produced by the
+        // identical computation over the identical inputs and lands at the identical offset.
+        const int64_t units = rows_total * ngrain_row;
+        const int64_t u0 = ((int64_t) ith * units) / nth;
+        const int64_t u1 = ((int64_t) (ith + 1) * units) / nth;
+        for (int64_t u = u0; u < u1; ) {
+            const int64_t r  = u / ngrain_row;
+            const int64_t gs = u - r * ngrain_row;
+            int64_t ge = u1 - r * ngrain_row;
+            if (ge > ngrain_row) ge = ngrain_row;
+            const int64_t e0 = gs * grain;
+            const int64_t e1 = (ge * grain < ne10) ? ge * grain : ne10;
+
+            const int64_t i13 = r / (ne11 * ne12);
+            const int64_t rem = r - i13 * ne11 * ne12;
+            const int64_t i12 = rem / ne11;
+            const int64_t i11 = rem - i12 * ne11;
+
+            iqk_quantize_activation(activation_type,
+                    (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11) + e0,
+                    wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + iqk_activation_row_size(activation_type, e0),
+                    e1 - e0);
+
+            u = r * ngrain_row + ge;
+        }
+        ggml_barrier(params->threadpool);
     } else {
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -221,6 +327,10 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
         ggml_barrier(params->threadpool);
     }
 
+#ifdef GGML_CPU_PROF
+    const int64_t p_t1 = prof ? ggml_time_us() : 0;
+#endif
+
     const bool ok = iqk_mul_mat_4d(ne01, ne11, ne00,
             ne02, ne03, ne12, ne13,
             nb02, nb03, nbw2, nbw3,
@@ -228,6 +338,19 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
             (int) src0->type, src0->data, nb01,
             activation_type, wdata, row_size,
             (float *) dst->data, nb1 / sizeof(float), ith, nth);
+#ifdef GGML_CPU_PROF
+    if (prof) {
+        const int64_t p_t2 = ggml_time_us();
+        iqk_prof_quant_ns.fetch_add((uint64_t)(p_t1 - p_t0), std::memory_order_relaxed);
+        iqk_prof_gemm_ns.fetch_add((uint64_t)(p_t2 - p_t1), std::memory_order_relaxed);
+        iqk_prof_n.fetch_add(1, std::memory_order_relaxed);
+        if (ne01 < nth) {
+            iqk_prof_sk_quant_ns.fetch_add((uint64_t)(p_t1 - p_t0), std::memory_order_relaxed);
+            iqk_prof_sk_gemm_ns.fetch_add((uint64_t)(p_t2 - p_t1), std::memory_order_relaxed);
+            iqk_prof_sk_n.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+#endif
     if (ok && ith == 0) {
         static std::atomic<uint64_t> logged_types{0};
         if (iqk_first_engagement(logged_types, (int) src0->type)) {

@@ -502,7 +502,115 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
+// INF-70 SYNC-15: GGML_VEC_Q8K — a BIT-IDENTICAL AVX-512 quantize_row_q8_K.
+//
+// On x86 quantize_row_q8_K is the scalar reference implementation, and it is the activation
+// quantizer for every IQ-family weight (iqk_activation_type() -> Q8_K).  Measured standalone on
+// this host: 12.395 us for a 10240-element row (1.21 ns/element), against 2.180 us (0.21 ns/el)
+// for the SIMD Q8_2_X4 quantizer next door -- a 5.7x gap that is pure missing vectorization.
+// A ~10240-wide activation row is quantized once per thread (D1's batch-1 fast path) or once
+// per activation row (the stock path), so those microseconds land straight on the critical path
+// of every hyper-connection gemv in the graph.
+//
+// Bit-identity, term by term against quantize_row_q8_K_ref():
+//   * amax is a max over the block; max is exact and order-independent, so the horizontal
+//     reduction gives the identical float.
+//   * `max` (the SIGNED value) must be the value at the FIRST index attaining amax, because the
+//     reference only updates it on a STRICT increase.  The lowest set bit of the |v| == amax
+//     mask, scanning groups in order, is exactly that index.
+//   * iscale = -127/max and d = 1/iscale stay scalar: identical operations.
+//   * nearest_int() is the magic-number trick (x + 12582912.f, then mantissa bits minus bias),
+//     which is a plain FP32 add in the prevailing rounding mode -- _mm512_add_ps is the same
+//     operation on the same bits, lane by lane.  MIN(127, v) is an integer min.
+//   * bsums are integer sums of the quantized bytes: exact, order-independent.
+//   * the amax == 0 branch reproduces the reference exactly, INCLUDING leaving bsums untouched.
+//
+// Default OFF; GGML_VEC_Q8K=1 enables it.
+#if defined(__AVX512F__)
+// -ffp-contract=off is LOAD-BEARING: with contraction on, GCC fuses the mul by iscale and the
+// magic-number add of nearest_int() into a single FMA, which rounds once instead of twice and
+// flips the occasional nearest-integer tie.  Measured: 4 mismatching rows in 140 x 10240
+// elements with contraction on, 0 with it off.
+__attribute__((optimize("-ffp-contract=off")))
+static void quantize_row_q8_K_avx512(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT y = (block_q8_K *) vy;
+
+    const __m512  absmask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+    const __m512  magic   = _mm512_set1_ps(12582912.f);
+    const __m512i mmant   = _mm512_set1_epi32(0x007fffff);
+    const __m512i mbias   = _mm512_set1_epi32(0x00400000);
+    const __m512i m127    = _mm512_set1_epi32(127);
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK_K;
+
+        __m512 vamax = _mm512_setzero_ps();
+        for (int j = 0; j < QK_K; j += 16) {
+            vamax = _mm512_max_ps(vamax, _mm512_and_ps(_mm512_loadu_ps(xb + j), absmask));
+        }
+        const float amax = _mm512_reduce_max_ps(vamax);
+
+        if (amax == 0.0f) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            continue;
+        }
+
+        // signed value at the first index attaining amax
+        const __m512 vamax_b = _mm512_set1_ps(amax);
+        float max = 0.0f;
+        for (int j = 0; j < QK_K; j += 16) {
+            const __m512 v = _mm512_loadu_ps(xb + j);
+            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_and_ps(v, absmask), vamax_b, _CMP_EQ_OQ);
+            if (m) {
+                max = xb[j + __builtin_ctz((unsigned) m)];
+                break;
+            }
+        }
+
+        const float iscale = -127.f/max;
+        const __m512 viscale = _mm512_set1_ps(iscale);
+        for (int j = 0; j < QK_K; j += 16) {
+            const __m512  v = _mm512_mul_ps(viscale, _mm512_loadu_ps(xb + j));
+            const __m512i b = _mm512_castps_si512(_mm512_add_ps(v, magic));
+            __m512i q = _mm512_sub_epi32(_mm512_and_si512(b, mmant), mbias);
+            q = _mm512_min_epi32(q, m127);
+            _mm_storeu_si128((__m128i *)(y[i].qs + j), _mm512_cvtepi32_epi8(q));
+        }
+
+        for (int j = 0; j < QK_K/16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) {
+                sum += y[i].qs[j*16 + ii];
+            }
+            y[i].bsums[j] = sum;
+        }
+        y[i].d = 1/iscale;
+    }
+}
+#endif // __AVX512F__
+
+static int ggml_vec_q8k_flag = -1;   // -1 unread, 0 off, 1 on; idempotent across threads
+static inline int ggml_vec_q8k_enabled(void) {
+    if (ggml_vec_q8k_flag < 0) {
+        const char * s = getenv("GGML_VEC_Q8K");
+        ggml_vec_q8k_flag = (s != NULL && atoi(s) != 0) ? 1 : 0;
+    }
+    return ggml_vec_q8k_flag;
+}
+
+__attribute__((used)) static const char ggml_inf70_sync15_q8k_marker[] =
+    "INF70_SYNC15_DEFAULT_OFF=GGML_VEC_Q8K";
+
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+#if defined(__AVX512F__)
+    if (ggml_vec_q8k_enabled()) {
+        quantize_row_q8_K_avx512(x, y, k);
+        return;
+    }
+#endif
     quantize_row_q8_K_ref(x, y, k);
 }
 
