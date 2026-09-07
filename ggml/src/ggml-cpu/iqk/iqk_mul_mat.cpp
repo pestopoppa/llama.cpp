@@ -580,6 +580,35 @@ extern "C" IQK_API int iqk_dequant_type(int type, int Ny) {
     return MulMat::is_dequant_better(ggml_type(type), Ny);
 }
 
+
+// INF-70 SYNC-14: even row split.  iqk's static partition is nrc_x = ceil(U/nth) with
+// first_x = ith*nrc_x, so the ceiling is paid by EVERY thread while the remainder falls on
+// the tail: at U=640, nth=48 threads 0..44 take 14 rows, thread 45 takes 10 and threads 46
+// and 47 take NONE.  The makespan is then 14/13.33 = 1.05x the balanced one and 2 of 48
+// cores are idle for the whole node.  The even split gives thread ith the range
+// [U*ith/nth, U*(ith+1)/nth), balanced to +-1 unit with no idle thread -- the same idiom
+// B3-k already uses for the MoE slab partition.  Bit-identical: every kernel reachable here
+// accumulates each output row independently in the same block order, so which thread owns a
+// row cannot change its value.  Gated by GGML_IQK_EVENSPLIT (default off).
+static inline int iqk_evensplit_on() {
+    static const int on = [] {
+        const char * e = getenv("GGML_IQK_EVENSPLIT");
+        return (e && atoi(e) != 0) ? 1 : 0;
+    }();
+    return on;
+}
+static inline void iqk_split_units(long U, int ith, int nth, long & first, long & n) {
+    if (iqk_evensplit_on()) {
+        first = (U * (long) ith) / nth;
+        n     = (U * (long) (ith + 1)) / nth - first;
+        return;
+    }
+    const long per = (U + nth - 1) / nth;
+    first = (long) ith * per;
+    n     = per;
+    if (first + n > U) n = U - first;
+}
+
 extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
@@ -623,9 +652,8 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
         GGML_ASSERT(Nx%num_rows == 0);
-        auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-        auto first_x = ith*nrc_x;
-        if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+        long nrc_x = 0, first_x = 0;
+        iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
         first_x *= num_rows;
         nrc_x   *= num_rows;
 
@@ -681,9 +709,8 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         return true;
     }
 
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    long nrc_x = 0, first_x = 0;
+    iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
 
     DataInfo info{C + first_x*num_rows, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
 
@@ -816,10 +843,9 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
         GGML_ASSERT(Nx%num_rows == 0);
-        auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-        auto first_x = ith*nrc_x;
-        if (first_x >= Nx/num_rows) return true;
-        if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+        long nrc_x = 0, first_x = 0;
+        iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
+        if (nrc_x <= 0) return true;
         first_x *= num_rows;
         nrc_x   *= num_rows;
 
@@ -852,10 +878,9 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     size_t row_size_qy = strideB;
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x >= Nx/num_rows) return true;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    long nrc_x = 0, first_x = 0;
+    iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
+    if (nrc_x <= 0) return true;
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
@@ -932,9 +957,8 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
             auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
             GGML_ASSERT(Nx%num_rows == 0);
-            auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-            auto first_x = ith*nrc_x;
-            if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+            long nrc_x = 0, first_x = 0;
+            iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
             first_x *= num_rows;
             nrc_x   *= num_rows;
 
@@ -973,9 +997,8 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     }
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    long nrc_x = 0, first_x = 0;
+    iqk_split_units(Nx/num_rows, ith, nth, first_x, nrc_x);
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),

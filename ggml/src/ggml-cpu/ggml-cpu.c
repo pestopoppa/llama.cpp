@@ -3630,6 +3630,10 @@ static uint64_t * ggml_cpu_prof_node_wall_max_ev = NULL; // accumulated-eval ind
 static uint64_t * ggml_cpu_prof_node_spikes    = NULL;   // evals with wall > spike threshold
 static uint64_t * ggml_cpu_prof_nt_ns          = NULL;   // [node*nth + ith] compute us
 static int        ggml_cpu_prof_nt_nth         = 0;
+// INF-70 SYNC-14: which logical CPU each OpenMP thread actually ran on (first observation).
+// Needed to fold per-thread compute onto the CCX / NUMA topology -- the per-CCX residency
+// hypothesis cannot be tested from a thread index alone.
+static int      * ggml_cpu_prof_thr_cpu        = NULL;
 static int        ggml_cpu_prof_threads        = -1;
 static int        ggml_cpu_prof_spike_us       = -1;
 
@@ -3768,6 +3772,10 @@ static void ggml_cpu_prof_ensure_nt(int n_nodes, int nth) {
     }
     ggml_cpu_prof_nt_nth = nth;
     ggml_cpu_prof_nt_ns  = (uint64_t *) calloc((size_t) n_nodes * (size_t) nth, sizeof(uint64_t));
+    ggml_cpu_prof_thr_cpu = (int *) calloc((size_t) nth, sizeof(int));
+    if (ggml_cpu_prof_thr_cpu) {
+        for (int t = 0; t < nth; t++) ggml_cpu_prof_thr_cpu[t] = -1;
+    }
 }
 
 static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
@@ -4002,6 +4010,39 @@ static void ggml_cpu_prof_dump(void) {
                 fclose(f);
             }
         }
+        // INF-70 SYNC-14: full per-(node,thread) matrix.  thr_max/thr_mean/thr_min collapse
+        // the distribution to three numbers, which cannot distinguish a bimodal split (the
+        // per-CCX residency signature) from a single straggler or from uniform jitter.
+        const char * tf = getenv("GGML_CPU_PROF_THRDUMP_FILE");
+        if (tf && ggml_cpu_prof_nt_ns && ggml_cpu_prof_nt_nth > 0) {
+            FILE * f = fopen(tf, "w");
+            if (f) {
+                fprintf(f, "# nth=%d\n# thr_cpu", ggml_cpu_prof_nt_nth);
+                for (int t = 0; t < ggml_cpu_prof_nt_nth; t++) {
+                    fprintf(f, "\t%d", ggml_cpu_prof_thr_cpu ? ggml_cpu_prof_thr_cpu[t] : -1);
+                }
+                fprintf(f, "\n");
+                fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tevals\twall_us");
+                for (int t = 0; t < ggml_cpu_prof_nt_nth; t++) fprintf(f, "\tt%d", t);
+                fprintf(f, "\n");
+                for (int i = 0; i < n; i++) {
+                    if (ggml_cpu_prof_node_cnt[i] == 0) continue;
+                    const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[i];
+                    const uint64_t * row = &ggml_cpu_prof_nt_ns[(size_t) i * (size_t) ggml_cpu_prof_nt_nth];
+                    const double gg = (double) ggml_cpu_prof_node_cnt[i];
+                    fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%llu\t%.3f",
+                            i, ggml_op_name((enum ggml_op) md->op), md->name,
+                            md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                            (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                            (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
+                            (unsigned long long) ggml_cpu_prof_node_cnt[i],
+                            ggml_cpu_prof_node_wall_ns[i]/g);
+                    for (int t = 0; t < ggml_cpu_prof_nt_nth; t++) fprintf(f, "\t%.3f", row[t]/gg);
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
         free(idx);
     }
     fflush(stderr);
@@ -4226,9 +4267,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #ifdef GGML_CPU_PROF
         const int64_t t1 = (t0 != 0) ? ggml_time_us() : 0;
-        if (tt0 != 0 && node_n < ggml_cpu_prof_node_cap && state->ith < ggml_cpu_prof_nt_nth) {
-            ggml_cpu_prof_nt_ns[(size_t) node_n * (size_t) ggml_cpu_prof_nt_nth + state->ith] +=
+        if (tt0 != 0 && prof_node_idx < ggml_cpu_prof_node_cap && state->ith < ggml_cpu_prof_nt_nth) {
+            // INF-70 SYNC-14: index by prof_node_idx, NOT node_n.  node_n has already been
+            // advanced by ggml_cpu_try_fuse_ops above, so SYNC-1's version wrote the 84
+            // RMS_NORM+MUL fused pairs onto the WRONG node index (disclosed in its report as
+            // "1.9% of nodes have thr_* = 0"); those rows were dropped from every aggregate.
+            ggml_cpu_prof_nt_ns[(size_t) prof_node_idx * (size_t) ggml_cpu_prof_nt_nth + state->ith] +=
                 (uint64_t)(ggml_time_us() - tt0);
+            if (ggml_cpu_prof_thr_cpu && ggml_cpu_prof_thr_cpu[state->ith] < 0) {
+                ggml_cpu_prof_thr_cpu[state->ith] = sched_getcpu();
+            }
         }
 #endif
 
