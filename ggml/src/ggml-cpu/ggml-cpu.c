@@ -2697,8 +2697,12 @@ __attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
 
 // INF-70 SYNC-15 build marker: both new levers default OFF (GGML_TINY_SOLO_ROWS=1 is the
 // champion's batch-1-only predicate; GGML_QSPLIT_MIN=0 disables the split entirely).
-__attribute__((used)) static const char ggml_inf70_sync15_marker[] =
-    "INF70_SYNC15_LEVERS_DEFAULT_OFF=GGML_TINY_SOLO_ROWS,GGML_TINY_SOLO_ROWS_MAX,GGML_QSPLIT,GGML_QSPLIT_MIN";
+// INF-70 CHAMPION-3 build marker: GGML_QSPLIT is now default ON, with GGML_QSPLIT_MIN
+// defaulting to INT64_MAX so only the multi-row branch is live (see iqk_dispatch.cpp).
+// GGML_TINY_SOLO_ROWS stays at 1 -- the code is kept, inert, at the champion's behaviour.
+__attribute__((used)) static const char ggml_inf70_champion3_marker[] =
+    "INF70_CHAMPION3_CPU_DEFAULT_ON=GGML_QSPLIT(multi-row-only,GGML_QSPLIT_MIN=INT64_MAX)"
+    ";DEFAULT_INERT=GGML_TINY_SOLO_ROWS=1,GGML_TINY_SOLO_ROWS_MAX";
 
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // a node with no elements writes nothing: no publication, no barrier needed

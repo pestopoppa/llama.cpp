@@ -596,13 +596,14 @@ static int ggml_vec_q8k_flag = -1;   // -1 unread, 0 off, 1 on; idempotent acros
 static inline int ggml_vec_q8k_enabled(void) {
     if (ggml_vec_q8k_flag < 0) {
         const char * s = getenv("GGML_VEC_Q8K");
-        ggml_vec_q8k_flag = (s != NULL && atoi(s) != 0) ? 1 : 0;
+        // INF-70 CHAMPION-3: default ON (unset or empty = ON, explicit 0 = OFF).
+        ggml_vec_q8k_flag = (s == NULL || *s == '\0') ? 1 : (atoi(s) != 0);
     }
     return ggml_vec_q8k_flag;
 }
 
 __attribute__((used)) static const char ggml_inf70_sync15_q8k_marker[] =
-    "INF70_SYNC15_DEFAULT_OFF=GGML_VEC_Q8K";
+    "INF70_CHAMPION3_QUANTS_DEFAULT_ON=GGML_VEC_Q8K";
 
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
 #if defined(__AVX512F__)

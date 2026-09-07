@@ -82,7 +82,9 @@ inline bool iqk_q8_0_enabled() {
 // the final segment carries any remainder, so every block is produced by the identical
 // computation over the identical inputs and lands at the identical byte offset.
 inline bool iqk_qsplit_enabled() {
-    static const bool e = []() { const char * s = getenv("GGML_QSPLIT"); return s && atoi(s) != 0; }();
+    // INF-70 CHAMPION-3: default ON (unset or empty = ON, explicit 0 = OFF).
+    static const bool e = []() { const char * s = getenv("GGML_QSPLIT");
+                                 return (s == nullptr || *s == '\0') ? true : (atoi(s) != 0); }();
     return e;
 }
 // Only consulted when there is exactly ONE activation row, i.e. when the split has to BUY the
@@ -91,7 +93,11 @@ inline bool iqk_qsplit_enabled() {
 inline int64_t iqk_qsplit_min() {
     static const int64_t v = []() -> int64_t {
         const char * s = getenv("GGML_QSPLIT_MIN");
-        return (s && *s) ? (int64_t) atoll(s) : 4096;
+        // INF-70 CHAMPION-3: default above every ne00 in the graph, so the shipped default
+        // engages the MULTI-ROW branch only.  Q's single-row branch buys a ~3.1 us barrier
+        // that pays at 12 us/row (scalar quantizer) and LOSES at ~2 us/row (GGML_VEC_Q8K,
+        // also default ON here).  Set GGML_QSPLIT_MIN explicitly to opt back in.
+        return (s && *s) ? (int64_t) atoll(s) : INT64_MAX;
     }();
     return v;
 }
