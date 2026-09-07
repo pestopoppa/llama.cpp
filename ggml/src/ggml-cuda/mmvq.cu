@@ -1383,25 +1383,39 @@ static __global__ void mul_mat_vec_q(
                                     // (same pattern as the mul_mat_vec_q8_0_prefetch loop above)
                                     const block_q8_1 * bq8_1 = &y[j*stride_col_y + kby];
                                     const block_q8_0 * bq8_0 = (const block_q8_0 *) vx + kbx_row;
+#if defined(GGML_USE_HIP)
+                                    using q8_i32x4_t = __attribute__((ext_vector_type(4))) int;
+                                    q8_i32x4_t v;
+                                    __builtin_memcpy(&v, bq8_0->qs + 4*kqs, sizeof(v));
+#else
                                     int v[vdr];
-                                    int u[vdr];
 #pragma unroll
                                     for (int l = 0; l < vdr; ++l) {
                                         v[l] = get_int_b2(bq8_0->qs, kqs + l);
+                                    }
+#endif
+                                    int u[vdr];
+#pragma unroll
+                                    for (int l = 0; l < vdr; ++l) {
                                         u[l] = get_int_b4(bq8_1->qs, kqs + l);
                                     }
                                     tmp[j][i][k_part] += vec_dot_q8_0_q8_1_impl<float, vdr>(
-                                        v, u, bq8_0->d, __low2half(bq8_1->ds));
+                                        (const int *) &v, u, bq8_0->d, __low2half(bq8_1->ds));
                                     if constexpr (has_fusion && !bias_only) {
                                         if (use_gate) {
                                             const block_q8_0 * gq8_0 = (const block_q8_0 *) vgate + kbx_row;
+#if defined(GGML_USE_HIP)
+                                            q8_i32x4_t gv;
+                                            __builtin_memcpy(&gv, gq8_0->qs + 4*kqs, sizeof(gv));
+#else
                                             int gv[vdr];
 #pragma unroll
                                             for (int l = 0; l < vdr; ++l) {
                                                 gv[l] = get_int_b2(gq8_0->qs, kqs + l);
                                             }
+#endif
                                             tmp_gate[j][i][k_part] += vec_dot_q8_0_q8_1_impl<float, vdr>(
-                                                gv, u, gq8_0->d, __low2half(bq8_1->ds));
+                                                (const int *) &gv, u, gq8_0->d, __low2half(bq8_1->ds));
                                         }
                                     }
                                 } else {
