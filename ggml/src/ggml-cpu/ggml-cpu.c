@@ -2809,7 +2809,18 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
         case GGML_OP_LOG:
         case GGML_OP_SIN:
         case GGML_OP_COS:
-        case GGML_OP_CLAMP:      // INF-70 SYNC-17 FIX-2: off by default, see above
+            return true;
+        // INF-70 SYNC-17 FIX-2, CORRECTED 2026-09-07 (SYNC-19/20).
+        // As originally written, `case GGML_OP_CLAMP:` was appended to the END of the
+        // group above and the SHARED return was changed to the knob — so the knob gated
+        // all TWELVE ops (~888 solo nodes/graph), not CLAMP. Proved at instruction level:
+        // the pre-fix binary's mask decoded to unconditional TRUE, the sync17 build's to
+        // {ADD,SUB,MUL,DIV,SQR,SQRT,LOG,SIN,COS,SCALE} + CLAMP. That confounded SYNC-17's
+        // arm B, so its -3.08% was not attributable to FIX-3 and is withdrawn.
+        // CLAMP needs its OWN case; a knob whose switch covers more than its name is a
+        // correctness-oracle failure, not a tolerance — outputs stay bit-identical, so an
+        // output-diffing gate cannot see it (ours passed 18/18 identity with the bug in).
+        case GGML_OP_CLAMP:      // off by default, see above
             return ggml_cpu_tiny_solo_clamp;
         case GGML_OP_SUM_ROWS:   // kernel is already ith==0 only
         case GGML_OP_UNARY:
