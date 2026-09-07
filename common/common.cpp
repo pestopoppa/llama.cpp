@@ -75,10 +75,25 @@
 // so no external consumer of libllama / libggml inherits a process-wide policy change.
 // Placement only: prctl() moves pages, it never changes a result bit.
 //
-// Idiom matches CHAMPION-1: unset or empty means ON, an explicit 0 means OFF.
-//   GGML_NOHUGEPAGE=0          -> off (master switch, also disables the ggml madvise)
-//   GGML_NOHUGEPAGE_PROCESS=0  -> off (this process-wide shim only; the ggml madvise stays on,
-//                                 reproducing the CHAMPION-1 binary's behaviour exactly)
+// INF-70 CHAMPION-3 -- DEFAULT OFF.  MEASURED, not argued.
+//
+// CHAMP-2 measured this shim at +1.0 % served on top of CHAMPION-1.  SYNC-15 predicted the win
+// would be only PARTLY additive with GGML_VEC_Q8K and GGML_QSPLIT, because those two make there
+// be less `wdata` traffic for the shim to place well.  CHAMPION-3 ran that leave-one-out on the
+// folded stack, 3 rounds ABA, 24-prompt production harness, MTP serving config:
+//
+//     shim ON (the folded default)   33.954 t/s
+//     shim OFF (this default)        34.433 t/s   -> +1.48 % [CI +1.04, +1.91], 48/60 wins
+//
+// The win did not merely shrink, it INVERTED.  Once V and Q ship, de-huge-paging the whole
+// process costs more on llama.cpp's own heap-resident std::vector state than the shrunken
+// `wdata` region gains from interleaving.  So the shim is kept -- it is correct, it is
+// placement-only, and it pays for a configuration without V/Q -- but it is OPT-IN.
+//
+// Inverted idiom, deliberately not CHAMPION-1's, because this lever's default is OFF:
+//   GGML_NOHUGEPAGE_PROCESS=1  -> ON  (opt in to the whole-process PR_SET_THP_DISABLE)
+//   unset / empty / 0          -> off (the shipped default; the ggml madvise stays on)
+//   GGML_NOHUGEPAGE=0          -> off regardless (master switch, also kills the ggml madvise)
 static bool common_thp_env_on(const char * name) {
     const char * e = getenv(name);
     if (e == NULL || *e == '\0') {
@@ -87,11 +102,20 @@ static bool common_thp_env_on(const char * name) {
     return atoi(e) != 0;
 }
 
+static bool common_thp_env_opt_in(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || *e == '\0') {
+        return false;
+    }
+    return atoi(e) != 0;
+}
+
 __attribute__((used)) static const char * const inf70_champ2_marker =
-    "INF70_CHAMP2_PROCESS_THP_DISABLE=GGML_NOHUGEPAGE,GGML_NOHUGEPAGE_PROCESS";
+    "INF70_CHAMPION3_PROCESS_THP_DISABLE=DEFAULT_OFF;OPT_IN=GGML_NOHUGEPAGE_PROCESS=1"
+    ";MASTER_OFF=GGML_NOHUGEPAGE=0";
 
 __attribute__((constructor)) static void common_thp_disable_process(void) {
-    if (!common_thp_env_on("GGML_NOHUGEPAGE") || !common_thp_env_on("GGML_NOHUGEPAGE_PROCESS")) {
+    if (!common_thp_env_on("GGML_NOHUGEPAGE") || !common_thp_env_opt_in("GGML_NOHUGEPAGE_PROCESS")) {
         return;
     }
     // runs before main(), so before any weight, KV or work-buffer page is faulted
