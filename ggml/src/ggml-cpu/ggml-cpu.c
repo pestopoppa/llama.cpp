@@ -2669,10 +2669,36 @@ static bool    ggml_cpu_tiny_solo     = true;   // set once in ggml_cpu_init(), 
 static bool    ggml_cpu_empty_skip    = true;   // INF-70 SYNC-9: drop zero-element nodes + their barrier
 static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ROWCOL_SPLIT
 
+// INF-70 SYNC-15: GGML_TINY_SOLO_ROWS — the largest ggml_nrows() a node may have and still be
+// solo-eligible.  1 (the default) is the champion's batch-1-only behaviour.
+//
+// The champion's predicate is gated on nrows == 1 because at one row thread 0 was ALREADY
+// doing 100% of the work under the row-range split, so nth=1 adds no work at all.  On the MTP
+// trunk graph the tensors carry ~4 tokens, nrows is 4, and the gate never fires -- the whole
+// lever is inert exactly where the serving config spends its time.
+//
+// Widening it is still bit-identical (the whitelisted kernels partition by rows, and running
+// all R rows on thread 0 performs the identical per-element arithmetic in the identical order),
+// and it is still correct to elide the barrier (only thread 0 writes inside a solo run, and no
+// other thread reads any of it before the run's closing barrier).  What it is NOT is free: at
+// R rows the run serialises R times the per-row work onto thread 0 to save one ~3.1 us barrier.
+// GGML_TINY_SOLO_MAX still caps total dst elements, so the serialised work stays bounded.
+static int64_t ggml_cpu_tiny_solo_rows = 1;
+// Element cap applied ONLY to multi-row solo candidates (nrows > 1).  At one row the solo run
+// is free -- thread 0 was doing all of it anyway -- but at R rows GGML_ROWCOL_SPLIT was already
+// spreading the node over the whole team, so the run really does serialise work.  This cap is
+// what bounds that; GGML_TINY_SOLO_ROWS_MAX overrides it.
+static int64_t ggml_cpu_tiny_solo_rows_max = 4096;
+
 // INF-70 CHAMPION-1 build marker (see ggml.c).
 __attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
     "INF70_CHAMPION_CPU_DEFAULT_ON=GGML_ROWCOL_SPLIT,GGML_TINY_SOLO,GGML_EMPTY_SKIP"
     ";DEFAULT_OFF=GGML_VEC_SIGMOID";
+
+// INF-70 SYNC-15 build marker: both new levers default OFF (GGML_TINY_SOLO_ROWS=1 is the
+// champion's batch-1-only predicate; GGML_QSPLIT_MIN=0 disables the split entirely).
+__attribute__((used)) static const char ggml_inf70_sync15_marker[] =
+    "INF70_SYNC15_LEVERS_DEFAULT_OFF=GGML_TINY_SOLO_ROWS,GGML_TINY_SOLO_ROWS_MAX,GGML_QSPLIT,GGML_QSPLIT_MIN";
 
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // a node with no elements writes nothing: no publication, no barrier needed
@@ -2692,13 +2718,16 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // thread 0 must already be the only writer under the row-range split.  Different kernels
     // hand a different tensor to get_thread_range() -- binary-ops/unary-ops/scale/dup/glu use
     // src[0], fill uses dst -- so BOTH must have a single row for thread 0 to own all of it.
-    if (ggml_nrows(node) != 1) {
+    if (ggml_nrows(node) > ggml_cpu_tiny_solo_rows) {
         return false;
     }
-    if (node->src[0] && ggml_nrows(node->src[0]) != 1) {
+    if (node->src[0] && ggml_nrows(node->src[0]) > ggml_cpu_tiny_solo_rows) {
         return false;
     }
     if (ggml_nelements(node) > ggml_cpu_tiny_solo_max) {
+        return false;
+    }
+    if (ggml_nrows(node) > 1 && ggml_nelements(node) > ggml_cpu_tiny_solo_rows_max) {
         return false;
     }
 
@@ -5063,6 +5092,22 @@ void ggml_cpu_init(void) {
                 const long long v = atoll(envm);
                 if (v > 0) {
                     ggml_cpu_tiny_solo_max = (int64_t) v;
+                }
+            }
+
+            // INF-70 SYNC-15: widen the solo predicate past batch 1 (default 1 = champion).
+            const char * envr = getenv("GGML_TINY_SOLO_ROWS");
+            if (envr != NULL) {
+                const long long v = atoll(envr);
+                if (v > 0) {
+                    ggml_cpu_tiny_solo_rows = (int64_t) v;
+                }
+            }
+            const char * envrm = getenv("GGML_TINY_SOLO_ROWS_MAX");
+            if (envrm != NULL) {
+                const long long v = atoll(envrm);
+                if (v > 0) {
+                    ggml_cpu_tiny_solo_rows_max = (int64_t) v;
                 }
             }
         }
