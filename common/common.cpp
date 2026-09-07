@@ -55,6 +55,50 @@
 #include <pwd.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <stdlib.h>
+
+// INF-70 CHAMP-2: the whole-process half of the THP lever.
+//
+// GGML_NOHUGEPAGE (CHAMPION-1, default ON) applies MADV_NOHUGEPAGE inside ggml_aligned_malloc,
+// which covers every ggml backend buffer -- model weights, KV cache and the graph compute
+// buffers all go through ggml_backend_cpu_buffer_type_alloc_buffer(). Measured on a live
+// llama-server (/proc/<pid>/smaps), that leaves exactly one THP-backed region: the glibc heap,
+// which holds the CPU backend's graph work buffer (new uint8_t[cplan.work_size] in
+// ggml-cpu.cpp) and llama.cpp's own std::vector state. THP there defeats
+// `numactl --interleave=all` in exactly the same way -- a sub-2 MiB region is served by ONE
+// memory controller of four -- and D6-PLACE measured the residual at +0.90 pp served for a
+// whole-process PR_SET_THP_DISABLE shim over the knob alone.
+//
+// This is that shim, in-tree. It lives in llama-common, which only the llama.cpp *tools* link,
+// so no external consumer of libllama / libggml inherits a process-wide policy change.
+// Placement only: prctl() moves pages, it never changes a result bit.
+//
+// Idiom matches CHAMPION-1: unset or empty means ON, an explicit 0 means OFF.
+//   GGML_NOHUGEPAGE=0          -> off (master switch, also disables the ggml madvise)
+//   GGML_NOHUGEPAGE_PROCESS=0  -> off (this process-wide shim only; the ggml madvise stays on,
+//                                 reproducing the CHAMPION-1 binary's behaviour exactly)
+static bool common_thp_env_on(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || *e == '\0') {
+        return true;
+    }
+    return atoi(e) != 0;
+}
+
+__attribute__((used)) static const char * const inf70_champ2_marker =
+    "INF70_CHAMP2_PROCESS_THP_DISABLE=GGML_NOHUGEPAGE,GGML_NOHUGEPAGE_PROCESS";
+
+__attribute__((constructor)) static void common_thp_disable_process(void) {
+    if (!common_thp_env_on("GGML_NOHUGEPAGE") || !common_thp_env_on("GGML_NOHUGEPAGE_PROCESS")) {
+        return;
+    }
+    // runs before main(), so before any weight, KV or work-buffer page is faulted
+    (void) prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+}
+#endif
+
 #if defined(_AIX)
 #include <sys/systemcfg.h>
 #endif
