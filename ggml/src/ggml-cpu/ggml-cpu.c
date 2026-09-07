@@ -16,6 +16,15 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "ggml-cpu-knobs.h"
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdatomic.h>
+#endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -43,6 +52,151 @@
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
+
+// ---------------------------------------------------------------------------------------
+// INF-70 HARNESS-1: runtime-switchable compute-path knobs. See ggml-cpu-knobs.h for the
+// contract (refreshed once per graph by the calling thread; every worker sees one value for
+// the whole graph). Allocation-time knobs (GGML_NOHUGEPAGE, the PR_SET_THP_DISABLE shim) are
+// deliberately NOT here -- they decide how pages are backed and need a fresh process.
+// ---------------------------------------------------------------------------------------
+
+__attribute__((used)) static const char ggml_inf70_harness1_marker[] =
+    "INF70_HARNESS1_RUNTIME_SWITCHABLE=GGML_ROWCOL_SPLIT,GGML_TINY_SOLO,GGML_EMPTY_SKIP,GGML_VEC_Q8K,"
+    "GGML_QSPLIT,GGML_VEC_SIGMOID,GGML_ROWCOL_MIN_ELEMS,GGML_TINY_SOLO_MAX,GGML_TINY_SOLO_ROWS,"
+    "GGML_TINY_SOLO_ROWS_MAX,GGML_QSPLIT_MIN;PROCESS_SCOPED=GGML_NOHUGEPAGE,GGML_NOHUGEPAGE_PROCESS"
+    ";CONTROL=GGML_KNOB_FILE";
+
+#define GGML_KNOB_PAGE_SZ 4096
+#define GGML_KNOB_SLOT_0  512
+#define GGML_KNOB_SLOT_SZ 1024
+
+struct ggml_cpu_knobs ggml_cpu_knobs_cur = { 1, 1, 1, 0, 1, 1, 512, 4096, INT64_MAX, 1, 4096 };
+static struct ggml_cpu_knobs ggml_cpu_knobs_env;   // env-derived baseline, never mutated after init
+
+static const void * ggml_knob_page     = NULL;
+static uint64_t     ggml_knob_seq_seen = 0;
+
+// "unset or empty" == on-by-default lever
+static int ggml_knob_bool_default_on(const char * v) {
+    return (v == NULL || *v == '\0') ? 1 : (atoi(v) != 0);
+}
+
+static void ggml_cpu_knobs_apply_kv(struct ggml_cpu_knobs * k, const char * key, const char * val) {
+    if (!strcmp(key, "GGML_ROWCOL_SPLIT"))        k->rowcol_split = ggml_knob_bool_default_on(val);
+    else if (!strcmp(key, "GGML_TINY_SOLO"))      k->tiny_solo    = ggml_knob_bool_default_on(val);
+    else if (!strcmp(key, "GGML_EMPTY_SKIP"))     k->empty_skip   = ggml_knob_bool_default_on(val);
+    else if (!strcmp(key, "GGML_VEC_Q8K"))        k->vec_q8k      = ggml_knob_bool_default_on(val);
+    else if (!strcmp(key, "GGML_QSPLIT"))         k->qsplit       = ggml_knob_bool_default_on(val);
+    else if (!strcmp(key, "GGML_VEC_SIGMOID"))    k->vec_sigmoid  = (val != NULL && atoi(val) != 0);
+    else if (!strcmp(key, "GGML_ROWCOL_MIN_ELEMS")) {
+        const int64_t d = val ? atoll(val) : 512;
+        k->rowcol_min_elems = d < 0 ? 0 : d;
+    }
+    else if (!strcmp(key, "GGML_TINY_SOLO_MAX")) {
+        const long long v = val ? atoll(val) : 0;
+        if (v > 0) k->tiny_solo_max = (int64_t) v;
+    }
+    else if (!strcmp(key, "GGML_QSPLIT_MIN")) {
+        k->qsplit_min = (val && *val) ? (int64_t) atoll(val) : INT64_MAX;
+    }
+    else if (!strcmp(key, "GGML_TINY_SOLO_ROWS")) {
+        const long long v = val ? atoll(val) : 0;
+        if (v > 0) k->tiny_solo_rows = (int64_t) v;
+    }
+    else if (!strcmp(key, "GGML_TINY_SOLO_ROWS_MAX")) {
+        const long long v = val ? atoll(val) : 0;
+        if (v > 0) k->tiny_solo_rows_max = (int64_t) v;
+    }
+}
+
+static void ggml_cpu_knobs_from_env(struct ggml_cpu_knobs * k) {
+    static const char * names[] = {
+        "GGML_ROWCOL_SPLIT", "GGML_TINY_SOLO", "GGML_EMPTY_SKIP", "GGML_VEC_Q8K", "GGML_QSPLIT",
+        "GGML_VEC_SIGMOID", "GGML_ROWCOL_MIN_ELEMS", "GGML_TINY_SOLO_MAX", "GGML_QSPLIT_MIN",
+        "GGML_TINY_SOLO_ROWS", "GGML_TINY_SOLO_ROWS_MAX",
+    };
+    // defaults, identical to the CHAMPION-3 latched values
+    k->rowcol_split = 1; k->tiny_solo = 1; k->empty_skip = 1;
+    k->vec_sigmoid  = 0; k->vec_q8k   = 1; k->qsplit     = 1;
+    k->rowcol_min_elems = 512; k->tiny_solo_max = 4096; k->qsplit_min = INT64_MAX;
+    k->tiny_solo_rows = 1; k->tiny_solo_rows_max = 4096;
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        const char * v = getenv(names[i]);
+        if (v != NULL) {
+            ggml_cpu_knobs_apply_kv(k, names[i], v);
+        }
+    }
+}
+
+int ggml_cpu_knobs_refresh(void) {
+#if defined(__linux__)
+    if (ggml_knob_page == NULL) {
+        return 0;
+    }
+    const uint64_t seq = atomic_load_explicit((const _Atomic uint64_t *) ggml_knob_page, memory_order_acquire);
+    if (seq == ggml_knob_seq_seen) {
+        return 0;   // the whole steady-state cost: one relaxed-ish load of a mapped word
+    }
+    ggml_knob_seq_seen = seq;
+
+    char buf[GGML_KNOB_SLOT_SZ];
+    memcpy(buf, (const char *) ggml_knob_page + GGML_KNOB_SLOT_0 + (seq & 1) * GGML_KNOB_SLOT_SZ, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+
+    struct ggml_cpu_knobs next = ggml_cpu_knobs_env;   // absent key == env-derived baseline
+    char * save = NULL;
+    for (char * line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char * eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        ggml_cpu_knobs_apply_kv(&next, line, eq + 1);
+    }
+    ggml_cpu_knobs_cur = next;
+    GGML_LOG_INFO("ggml knobs: seq=%llu ROWCOL_SPLIT=%d(min=%lld) TINY_SOLO=%d(max=%lld) EMPTY_SKIP=%d "
+                  "VEC_Q8K=%d QSPLIT=%d(min=%lld) VEC_SIGMOID=%d\n",
+                  (unsigned long long) seq,
+                  ggml_cpu_knobs_cur.rowcol_split, (long long) ggml_cpu_knobs_cur.rowcol_min_elems,
+                  ggml_cpu_knobs_cur.tiny_solo,    (long long) ggml_cpu_knobs_cur.tiny_solo_max,
+                  ggml_cpu_knobs_cur.empty_skip,   ggml_cpu_knobs_cur.vec_q8k,
+                  ggml_cpu_knobs_cur.qsplit,       (long long) ggml_cpu_knobs_cur.qsplit_min,
+                  ggml_cpu_knobs_cur.vec_sigmoid);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void ggml_cpu_knobs_init(void) {
+    ggml_cpu_knobs_from_env(&ggml_cpu_knobs_env);
+    ggml_cpu_knobs_cur = ggml_cpu_knobs_env;
+#if defined(__linux__)
+    const char * path = getenv("GGML_KNOB_FILE");
+    if (path == NULL || *path == '\0') {
+        return;
+    }
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        GGML_LOG_WARN("ggml knobs: GGML_KNOB_FILE=%s cannot be opened; env defaults latched\n", path);
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < GGML_KNOB_PAGE_SZ) {
+        GGML_LOG_WARN("ggml knobs: GGML_KNOB_FILE=%s is smaller than %d bytes; env defaults latched\n",
+                      path, GGML_KNOB_PAGE_SZ);
+        close(fd);
+        return;
+    }
+    void * m = mmap(NULL, GGML_KNOB_PAGE_SZ, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) {
+        GGML_LOG_WARN("ggml knobs: mmap of %s failed; env defaults latched\n", path);
+        return;
+    }
+    ggml_knob_page = m;
+    GGML_LOG_INFO("ggml knobs: live control page %s mapped (runtime-switchable compute knobs)\n", path);
+    ggml_cpu_knobs_refresh();
+#endif
+}
 
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
@@ -2665,9 +2819,12 @@ static int64_t ggml_get_rows_min_bytes(void) {
 // INF-70 CHAMPION-1: both DEFAULT ON (bit-identical; +3.86% and +0.87% plain).
 // Escape hatches: GGML_TINY_SOLO=0 / GGML_EMPTY_SKIP=0 restore upstream barrier behaviour
 // with no rebuild.  GGML_TINY_SOLO_MAX caps dst elements.
-static bool    ggml_cpu_tiny_solo     = true;   // set once in ggml_cpu_init(), read-only after
-static bool    ggml_cpu_empty_skip    = true;   // INF-70 SYNC-9: drop zero-element nodes + their barrier
-static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ROWCOL_SPLIT
+// INF-70 HARNESS-1: these were process-lifetime statics latched in ggml_cpu_init(); they are now
+// views onto the per-graph snapshot (ggml-cpu-knobs.h), refreshed by the calling thread before
+// any worker is dispatched, so all nth threads still agree for the whole graph.
+#define ggml_cpu_tiny_solo     (ggml_cpu_knobs_cur.tiny_solo)
+#define ggml_cpu_empty_skip    (ggml_cpu_knobs_cur.empty_skip)
+#define ggml_cpu_tiny_solo_max (ggml_cpu_knobs_cur.tiny_solo_max)
 
 // INF-70 SYNC-15: GGML_TINY_SOLO_ROWS — the largest ggml_nrows() a node may have and still be
 // solo-eligible.  1 (the default) is the champion's batch-1-only behaviour.
@@ -2683,12 +2840,12 @@ static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes ava
 // other thread reads any of it before the run's closing barrier).  What it is NOT is free: at
 // R rows the run serialises R times the per-row work onto thread 0 to save one ~3.1 us barrier.
 // GGML_TINY_SOLO_MAX still caps total dst elements, so the serialised work stays bounded.
-static int64_t ggml_cpu_tiny_solo_rows = 1;
+#define ggml_cpu_tiny_solo_rows (ggml_cpu_knobs_cur.tiny_solo_rows)
 // Element cap applied ONLY to multi-row solo candidates (nrows > 1).  At one row the solo run
 // is free -- thread 0 was doing all of it anyway -- but at R rows GGML_ROWCOL_SPLIT was already
 // spreading the node over the whole team, so the run really does serialise work.  This cap is
 // what bounds that; GGML_TINY_SOLO_ROWS_MAX overrides it.
-static int64_t ggml_cpu_tiny_solo_rows_max = 4096;
+#define ggml_cpu_tiny_solo_rows_max (ggml_cpu_knobs_cur.tiny_solo_rows_max)
 
 // INF-70 CHAMPION-1 build marker (see ggml.c).
 __attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
@@ -4553,6 +4710,12 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
+    // INF-70 HARNESS-1: one refresh per graph, here and nowhere else. Doing it per node would
+    // cost per node AND would let a knob change mid-graph, which breaks barrier pairing --
+    // the tiny-solo run detector and the rowcol split must be pure functions of the graph
+    // for the whole graph (SYNC-12).
+    ggml_cpu_knobs_refresh();
+
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
@@ -5083,38 +5246,9 @@ void ggml_cpu_init(void) {
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
 
-        {
-            // INF-70 CHAMPION-1: tiny-op barrier elision, DEFAULT ON; set the var to 0 to disable
-            const char * env = getenv("GGML_TINY_SOLO");
-            ggml_cpu_tiny_solo = (env == NULL || *env == '\0') ? true : (atoi(env) != 0);
-
-            const char * enve = getenv("GGML_EMPTY_SKIP");
-            ggml_cpu_empty_skip = (enve == NULL || *enve == '\0') ? true : (atoi(enve) != 0);
-
-            const char * envm = getenv("GGML_TINY_SOLO_MAX");
-            if (envm != NULL) {
-                const long long v = atoll(envm);
-                if (v > 0) {
-                    ggml_cpu_tiny_solo_max = (int64_t) v;
-                }
-            }
-
-            // INF-70 SYNC-15: widen the solo predicate past batch 1 (default 1 = champion).
-            const char * envr = getenv("GGML_TINY_SOLO_ROWS");
-            if (envr != NULL) {
-                const long long v = atoll(envr);
-                if (v > 0) {
-                    ggml_cpu_tiny_solo_rows = (int64_t) v;
-                }
-            }
-            const char * envrm = getenv("GGML_TINY_SOLO_ROWS_MAX");
-            if (envrm != NULL) {
-                const long long v = atoll(envrm);
-                if (v > 0) {
-                    ggml_cpu_tiny_solo_rows_max = (int64_t) v;
-                }
-            }
-        }
+        // INF-70 HARNESS-1: seeds every compute-path knob from the environment (identical
+        // semantics to the latched statics this replaces) and maps GGML_KNOB_FILE if set.
+        ggml_cpu_knobs_init();
 
         is_first_call = false;
     }

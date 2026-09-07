@@ -5,6 +5,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "simd-mappings.h"
+#include "ggml-cpu-knobs.h"
 
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
@@ -107,32 +108,22 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
 // +3.05% served / +8.42% plain. Escape hatch: GGML_ROWCOL_SPLIT=0 restores the upstream
 // row-only split with no rebuild. GGML_ROWCOL_MIN_ELEMS sets the smallest row worth cutting.
 
+// INF-70 HARNESS-1: was a function-local `static const` latched on first use (one guard-variable
+// load per call, and one process per arm). Now a plain load of the per-graph snapshot refreshed
+// by ggml_graph_compute() before any worker starts -- cheaper here, and hot-switchable.
 static inline bool ggml_rowcol_split_enabled(void) {
-    static const bool v = [] {
-        const char * s = getenv("GGML_ROWCOL_SPLIT");
-        return (s == NULL || *s == '\0') ? true : (atoi(s) != 0);
-    }();
-    return v;
+    return ggml_cpu_knobs_cur.rowcol_split != 0;
 }
 
 static inline int64_t ggml_rowcol_min_elems(void) {
-    static const int64_t v = []() -> int64_t {
-        const char * s = getenv("GGML_ROWCOL_MIN_ELEMS");
-        const int64_t d = s ? atoll(s) : 512;
-        return d < 0 ? 0 : d;
-    }();
-    return v;
+    return ggml_cpu_knobs_cur.rowcol_min_elems;
 }
 
 // INF-70 SYNC-10: route sigmoid through the SIMD ggml_vec_sigmoid_f32 instead of a scalar
 // libm expf per element. Separate knob from GGML_ROWCOL_SPLIT so the vectorisation and the
 // threading can be attributed independently. NOT bit-identical to libm expf -- default OFF.
 static inline bool ggml_vec_sigmoid_enabled(void) {
-    static const bool v = [] {
-        const char * s = getenv("GGML_VEC_SIGMOID");
-        return s != NULL && atoi(s) != 0;
-    }();
-    return v;
+    return ggml_cpu_knobs_cur.vec_sigmoid != 0;
 }
 
 struct ggml_rowcol_split {

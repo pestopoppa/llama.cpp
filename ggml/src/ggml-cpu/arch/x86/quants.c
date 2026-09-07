@@ -1,5 +1,6 @@
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
+#include "../../ggml-cpu-knobs.h"
 #include "ggml-quants.h"
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
@@ -592,14 +593,11 @@ static void quantize_row_q8_K_avx512(const float * GGML_RESTRICT x, void * GGML_
 }
 #endif // __AVX512F__
 
-static int ggml_vec_q8k_flag = -1;   // -1 unread, 0 off, 1 on; idempotent across threads
+// INF-70 HARNESS-1: was a lazily-latched file static read from inside the parallel region.
+// Now a plain read of the per-graph snapshot (refreshed once, before any worker is dispatched),
+// so every thread quantizes with the same routine for the whole graph.
 static inline int ggml_vec_q8k_enabled(void) {
-    if (ggml_vec_q8k_flag < 0) {
-        const char * s = getenv("GGML_VEC_Q8K");
-        // INF-70 CHAMPION-3: default ON (unset or empty = ON, explicit 0 = OFF).
-        ggml_vec_q8k_flag = (s == NULL || *s == '\0') ? 1 : (atoi(s) != 0);
-    }
-    return ggml_vec_q8k_flag;
+    return ggml_cpu_knobs_cur.vec_q8k;
 }
 
 __attribute__((used)) static const char ggml_inf70_sync15_q8k_marker[] =
