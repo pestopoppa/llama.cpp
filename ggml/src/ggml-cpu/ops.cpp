@@ -8669,6 +8669,10 @@ void ggml_compute_forward_timestep_embedding(
 
 // ggml_compute_forward_argsort
 
+// INF-70 SYNC-16 build marker (strings-auditable proof the knob is compiled in).
+__attribute__((used)) static const char ggml_inf70_sync16_argsort_marker[] =
+    "INF70_SYNC16_ARGSORT_K=GGML_ARGSORT_K;DEFAULT_OFF;partial_sort+tie_guard";
+
 template<enum ggml_sort_order order>
 struct cmp_argsort {
     const float * data;
@@ -8698,6 +8702,12 @@ static void ggml_compute_forward_argsort_f32(
 
     ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(dst, 0);
 
+    // INF-70 SYNC-16: k hint written by ggml_argsort_top_k (0 = no hint = full sort wanted).
+    // Only the first k positions of this node are ever read by that caller, so a sorted
+    // PREFIX of length k is a sufficient answer. See ggml-cpu/common.h.
+    const int64_t k_hint = ggml_argsort_k_enabled() ? (int64_t) ggml_get_op_params_i32(dst, 1) : 0;
+    const bool    use_k  = k_hint > 0 && k_hint < ne0;
+
     for (int64_t i = ith; i < nr; i += nth) {
         const float * src_data = (float *)((char *) src0->data + i*nb01);
 
@@ -8705,6 +8715,48 @@ static void ggml_compute_forward_argsort_f32(
 
         for (int64_t j = 0; j < ne0; j++) {
             dst_data[j] = j;
+        }
+
+        if (use_k) {
+            // Sorted prefix of length k+1; positions k+1..ne0-1 are left in an arbitrary
+            // (but still permuted) order, which no consumer of a k-hinted node reads.
+            //
+            // k+1, not k, is load-bearing. std::partial_sort only guarantees that
+            // [first, middle) is sorted and that nothing in [middle, last) compares
+            // BEFORE anything in the prefix -- dst[k] is NOT necessarily the (k+1)-th
+            // largest, so a tie against the k-th could hide anywhere in the tail and the
+            // guard below would miss it. Sorting k+1 makes dst[k] the true (k+1)-th and
+            // the guard exact. (Caught by unit_argsort_k.cpp: with a k-wide prefix,
+            // 2363/200000 tie-rich rows diverged from std::sort; with k+1, 0/1.2M do.)
+            if (order == GGML_SORT_ORDER_ASC) {
+                std::partial_sort(dst_data, dst_data + k_hint + 1, dst_data + ne0,
+                                  cmp_argsort<GGML_SORT_ORDER_ASC>{src_data});
+            } else if (order == GGML_SORT_ORDER_DESC) {
+                std::partial_sort(dst_data, dst_data + k_hint + 1, dst_data + ne0,
+                                  cmp_argsort<GGML_SORT_ORDER_DESC>{src_data});
+            } else {
+                GGML_ABORT("invalid sort order");
+            }
+
+            // Bit-identity contract. If v[dst[j]] != v[dst[j+1]] strictly for every
+            // j in [0,k), then every element outside the prefix is strictly worse than
+            // the k-th (so the selected SET is unique) and the prefix order is unique.
+            // std::sort would therefore have produced exactly these k indices in exactly
+            // this order. On an exact tie anywhere in that window the guarantee lapses,
+            // so redo the full sort for this row and take std::sort's own answer.
+            bool unique = true;
+            for (int64_t j = 0; j < k_hint; j++) {
+                if (src_data[dst_data[j]] == src_data[dst_data[j + 1]]) {
+                    unique = false;
+                    break;
+                }
+            }
+            if (unique) {
+                continue;
+            }
+            for (int64_t j = 0; j < ne0; j++) {
+                dst_data[j] = j;
+            }
         }
 
         switch (order) {

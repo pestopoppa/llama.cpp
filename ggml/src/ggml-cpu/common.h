@@ -124,6 +124,34 @@ static inline int64_t ggml_rowcol_min_elems(void) {
     return v;
 }
 
+// INF-70 SYNC-16: ARGSORT k hint -- partial selection instead of a full sort.
+//
+// The MoE router calls ggml_argsort_top_k(logits, n_expert_used): a FULL ggml_argsort(DESC)
+// over all n_expert indices followed by a view of the first k. On this model that is
+// std::sort over 512 indices, on ONE thread (nr = n_tokens = 1 at decode), 48x per token,
+// to keep 10. 502 sorted positions are discarded. Measured on the champion: 928.5 us of a
+// 45506.3 us plain token = 2.040%, of which thr_max 19.328 us/node is real single-threaded
+// sort work and only ~0.46 us/node is barrier (SYNC-16 REPORT.md ss2).
+//
+// std::partial_sort produces a SORTED PREFIX, so when the k-th and (k+1)-th values differ
+// strictly the answer is unique and the result is bit-identical to std::sort's, element for
+// element. The kernel proves that precondition per row instead of assuming it: it checks the
+// k+1 prefix values for adjacent equality and falls back to the full std::sort if any two are
+// equal. That makes bit-identity a CONTRACT, not an observation, for ~k extra comparisons.
+//
+// std::nth_element must NOT be used here: it leaves the top-k unordered, which permutes the
+// experts and changes FP accumulation order in MOE_TOPK_NORM / MUL_MAT_ID -- a real output
+// change. Nor can ggml_top_k be substituted, as it deliberately swaps dst[0] and dst[1].
+//
+// DEFAULT OFF. GGML_ARGSORT_K=1 enables it.
+static inline bool ggml_argsort_k_enabled(void) {
+    static const bool v = [] {
+        const char * s = getenv("GGML_ARGSORT_K");
+        return s != NULL && *s != '\0' && atoi(s) != 0;
+    }();
+    return v;
+}
+
 // INF-70 SYNC-10: route sigmoid through the SIMD ggml_vec_sigmoid_f32 instead of a scalar
 // libm expf per element. Separate knob from GGML_ROWCOL_SPLIT so the vectorisation and the
 // threading can be attributed independently. NOT bit-identical to libm expf -- default OFF.

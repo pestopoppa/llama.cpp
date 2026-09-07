@@ -5448,6 +5448,14 @@ struct ggml_tensor * ggml_argsort_top_k(
 
     struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
 
+    // INF-70 SYNC-16: record k as a HINT in op_params[1]. The op contract is unchanged --
+    // the node still produces a full ne0-wide permutation -- but a backend that can select
+    // instead of fully sorting may now do so, because only the first k positions are read
+    // (the view below is the sole consumer; audited in SYNC-16 REPORT.md ss4).
+    // Backends that ignore op_params[1] are unaffected. See ggml-cpu/ops.cpp
+    // ggml_compute_forward_argsort_f32 and GGML_ARGSORT_K.
+    ggml_set_op_params_i32(result, 1, (int32_t) k);
+
     result = ggml_view_4d(ctx, result,
                 k, result->ne[1], result->ne[2], result->ne[3],
                    result->nb[1], result->nb[2], result->nb[3],
