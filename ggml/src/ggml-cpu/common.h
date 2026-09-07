@@ -115,6 +115,16 @@ static inline bool ggml_rowcol_split_enabled(void) {
     return v;
 }
 
+// INF-70 SYNC-17 FIX-1: GGML_SCALE_SPLIT gates routing scale_f32 through get_rowcol_split.
+// Bit-identical by construction (elementwise), DEFAULT ON; =0 restores the upstream row split.
+static inline bool ggml_scale_split_enabled(void) {
+    static const bool v = [] {
+        const char * s = getenv("GGML_SCALE_SPLIT");
+        return (s == NULL || *s == '\0') ? true : (atoi(s) != 0);
+    }();
+    return v;
+}
+
 static inline int64_t ggml_rowcol_min_elems(void) {
     static const int64_t v = []() -> int64_t {
         const char * s = getenv("GGML_ROWCOL_MIN_ELEMS");

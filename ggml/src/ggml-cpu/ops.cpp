@@ -4871,6 +4871,42 @@ static void ggml_compute_forward_scale_f32(
 
     const size_t nb1 = dst->nb[1];
 
+    // INF-70 SYNC-17 FIX-1: GGML_ROWCOL_SPLIT never reached SCALE.  scale_f32 splits by ROWS
+    // only, so at batch 1 (nr == 1) thread 0 owns the entire tensor and the other nth-1 threads
+    // fall straight through to the barrier -- SYNC-7 measured 375 such nodes per token still
+    // running thread-0-only INSIDE the shipped champion.  SCALE is elementwise (y = x*s + b), so
+    // dealing (row, column-chunk) pairs out to the team is BIT-IDENTICAL by construction: each
+    // output element is computed from the input element at the same index, by the same
+    // instruction sequence, and no element is touched twice.
+    // Knob: GGML_SCALE_SPLIT=0 restores the upstream row-only path with no rebuild.
+    if (ggml_scale_split_enabled() && ggml_rowcol_split_enabled()) {
+        const ggml_rowcol_split split = get_rowcol_split(params, nr, nc, sizeof(float));
+        if (split.ncc > 1) {
+            for (int64_t t = split.t0; t < split.t1; ++t) {
+                int64_t i1, c0, c1;
+                split.unpack(t, nc, i1, c0, c1);
+                if (c0 >= c1) {
+                    continue;
+                }
+                const int64_t n = c1 - c0;
+                if (b == 0.0f) {
+                    if (dst->data != src0->data) {
+                        memcpy((char *) dst->data + i1*nb1  + c0*sizeof(float),
+                               (char *) src0->data + i1*nb01 + c0*sizeof(float), n * sizeof(float));
+                    }
+                    ggml_vec_scale_f32(n, (float *) ((char *) dst->data + i1*nb1) + c0, s);
+                } else {
+                    // NOTE: src0 is indexed with nb1 here, exactly as upstream does below.
+                    ggml_vec_mad1_f32(n,
+                        (float *) ((char *) dst->data  + i1*nb1) + c0,
+                        (float *) ((char *) src0->data + i1*nb1) + c0,
+                        s, b);
+                }
+            }
+            return;
+        }
+    }
+
     if (b == 0.0f) {
         for (int i1 = ir0; i1 < ir1; i1++) {
             if (dst->data != src0->data) {
@@ -12362,3 +12398,10 @@ void ggml_compute_forward_lightning_indexer(
     }
 }
 
+
+
+// ================= INF-70 SYNC-17 =================
+// ggml-cpu.c is C; common.h's knob readers are C++ (function-local static + lambda).  Export
+// them so the TINY_SOLO predicate can ask whether GGML_ROWCOL_SPLIT would claim a node.
+extern "C" bool    ggml_inf70_rowcol_split_enabled_c(void) { return ggml_rowcol_split_enabled(); }
+extern "C" int64_t ggml_inf70_rowcol_min_elems_c(void)     { return ggml_rowcol_min_elems();     }

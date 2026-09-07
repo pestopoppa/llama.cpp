@@ -2690,6 +2690,53 @@ static int64_t ggml_cpu_tiny_solo_rows = 1;
 // what bounds that; GGML_TINY_SOLO_ROWS_MAX overrides it.
 static int64_t ggml_cpu_tiny_solo_rows_max = 4096;
 
+// INF-70 SYNC-17 FIX-2: GGML_OP_CLAMP was whitelisted on a FALSE PREMISE.  The whitelist's
+// justification is "thread 0 already owns the whole row under the row-range split", but
+// clamp_f32 (ops.cpp) strides COLUMNS, not rows: thread ith owns every (ith + k*nth)-th
+// element, so thread 0 owns 1/nth of the work, not all of it.  Running a CLAMP node solo is
+// still bit-identical, but it SERIALISES parallel work to save one ~3.1 us barrier.
+// Default: CLAMP is OUT of the whitelist.  GGML_TINY_SOLO_CLAMP=1 restores the old behaviour.
+static bool ggml_cpu_tiny_solo_clamp = false;
+
+// INF-70 SYNC-17 FIX-3: TINY_SOLO x ROWCOL_SPLIT collision.  Both ship ON in the champion and
+// in the 512..GGML_TINY_SOLO_MAX element band they claim the SAME nodes -- and TINY_SOLO wins,
+// because it is evaluated in the graph loop and re-dispatches the node with nth = 1, so
+// get_rowcol_split() never sees a team to split across.  The premise TINY_SOLO rests on
+// ("thread 0 was doing all of it anyway") is exactly what ROWCOL_SPLIT falsified: under the
+// column split thread 0 owns 1/ncc of the row.  So in that band the champion pays a full
+// serialisation of the node to save one barrier.
+// Default: a node ROWCOL_SPLIT would column-split is NOT solo-eligible (the split wins).
+// GGML_SOLO_YIELD_ROWCOL=0 restores the champion's behaviour (TINY_SOLO wins) with no rebuild.
+static bool ggml_cpu_solo_yield_rowcol = true;
+
+// Defined in ops.cpp -- common.h is C++ and cannot be included from this C translation unit.
+bool    ggml_inf70_rowcol_split_enabled_c(void);
+int64_t ggml_inf70_rowcol_min_elems_c(void);
+
+// Is this op actually routed through get_rowcol_split() today?  binary-ops.cpp (ADD/SUB/MUL/DIV),
+// unary-ops.cpp (the UNARY family plus SQR/SQRT/SIN/COS/LOG/...), ops.cpp REPEAT, and -- as of
+// SYNC-17 FIX-1 -- SCALE.  GLU, FILL, CPY/CONT/DUP and SUM_ROWS are NOT covered, so they keep
+// their solo eligibility: yielding them would hand the node back to a row-only split that
+// leaves it on thread 0 regardless, i.e. all cost and no benefit.
+static bool ggml_cpu_op_is_rowcol_split(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_UNARY:
+        case GGML_OP_SCALE:     // SYNC-17 FIX-1
+            return true;
+        default:
+            return false;
+    }
+}
+
 // INF-70 CHAMPION-1 build marker (see ggml.c).
 __attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
     "INF70_CHAMPION_CPU_DEFAULT_ON=GGML_ROWCOL_SPLIT,GGML_TINY_SOLO,GGML_EMPTY_SKIP"
@@ -2700,6 +2747,10 @@ __attribute__((used)) static const char ggml_inf70_champion_cpu_marker[] =
 // INF-70 CHAMPION-3 build marker: GGML_QSPLIT is now default ON, with GGML_QSPLIT_MIN
 // defaulting to INT64_MAX so only the multi-row branch is live (see iqk_dispatch.cpp).
 // GGML_TINY_SOLO_ROWS stays at 1 -- the code is kept, inert, at the champion's behaviour.
+__attribute__((used)) static const char ggml_inf70_sync17_marker[] =
+    "INF70_SYNC17_CPU_DEFAULT_ON=GGML_SCALE_SPLIT,GGML_SOLO_YIELD_ROWCOL"
+    ";DEFAULT_OFF=GGML_TINY_SOLO_CLAMP";
+
 __attribute__((used)) static const char ggml_inf70_champion3_marker[] =
     "INF70_CHAMPION3_CPU_DEFAULT_ON=GGML_QSPLIT(multi-row-only,GGML_QSPLIT_MIN=INT64_MAX)"
     ";DEFAULT_INERT=GGML_TINY_SOLO_ROWS=1,GGML_TINY_SOLO_ROWS_MAX";
@@ -2735,19 +2786,31 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
         return false;
     }
 
+    // INF-70 SYNC-17 FIX-3: do not steal a node GGML_ROWCOL_SPLIT would spread over the team.
+    // get_rowcol_split() cuts columns when nr < nth and ne[0] >= GGML_ROWCOL_MIN_ELEMS; a solo
+    // node has nr <= GGML_TINY_SOLO_ROWS (1 by default) and the dispatcher only consults this
+    // predicate when nth > 1, so nr < nth holds here by construction.
+    if (ggml_cpu_solo_yield_rowcol &&
+        ggml_inf70_rowcol_split_enabled_c() &&
+        ggml_cpu_op_is_rowcol_split(node->op) &&
+        node->ne[0] >= ggml_inf70_rowcol_min_elems_c()) {
+        return false;
+    }
+
     switch (node->op) {
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_SCALE:
-        case GGML_OP_CLAMP:
         case GGML_OP_FILL:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
         case GGML_OP_SIN:
         case GGML_OP_COS:
+        case GGML_OP_CLAMP:      // INF-70 SYNC-17 FIX-2: off by default, see above
+            return ggml_cpu_tiny_solo_clamp;
         case GGML_OP_SUM_ROWS:   // kernel is already ith==0 only
         case GGML_OP_UNARY:
         case GGML_OP_GLU:
@@ -5106,6 +5169,15 @@ void ggml_cpu_init(void) {
                 if (v > 0) {
                     ggml_cpu_tiny_solo_rows = (int64_t) v;
                 }
+            }
+            // INF-70 SYNC-17 FIX-2 / FIX-3
+            {
+                const char * e = getenv("GGML_TINY_SOLO_CLAMP");
+                ggml_cpu_tiny_solo_clamp = (e == NULL || *e == '\0') ? false : (atoi(e) != 0);
+            }
+            {
+                const char * e = getenv("GGML_SOLO_YIELD_ROWCOL");
+                ggml_cpu_solo_yield_rowcol = (e == NULL || *e == '\0') ? true : (atoi(e) != 0);
             }
             const char * envrm = getenv("GGML_TINY_SOLO_ROWS_MAX");
             if (envrm != NULL) {
