@@ -88,6 +88,7 @@ enum llm_arch {
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
     LLM_ARCH_GLM_DSA,
+    LLM_ARCH_GLM5_NEXT,
     LLM_ARCH_BITNET,
     LLM_ARCH_T5,
     LLM_ARCH_T5ENCODER,
@@ -260,6 +261,10 @@ enum llm_kv {
     LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
     LLM_KV_ATTENTION_INDEXER_TOP_K,
+    LLM_KV_ATTENTION_INDEXER_TYPES,
+    LLM_KV_ATTENTION_INDEXER_KPOOL,
+    LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,
+    LLM_KV_ATTENTION_INDEXER_INDEX_SHARE_MTP,
     LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
     LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
     LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
@@ -314,6 +319,7 @@ enum llm_kv {
     LLM_KV_SSM_DT_B_C_RMS,
 
     LLM_KV_KDA_HEAD_DIM,
+    LLM_KV_KDA_GATE_LOWER_BOUND,
 
     LLM_KV_WKV_HEAD_SIZE,
 
@@ -640,6 +646,8 @@ enum llm_tensor {
     LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,
     LLM_TENSOR_INDEXER_COMPRESSOR_APE,
     LLM_TENSOR_INDEXER_COMPRESSOR_NORM,
+    LLM_TENSOR_INDEXER_KPOOL_GATE,   // glm5-next: k-pool gate scores
+    LLM_TENSOR_INDEXER_KPOOL_APE,    // glm5-next: k-pool position bias
     LLM_TENSOR_FFN_GATE_TID2EID,
     LLM_TENSOR_NEXTN_PROJ_PRE,
     LLM_TENSOR_NEXTN_PROJ_POST,
@@ -676,10 +684,11 @@ enum llm_tensor_layer {
 };
 
 struct LLM_KV {
-    LLM_KV(llm_arch arch, const char * suffix = nullptr);
+    LLM_KV(llm_arch arch, const char * suffix = nullptr, const char * arch_name_override = nullptr);
 
     llm_arch arch;
     const char * suffix;
+    std::string arch_name_override;
 
     std::string operator()(llm_kv kv) const;
 };

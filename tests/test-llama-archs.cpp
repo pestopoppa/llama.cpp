@@ -27,6 +27,13 @@ static std::runtime_error phase_error(const char * phase, llm_arch arch, bool mo
         (moe ? " MoE: " : " Dense: ") + err.what());
 }
 
+static void test_glm5_next_naming() {
+    GGML_ASSERT(llm_arch_from_string("glm5-next") == LLM_ARCH_GLM5_NEXT);
+    GGML_ASSERT(llm_arch_from_string("glm5next") == LLM_ARCH_GLM5_NEXT);
+    GGML_ASSERT(LLM_KV(LLM_ARCH_GLM5_NEXT)(LLM_KV_CONTEXT_LENGTH) == "glm5-next.context_length");
+    GGML_ASSERT(LLM_KV(LLM_ARCH_GLM5_NEXT, nullptr, "glm5next")(LLM_KV_CONTEXT_LENGTH) == "glm5next.context_length");
+}
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
@@ -476,6 +483,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        return false;
+    }
 
     // FIXME some models are segfaulting with WebGPU:
 #ifdef GGML_USE_WEBGPU
@@ -745,6 +755,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
+    test_glm5_next_naming();
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;

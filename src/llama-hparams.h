@@ -5,6 +5,7 @@
 #include <array>
 #include <bitset>
 #include <cassert>
+#include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -155,6 +156,9 @@ struct llama_hparams {
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
 
+    // full indexer layers compute a selection; shared layers reuse it
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_indexer_full_impl;
+
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
     uint32_t ssm_d_inner = 0;
@@ -164,6 +168,7 @@ struct llama_hparams {
 
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
+    float    kda_gate_lower_bound = -INFINITY;
 
     bool ssm_dt_b_c_rms = false;
 
@@ -235,6 +240,9 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0;
+    bool     indexer_kpool_select_tail = true;
+    bool     indexer_index_share_mtp   = false;
 
     // DeepSeek-V4
     uint32_t dsv4_o_group_count        = 0;
@@ -334,6 +342,8 @@ struct llama_hparams {
     bool is_swa_any() const;
 
     bool is_swa(uint32_t il) const;
+
+    bool is_indexer_full(uint32_t il) const;
 
     void set_recr_pattern(uint32_t n_pattern, bool dense_first = false);
 

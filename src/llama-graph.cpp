@@ -1263,6 +1263,8 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_dsa_sel  = nullptr;
+    t_mtp_dsa_mask = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1308,6 +1310,12 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_mtp_dsa_sel != nullptr) {
+        ggml_set_output(t_mtp_dsa_sel);
+    }
+    if (t_mtp_dsa_mask != nullptr) {
+        ggml_set_output(t_mtp_dsa_mask);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1719,7 +1727,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
                         cb(tmp, "ffn_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
@@ -2154,7 +2162,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_moe_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, up);

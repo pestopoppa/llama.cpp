@@ -308,6 +308,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
             return new llama_model_kimi_linear(params);
+        case LLM_ARCH_GLM5_NEXT:
+            return new llama_model_glm5_next(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
         default:
@@ -844,6 +846,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
         case LLM_TYPE_744B_A40B:     return "744B.A40B";
+        case LLM_TYPE_320B_A18B:     return "320B.A18B";
         case LLM_TYPE_E2B:           return "E2B";
         case LLM_TYPE_E4B:           return "E4B";
         default:                     return "?B";
@@ -1149,6 +1152,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
+    std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
@@ -2221,7 +2225,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
-                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
+                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT);
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
@@ -2232,18 +2236,36 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
-                        };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
-                        };
+                    } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
+                        if (arch == LLM_ARCH_GLM5_NEXT && !cparams.kv_unified && cparams.n_seq_max > 1) {
+                            throw std::runtime_error("GLM5-Next requires a unified KV cache for multiple sequences, use --kv-unified");
+                        }
+
+                        if (arch == LLM_ARCH_GLM5_NEXT) {
+                            filter_attn = [&](uint32_t il) {
+                                return params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? il >= hparams.n_layer() : il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                            filter_recr = [&](uint32_t il) {
+                                return params.ctx_type != LLAMA_CONTEXT_TYPE_MTP && il < hparams.n_layer() && hparams.is_recr(il);
+                            };
+                        } else {
+                            filter_attn = [&](uint32_t il) {
+                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                            filter_recr = [&](uint32_t il) {
+                                return il < hparams.n_layer() && hparams.is_recr(il);
+                            };
+                        }
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
+                            };
+                        } else if (arch == LLM_ARCH_GLM5_NEXT) {
+                            filter_idx = [&](uint32_t il) {
+                                return params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? il >= hparams.n_layer() :
+                                    il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                             };
                         }
                     }
@@ -2579,6 +2601,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_GLM5_NEXT:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
