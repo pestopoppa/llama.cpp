@@ -179,6 +179,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
 llama_build(test-glm5next-mtp-rollback.cpp)
+llama_build(test-glm5next-real-divergence.cpp)
 llama_build(test-glm5next-mtp-state-kpool.cpp)
 target_include_directories(test-glm5next-mtp-state-kpool PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

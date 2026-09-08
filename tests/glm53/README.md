@@ -49,3 +49,20 @@ The two architecture/key spellings and present/absent MTP index-sharing and
 tail-selection flags use identical deterministic tensor payloads. Optional
 NextN embedding and output tensors remain absent so the global fallbacks are
 covered structurally.
+
+## Real-model target batch divergence diagnostic
+
+`../test-glm5next-real-divergence.cpp` reproduces the observed greedy split at the
+six-token accepted prefix using target-only public decoding APIs. It compares
+strictly sequential logits with cumulative batched decoding, a clean four-row
+speculative-shaped batch, and the same shape after a prior one-token rollback.
+The recorded CPU run used source SHA-256
+`4ebb20360fefaf1ee3bb2ab1ba936735dbfa97c357362fc1245c8fffceecc500`
+and is preserved outside the source tree at
+`/mnt/raid0/llm/tmp/glm53-validation-20260908/runtime/real-divergence-20260908T212632Z/`.
+
+This is a numerical behavior diagnostic with a predeclared `1e-5` logit
+tolerance. A nonzero exit records a detected difference; it is not a general
+model-quality or rollback-correctness verdict. The clean four-row comparison
+can demonstrate that rollback is not required to reproduce a divergence, while
+the after-rollback comparison remains separately reported.

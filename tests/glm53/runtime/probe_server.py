@@ -35,7 +35,11 @@ def digest_bytes(data: bytes) -> str:
 def response_row(kind: str, ordinal: int, raw: bytes, doc: dict) -> dict:
     timings = doc.get("timings") or {}
     choice = (doc.get("choices") or [{}])[0]
-    finish = choice.get("finish_reason") or doc.get("stop_type")
+    native_stop = doc.get("stop_type")
+    finish = choice.get("finish_reason")
+    finish_source = "choices[0].finish_reason"
+    if not finish and (native_stop == "limit" or doc.get("stopped_limit") is True):
+        finish, finish_source = "length", "normalized from native stop_type=limit/stopped_limit=true"
     row = {
         "kind": kind,
         "ordinal": ordinal,
@@ -46,6 +50,9 @@ def response_row(kind: str, ordinal: int, raw: bytes, doc: dict) -> dict:
         "draft_n": timings.get("draft_n", 0),
         "draft_n_accepted": timings.get("draft_n_accepted", 0),
         "finish_reason": finish,
+        "finish_reason_source": finish_source,
+        "native_stop_type": native_stop,
+        "native_stopped_limit": doc.get("stopped_limit"),
         "canonical_response_sha256": digest_bytes(raw),
     }
     for key in ("predicted_n", "predicted_per_second"):
@@ -66,7 +73,15 @@ def main() -> int:
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
 
-    base = {"prompt": args.prompt, "temperature": 0.0, "top_k": 1,
+    format_payload = {"messages": [{"role": "user", "content": args.prompt}], "add_generation_prompt": True}
+    (args.out / "apply-template-request.json").write_text(json.dumps(format_payload, indent=2, sort_keys=True) + "\n")
+    formatted = post(args.port, "/apply-template", format_payload, args.timeout)
+    (args.out / "apply-template-response.json").write_text(json.dumps(formatted, indent=2, sort_keys=True) + "\n")
+    rendered_prompt = formatted.get("prompt")
+    if not isinstance(rendered_prompt, str) or not rendered_prompt:
+        raise RuntimeError("/apply-template response lacks non-empty prompt")
+    (args.out / "rendered-prompt.txt").write_text(rendered_prompt)
+    base = {"prompt": rendered_prompt, "temperature": 0.0, "top_k": 1,
             "seed": 42, "cache_prompt": False, "stream": False,
             "ignore_eos": True, "return_tokens": True}
     (args.out / "request-base.json").write_text(json.dumps(base, indent=2, sort_keys=True) + "\n")

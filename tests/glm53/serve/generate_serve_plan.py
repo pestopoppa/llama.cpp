@@ -76,6 +76,8 @@ def build_plan(
     draft_max: int = 3,
     draft_p_min: float = 0.0,
     mtp: bool = True,
+    evidence_trace: bool = False,
+    reasoning_off: bool = False,
     recipe_source: Path | str | None = None,
 ) -> dict[str, Any]:
     binary = Path(binary).expanduser().resolve(strict=False)
@@ -113,6 +115,10 @@ def build_plan(
     if mtp:
         argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_max),
                  "--spec-draft-p-min", format(draft_p_min, "g")]
+    if evidence_trace:
+        env["LLAMA_TRACE"] = "1"
+    if reasoning_off:
+        argv += ["--reasoning", "off"]
     if "-md" in argv or "--model-draft" in argv:
         raise AssertionError("GLM-5.3 must use its embedded NextN head")
     shell = "env -i " + " ".join(
@@ -151,6 +157,8 @@ def build_plan(
             "validation_parameters": "acceptance/performance validation separately sweeps draft-max 1,3,5; draft-max 5 is not the default serve value",
             "identity_policy": "binary and model are required caller inputs; no stale champion binary/build/digest is copied",
             "recipe_source": provenance,
+            "runtime_evidence_overrides": {"LLAMA_TRACE": "1 enables source-gated accepted A/D records"} if evidence_trace else {},
+            "reasoning_mode": "off via server flag for consistently formatted useful output" if reasoning_off else "recipe default",
         },
     }
     stable = {key: value for key, value in result.items() if key != "shell_preview"}
@@ -169,13 +177,16 @@ def main() -> int:
     parser.add_argument("--draft-max", type=int, default=3)
     parser.add_argument("--draft-p-min", type=float, default=0.0)
     parser.add_argument("--plain-diagnostic", action="store_true", help="emit matched no-spec control; default remains native MTP")
+    parser.add_argument("--evidence-trace", action="store_true", help="add LLAMA_TRACE=1 for per-verification accepted A/D records")
+    parser.add_argument("--reasoning-off", action="store_true", help="disable template thinking consistently across matched arms")
     parser.add_argument("--recipe-source", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     plan = build_plan(args.binary, args.model, host=args.host, port=args.port,
                       context=args.context, threads=args.threads,
                       draft_max=args.draft_max, draft_p_min=args.draft_p_min,
-                      mtp=not args.plain_diagnostic, recipe_source=args.recipe_source)
+                      mtp=not args.plain_diagnostic, evidence_trace=args.evidence_trace,
+                      reasoning_off=args.reasoning_off, recipe_source=args.recipe_source)
     rendered = json.dumps(plan, indent=2) + "\n"
     if args.output: args.output.write_text(rendered)
     print(rendered, end="")
