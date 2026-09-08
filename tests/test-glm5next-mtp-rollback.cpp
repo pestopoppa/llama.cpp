@@ -126,12 +126,24 @@ int main(int argc, char ** argv) {
     std::ofstream jsonl(output, std::ios::out | std::ios::trunc);
     if (!jsonl) { std::fprintf(stderr, "cannot open %s\n", output); return 2; }
 
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    auto tokens = common_tokenize(init->context(), params.prompt, true, true);
     const uint32_t prefix = 16;
     const uint32_t need = prefix + draft_max + horizon;
-    if (tokens.empty()) return 2;
-    tokens.resize(need, tokens.back());
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        std::fprintf(stderr, "REFUSE: model vocabulary size is zero\n"); return 2;
+    }
+    std::vector<llama_token> tokens;
+    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
+        tokens.resize(need);
+        for (uint32_t i = 0; i < need; ++i) {
+            tokens[i] = n_vocab > 1 ? (llama_token) (1 + i % (n_vocab - 1)) : 0;
+        }
+    } else {
+        tokens = common_tokenize(init->context(), params.prompt, true, true);
+        if (tokens.empty()) return 2;
+        tokens.resize(need, tokens.back());
+    }
     if (llama_n_ctx(init->context()) < need || llama_n_batch(init->context()) < (uint32_t) draft_max) {
         std::fprintf(stderr, "REFUSE: context/batch capacity below test shape\n"); return 2;
     }
