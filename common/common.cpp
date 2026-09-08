@@ -55,6 +55,74 @@
 #include <pwd.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <stdlib.h>
+
+// INF-70 CHAMP-2: the whole-process half of the THP lever.
+//
+// GGML_NOHUGEPAGE (CHAMPION-1, default ON) applies MADV_NOHUGEPAGE inside ggml_aligned_malloc,
+// which covers every ggml backend buffer -- model weights, KV cache and the graph compute
+// buffers all go through ggml_backend_cpu_buffer_type_alloc_buffer(). Measured on a live
+// llama-server (/proc/<pid>/smaps), that leaves exactly one THP-backed region: the glibc heap,
+// which holds the CPU backend's graph work buffer (new uint8_t[cplan.work_size] in
+// ggml-cpu.cpp) and llama.cpp's own std::vector state. THP there defeats
+// `numactl --interleave=all` in exactly the same way -- a sub-2 MiB region is served by ONE
+// memory controller of four -- and D6-PLACE measured the residual at +0.90 pp served for a
+// whole-process PR_SET_THP_DISABLE shim over the knob alone.
+//
+// This is that shim, in-tree. It lives in llama-common, which only the llama.cpp *tools* link,
+// so no external consumer of libllama / libggml inherits a process-wide policy change.
+// Placement only: prctl() moves pages, it never changes a result bit.
+//
+// INF-70 CHAMPION-3 -- DEFAULT OFF.  MEASURED, not argued.
+//
+// CHAMP-2 measured this shim at +1.0 % served on top of CHAMPION-1.  SYNC-15 predicted the win
+// would be only PARTLY additive with GGML_VEC_Q8K and GGML_QSPLIT, because those two make there
+// be less `wdata` traffic for the shim to place well.  CHAMPION-3 ran that leave-one-out on the
+// folded stack, 3 rounds ABA, 24-prompt production harness, MTP serving config:
+//
+//     shim ON (the folded default)   33.954 t/s
+//     shim OFF (this default)        34.433 t/s   -> +1.48 % [CI +1.04, +1.91], 48/60 wins
+//
+// The win did not merely shrink, it INVERTED.  Once V and Q ship, de-huge-paging the whole
+// process costs more on llama.cpp's own heap-resident std::vector state than the shrunken
+// `wdata` region gains from interleaving.  So the shim is kept -- it is correct, it is
+// placement-only, and it pays for a configuration without V/Q -- but it is OPT-IN.
+//
+// Inverted idiom, deliberately not CHAMPION-1's, because this lever's default is OFF:
+//   GGML_NOHUGEPAGE_PROCESS=1  -> ON  (opt in to the whole-process PR_SET_THP_DISABLE)
+//   unset / empty / 0          -> off (the shipped default; the ggml madvise stays on)
+//   GGML_NOHUGEPAGE=0          -> off regardless (master switch, also kills the ggml madvise)
+static bool common_thp_env_on(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || *e == '\0') {
+        return true;
+    }
+    return atoi(e) != 0;
+}
+
+static bool common_thp_env_opt_in(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || *e == '\0') {
+        return false;
+    }
+    return atoi(e) != 0;
+}
+
+__attribute__((used)) static const char * const inf70_champ2_marker =
+    "INF70_CHAMPION3_PROCESS_THP_DISABLE=DEFAULT_OFF;OPT_IN=GGML_NOHUGEPAGE_PROCESS=1"
+    ";MASTER_OFF=GGML_NOHUGEPAGE=0";
+
+__attribute__((constructor)) static void common_thp_disable_process(void) {
+    if (!common_thp_env_on("GGML_NOHUGEPAGE") || !common_thp_env_opt_in("GGML_NOHUGEPAGE_PROCESS")) {
+        return;
+    }
+    // runs before main(), so before any weight, KV or work-buffer page is faulted
+    (void) prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+}
+#endif
+
 #if defined(_AIX)
 #include <sys/systemcfg.h>
 #endif
@@ -1558,6 +1626,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+        mparams.tensor_read_lazy = params.tensor_read_lazy;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

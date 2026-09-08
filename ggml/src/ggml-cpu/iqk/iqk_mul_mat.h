@@ -30,6 +30,17 @@ IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         int typeB, const void * B, long strideB,
         float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth);
 
+// INF-70 B3-k: rows [first_x, first_x + nrc_x) of ONE expert, no thread split — the caller
+// partitions the flat (expert, row) space. Serves only the direct-kernel path: check
+// iqk_dequant_type(typeA, Ny) == typeA first. first_x/nrc_x must be multiples of
+// iqk_mul_mat_moe_row_granularity(typeA). Bit-identical to iqk_mul_mat_moe over the same rows.
+IQK_API bool iqk_mul_mat_moe_rows(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, long first_x, long nrc_x);
+
+IQK_API int iqk_mul_mat_moe_row_granularity(int typeA);
+
 IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,

@@ -102,7 +102,7 @@ llama_context::llama_context(
 
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
-        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
@@ -1155,6 +1155,12 @@ void llama_context::set_embeddings(bool value) {
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
+    // INF-70 E2a diagnostic only: force the gathered (masked) nextn export so the
+    // arch graph keeps its normal last-layer inp_out_ids gather. Not a fix.
+    if (value && getenv("LLAMA_MTP_DIAG_FORCE_MASKED") != NULL) {
+        masked = true;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     cparams.embeddings_nextn        = value;
@@ -1318,14 +1324,47 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.token != nullptr && ubatch.n_tokens == 1) {
+        fprintf(stderr, "process_ubatch: ubatch.token[0]=%d (0x%x) pos=%lld n_tokens=%lld\n",
+                ubatch.token[0], (unsigned) ubatch.token[0], (long long) ubatch.pos[0], (long long) ubatch.n_tokens);
+    }
+#ifdef GGML_CPU_PROF
+    const int64_t t_phase0 = ggml_time_us();
+#endif
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_mctx = ggml_time_us();
+#endif
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
+
+    // the fused decode fast path (INF-64): single-token decode on a fully
+    // CPU-resident model runs the fused layer functions instead of the graph;
+    // any failure falls through to the graph path below
+    // the fused path produces logits only; it exports no t_h_nextn, so an MTP
+    // draft target must stay on the graph path or the draft head sees no hidden state
+    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
+            gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
+            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
+        // snapshot the previous graph's per-layer inputs (the fused path may
+        // compare against them for layer-level isolation; the reset clears them)
+        const int64_t n_layers = model.hparams.n_layer();
+        std::vector<const ggml_tensor *> prev_inp(n_layers + 2);
+        for (int64_t il = 0; il <= n_layers; il++) {
+            prev_inp[il] = res->get_layer_inp((int) il);
+        }
+        prev_inp[n_layers + 1] = res->get_logits();
+        res->reset();
+        if (model.fused_decode(ubatch, mctx, res, cparams.n_threads, prev_inp.data())) {
+            ret = GGML_STATUS_SUCCESS;
+            return res;
+        }
+    }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1373,18 +1412,283 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+            const ggml_tensor * tk = res->get_inp_tokens();
+            fprintf(stderr, "after set_inputs: inp_tokens raw bytes: %02x %02x %02x %02x (ubatch token %d)\n",
+                    ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                    ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3],
+                    ubatch.token[0]);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_inputs = ggml_time_us();
+#endif
 
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+        const ggml_tensor * tk = res->get_inp_tokens();
+        fprintf(stderr, "before compute: inp_tokens %02x %02x %02x %02x (data %p flags %u view_src %p)\n",
+                ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3], (void *) tk->data,
+                tk->flags, (void *) tk->view_src);
+        ggml_cgraph * gf = (ggml_cgraph *) res->get_gf();
+        fprintf(stderr, "graph n_nodes=%d\n", ggml_graph_n_nodes(gf));
+        for (int i = 0; i < ggml_graph_n_nodes(gf) && i < 300; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            if (nd->data == tk->data && nd != tk) {
+                fprintf(stderr, "ALIAS i=%d op=%s name=%s size=%zu nbytes=%zu\n", i, ggml_op_name(nd->op), nd->name,
+                        (size_t) ggml_nbytes(nd), (size_t) ggml_nbytes(nd));
+            }
+        }
+        for (int i = 0; i < 26; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            const char * nm = nd->name[0] ? nd->name : ggml_op_name(nd->op);
+            fprintf(stderr, "node %d op=%-16s name=%-30s data=%p\n", i, ggml_op_name(nd->op), nm, (void *) nd->data);
+        }
+        {
+            const ggml_tensor * nd = ggml_graph_node(gf, 21);
+            fprintf(stderr, "node21: src0=%s data=%p | src1=%s data=%p | out data=%p shape %lld x %lld type=%d\n",
+                    nd->src[0] ? nd->src[0]->name : "-", (void *) (nd->src[0] ? nd->src[0]->data : nullptr),
+                    nd->src[1] ? nd->src[1]->name : "-", (void *) (nd->src[1] ? nd->src[1]->data : nullptr),
+                    (void *) nd->data, (long long) nd->ne[0], (long long) nd->ne[1], (int) nd->type);
+        }
+        for (int i = 19; i <= 21; i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            fprintf(stderr, "node%d: op=%s ne=%lldx%lldx%lldx%lld data=%p | src1=%s ne=%lldx%lld data=%p\n",
+                    i, ggml_op_name(nd->op), (long long) nd->ne[0], (long long) nd->ne[1],
+                    (long long) nd->ne[2], (long long) nd->ne[3], (void *) nd->data,
+                    nd->src[1] ? nd->src[1]->name : "-",
+                    nd->src[1] ? (long long) nd->src[1]->ne[0] : -1,
+                    nd->src[1] ? (long long) nd->src[1]->ne[1] : -1,
+                    (void *) (nd->src[1] ? nd->src[1]->data : nullptr));
+        }
+        const ggml_tensor * lf7 = ggml_graph_node(gf, 18)->src[0];
+        if (lf7) {
+            const uint8_t * b = (const uint8_t *) lf7->data;
+            fprintf(stderr, "leaf7 name=%s data=%p first bytes: %02x %02x %02x %02x | i32 %d %d | ne %lldx%lld\n",
+                    lf7->name, (void *) lf7->data, b[0], b[1], b[2], b[3],
+                    ((const int32_t *) lf7->data)[0], ((const int32_t *) lf7->data)[1],
+                    (long long) lf7->ne[0], (long long) lf7->ne[1]);
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            if (nd->data == tk->data) {
+                fprintf(stderr, "NODE %d type=%s name=%s data == inp_tokens data!\n", i, ggml_op_name(nd->op), nd->name);
+            }
+        }
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
+        const ggml_tensor * tk = res->get_inp_tokens();
+        fprintf(stderr, "after compute:  inp_tokens %02x %02x %02x %02x\n",
+                ((const uint8_t *) tk->data)[0], ((const uint8_t *) tk->data)[1],
+                ((const uint8_t *) tk->data)[2], ((const uint8_t *) tk->data)[3]);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
+#ifdef GGML_CPU_PROF
+    const int64_t t_graph = ggml_time_us();
+    if (getenv("GGML_CPU_PROF") != NULL) {
+        fprintf(stderr, "[phase_prof] n_tokens=%d mctx_apply=%.3f ms set_inputs=%.3f ms graph_compute=%.3f ms\n",
+                ubatch.n_tokens, (t_mctx - t_phase0)/1e3, (t_inputs - t_mctx)/1e3, (t_graph - t_inputs)/1e3);
+    }
+#endif
 
     ret = GGML_STATUS_SUCCESS;
+
+    // INF-64 debug: dump the graph's per-layer outputs (env-gated) for the
+    // same-position comparison against the fused decode's layer dump
+    if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL) {
+        FILE * f = fopen("/tmp/qwen4exp-builds/g_layers.bin", "wb");
+        if (f) {
+            const int64_t nl = model.hparams.n_layer();
+            for (int64_t il = 0; il + 1 < nl; il++) {
+                const ggml_tensor * t = res->get_layer_inp((int) il + 1);
+                if (!t || !t->data) {
+                    fprintf(stderr, "g_layers: il=%lld missing\\n", (long long) il);
+                    fclose(f);
+                    return res;
+                }
+                const int64_t nt = t->ne[1];
+                fwrite((const float *) t->data + (nt - 1) * t->ne[0] * t->ne[1], 4, t->ne[0] * t->ne[1], f);
+            }
+            fclose(f);
+        }
+        // the first occurrence of each fused-relevant op (layer 0), by op type
+        if (res->get_gf()) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/g_nodes.bin", "wb");
+            if (f) {
+                enum ggml_op want[] = {
+                    GGML_OP_SSM_CONV, GGML_OP_GATED_DELTA_NET, GGML_OP_MUL_MAT_ID,
+                    GGML_OP_DSV4_HC_PRE, GGML_OP_DSV4_HC_COMB, GGML_OP_MEAN_D1,
+                    GGML_OP_MOE_TOPK_NORM, GGML_OP_L2_NORM, GGML_OP_MUL_MAT, GGML_OP_COUNT
+                };
+                const int64_t n_nodes = ggml_graph_n_nodes(res->get_gf());
+                const int n_want = 9;
+                for (int ni = 0; ni < n_nodes; ni++) {
+                    const ggml_tensor * nd = ggml_graph_node(res->get_gf(), (int) ni);
+                    if (!nd || !nd->data) continue;
+                    if (nd->op == GGML_OP_GET_ROWS && strcmp(ggml_get_name(nd->src[1]), "inp_tokens") == 0) {
+                        fprintf(stderr, "inp_tokens data: %d 0x%x (expect 11751)\n",
+                                ((const int32_t *) nd->src[1]->data)[0],
+                                (unsigned) ((const int32_t *) nd->src[1]->data)[0]);
+                    }
+                    if (nd->op == GGML_OP_GET_ROWS && nd->src[1] && nd->src[1]->data && nd->src[1]->ne[0] == 1 && ni < 20) {
+                        fprintf(stderr, "get_rows[%d] src1=%s src0=%s token=%lld (0x%x)\n",
+                                ni, ggml_get_name(nd->src[1]), nd->src[0] ? ggml_get_name(nd->src[0]) : "?",
+                                (long long) ((const int32_t *) nd->src[1]->data)[0],
+                                (unsigned) ((const int32_t *) nd->src[1]->data)[0]);
+                    }
+                    if (nd->op == GGML_OP_GET_ROWS && nd->src[0] && strstr(ggml_get_name(nd->src[0]), "per_layer") && nd->src[1]->data) {
+                        const int64_t nr = nd->src[1]->ne[0];
+                        fprintf(stderr, "graph ple gather: node %d rows[0..2]=%d %d %d nrows=%lld\n",
+                                ni,
+                                ((const int32_t *) nd->src[1]->data)[0],
+                                ((const int32_t *) nd->src[1]->data)[1],
+                                ((const int32_t *) nd->src[1]->data)[2],
+                                (long long) nr);
+                    }
+                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni == 3 && nd->src[0] && nd->src[0]->data && !getenv("GGML_FUSED_NORMSRC") && nd->src[0]->ne[2] == 1) {
+                        // dump the full step-1 hc_init (the rms_norm input) + its src chain
+                        const ggml_tensor * s0 = nd->src[0];
+                        FILE * f = fopen("/tmp/qwen4exp-builds/g_hcinit.bin", "wb");
+                        if (f) { fwrite(s0->data, 4, s0->ne[0] * s0->ne[1], f); fclose(f); }
+                        if (s0->src[0] && s0->src[0]->src[0] && s0->src[0]->src[0]->src[0] && s0->src[0]->src[0]->src[0]->op == GGML_OP_GET_ROWS) {
+                            const ggml_tensor * gr = s0->src[0]->src[0]->src[0];
+                            fprintf(stderr, "embedding get_rows: tokens[0]=%lld src0=%s src1=%s ne0=[%lld,%lld]\n",
+                                    gr->src[1] && gr->src[1]->data ? (long long) ((const int32_t *) gr->src[1]->data)[0] : -1,
+                                    gr->src[0] ? ggml_get_name(gr->src[0]) : "?",
+                                    gr->src[1] ? ggml_get_name(gr->src[1]) : "?",
+                                    gr->src[0] ? (long long) gr->src[0]->ne[0] : 0,
+                                    gr->src[0] ? (long long) gr->src[0]->ne[1] : 0);
+                        }
+                        fprintf(stderr, "hc_init node: op=%d name=%s src0=%s src1=%s src2=%s src0op=%d src0name=%s src0ne=[%lld,%lld,%lld]\n",
+                                (int) nd->op, ggml_get_name(nd),
+                                s0->src[0] ? ggml_get_name(s0->src[0]) : "?",
+                                s0->src[1] ? ggml_get_name(s0->src[1]) : "?",
+                                s0->src[2] ? ggml_get_name(s0->src[2]) : "?",
+                                s0->src[0] ? (int) s0->src[0]->op : -1,
+                                s0->src[0] ? ggml_get_name(s0->src[0]) : "?",
+                                s0->src[0] ? (long long) s0->src[0]->ne[0] : 0,
+                                s0->src[0] ? (long long) s0->src[0]->ne[1] : 0,
+                                s0->src[0] ? (long long) s0->src[0]->ne[2] : 0);
+                    }
+                    if (nd->op == GGML_OP_RMS_NORM && nd->data && ni < 30 && !getenv("GGML_FUSED_NORMSRC")) {
+                        // the rms_norm output + its eps + the name + the src0's first values
+                        const ggml_tensor * s0 = nd->src[0];
+                        fprintf(stderr, "rms_norm[%d] %s eps=%.6g out[0..3]=%.6g %.6g %.6g %.6g src0=%s ne=[%lld,%lld,%lld] src0[0..3]=%.6g %.6g %.6g %.6g\n",
+                                ni, ggml_get_name(nd),
+                                ((const float *) nd->op_params)[0],
+                                ((const float *) nd->data)[0], ((const float *) nd->data)[1],
+                                ((const float *) nd->data)[2], ((const float *) nd->data)[3],
+                                s0 ? ggml_get_name(s0) : "?",
+                                s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[0] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[1] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[2] : 0,
+                                s0 && s0->data ? ((const float *) s0->data)[3] : 0);
+                    }
+                    if (nd->op == GGML_OP_MEAN_D1 && nd->data && nd->src[0] && nd->src[0]->data) {
+                        const ggml_tensor * gated = nd->src[0];
+                        for (int si = 0; si < 3; si++) {
+                            const ggml_tensor * s0 = si == 0 ? gated : (si == 1 ? (gated ? gated->src[0] : nullptr) : (gated ? gated->src[1] : nullptr));
+                            if (!s0 || !s0->data) continue;
+                            char nm[32];
+                            snprintf(nm, sizeof(nm), si == 0 ? "hc_gated" : (si == 1 ? "hc_xn" : "hc_gate"));
+                            size_t nm_len = strlen(nm);
+                            fwrite(&nm_len, 4, 1, f);
+                            fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) s0->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { s0->ne[0], s0->ne[1], s0->ne[2], s0->ne[3] };
+                            size_t nb[4] = { s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) s0->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(s0);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(s0->data, 1, nbytes, f);
+                        }
+                    }
+                    if ((nd->op == GGML_OP_SSM_CONV || nd->op == GGML_OP_DSV4_HC_PRE) && nd->src[0] && nd->src[0]->data && want[8] == GGML_OP_COUNT) {
+                        // dump the src0 (and src1 for the hc pre) as side entries
+                        for (int si = 0; si < (nd->op == GGML_OP_DSV4_HC_PRE ? 2 : 1); si++) {
+                            const ggml_tensor * s0 = nd->src[si];
+                            if (!s0 || !s0->data) continue;
+                            char nm[32];
+                            if (nd->op == GGML_OP_DSV4_HC_PRE) {
+                                snprintf(nm, sizeof(nm), "hcpre_s%d", si);
+                            } else {
+                                snprintf(nm, sizeof(nm), "conv_window");
+                            }
+                            size_t nm_len = strlen(nm);
+                            fwrite(&nm_len, 4, 1, f);
+                            fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) nd->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { s0->ne[0], s0->ne[1], s0->ne[2], s0->ne[3] };
+                            size_t nb[4] = { s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) s0->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(s0);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(s0->data, 1, nbytes, f);
+                        }
+                    }
+                    for (int k = 0; k < n_want; k++) {
+                        if (want[k] != GGML_OP_COUNT && nd->op == want[k]) {
+                            const char * nm = ggml_get_name(nd);
+                            size_t nm_len = nm ? strlen(nm) : 0;
+                            fwrite(&nm_len, 4, 1, f);
+                            if (nm_len) fwrite(nm, 1, nm_len, f);
+                            uint32_t nmpad = (4 - (nm_len % 4)) % 4;
+                            for (uint32_t z = 0; z < nmpad; z++) fputc(0, f);
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "%d", (int) nd->op);
+                            size_t tlen = strlen(tag);
+                            fwrite(&tlen, 4, 1, f);
+                            fwrite(tag, 1, tlen, f);
+                            uint32_t pad = (4 - (tlen % 4)) % 4;
+                            for (uint32_t z = 0; z < pad; z++) fputc(0, f);
+                            int64_t ne[4] = { nd->ne[0], nd->ne[1], nd->ne[2], nd->ne[3] };
+                            size_t nb[4] = { nd->nb[0], nd->nb[1], nd->nb[2], nd->nb[3] };
+                            fwrite(ne, 8, 4, f);
+                            fwrite(nb, 8, 4, f);
+                            int type = (int) nd->type;
+                            fwrite(&type, 4, 1, f);
+                            size_t nbytes = ggml_nbytes(nd);
+                            fwrite(&nbytes, 8, 1, f);
+                            fwrite(nd->data, 1, nbytes, f);
+                            want[k] = GGML_OP_COUNT;
+                            break;
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
 
     return res;
 }
@@ -2343,6 +2647,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0)) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());

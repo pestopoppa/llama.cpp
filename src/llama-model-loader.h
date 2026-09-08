@@ -68,6 +68,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+    static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -82,11 +83,23 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // set by the caller before the create_tensor() calls
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
+
+    // target model a draft head borrows token_embd / output / output_norm from
+    const struct llama_model * model_shared = nullptr;
+
+    // cached nextn_shared_target_tensors, -1 until first read
+    int shared_target_tensors = -1;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
 
     llama_mmaps mappings;
+
+    // byte ranges of TENSOR_READ_LAZY tensors, per file index
+    std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
@@ -188,6 +201,9 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // token_embd/output/output_norm taken from the target. null unless the file declares the flag.
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 
