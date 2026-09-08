@@ -127,7 +127,7 @@ int main(int argc, char ** argv) {
     if (!jsonl) { std::fprintf(stderr, "cannot open %s\n", output); return 2; }
 
     const uint32_t prefix = 16;
-    const uint32_t need = prefix + draft_max + horizon;
+    const uint32_t need = prefix + 1 + draft_max + horizon;
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
@@ -157,14 +157,14 @@ int main(int argc, char ** argv) {
             if (!decode_range(rollback, tokens, 0, prefix, false) ||
                     !decode_range(replay, tokens, 0, prefix, false)) return 2;
 
-            // Process the whole target verification batch, then force rejection
-            // after k accepted tokens through the real memory seq_rm path.
-            if (!decode_range(rollback, tokens, prefix, draft_max, false)) return 2;
-            if (!llama_memory_seq_rm(llama_get_memory(rollback), 0, prefix + k, -1)) {
+            // A real speculative target verification batch contains the sampled anchor
+            // followed by every draft token. The anchor is always retained, including k=0.
+            if (!decode_range(rollback, tokens, prefix, draft_max + 1, false)) return 2;
+            if (!llama_memory_seq_rm(llama_get_memory(rollback), 0, prefix + 1 + k, -1)) {
                 std::fprintf(stderr, "rollback refused at k=%d\n", k); return 2;
             }
-            // Fresh context replays exactly the same accepted prefix.
-            if (k && !decode_range(replay, tokens, prefix, k, false)) return 2;
+            // Fresh context replays the same anchor and accepted draft prefix.
+            if (!decode_range(replay, tokens, prefix, 1 + k, false)) return 2;
 
             // Restore the accepted-prefix checkpoint into a context that already
             // owns recurrent snapshots. This catches stale state_read/state_drop
@@ -182,7 +182,7 @@ int main(int argc, char ** argv) {
             bool logits_finite = true;
             std::vector<llama_token> roll_next, replay_next, used_next;
             for (int step = 0; step < horizon; ++step) {
-                const uint32_t pos = prefix + k + step;
+                const uint32_t pos = prefix + 1 + k + step;
                 if (!decode_range(rollback, tokens, pos, 1, true) ||
                         !decode_range(replay, tokens, pos, 1, true)) return 2;
                 max_diff = std::max(max_diff, compare_logits(rollback, replay, n_vocab, logits_finite));
@@ -199,9 +199,9 @@ int main(int argc, char ** argv) {
                   << ",\"architecture\":\"" << architecture << "\",\"recipe_id\":\"glm53-target-verify-seq-rm-v1\""
                   << ",\"forced_accepted_prefix\":" << k << ",\"drafted_tokens\":" << draft_max
                   << ",\"accepted_prefix_tokens\":[";
-            for (int i = 0; i < k; ++i) { if (i) jsonl << ','; jsonl << tokens[prefix + i]; }
+            for (int i = 0; i < k; ++i) { if (i) jsonl << ','; jsonl << tokens[prefix + 1 + i]; }
             jsonl << "],\"replay_prefix_tokens\":[";
-            for (int i = 0; i < k; ++i) { if (i) jsonl << ','; jsonl << tokens[prefix + i]; }
+            for (int i = 0; i < k; ++i) { if (i) jsonl << ','; jsonl << tokens[prefix + 1 + i]; }
             jsonl << "],\"continuation_steps\":" << horizon
                   << ",\"continuation_tokens_equal\":" << (tokens_equal ? "true" : "false")
                   << ",\"max_abs_logit_diff\":" << max_diff
