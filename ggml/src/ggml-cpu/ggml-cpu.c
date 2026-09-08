@@ -1320,8 +1320,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
 // INF-70 BE-1: true when this mul_mat is a small batch that must be computed row-exactly,
 // i.e. every output row bit-equal to the corresponding single-token (ne11 == 1) decode.
-static inline bool ggml_cpu_rowexact_batch(int64_t ne11) {
-    return ne11 > 1 && ne11 <= ggml_cpu_rowexact_n();
+static inline bool ggml_cpu_rowexact_batch(const struct ggml_compute_params * params, int64_t ne11) {
+    return !params->disable_rowexact && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n();
 }
 
 void ggml_compute_forward_mul_mat(
@@ -1399,7 +1399,7 @@ void ggml_compute_forward_mul_mat(
     // The correct answer is to skip the tinyBLAS section entirely: the single-token decode is
     // refused by llamafile_sgemm for exactly these shapes too and runs the generic vec_dot
     // mul_mat below, so the generic path IS the row-exact reference, not an approximation of it.
-    if (src1_cont && ggml_cpu_rowexact_batch(ne11)) {
+    if (src1_cont && ggml_cpu_rowexact_batch(params, ne11)) {
         goto UseGgmlGemm1;
     }
 
@@ -1505,7 +1505,7 @@ UseGgmlGemm1:;
 
 #if GGML_USE_LLAMAFILE
     // INF-70 BE-1: same row-exactness guard as the first tinyBLAS block above.
-    if (src1->type != vec_dot_type && !ggml_cpu_rowexact_batch(ne11)) {
+    if (src1->type != vec_dot_type && !ggml_cpu_rowexact_batch(params, ne11)) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : src1_wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1596,19 +1596,25 @@ UseGgmlGemm2:;
 // plain 12.484 (N=0) vs 12.516 (N=8) -- free on the trunk; MTP n-max 4 22.93 (N=0) vs
 // 21.56 (N=8) -- a real cost. It is opt-in.
 //
-// CHOOSING A VALUE. ne11 is NOT the token count for every node. This model has 12 F32
-// [128x64] mul_mat nodes per graph whose ne11 is 4*n_tokens (measured: ne11=4 on a
-// single-token decode, ne11=12 on a 3-token batch; INF-70 batch-envelope dispatch trace).
-// Two consequences, both counter-intuitive:
+// CHOOSING A VALUE. ne11 is NOT the token count for every node. Qwen3.8 Flash Next has
+// 12 F32 [128x64] mul_mat nodes per graph whose ne11 is 4*n_tokens (measured: ne11=4
+// on a single-token decode, ne11=12 on a 3-token batch; INF-70 batch-envelope trace).
+// For that architecture:
 //   * any N >= 4 changes SINGLE-TOKEN decode numerics, because those nodes present ne11=4
 //     at batch 1 -- so the served stream moves even with no batching anywhere;
 //   * a value that covers the router (ne11 = n_tokens) can still MISS those nodes on the
 //     verify batch. N=8 is exactly this trap: it catches ne11=4 at batch 1 but not the
 //     ne11=20 of a 5-row verify batch, so it perturbs single decodes AND leaves the batch
 //     non-row-exact. It is the worst of both and must not be used.
-// For batch <= T rows to be row-exact, use N >= 4*T, i.e. N >= 4*(n_max+1) for MTP
-// (n_max=4 -> N >= 20; 24 or 32 is a safe setting). Prefill is still never touched: a 512
-// -row ubatch presents ne11=2048 at those nodes and ne11=512 at the rest.
+// For Qwen batch <= T rows to be row-exact, use N >= 4*T, i.e. N >= 4*(n_max+1)
+// for MTP (n_max=4 -> N >= 20; 24 or 32 is a safe setting).
+//
+// MUL_MAT_ID needs a second distinction: its IQK implementation partitions the global
+// logical batch into per-expert buckets. A large prefill can contain a small expert bucket,
+// so applying this threshold to the local bucket alone changes prefill arithmetic. The IQK
+// dispatcher therefore decides row-exact eligibility from the global logical row count and
+// only then uses single-row kernels inside eligible expert buckets. This keeps an opt-in
+// decode threshold from silently changing larger prefills.
 #ifndef GGML_ROWEXACT_DEFAULT_N
 #define GGML_ROWEXACT_DEFAULT_N 0
 #endif
@@ -3600,10 +3606,11 @@ struct ggml_cplan ggml_graph_plan(
         work_size += CACHE_LINE_SIZE*(n_threads);
     }
 
-    cplan.threadpool = threadpool;
-    cplan.n_threads  = MIN(max_tasks, n_threads);
-    cplan.work_size  = work_size;
-    cplan.work_data  = NULL;
+    cplan.threadpool      = threadpool;
+    cplan.n_threads       = MIN(max_tasks, n_threads);
+    cplan.work_size       = work_size;
+    cplan.work_data       = NULL;
+    cplan.disable_rowexact = false;
 
     return cplan;
 }
@@ -4099,6 +4106,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.disable_rowexact =*/ cplan->disable_rowexact,
     };
 
 #ifdef GGML_USE_OPENMP

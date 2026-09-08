@@ -1012,6 +1012,10 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Enable or disable optional row-exact small-batch CPU kernels for this context.
+    // This is applied immediately before each graph computation, including reused graphs.
+    LLAMA_API void llama_set_rowexact(struct llama_context * ctx, bool enabled);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);

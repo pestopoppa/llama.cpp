@@ -367,6 +367,15 @@ llama_context::llama_context(
             }
         }
 
+        if (backend_cpu != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_cpu);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg) {
+                set_rowexact_fn = (ggml_backend_set_rowexact_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cpu_set_rowexact");
+            }
+        }
+
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
         // graph outputs buffer
@@ -1221,6 +1230,14 @@ void llama_context::set_embeddings(bool value) {
 
     // TODO: not sure yet if we want to reserve here
     //sched_need_reserve = true;
+}
+
+void llama_context::set_rowexact(bool enabled) {
+    if (rowexact_enabled == enabled) {
+        return;
+    }
+    LLAMA_LOG_DEBUG("%s: enabled = %d\n", __func__, enabled);
+    rowexact_enabled = enabled;
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -2876,6 +2893,13 @@ ggml_status llama_context::graph_compute(
         }
     }
 
+
+    // A CPU backend can be shared by contexts and cached graph plans. Reapply the
+    // context policy at every compute boundary so neither can retain stale state.
+    if (set_rowexact_fn != nullptr) {
+        set_rowexact_fn(backend_cpu, rowexact_enabled);
+    }
+
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
@@ -4101,6 +4125,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_rowexact(llama_context * ctx, bool enabled) {
+    ctx->set_rowexact(enabled);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
