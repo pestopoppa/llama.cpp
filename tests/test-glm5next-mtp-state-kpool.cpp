@@ -69,13 +69,17 @@ static std::vector<llama_token> deterministic_tokens(int n_vocab, int n, int sal
 }
 
 static mtp_pair make_pair(const common_params & params, llama_model * model,
-                          uint32_t n_ctx, uint32_t n_batch, uint32_t n_ubatch) {
+                          uint32_t n_ctx, uint32_t n_batch, uint32_t n_ubatch,
+                          int32_t n_rs_seq = -1) {
     auto cp_tgt = common_context_params_to_llama(params);
     cp_tgt.n_ctx = n_ctx;
     cp_tgt.n_batch = n_batch;
     cp_tgt.n_ubatch = n_ubatch;
     cp_tgt.n_seq_max = 1;
     cp_tgt.n_outputs_max = n_batch;
+    if (n_rs_seq >= 0) {
+        cp_tgt.n_rs_seq = (uint32_t) n_rs_seq;
+    }
     cp_tgt.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
     cp_tgt.ctx_other = nullptr;
     mtp_pair result;
@@ -286,7 +290,10 @@ static eval_result run_pool_variant(const common_params & params, llama_model * 
                                     const std::vector<llama_token> & tokens,
                                     uint32_t ubatch) {
     const uint32_t n = (uint32_t) tokens.size();
-    auto pair = make_pair(params, model, n + 2, n, ubatch);
+    // This gate tests ordinary prefill chunking. Recurrent speculative
+    // rollback tails impose a separate minimum ubatch and are covered by the
+    // restore test, so disable them here before exercising tiny chunks.
+    auto pair = make_pair(params, model, n + 2, n, ubatch, 0);
     return process_tokens(pair, model, tokens, 0, (int) n);
 }
 
