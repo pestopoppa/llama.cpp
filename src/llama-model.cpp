@@ -1162,8 +1162,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer(), false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer(), false);
+    // Official GLM5Next metadata includes the NextN block in per-layer arrays.
+    // Other MTP architectures on this champion describe trunk layers only.
+    const uint32_t n_layer_metadata = arch == LLM_ARCH_GLM5_NEXT ? hparams.n_layer_all : hparams.n_layer();
+    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   n_layer_metadata, false);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, n_layer_metadata, false);
 
     // Populate deepstack_mapping_arr - initialized to -1 (no deepstack)
     std::fill(hparams.deepstack_mapping_arr.begin(), hparams.deepstack_mapping_arr.end(), -1);
@@ -1171,12 +1174,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer(), false);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, n_layer_metadata, false);
 
-    // NextN/MTP layers (il >= n_layer()) are not covered by the per-layer reads above, which run over
-    // n_layer() now that n_layer_nextn is known this early. A draft-only MTP context builds a KV cache
-    // for exactly those layers and a zero head count gives it a zero-byte buffer ("failed to allocate
-    // buffer for kv cache"). Inherit the last trunk layer's values where nothing was read.
+    // For metadata formats whose arrays cover trunk layers only, a draft-only MTP context still builds
+    // a KV cache for the NextN layers. Inherit the last trunk layer's values where nothing was read so
+    // those layers do not receive a zero-byte buffer ("failed to allocate buffer for kv cache").
     if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
         const uint32_t il_last = hparams.n_layer() - 1;
         for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
