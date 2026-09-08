@@ -150,7 +150,7 @@ static eval_result process_tokens(mtp_pair & pair, llama_model * model,
 
     eval_result result;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const float * logits = llama_get_logits_ith(pair.dft.get(), 0);
+    const float * logits = llama_get_logits_ith(pair.dft.get(), -1);
     if (!logits) {
         free_mtp_batch(dft); llama_batch_free(tgt);
         throw std::runtime_error("MTP context did not expose logits");
@@ -186,7 +186,7 @@ static eval_result decode_mtp_one(llama_context * dft, llama_model * model,
     }
     eval_result result;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const float * logits = llama_get_logits_ith(dft, 0);
+    const float * logits = llama_get_logits_ith(dft, -1);
     if (!logits) { free_mtp_batch(batch); throw std::runtime_error("missing MTP continuation logits"); }
     result.logits.assign(logits, logits + n_vocab);
     size_t n = 0;
