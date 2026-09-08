@@ -2704,6 +2704,58 @@ __attribute__((used)) static const char ggml_inf70_champion3_marker[] =
     "INF70_CHAMPION3_CPU_DEFAULT_ON=GGML_QSPLIT(multi-row-only,GGML_QSPLIT_MIN=INT64_MAX)"
     ";DEFAULT_INERT=GGML_TINY_SOLO_ROWS=1,GGML_TINY_SOLO_ROWS_MAX";
 
+// ================= INF-70 SYNC-17 CENSUS (analysis build only) =================
+static bool ggml_inf70_census_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_INF70_CENSUS"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v != 0;
+}
+static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node);
+struct ggml_inf70_cens_row { int op; int64_t nrows; int64_t ne0; int64_t nelem; int64_t n; int64_t solo; int64_t rcs; };
+static struct ggml_inf70_cens_row ggml_inf70_cens[4096];
+static int    ggml_inf70_cens_n = 0;
+static int64_t ggml_inf70_cens_graphs = 0;
+static int    ggml_inf70_cens_atexit = 0;
+static void ggml_inf70_census_dump(void) {
+    FILE * f = fopen(getenv("GGML_INF70_CENSUS_OUT") ? getenv("GGML_INF70_CENSUS_OUT") : "/tmp/inf70_census.tsv", "w");
+    if (!f) return;
+    fprintf(f, "# graphs=%lld\n", (long long) ggml_inf70_cens_graphs);
+    fprintf(f, "op\tnrows\tne0\tnelem\tcount\tsolo_claimed\trowcol_splittable\n");
+    for (int i = 0; i < ggml_inf70_cens_n; i++) {
+        struct ggml_inf70_cens_row * r = &ggml_inf70_cens[i];
+        fprintf(f, "%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\n", ggml_op_name((enum ggml_op) r->op),
+                (long long) r->nrows, (long long) r->ne0, (long long) r->nelem,
+                (long long) r->n, (long long) r->solo, (long long) r->rcs);
+    }
+    fclose(f);
+}
+static void ggml_inf70_census_graph(const struct ggml_cgraph * cgraph, int nth) {
+    if (!ggml_inf70_cens_atexit) { ggml_inf70_cens_atexit = 1; atexit(ggml_inf70_census_dump); }
+    ggml_inf70_cens_graphs++;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        if (ggml_op_is_empty(nd->op) || (nd->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
+        const int64_t nr = ggml_nrows(nd), ne0 = nd->ne[0], nel = ggml_nelements(nd);
+        const int solo = (nth > 1 && ggml_cpu_node_is_solo(nd)) ? 1 : 0;
+        // would get_rowcol_split() produce >1 column chunk for this shape?
+        const int rcs = (nth > 1 && nr < nth && ne0 >= 512 && nel > 0) ? 1 : 0;
+        int k = -1;
+        for (int j = 0; j < ggml_inf70_cens_n; j++) {
+            if (ggml_inf70_cens[j].op == (int) nd->op && ggml_inf70_cens[j].nrows == nr &&
+                ggml_inf70_cens[j].ne0 == ne0 && ggml_inf70_cens[j].nelem == nel) { k = j; break; }
+        }
+        if (k < 0) {
+            if (ggml_inf70_cens_n >= 4096) continue;
+            k = ggml_inf70_cens_n++;
+            ggml_inf70_cens[k].op = (int) nd->op; ggml_inf70_cens[k].nrows = nr;
+            ggml_inf70_cens[k].ne0 = ne0; ggml_inf70_cens[k].nelem = nel;
+            ggml_inf70_cens[k].n = 0; ggml_inf70_cens[k].solo = 0; ggml_inf70_cens[k].rcs = 0;
+        }
+        ggml_inf70_cens[k].n++; ggml_inf70_cens[k].solo += solo; ggml_inf70_cens[k].rcs += rcs;
+    }
+}
+// =============== end INF-70 SYNC-17 CENSUS ===============
+
 static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     // a node with no elements writes nothing: no publication, no barrier needed
     if (ggml_nelements(node) == 0) {
@@ -4144,6 +4196,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
     }
 #endif
+
+    // INF-70 SYNC-17 CENSUS BUILD ONLY -- never shipped in a measured binary.
+    if (state->ith == 0 && ggml_inf70_census_enabled()) {
+        ggml_inf70_census_graph(cgraph, params.nth);
+    }
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
