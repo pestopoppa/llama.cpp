@@ -187,6 +187,7 @@ llama_build(test-iqk-expert-multirow.cpp)
 llama_build(test-q8-rowexact-batch.cpp)
 llama_build(test-cpy-outer-rows.cpp)
 llama_build(bench-iqk-expert-multirow.cpp)
+llama_build(bench-cpy-outer-rows.cpp)
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-iqk-expert-multirow)
     set_tests_properties(test-iqk-expert-multirow PROPERTIES
