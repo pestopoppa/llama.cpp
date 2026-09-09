@@ -185,9 +185,7 @@ llama_build(test-glm5next-rowexact-phase.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-iqk-expert-multirow.cpp)
 llama_build(test-q8-rowexact-batch.cpp)
-llama_build(test-cpy-outer-rows.cpp)
 llama_build(bench-iqk-expert-multirow.cpp)
-llama_build(bench-cpy-outer-rows.cpp)
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-iqk-expert-multirow)
     set_tests_properties(test-iqk-expert-multirow PROPERTIES
@@ -198,15 +196,6 @@ llama_test(test-q8-rowexact-batch)
 set_tests_properties(test-q8-rowexact-batch PROPERTIES
     PASS_REGULAR_EXPRESSION "\\[q8\\] ACTIVE: exact row batch"
     FAIL_REGULAR_EXPRESSION "mismatch|non-finite|[1-9][0-9]* failed")
-llama_test(test-cpy-outer-rows NAME test-cpy-outer-rows-separate ARGS separate)
-set_tests_properties(test-cpy-outer-rows-separate PROPERTIES
-    ENVIRONMENT "GGML_CPY_OUTER_ROWS=1;GGML_CPY_OUTER_ROWS_TRACE=1"
-    PASS_REGULAR_EXPRESSION "\\[cpy\\] ACTIVE: outer-row partition"
-    FAIL_REGULAR_EXPRESSION "exact=0")
-llama_test(test-cpy-outer-rows NAME test-cpy-outer-rows-alias ARGS alias)
-set_tests_properties(test-cpy-outer-rows-alias PROPERTIES
-    ENVIRONMENT "GGML_CPY_OUTER_ROWS=1;GGML_CPY_OUTER_ROWS_TRACE=1"
-    FAIL_REGULAR_EXPRESSION "\\[cpy\\] ACTIVE: outer-row partition|exact=0")
 target_include_directories(test-glm5next-mtp-state-kpool PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

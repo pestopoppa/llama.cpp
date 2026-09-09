@@ -9,13 +9,10 @@
 #include "vec.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cfloat>
-#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <limits>
 
 // ggml_compute_forward_dup
 
@@ -328,69 +325,6 @@ static void ggml_compute_forward_dup_to_q(
 }
 
 // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
-static bool ggml_cpu_cpy_outer_rows_enabled(void) {
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_CPY_OUTER_ROWS");
-        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "false") != 0;
-    }();
-
-    return enabled;
-}
-
-static bool ggml_cpu_cpy_outer_rows_trace_enabled(void) {
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_CPY_OUTER_ROWS_TRACE");
-        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "false") != 0;
-    }();
-
-    return enabled;
-}
-
-static bool ggml_cpu_cpy_spans_overlap(const ggml_tensor * src, const ggml_tensor * dst) {
-    const uintptr_t src_begin = (uintptr_t) src->data;
-    const uintptr_t dst_begin = (uintptr_t) dst->data;
-    if (ggml_nbytes(src) > std::numeric_limits<uintptr_t>::max() - src_begin ||
-        ggml_nbytes(dst) > std::numeric_limits<uintptr_t>::max() - dst_begin) {
-        return true;
-    }
-    const uintptr_t src_end   = src_begin + ggml_nbytes(src);
-    const uintptr_t dst_end   = dst_begin + ggml_nbytes(dst);
-
-    return src_begin < dst_end && dst_begin < src_end;
-}
-
-static bool ggml_cpu_cpy_outer_rows_disjoint(const ggml_tensor * tensor, size_t row_size) {
-    if (row_size == 0) {
-        return false;
-    }
-    struct outer_axis {
-        size_t  stride;
-        int64_t extent;
-    } axes[] = {
-        { tensor->nb[1], tensor->ne[1] },
-        { tensor->nb[2], tensor->ne[2] },
-        { tensor->nb[3], tensor->ne[3] },
-    };
-
-    std::sort(std::begin(axes), std::end(axes), [](const outer_axis & a, const outer_axis & b) {
-        return a.stride < b.stride;
-    });
-
-    size_t span = row_size;
-    for (const auto & axis : axes) {
-        if (axis.extent <= 1) {
-            continue;
-        }
-        if (axis.stride == 0 || axis.stride < span ||
-            (size_t) (axis.extent - 1) > (std::numeric_limits<size_t>::max() - span) / axis.stride) {
-            return false;
-        }
-        span += (size_t) (axis.extent - 1) * axis.stride;
-    }
-
-    return true;
-}
-
 static void ggml_compute_forward_dup_bytes(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -424,40 +358,6 @@ static void ggml_compute_forward_dup_bytes(
         nb00 == type_size && nb0 == type_size) {
         // copy by rows
         const size_t rs = ggml_row_size(src0->type, ne00);
-
-        // Recurrent rollback snapshots commonly have shape [state_size, 1, K].
-        // Splitting only ne1 leaves one worker copying every K-sized outer plane.
-        // Assign complete logical rows across all outer dimensions. Each memcpy and
-        // its byte order are unchanged; only the worker that owns a disjoint row differs.
-        if (ggml_cpu_cpy_outer_rows_enabled() &&
-            !ggml_cpu_cpy_spans_overlap(src0, dst) &&
-            ggml_cpu_cpy_outer_rows_disjoint(src0, rs) &&
-            ggml_cpu_cpy_outer_rows_disjoint(dst,  rs)) {
-            if (ith == 0 && ggml_cpu_cpy_outer_rows_trace_enabled()) {
-                static std::atomic_flag once = ATOMIC_FLAG_INIT;
-                if (!once.test_and_set()) {
-                    fprintf(stderr, "[cpy] ACTIVE: outer-row partition (%" PRId64 " rows)\n", ne01 * ne02 * ne03);
-                }
-            }
-
-            const int64_t nr_outer = ne01 * ne02 * ne03;
-            const int64_t dr_outer = (nr_outer + nth - 1) / nth;
-            const int64_t ir0_outer = dr_outer * ith;
-            const int64_t ir1_outer = MIN(ir0_outer + dr_outer, nr_outer);
-
-            for (int64_t ir = ir0_outer; ir < ir1_outer; ++ir) {
-                const int64_t i01 = ir % ne01;
-                const int64_t i02 = (ir / ne01) % ne02;
-                const int64_t i03 = ir / (ne01 * ne02);
-
-                memcpy(
-                    (      char *) dst->data  + i01*nb1  + i02*nb2  + i03*nb3,
-                    (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03,
-                    rs);
-            }
-            return;
-        }
-
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
