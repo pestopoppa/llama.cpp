@@ -2379,8 +2379,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
-        auto * t_mtp_sel  = res->get_mtp_dsa_sel();
-        auto * t_mtp_mask = res->get_mtp_dsa_mask();
+        // The selected width can change as the k-pool grows between ubatches.
+        // The public export is rectangular, so only expose single-ubatch decodes.
+        auto * t_mtp_sel  = ubatch.n_tokens == n_tokens_all ? res->get_mtp_dsa_sel()  : nullptr;
+        auto * t_mtp_mask = ubatch.n_tokens == n_tokens_all ? res->get_mtp_dsa_mask() : nullptr;
         if (t_mtp_sel != nullptr || t_mtp_mask != nullptr) {
             GGML_ASSERT(t_mtp_sel != nullptr && t_mtp_mask != nullptr);
             GGML_ASSERT(t_mtp_sel->type == GGML_TYPE_I32 && t_mtp_mask->type == GGML_TYPE_F32);

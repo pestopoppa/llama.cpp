@@ -122,7 +122,7 @@ static void free_mtp_batch(llama_batch & batch) {
 
 static eval_result process_tokens(mtp_pair & pair, llama_model * model,
                                   const std::vector<llama_token> & tokens,
-                                  int begin, int count) {
+                                  int begin, int count, bool expect_selection = true) {
     llama_batch tgt = make_batch(tokens, begin, count, 0, nullptr);
     if (llama_decode(pair.tgt.get(), tgt) != 0) {
         llama_batch_free(tgt); throw std::runtime_error("target decode failed");
@@ -163,6 +163,15 @@ static eval_result process_tokens(mtp_pair & pair, llama_model * model,
 
     size_t n_selection = 0;
     const int32_t * selection = llama_get_mtp_dsa_selection(pair.dft.get(), &n_selection);
+    if (!expect_selection) {
+        if (selection != nullptr || n_selection != 0) {
+            free_mtp_batch(dft); llama_batch_free(tgt);
+            throw std::runtime_error("multi-ubatch MTP decode exposed a DSA selection");
+        }
+        free_mtp_batch(dft);
+        llama_batch_free(tgt);
+        return result;
+    }
     if (!selection || n_selection == 0 || n_selection % (size_t) count != 0) {
         free_mtp_batch(dft); llama_batch_free(tgt);
         throw std::runtime_error("MTP graph did not expose a rectangular DSA selection");
@@ -294,7 +303,37 @@ static eval_result run_pool_variant(const common_params & params, llama_model * 
     // rollback tails impose a separate minimum ubatch and are covered by the
     // restore test, so disable them here before exercising tiny chunks.
     auto pair = make_pair(params, model, n + 2, n, ubatch, 0);
-    return process_tokens(pair, model, tokens, 0, (int) n);
+    eval_result result;
+    for (uint32_t begin = 0; begin < n; begin += ubatch) {
+        result = process_tokens(pair, model, tokens, (int) begin, (int) std::min(ubatch, n - begin));
+    }
+    return result;
+}
+
+static int run_export(const common_params & params, llama_model * model,
+                      int n_vocab, std::ostream & out) {
+    const uint32_t kpool = model->hparams.indexer_kpool;
+    const uint32_t topk = model->hparams.indexer_top_k;
+    if (!model->hparams.indexer_kpool_select_tail || topk <= 64*kpool) {
+        std::fprintf(stderr, "REFUSE: export test requires topk > 64*kpool and tail selection\n");
+        return 2;
+    }
+
+    const uint32_t n = 64*kpool + 1;
+    const uint32_t ubatch = std::max<uint32_t>(kpool, n/2);
+    const auto tokens = deterministic_tokens(n_vocab, (int) n + 1);
+    auto pair = make_pair(params, model, n + 4, n + 1, ubatch, 0);
+
+    const auto prefill = process_tokens(pair, model, tokens, 0, (int) n, false);
+    const auto next = decode_mtp_one(pair.dft.get(), model, tokens[n], (llama_pos) n, pair.pending_h);
+    const bool pass = !prefill.logits.empty() && !next.logits.empty() &&
+                      next.selection_width > 0 && !next.selection.empty();
+    out << "{\"schema\":\"epyc.glm53.mtp_dsa_export.v1\",\"prefill_tokens\":" << n
+        << ",\"n_ubatch\":" << ubatch
+        << ",\"prefill_selection_null\":true"
+        << ",\"next_selection_width\":" << next.selection_width
+        << ",\"verdict\":\"" << (pass ? "PASS" : "FAIL") << "\"}\n";
+    return pass ? 0 : 3;
 }
 
 static int run_pool(const common_params & params, llama_model * model,
@@ -405,7 +444,8 @@ int main(int argc, char ** argv) {
         const std::string mode = std::getenv("GLM53_TEST_MODE") ? std::getenv("GLM53_TEST_MODE") : "restore";
         if (mode == "restore") return run_restore(params, model, n_vocab, tolerance, out);
         if (mode == "pool") return run_pool(params, model, n_vocab, tolerance, out);
-        std::fprintf(stderr, "REFUSE: GLM53_TEST_MODE must be restore or pool\n"); return 2;
+        if (mode == "export") return run_export(params, model, n_vocab, out);
+        std::fprintf(stderr, "REFUSE: GLM53_TEST_MODE must be restore, pool, or export\n"); return 2;
     } catch (const std::exception & exc) {
         std::fprintf(stderr, "REFUSE: %s\n", exc.what()); return 2;
     }

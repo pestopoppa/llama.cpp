@@ -109,6 +109,7 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 
 LLAMA_API bool llama_set_mtp_dsa_index_share(struct llama_context * ctx, bool enabled);
 LLAMA_API bool llama_set_mtp_dsa_selection(struct llama_context * ctx, const int32_t * data, size_t size);
+// Returns nullptr after a decode that spans multiple ubatches.
 LLAMA_API const int32_t * llama_get_mtp_dsa_selection(struct llama_context * ctx, size_t * size);
 
 // Set whether the context outputs the input embeddings of a specific layer
