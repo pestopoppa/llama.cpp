@@ -311,7 +311,7 @@ static eval_result run_pool_variant(const common_params & params, llama_model * 
 }
 
 static int run_export(const common_params & params, llama_model * model,
-                      int n_vocab, std::ostream & out) {
+                      int n_vocab, double tolerance, std::ostream & out) {
     const uint32_t kpool = model->hparams.indexer_kpool;
     const uint32_t topk = model->hparams.indexer_top_k;
     if (!model->hparams.indexer_kpool_select_tail || topk <= 64*kpool) {
@@ -322,16 +322,27 @@ static int run_export(const common_params & params, llama_model * model,
     const uint32_t n = 64*kpool + 1;
     const uint32_t ubatch = std::max<uint32_t>(kpool, n/2);
     const auto tokens = deterministic_tokens(n_vocab, (int) n + 1);
-    auto pair = make_pair(params, model, n + 4, n + 1, ubatch, 0);
+    auto split = make_pair(params, model, n + 4, n + 1, ubatch, 0);
+    auto full = make_pair(params, model, n + 4, n + 1, n + 1, 0);
 
-    const auto prefill = process_tokens(pair, model, tokens, 0, (int) n, false);
-    const auto next = decode_mtp_one(pair.dft.get(), model, tokens[n], (llama_pos) n, pair.pending_h);
-    const bool pass = !prefill.logits.empty() && !next.logits.empty() &&
-                      next.selection_width > 0 && !next.selection.empty();
+    const auto prefill_split = process_tokens(split, model, tokens, 0, (int) n, false);
+    const auto prefill_full = process_tokens(full, model, tokens, 0, (int) n);
+    const auto next_split = decode_mtp_one(split.dft.get(), model, tokens[n], (llama_pos) n, split.pending_h);
+    const auto next_full = decode_mtp_one(full.dft.get(), model, tokens[n], (llama_pos) n, full.pending_h);
+    const double prefill_diff = max_abs_diff(prefill_split.logits, prefill_full.logits);
+    const double next_diff = max_abs_diff(next_split.logits, next_full.logits);
+    const bool pass = prefill_diff <= tolerance && next_diff <= tolerance &&
+                      argmax(next_split.logits) == argmax(next_full.logits) &&
+                      next_split.selection == next_full.selection &&
+                      next_split.selection_width > 0;
     out << "{\"schema\":\"epyc.glm53.mtp_dsa_export.v1\",\"prefill_tokens\":" << n
         << ",\"n_ubatch\":" << ubatch
         << ",\"prefill_selection_null\":true"
-        << ",\"next_selection_width\":" << next.selection_width
+        << ",\"next_selection_width\":" << next_split.selection_width
+        << ",\"next_selection_equal\":" << (next_split.selection == next_full.selection ? "true" : "false")
+        << ",\"prefill_max_abs_logit_diff\":" << prefill_diff
+        << ",\"next_max_abs_logit_diff\":" << next_diff
+        << ",\"declared_logit_tolerance\":" << tolerance
         << ",\"verdict\":\"" << (pass ? "PASS" : "FAIL") << "\"}\n";
     return pass ? 0 : 3;
 }
@@ -444,7 +455,7 @@ int main(int argc, char ** argv) {
         const std::string mode = std::getenv("GLM53_TEST_MODE") ? std::getenv("GLM53_TEST_MODE") : "restore";
         if (mode == "restore") return run_restore(params, model, n_vocab, tolerance, out);
         if (mode == "pool") return run_pool(params, model, n_vocab, tolerance, out);
-        if (mode == "export") return run_export(params, model, n_vocab, out);
+        if (mode == "export") return run_export(params, model, n_vocab, tolerance, out);
         std::fprintf(stderr, "REFUSE: GLM53_TEST_MODE must be restore, pool, or export\n"); return 2;
     } catch (const std::exception & exc) {
         std::fprintf(stderr, "REFUSE: %s\n", exc.what()); return 2;
