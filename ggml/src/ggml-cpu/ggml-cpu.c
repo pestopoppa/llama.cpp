@@ -1225,6 +1225,33 @@ static inline void ggml_mul_mat_chunk_plan(
     *nchunk1 = c1;
 }
 
+static int ggml_cpu_q8_rowexact_batch_mode(void) {
+    // 0: disabled; 1: share each weight row across activation rows;
+    // 2: additionally share each activation row across pairs of weight rows.
+    static atomic_int mode = ATOMIC_VAR_INIT(-1);
+    int value = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (value < 0) {
+        const char * s = getenv("GGML_Q8_ROWEXACT_BATCH");
+        value = s != NULL ? atoi(s) : 0;
+        value = value < 0 ? 0 : MIN(value, 2);
+        atomic_store_explicit(&mode, value, memory_order_relaxed);
+    }
+    return value;
+}
+
+static bool ggml_cpu_q8_rowexact_batch_trace(void) {
+    static atomic_int enabled = ATOMIC_VAR_INIT(-1);
+    int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (value < 0) {
+        const char * s = getenv("GGML_Q8_ROWEXACT_BATCH_TRACE");
+        value = s != NULL && atoi(s) != 0;
+        atomic_store_explicit(&enabled, value, memory_order_relaxed);
+    }
+    return value != 0;
+}
+
+static inline bool ggml_cpu_rowexact_batch(const struct ggml_compute_params * params, int64_t ne11);
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1270,6 +1297,73 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+    const bool q8_rowexact_batch_eligible =
+        type == GGML_TYPE_Q8_0 &&
+        num_rows_per_vec_dot == 1 &&
+        ggml_cpu_rowexact_batch(params, ne11) &&
+        ne11 <= 4;
+    const int q8_rowexact_batch_mode =
+        q8_rowexact_batch_eligible ? ggml_cpu_q8_rowexact_batch_mode() : 0;
+
+    if (q8_rowexact_batch_mode > 0) {
+        if (ggml_cpu_q8_rowexact_batch_trace()) {
+            static atomic_flag logged = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set_explicit(&logged, memory_order_relaxed)) {
+                fprintf(stderr, "[q8] ACTIVE: exact row batch (rows=%lld mode=%d)\n",
+                    (long long) ne11, q8_rowexact_batch_mode);
+            }
+        }
+        float tmp_batch[4][16];
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end;) {
+                    const int64_t i13 = ir1 / (ne12 * ne1);
+                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                    const int64_t i11 = ir1 - i13 * ne12 * ne1 - i12 * ne1;
+                    const int64_t nrc = MIN(4, MIN(iir1 + blck_1 - ir1,
+                                                  MIN(ir1_end - ir1, ne1 - i11)));
+
+                    const int64_t i03 = i13 / r3;
+                    const int64_t i02 = i12 / r2;
+                    const char * src0_row = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                    const char * src1_col = (const char *) wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+
+                    int64_t ir0 = iir0;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+                    if (q8_rowexact_batch_mode >= 2) {
+                        for (; ir0 + 1 < iir0 + blck_0 && ir0 + 1 < ir0_end; ir0 += 2) {
+                            ggml_vec_dot_q8_0_q8_0_batch_xy2(ne00, &tmp_batch[0][ir0 - iir0], 16,
+                                src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride, (int) nrc);
+                        }
+                    }
+#endif
+                    for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+                        ggml_vec_dot_q8_0_q8_0_batch_y(ne00, &tmp_batch[0][ir0 - iir0], 16,
+                            src0_row + ir0 * nb01, src1_col, src1_col_stride, (int) nrc);
+#else
+                        ggml_vec_dot_q8_0_q8_0_batch_y_generic(ne00, &tmp_batch[0][ir0 - iir0], 16,
+                            src0_row + ir0 * nb01, src1_col, src1_col_stride, (int) nrc);
+#endif
+                    }
+
+                    for (int64_t ir = 0; ir < nrc; ++ir) {
+                        float * dst_col = (float *) ((char *) dst->data +
+                            ((i11 + ir) * nb1 + i12 * nb2 + i13 * nb3));
+                        memcpy(&dst_col[iir0], &tmp_batch[ir][0],
+                            (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    }
+                    ir1 += nrc;
+                }
+            }
+        }
+        return;
+    }
 
     // attempt to reduce false-sharing (does not seem to make a difference)
     // 16 * 2, accounting for mmla kernels

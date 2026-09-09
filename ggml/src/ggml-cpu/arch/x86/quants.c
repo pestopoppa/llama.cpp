@@ -1482,6 +1482,219 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+#if defined(__AVX2__)
+#define GGML_Q8_BATCH_Y_STEP(ir) do {                                                                     \
+    const __m256 d##ir = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y##ir[ib].d));                         \
+    const __m256i qy##ir = _mm256_loadu_si256((const __m256i *) y##ir[ib].qs);                            \
+    const __m256 q##ir = mul_sum_i8_pairs_float(qx, qy##ir);                                              \
+    acc##ir = _mm256_fmadd_ps(d##ir, q##ir, acc##ir);                                                     \
+} while (0)
+
+static void ggml_vec_dot_q8_0_q8_0_batch_y_2(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const __m256i qx = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        GGML_Q8_BATCH_Y_STEP(0);
+        GGML_Q8_BATCH_Y_STEP(1);
+    }
+    s[0] = hsum_float_8(acc0);
+    s[bs] = hsum_float_8(acc1);
+}
+
+static void ggml_vec_dot_q8_0_q8_0_batch_y_3(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    const block_q8_0 * GGML_RESTRICT y2 = (const block_q8_0 *) ((const char *) vy + 2 * by);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const __m256i qx = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        GGML_Q8_BATCH_Y_STEP(0);
+        GGML_Q8_BATCH_Y_STEP(1);
+        GGML_Q8_BATCH_Y_STEP(2);
+    }
+    s[0] = hsum_float_8(acc0);
+    s[bs] = hsum_float_8(acc1);
+    s[2 * bs] = hsum_float_8(acc2);
+}
+
+static void ggml_vec_dot_q8_0_q8_0_batch_y_4(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    const block_q8_0 * GGML_RESTRICT y2 = (const block_q8_0 *) ((const char *) vy + 2 * by);
+    const block_q8_0 * GGML_RESTRICT y3 = (const block_q8_0 *) ((const char *) vy + 3 * by);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const __m256i qx = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        GGML_Q8_BATCH_Y_STEP(0);
+        GGML_Q8_BATCH_Y_STEP(1);
+        GGML_Q8_BATCH_Y_STEP(2);
+        GGML_Q8_BATCH_Y_STEP(3);
+    }
+    s[0] = hsum_float_8(acc0);
+    s[bs] = hsum_float_8(acc1);
+    s[2 * bs] = hsum_float_8(acc2);
+    s[3 * bs] = hsum_float_8(acc3);
+}
+
+#define GGML_Q8_BATCH_XY2_STEP(ir) do {                                                                    \
+    const __m256i qy##ir = _mm256_loadu_si256((const __m256i *) y##ir[ib].qs);                             \
+    const __m256 q0##ir = mul_sum_i8_pairs_float(qx0, qy##ir);                                             \
+    const __m256 q1##ir = mul_sum_i8_pairs_float(qx1, qy##ir);                                             \
+    const float dy##ir = GGML_CPU_FP16_TO_FP32(y##ir[ib].d);                                               \
+    const __m256 d0##ir = _mm256_set1_ps(dx0 * dy##ir);                                                    \
+    const __m256 d1##ir = _mm256_set1_ps(dx1 * dy##ir);                                                    \
+    acc0##ir = _mm256_fmadd_ps(d0##ir, q0##ir, acc0##ir);                                                  \
+    acc1##ir = _mm256_fmadd_ps(d1##ir, q1##ir, acc1##ir);                                                  \
+} while (0)
+
+static void ggml_vec_dot_q8_0_q8_0_batch_xy2_2(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x0 = vx;
+    const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *) ((const char *) vx + bx);
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    __m256 acc00 = _mm256_setzero_ps();
+    __m256 acc10 = _mm256_setzero_ps();
+    __m256 acc01 = _mm256_setzero_ps();
+    __m256 acc11 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+        const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *) x0[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *) x1[ib].qs);
+        GGML_Q8_BATCH_XY2_STEP(0);
+        GGML_Q8_BATCH_XY2_STEP(1);
+    }
+    s[0] = hsum_float_8(acc00);
+    s[1] = hsum_float_8(acc10);
+    s[bs] = hsum_float_8(acc01);
+    s[bs + 1] = hsum_float_8(acc11);
+}
+
+static void ggml_vec_dot_q8_0_q8_0_batch_xy2_3(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x0 = vx;
+    const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *) ((const char *) vx + bx);
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    const block_q8_0 * GGML_RESTRICT y2 = (const block_q8_0 *) ((const char *) vy + 2 * by);
+    __m256 acc00 = _mm256_setzero_ps();
+    __m256 acc10 = _mm256_setzero_ps();
+    __m256 acc01 = _mm256_setzero_ps();
+    __m256 acc11 = _mm256_setzero_ps();
+    __m256 acc02 = _mm256_setzero_ps();
+    __m256 acc12 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+        const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *) x0[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *) x1[ib].qs);
+        GGML_Q8_BATCH_XY2_STEP(0);
+        GGML_Q8_BATCH_XY2_STEP(1);
+        GGML_Q8_BATCH_XY2_STEP(2);
+    }
+    s[0] = hsum_float_8(acc00);
+    s[1] = hsum_float_8(acc10);
+    s[bs] = hsum_float_8(acc01);
+    s[bs + 1] = hsum_float_8(acc11);
+    s[2 * bs] = hsum_float_8(acc02);
+    s[2 * bs + 1] = hsum_float_8(acc12);
+}
+
+static void ggml_vec_dot_q8_0_q8_0_batch_xy2_4(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by) {
+    const block_q8_0 * GGML_RESTRICT x0 = vx;
+    const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *) ((const char *) vx + bx);
+    const block_q8_0 * GGML_RESTRICT y0 = vy;
+    const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+    const block_q8_0 * GGML_RESTRICT y2 = (const block_q8_0 *) ((const char *) vy + 2 * by);
+    const block_q8_0 * GGML_RESTRICT y3 = (const block_q8_0 *) ((const char *) vy + 3 * by);
+    __m256 acc00 = _mm256_setzero_ps();
+    __m256 acc10 = _mm256_setzero_ps();
+    __m256 acc01 = _mm256_setzero_ps();
+    __m256 acc11 = _mm256_setzero_ps();
+    __m256 acc02 = _mm256_setzero_ps();
+    __m256 acc12 = _mm256_setzero_ps();
+    __m256 acc03 = _mm256_setzero_ps();
+    __m256 acc13 = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < n / QK8_0; ++ib) {
+        const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+        const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+        const __m256i qx0 = _mm256_loadu_si256((const __m256i *) x0[ib].qs);
+        const __m256i qx1 = _mm256_loadu_si256((const __m256i *) x1[ib].qs);
+        GGML_Q8_BATCH_XY2_STEP(0);
+        GGML_Q8_BATCH_XY2_STEP(1);
+        GGML_Q8_BATCH_XY2_STEP(2);
+        GGML_Q8_BATCH_XY2_STEP(3);
+    }
+    s[0] = hsum_float_8(acc00);
+    s[1] = hsum_float_8(acc10);
+    s[bs] = hsum_float_8(acc01);
+    s[bs + 1] = hsum_float_8(acc11);
+    s[2 * bs] = hsum_float_8(acc02);
+    s[2 * bs + 1] = hsum_float_8(acc12);
+    s[3 * bs] = hsum_float_8(acc03);
+    s[3 * bs + 1] = hsum_float_8(acc13);
+}
+
+#undef GGML_Q8_BATCH_Y_STEP
+#undef GGML_Q8_BATCH_XY2_STEP
+#endif
+
+void ggml_vec_dot_q8_0_q8_0_batch_y(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK8_0 == 0);
+    assert(nrc >= 1 && nrc <= 4);
+
+#if defined(__AVX2__)
+    switch (nrc) {
+        case 2: ggml_vec_dot_q8_0_q8_0_batch_y_2(n, s, bs, vx, vy, by); return;
+        case 3: ggml_vec_dot_q8_0_q8_0_batch_y_3(n, s, bs, vx, vy, by); return;
+        case 4: ggml_vec_dot_q8_0_q8_0_batch_y_4(n, s, bs, vx, vy, by); return;
+        default: break;
+    }
+#endif
+    ggml_vec_dot_q8_0_q8_0_batch_y_generic(n, s, bs, vx, vy, by, nrc);
+}
+
+void ggml_vec_dot_q8_0_q8_0_batch_xy2(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK8_0 == 0);
+    assert(nrc >= 1 && nrc <= 4);
+
+#if defined(__AVX2__)
+    switch (nrc) {
+        case 2: ggml_vec_dot_q8_0_q8_0_batch_xy2_2(n, s, bs, vx, bx, vy, by); return;
+        case 3: ggml_vec_dot_q8_0_q8_0_batch_xy2_3(n, s, bs, vx, bx, vy, by); return;
+        case 4: ggml_vec_dot_q8_0_q8_0_batch_xy2_4(n, s, bs, vx, bx, vy, by); return;
+        default: break;
+    }
+#endif
+    ggml_vec_dot_q8_0_q8_0_batch_y_generic(n, s, bs, vx, vy, by, nrc);
+    ggml_vec_dot_q8_0_q8_0_batch_y_generic(n, s + 1, bs, (const char *) vx + bx, vy, by, nrc);
+}
+
 void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

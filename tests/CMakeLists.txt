@@ -183,6 +183,19 @@ llama_build(test-glm5next-real-divergence.cpp)
 llama_build(test-glm5next-mtp-state-kpool.cpp)
 llama_build(test-glm5next-rowexact-phase.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
+llama_build(test-iqk-expert-multirow.cpp)
+llama_build(test-q8-rowexact-batch.cpp)
+llama_build(bench-iqk-expert-multirow.cpp)
+if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    llama_test(test-iqk-expert-multirow)
+    set_tests_properties(test-iqk-expert-multirow PROPERTIES
+        PASS_REGULAR_EXPRESSION "\\[iqk\\] ACTIVE: exact expert multirow"
+        FAIL_REGULAR_EXPRESSION "differs|non-finite|size mismatch")
+endif()
+llama_test(test-q8-rowexact-batch)
+set_tests_properties(test-q8-rowexact-batch PROPERTIES
+    PASS_REGULAR_EXPRESSION "\\[q8\\] ACTIVE: exact row batch"
+    FAIL_REGULAR_EXPRESSION "mismatch|non-finite|[1-9][0-9]* failed")
 target_include_directories(test-glm5next-mtp-state-kpool PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

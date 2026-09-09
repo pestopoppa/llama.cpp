@@ -478,6 +478,14 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+void ggml_vec_dot_q8_0_q8_0_batch_y_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc >= 1 && nrc <= 4);
+
+    for (int ir = 0; ir < nrc; ++ir) {
+        ggml_vec_dot_q8_0_q8_0(n, s + ir * bs, 0, vx, 0, (const char *) vy + ir * by, 0, 1);
+    }
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

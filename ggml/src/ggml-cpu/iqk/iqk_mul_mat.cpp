@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
 #include <type_traits>
 #include <vector>
 #include <algorithm>
@@ -64,6 +65,22 @@ namespace {
 // GGML_ROWEXACT_N overrides the threshold (0 disables).
 static inline int iqk_rowexact_n() { return ggml_cpu_rowexact_n(); }
 
+static inline bool iqk_expert_multirow_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_IQK_EXPERT_MULTIROW");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+static inline bool iqk_expert_multirow_trace() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_IQK_EXPERT_MULTIROW_TRACE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 // GGML_IQK_DEQUANT=0 keeps every type on its direct kernel (no weight requantisation to Q8 at
 // large Ny). Diagnostic/serving knob; default on (upstream behaviour) except for the types
 // excluded below.
@@ -79,6 +96,7 @@ static inline bool iqk_dequant_enabled() {
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
+    bool expert_multirow_capable = false;
     inline void mul_mat_NxM(int n, const void * vx, size_t bx, DataInfo& info, int nrc_x, int nrc_y) {
 #ifdef __aarch64__
         constexpr int k_x_step = 64; //8192; // Tiling does not seem to help on my M2 Max (but difference to tiling is small)
@@ -87,13 +105,31 @@ struct MulMat {
 #endif
         if (const int n_y = nrc_y - info.cur_y;
                 info.allow_rowexact && n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+            const bool expert_multirow = info.row_mapping && expert_multirow_capable &&
+                iqk_expert_multirow_enabled();
+            if (expert_multirow && iqk_expert_multirow_trace()) {
+                static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                if (!logged.test_and_set(std::memory_order_relaxed)) {
+                    fprintf(stderr, "[iqk] ACTIVE: exact expert multirow (rows=%d)\n", n_y);
+                }
+            }
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
-                for (int iy = 0; iy < n_y; ++iy) {
-                    funcs[0](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
-                    this_info.cur_y += 1;
+                if (expert_multirow) {
+                    for (int iy = 0; iy < n_y; ) {
+                        const int ny = std::min(4, n_y - iy);
+                        GGML_ASSERT(funcs[ny - 1] != nullptr);
+                        funcs[ny - 1](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                        this_info.cur_y += ny;
+                        iy += ny;
+                    }
+                } else {
+                    for (int iy = 0; iy < n_y; ++iy) {
+                        funcs[0](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                        this_info.cur_y += 1;
+                    }
                 }
             }
             info.cur_y = nrc_y;
@@ -1013,6 +1049,8 @@ namespace {
 bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
 
     (void)Ny;
+    mm.expert_multirow_capable =
+        (typeA == GGML_TYPE_Q4_K || typeA == GGML_TYPE_Q5_K) && typeB == GGML_TYPE_Q8_2_X4;
 
     switch (typeA) {
         case GGML_TYPE_F16:
