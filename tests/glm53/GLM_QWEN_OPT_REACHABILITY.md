@@ -57,7 +57,7 @@ The most relevant prior controls are preserved rather than repeated:
 The GLM profile and its evidence limits are documented in
 `/workspace/docs/reference/models/glm53-cpu-profile-20260908.md`. The real GLM shape trace is retained at
 `/mnt/raid0/llm/tmp/glm53-validation-20260908/runtime/mm-shape-trace-20260908T223524Z/`.
-Validation completed on the diagnostic-free final library:
+Validation of the Q8 cutoff and logical-row correction used the diagnostic-free intermediate library below. This build predates phase-scoped row exactness and failed the later plain original-reference gate:
 
 - Fresh processes at `GGML_IQK_Q8_0_MIN_ROWS=32` observed IQK inactive at
   rows 1, 4, and 31, and active at rows 32, 33, 40, and 48. All seven real
@@ -71,16 +71,25 @@ Validation completed on the diagnostic-free final library:
   absolute logit difference zero and argmax 1246, matching serial. Evidence:
   `/mnt/raid0/llm/tmp/glm53-validation-20260908/runtime/rowexact-logical-control-20260908T224928Z/`;
   N16 result SHA-256 `b2301ba14d1cd75b97d3678d2018a6d083f82b3486f08bb65838e932ec127c02`, comparator binary SHA-256 `ed4abf02810019a962b559409bad1eaace6f995d9fe663640276df5e24f826a5`.
-- Final `libggml-cpu.so` SHA-256 is
+- Superseded intermediate `libggml-cpu.so` SHA-256 is
   `1cc8346f94305cde426be3b23e4076586432af3a098fb044c5c994103870d0ae`;
-  final `llama-server` SHA-256 is
+  its `llama-server` SHA-256 is
   `c23fe97c585072496142a7d99eecc2e128841f9d77bd1544d5c69398850748b7`.
   The library contains `GGML_IQK_Q8_0_MIN_ROWS` and contains no
   `GGML_MM_SHAPE_TRACE`, `MM_SHAPE`, or `MMID_SHAPE` strings.
 
-The full source diff used for these binaries is retained at
+The superseded intermediate source diff used for those binaries is retained at
 `/mnt/raid0/llm/tmp/glm53-validation-20260908/final-q8-source-before-benchmark.patch`,
 SHA-256 `bfd3dbe8a9ea36f2d02258c3b808d065a0e94a1beeee2aed54db89acc289674d`.
+
+
+Committed phase-scoped source is candidate commit `04ffb8ad0` (`cpu: gate Q8
+prefill and scope row-exact MTP verification`). Final rebuilt binary identities:
+
+- `libggml-cpu.so`: `8c5a352b3b899aed15b2dcb827d9a55bbac53f5baece2ec904c9c9043a3024bf`
+- `libllama.so`: `f81b1fc28c677ff93fd117ab94413d3ce7962714a399fad448d4411485c4e07f`
+- `libllama-server-impl.so`: `a3ad4f4554942cad305d7fc32d50f6cf95557d298e2339e7e89f09db186a8c60`
+- `llama-server`: `8ce86a370cad067bcc1e9b2bacc7ca74364ab6a94df1d2f3546284c95de3c9fe`
 
 ## Phase-scoped row exactness
 

@@ -1,0 +1,99 @@
+{
+  "provenance": {
+    "canonical_prompts": {
+      "path": "/mnt/raid0/llm/tmp/inf70/agents/e3-alpha/prompts.json",
+      "sha256": "ea154096eb110850ab5be5e4f574e995e5dbf17540dcbb9461b8cc38c0855783"
+    },
+    "dataset_adapters": {
+      "path": "/workspace/repos/epyc-inference-research/scripts/benchmark/dataset_adapters.py",
+      "sha256": "038edd6ed93f2e7021baccc4955b1601422791faaaf798aa7754b1fa87a420fe"
+    },
+    "debug_scorer": {
+      "path": "/workspace/repos/epyc-inference-research/scripts/benchmark/debug_scorer.py",
+      "sha256": "88ace99c6392c36ea8cb1ed94e04b1eecabcfe878e45f65967b1fe3fff0bd3b1"
+    },
+    "lookup_question": {
+      "path": "/workspace/repos/epyc-inference-research/scripts/benchmark/lookup_question.py",
+      "sha256": "e2cae5d4953d9b3711099fb82b722a1936ffbf0c3e1513f4e76e4484f26f1d29"
+    }
+  },
+  "rows": [
+    {
+      "adapter_prompt_sha256": "10a1407279ddead16222780e29795a0279d41a399cdd516a51d7b6bc8cd705c9",
+      "canonical_prompt_equal_adapter": true,
+      "canonical_prompt_sha256": "10a1407279ddead16222780e29795a0279d41a399cdd516a51d7b6bc8cd705c9",
+      "canonical_source_ordinal": 8,
+      "expected": "98",
+      "id": "gsm8k_00739",
+      "prompt": "Cecelia went to the milk store and found out that a gallon jar costs $2 more than a half-gallon jar. If a gallon jar costs $5, calculate the total amount of money she spent on 10-gallon jars and 16 half-gallon jars.\n\nSolve step by step. Put your final numeric answer inside <answer></answer> tags.",
+      "scoring_config": {
+        "extract_pattern": "<answer>(.*?)</answer>"
+      },
+      "scoring_method": "exact_match",
+      "suite": "math",
+      "tier": 1
+    },
+    {
+      "adapter_prompt_sha256": "c41917c9bd465a7b6b97f4819a8315acb103fc52fe47ad67dae51e046a8aa485",
+      "canonical_prompt_equal_adapter": true,
+      "canonical_prompt_sha256": "c41917c9bd465a7b6b97f4819a8315acb103fc52fe47ad67dae51e046a8aa485",
+      "canonical_source_ordinal": 9,
+      "expected": "90",
+      "id": "gsm8k_00115",
+      "prompt": "Sasha notices that prices for lumber have gone up 50% in the last few months after she bought some lumber. Since she has leftovers, she decides to sell them. She has leftover ten 2 x 4 x 10 boards that cost her $10 each. She also has five 4 x 4 x 10 boards she bought for $16 each. If she sells them all, how much profit does she make?\n\nSolve step by step. Put your final numeric answer inside <answer></answer> tags.",
+      "scoring_config": {
+        "extract_pattern": "<answer>(.*?)</answer>"
+      },
+      "scoring_method": "exact_match",
+      "suite": "math",
+      "tier": 1
+    },
+    {
+      "adapter_prompt_sha256": "949c416af9b63e15d2ced8cc874e4e034f4da25dd7c345c4952b001f6f45ca71",
+      "canonical_prompt_equal_adapter": true,
+      "canonical_prompt_sha256": "949c416af9b63e15d2ced8cc874e4e034f4da25dd7c345c4952b001f6f45ca71",
+      "canonical_source_ordinal": 10,
+      "expected": "200",
+      "id": "gsm8k_00041",
+      "prompt": "The great dragon, Perg, sat high atop mount Farbo, breathing fire upon anything within a distance of 1000 feet.  Polly could throw the gold javelin, the only known weapon that could sleigh the dragon, for a distance of 400 feet, well within the reach of the dragon's flames.  But when Polly held the sapphire gemstone, she could throw the javelin three times farther than when not holding the gemstone. If holding the gemstone, how far outside of the reach of the dragon's flames could Polly stand and still hit the dragon with the gold javelin?\n\nSolve step by step. Put your final numeric answer inside <answer></answer> tags.",
+      "scoring_config": {
+        "extract_pattern": "<answer>(.*?)</answer>"
+      },
+      "scoring_method": "exact_match",
+      "suite": "math",
+      "tier": 1
+    },
+    {
+      "adapter_prompt_sha256": "35dd78a47eadc727bdc9dd55bf86d02308c84392686f92f71d20d985288aba1a",
+      "canonical_prompt_equal_adapter": true,
+      "canonical_prompt_sha256": "35dd78a47eadc727bdc9dd55bf86d02308c84392686f92f71d20d985288aba1a",
+      "canonical_source_ordinal": 22,
+      "expected": "Romanian",
+      "id": "simpleqa_general_01814",
+      "prompt": "What language is represented in Figure 4 of the text 'Generating Semantic Maps through Multidimensional Scaling: Linguistic Applications and Theory'?\n\nGive a short, precise answer. Put your final answer inside <answer></answer> tags.",
+      "scoring_config": {
+        "extract_pattern": "<answer>(.*?)</answer>",
+        "normalize": true,
+        "threshold": 0.8
+      },
+      "scoring_method": "f1",
+      "suite": "simpleqa",
+      "tier": 1
+    },
+    {
+      "adapter_prompt_sha256": "b7c7906697b1d47973e9e8904215498c524f7227d3901977ea9a01440ecfbf72",
+      "canonical_prompt_equal_adapter": true,
+      "canonical_prompt_sha256": "b7c7906697b1d47973e9e8904215498c524f7227d3901977ea9a01440ecfbf72",
+      "canonical_source_ordinal": 23,
+      "expected": "B",
+      "id": "hellaswag_06230",
+      "prompt": "Choose the most plausible continuation:\n\nContext: . a man wearing a black t - shirt and to ladies\n\nA) breasts is standing in a room talking.\nB) stand behind a counter in a kitchen.\nC) training helmet is picking up a white ball that is in a basket on a table.\nD) right is holding a camera while walking in the air.\n\nAnswer with the letter only (A, B, C, or D).",
+      "scoring_config": {},
+      "scoring_method": "multiple_choice",
+      "suite": "thinking",
+      "tier": 1
+    }
+  ],
+  "schema": "glm53-bounded-quality-manifest-v1",
+  "selection": "fixed canonical production-mix subset: 3 GSM8K, 1 SimpleQA, 1 HellaSwag"
+}

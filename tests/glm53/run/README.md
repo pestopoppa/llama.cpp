@@ -56,3 +56,20 @@ rendering, and report generation happen outside the recorded windows.
 The instrument owns and stops only the two `perf` PIDs it launches. Its evidence
 is observational unless the caller also records the server recipe, binary and
 library identities, physical region lock, contention samples, and model identity.
+
+The final suite drivers preserve the pinned canonical, quality, repeated-decode,
+long-prefill, and distinct-prompt inputs used by the committed GLM validation.
+They connect to an already owned server; the wrapper still owns locking, process
+lifecycle, library identity, and server logs.
+
+```bash
+python3 final_plain_suite.py --port 18497 --out final-plain \
+  --scorer-root /path/to/epyc-inference-research/scripts/benchmark
+python3 final_mtp_suite.py --port 18497 --out final-mtp \
+  --scorer-root /path/to/epyc-inference-research/scripts/benchmark
+python3 -m unittest -v test_run_glm53_arm.py test_final_workload_clients.py
+```
+
+The canonical client's content-only SALAD label is a degeneracy diagnostic. It
+is not a quality score for responses whose generated text is carried in the
+separate reasoning field.
