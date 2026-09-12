@@ -2216,7 +2216,11 @@ void iqk_convert_q4_k_q8_1_r8(int n, const void * vx, size_t bx, void * vy, int 
 
     uint32_t utmp[4];
     const uint8_t * u8 = (const uint8_t *)utmp;
+#ifndef HAVE_FANCY_SIMD
     uint32_t block[8];
+#else
+    const __m512i transpose = _mm512_setr_epi64(0, 1, 4, 5, 2, 3, 6, 7);
+#endif
 
     for (int ix = 0; ix < nrc_x; ix += 8) {
         for (int k = 0; k < 8; ++k) x8[k] = (const block_q4_K *)((const char *)vx + (ix + k)*bx);
@@ -2225,12 +2229,47 @@ void iqk_convert_q4_k_q8_1_r8(int n, const void * vx, size_t bx, void * vy, int 
                 dh[k+0] = x8[k][i].d;
                 dh[k+8] = x8[k][i].dmin;
                 make_q4_scales(x8[k][i].scales, utmp);
-                auto qs  = x8[k][i].qs;
                 for (int ib64 = 0; ib64 < 4; ++ib64) {
                     all_ls[8*(2*ib64 + 0) + k     ] = u8[2*ib64+0];
                     all_ls[8*(2*ib64 + 1) + k     ] = u8[2*ib64+1];
                     all_ls[8*(2*ib64 + 0) + k + 64] = u8[2*ib64+8];
                     all_ls[8*(2*ib64 + 1) + k + 64] = u8[2*ib64+9];
+                }
+            }
+#ifdef HAVE_FANCY_SIMD
+            for (int ib64 = 0; ib64 < 4; ++ib64) {
+                __m512i values[2][4];
+                for (int k = 0; k < 4; ++k) {
+                    auto bits0 = _mm256_loadu_si256((const __m256i *)x8[k+0][i].qs + ib64);
+                    auto bits4 = _mm256_loadu_si256((const __m256i *)x8[k+4][i].qs + ib64);
+                    auto low0  = _mm256_and_si256(bits0, _mm256_set1_epi8(0xf));
+                    auto low4  = _mm256_and_si256(bits4, _mm256_set1_epi8(0xf));
+                    auto high0 = _mm256_and_si256(_mm256_srli_epi16(bits0, 4), _mm256_set1_epi8(0xf));
+                    auto high4 = _mm256_and_si256(_mm256_srli_epi16(bits4, 4), _mm256_set1_epi8(0xf));
+                    values[0][k] = _mm512_inserti32x8(_mm512_castsi256_si512(low0),  low4,  1);
+                    values[1][k] = _mm512_inserti32x8(_mm512_castsi256_si512(high0), high4, 1);
+                }
+                for (int j = 0; j < 2; ++j) {
+                    auto t0 = _mm512_unpacklo_epi32(values[j][0], values[j][1]);
+                    auto t1 = _mm512_unpacklo_epi32(values[j][2], values[j][3]);
+                    auto t2 = _mm512_unpackhi_epi32(values[j][0], values[j][1]);
+                    auto t3 = _mm512_unpackhi_epi32(values[j][2], values[j][3]);
+                    values[j][0] = _mm512_unpacklo_epi64(t0, t1);
+                    values[j][1] = _mm512_unpackhi_epi64(t0, t1);
+                    values[j][2] = _mm512_unpacklo_epi64(t2, t3);
+                    values[j][3] = _mm512_unpackhi_epi64(t2, t3);
+                    auto q8 = (uint32_t *)y[2*ib64+j].qs;
+                    for (int l = 0; l < 4; ++l) {
+                        auto v = _mm512_permutexvar_epi64(transpose, values[j][l]);
+                        _mm256_storeu_si256((__m256i *)(q8 + 8*(l+0)), _mm512_castsi512_si256(v));
+                        _mm256_storeu_si256((__m256i *)(q8 + 8*(l+4)), _mm512_extracti64x4_epi64(v, 1));
+                    }
+                }
+            }
+#else
+            for (int k = 0; k < 8; ++k) {
+                auto qs = x8[k][i].qs;
+                for (int ib64 = 0; ib64 < 4; ++ib64) {
                     auto bits = _mm256_loadu_si256((const __m256i *)qs+ib64);
                     auto values1 = _mm256_and_si256(bits, _mm256_set1_epi8(0xf));
                     auto values2 = _mm256_and_si256(_mm256_srli_epi16(bits, 4), _mm256_set1_epi8(0xf));
@@ -2248,6 +2287,7 @@ void iqk_convert_q4_k_q8_1_r8(int n, const void * vx, size_t bx, void * vy, int 
                     }
                 }
             }
+#endif
             auto vd = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)dh+0));
             auto vm = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)dh+1));
             vm = _mm256_mul_ps(_mm256_set1_ps(-1.f), vm);
