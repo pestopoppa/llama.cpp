@@ -776,15 +776,34 @@ struct DequantizerQ5K_AVX2 final : public BaseDequantizer<block_q5_K> {
     DequantizerQ5K_AVX2(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
     inline void prepare(int i, int j) {
         bits.prepare(x[i].qs, j);
-        hbits = j == 0 ? _mm256_loadu_si256((const __m256i *)x[i].qh) : _mm256_srli_epi16(hbits, 4);
+        if (j == 0) {
+            hbits = _mm256_loadu_si256((const __m256i *)x[i].qh);
+        }
+#ifdef HAVE_FANCY_SIMD
+        apply_hbits(j);
+#else
+        if (j != 0) {
+            hbits = _mm256_srli_epi16(hbits, 4);
+        }
         apply_hbits();
+#endif
     }
+#ifdef HAVE_FANCY_SIMD
+    inline void apply_hbits(int j) {
+        const int shift = 4*j;
+        bits.values[0] = _mm256_mask_add_epi8(bits.values[0], _mm256_test_epi8_mask(hbits, _mm256_set1_epi8(1 << (shift + 0))), bits.values[0], mh);
+        bits.values[1] = _mm256_mask_add_epi8(bits.values[1], _mm256_test_epi8_mask(hbits, _mm256_set1_epi8(1 << (shift + 1))), bits.values[1], mh);
+        bits.values[2] = _mm256_mask_add_epi8(bits.values[2], _mm256_test_epi8_mask(hbits, _mm256_set1_epi8(1 << (shift + 2))), bits.values[2], mh);
+        bits.values[3] = _mm256_mask_add_epi8(bits.values[3], _mm256_test_epi8_mask(hbits, _mm256_set1_epi8(1 << (shift + 3))), bits.values[3], mh);
+    }
+#else
     inline void apply_hbits() {
         bits.values[0] = _mm256_or_si256(bits.values[0], _mm256_and_si256(_mm256_slli_epi16(hbits, 4), mh));
         bits.values[1] = _mm256_or_si256(bits.values[1], _mm256_and_si256(_mm256_slli_epi16(hbits, 3), mh));
         bits.values[2] = _mm256_or_si256(bits.values[2], _mm256_and_si256(_mm256_slli_epi16(hbits, 2), mh));
         bits.values[3] = _mm256_or_si256(bits.values[3], _mm256_and_si256(_mm256_slli_epi16(hbits, 1), mh));
     }
+#endif
 
     const __m256i mh = _mm256_set1_epi8(0x10);
     Q4Bits_AVX2 bits;
