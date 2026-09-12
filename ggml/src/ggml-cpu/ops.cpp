@@ -9603,11 +9603,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             nchunk = nth;
         }
 
-        if (ith == 0) {
-            ggml_threadpool_chunk_set(params->threadpool, nth);
-        }
+        const bool use_static_chunks = neq1 <= 4;
 
-        ggml_barrier(params->threadpool);
+        if (!use_static_chunks) {
+            if (ith == 0) {
+                ggml_threadpool_chunk_set(params->threadpool, nth);
+            }
+
+            ggml_barrier(params->threadpool);
+        }
 
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
@@ -9637,7 +9641,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
             }
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            if (use_static_chunks) {
+                current_chunk += nth;
+            } else {
+                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            }
         }
     }
 }
