@@ -12382,6 +12382,40 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
 
 // ggml_compute_forward_lightning_indexer
 
+#if defined(__AVX512F__)
+static inline void ggml_vec_dot_f32_f16_4_avx512(
+        int n, float * s, const float * const q[4], const ggml_fp16_t * k) {
+    const int np = n & ~63;
+    __m512 sum[4][4];
+
+    for (int h = 0; h < 4; ++h) {
+        for (int j = 0; j < 4; ++j) {
+            sum[h][j] = _mm512_setzero_ps();
+        }
+    }
+
+    for (int i = 0; i < np; i += 64) {
+        for (int j = 0; j < 4; ++j) {
+            const int offset = i + 16*j;
+            const __m512 vk = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (k + offset)));
+            for (int h = 0; h < 4; ++h) {
+                sum[h][j] = _mm512_fmadd_ps(_mm512_loadu_ps(q[h] + offset), vk, sum[h][j]);
+            }
+        }
+    }
+
+    for (int h = 0; h < 4; ++h) {
+        sum[h][0] = _mm512_add_ps(sum[h][0], sum[h][2]);
+        sum[h][1] = _mm512_add_ps(sum[h][1], sum[h][3]);
+        sum[h][0] = _mm512_add_ps(sum[h][0], sum[h][1]);
+        s[h] = (float) _mm512_reduce_add_ps(sum[h][0]);
+        for (int i = np; i < n; ++i) {
+            s[h] += q[h][i]*GGML_CPU_FP16_TO_FP32(k[i]);
+        }
+    }
+}
+#endif
+
 void ggml_compute_forward_lightning_indexer(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -12443,6 +12477,34 @@ void ggml_compute_forward_lightning_indexer(
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
+#if defined(__AVX512F__)
+                if (k->type == GGML_TYPE_F16) {
+                    float score = 0.0f;
+                    int h = 0;
+                    for (; h + 4 <= n_head; h += 4) {
+                        const float * q_rows[4];
+                        for (int j = 0; j < 4; ++j) {
+                            q_rows[j] = (const float *) ((const char *) q->data + (h + j)*nbq1 + t*nbq2 + s*nbq3);
+                        }
+                        float qk[4];
+                        ggml_vec_dot_f32_f16_4_avx512(n_embd, qk, q_rows, (const ggml_fp16_t *) k_row);
+                        for (int j = 0; j < 4; ++j) {
+                            score += MAX(qk[j], 0.0f) * w_row[h + j];
+                        }
+                    }
+                    if (h < n_head) {
+                        k_to_float(k_row, k_row_f32, n_embd);
+                        for (; h < n_head; ++h) {
+                            float qk = 0.0f;
+                            const float * q_row = (const float *) ((const char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
+                            ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
+                            score += MAX(qk, 0.0f) * w_row[h];
+                        }
+                    }
+                    dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                    continue;
+                }
+#endif
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
                 } else {
