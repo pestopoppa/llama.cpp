@@ -851,6 +851,18 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
             for (int i = 0; i < nb; ++i) {
                 Dequantizer * deqs[2] = {&deq, &deq2};
 
+                __m256 dy_shared;
+                __m256 my_shared;
+                if constexpr (nrc_y == 1) {
+                    auto d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+0].d)));
+                    auto d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+1].d)));
+                    dy_shared = _mm256_castsi256_ps(_mm256_slli_epi32(MM256_SET_M128I(d4_2, d4_1), 16));
+                    _mm256_storeu_ps(d8, dy_shared);
+                    auto m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+0].d+4)));
+                    auto m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+1].d+4)));
+                    my_shared = _mm256_mul_ps(dy_shared, _mm256_cvtepi32_ps(MM256_SET_M128I(m4_2, m4_1)));
+                }
+
                 for (int k = 0; k < 2; ++k) {
                     deqs[k]->d = GGML_FP16_TO_FP32(deqs[k]->x[i].d);
                     auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deqs[k]->x[i].dmin));
@@ -859,15 +871,20 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                         _mm_loadl_epi64((const __m128i *)(utmp2[k] + 2)))));
                     mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins);
                     for (int iy = 0; iy < nrc_y; ++iy) {
-                        auto d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d)));
-                        auto d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+1].d)));
-                        auto dy = _mm256_castsi256_ps(_mm256_slli_epi32(MM256_SET_M128I(d4_2, d4_1), 16));
-                        if (k == 0) {
-                            _mm256_storeu_ps(d8 + 8*iy, dy);
+                        __m256 my;
+                        if constexpr (nrc_y == 1) {
+                            my = my_shared;
+                        } else {
+                            auto d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d)));
+                            auto d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+1].d)));
+                            auto dy = _mm256_castsi256_ps(_mm256_slli_epi32(MM256_SET_M128I(d4_2, d4_1), 16));
+                            if (k == 0) {
+                                _mm256_storeu_ps(d8 + 8*iy, dy);
+                            }
+                            auto m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d+4)));
+                            auto m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+1].d+4)));
+                            my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(MM256_SET_M128I(m4_2, m4_1)));
                         }
-                        auto m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d+4)));
-                        auto m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+1].d+4)));
-                        auto my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(MM256_SET_M128I(m4_2, m4_1)));
                         accd2[k][iy] = _mm256_fmadd_ps(my, mins, accd2[k][iy]);
                     }
 
