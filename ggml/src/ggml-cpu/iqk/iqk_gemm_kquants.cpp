@@ -835,6 +835,48 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
             auto scales_h = _mm256_extractf128_ps(all_scales, 1);
             scales[1] = _mm256_set_m128(scales_h, scales_h);
 
+#ifdef HAVE_FANCY_SIMD
+            if constexpr (std::is_same_v<Dequantizer, DequantizerQ4K_AVX2>) {
+                const __m256i q4_0 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 0);
+                const __m256i q4_1 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 1);
+                const __m256i q4_2 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 2);
+                const __m256i q4_3 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 3);
+                const __m512i ml = _mm512_set1_epi8(0xf);
+                __m512i qx[4];
+                qx[0] = _mm512_and_si512(_mm512_inserti32x8(_mm512_castsi256_si512(q4_0), q4_2, 1), ml);
+                qx[1] = _mm512_and_si512(_mm512_srli_epi16(
+                            _mm512_inserti32x8(_mm512_castsi256_si512(q4_0), q4_2, 1), 4), ml);
+                qx[2] = _mm512_and_si512(_mm512_inserti32x8(_mm512_castsi256_si512(q4_1), q4_3, 1), ml);
+                qx[3] = _mm512_and_si512(_mm512_srli_epi16(
+                            _mm512_inserti32x8(_mm512_castsi256_si512(q4_1), q4_3, 1), 4), ml);
+
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    const block_q8_2_x4& y0 = q8.y[iy][2*i+0];
+                    const block_q8_2_x4& y1 = q8.y[iy][2*i+1];
+                    __m512i qy[4];
+                    for (int k = 0; k < 4; ++k) {
+                        qy[k] = _mm512_inserti32x8(
+                            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)y0.qs + k)),
+                            _mm256_loadu_si256((const __m256i *)y1.qs + k), 1);
+                    }
+
+                    auto sumi1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[0], qy[0]);
+                    auto sumi2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[1], qy[1]);
+                    auto sumi3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[2], qy[2]);
+                    auto sumi4 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[3], qy[3]);
+                    sumi1 = _mm512_add_epi32(_mm512_unpacklo_epi32(sumi1, sumi2), _mm512_unpackhi_epi32(sumi1, sumi2));
+                    sumi3 = _mm512_add_epi32(_mm512_unpacklo_epi32(sumi3, sumi4), _mm512_unpackhi_epi32(sumi3, sumi4));
+                    sumi1 = _mm512_add_epi32(_mm512_unpacklo_epi64(sumi1, sumi3), _mm512_unpackhi_epi64(sumi1, sumi3));
+
+                    auto dy4 = _mm_loadu_ps(d8 + 8*iy + 0);
+                    auto d4d8 = _mm256_mul_ps(scales[0], _mm256_set_m128(dy4, dy4));
+                    accd[iy] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(_mm512_castsi512_si256(sumi1)), accd[iy]);
+                    dy4 = _mm_loadu_ps(d8 + 8*iy + 4);
+                    d4d8 = _mm256_mul_ps(scales[1], _mm256_set_m128(dy4, dy4));
+                    accd[iy] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(_mm512_extracti32x8_epi32(sumi1, 1)), accd[iy]);
+                }
+            } else
+#endif
             for (int j = 0; j < QK_K/128; ++j) {
 
                 deq.prepare(i, j);
