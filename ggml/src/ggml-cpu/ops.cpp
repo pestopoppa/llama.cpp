@@ -9044,6 +9044,80 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
+#if defined(__AVX512F__) && defined(__F16C__)
+static inline void ggml_flash_attn_ext_pack_k_f16_16x16(
+        const char * src, size_t src_stride, float * dst, int64_t dst_stride) {
+    const __m512 r0  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  0*src_stride)));
+    const __m512 r1  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  1*src_stride)));
+    const __m512 r2  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  2*src_stride)));
+    const __m512 r3  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  3*src_stride)));
+    const __m512 r4  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  4*src_stride)));
+    const __m512 r5  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  5*src_stride)));
+    const __m512 r6  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  6*src_stride)));
+    const __m512 r7  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  7*src_stride)));
+    const __m512 r8  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  8*src_stride)));
+    const __m512 r9  = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src +  9*src_stride)));
+    const __m512 r10 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 10*src_stride)));
+    const __m512 r11 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 11*src_stride)));
+    const __m512 r12 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 12*src_stride)));
+    const __m512 r13 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 13*src_stride)));
+    const __m512 r14 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 14*src_stride)));
+    const __m512 r15 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (src + 15*src_stride)));
+
+    const __m512 t0  = _mm512_unpacklo_ps(r0,  r1);
+    const __m512 t1  = _mm512_unpackhi_ps(r0,  r1);
+    const __m512 t2  = _mm512_unpacklo_ps(r2,  r3);
+    const __m512 t3  = _mm512_unpackhi_ps(r2,  r3);
+    const __m512 t4  = _mm512_unpacklo_ps(r4,  r5);
+    const __m512 t5  = _mm512_unpackhi_ps(r4,  r5);
+    const __m512 t6  = _mm512_unpacklo_ps(r6,  r7);
+    const __m512 t7  = _mm512_unpackhi_ps(r6,  r7);
+    const __m512 t8  = _mm512_unpacklo_ps(r8,  r9);
+    const __m512 t9  = _mm512_unpackhi_ps(r8,  r9);
+    const __m512 t10 = _mm512_unpacklo_ps(r10, r11);
+    const __m512 t11 = _mm512_unpackhi_ps(r10, r11);
+    const __m512 t12 = _mm512_unpacklo_ps(r12, r13);
+    const __m512 t13 = _mm512_unpackhi_ps(r12, r13);
+    const __m512 t14 = _mm512_unpacklo_ps(r14, r15);
+    const __m512 t15 = _mm512_unpackhi_ps(r14, r15);
+
+    const __m512 s0  = _mm512_shuffle_ps(t0,  t2,  0x44);
+    const __m512 s1  = _mm512_shuffle_ps(t0,  t2,  0xee);
+    const __m512 s2  = _mm512_shuffle_ps(t1,  t3,  0x44);
+    const __m512 s3  = _mm512_shuffle_ps(t1,  t3,  0xee);
+    const __m512 s4  = _mm512_shuffle_ps(t4,  t6,  0x44);
+    const __m512 s5  = _mm512_shuffle_ps(t4,  t6,  0xee);
+    const __m512 s6  = _mm512_shuffle_ps(t5,  t7,  0x44);
+    const __m512 s7  = _mm512_shuffle_ps(t5,  t7,  0xee);
+    const __m512 s8  = _mm512_shuffle_ps(t8,  t10, 0x44);
+    const __m512 s9  = _mm512_shuffle_ps(t8,  t10, 0xee);
+    const __m512 s10 = _mm512_shuffle_ps(t9,  t11, 0x44);
+    const __m512 s11 = _mm512_shuffle_ps(t9,  t11, 0xee);
+    const __m512 s12 = _mm512_shuffle_ps(t12, t14, 0x44);
+    const __m512 s13 = _mm512_shuffle_ps(t12, t14, 0xee);
+    const __m512 s14 = _mm512_shuffle_ps(t13, t15, 0x44);
+    const __m512 s15 = _mm512_shuffle_ps(t13, t15, 0xee);
+
+#define GGML_STORE_TRANSPOSED_16X16(i, a, b, c, d) do {                                   \
+        const __m512 p0 = _mm512_shuffle_f32x4(a, b, 0x88);                               \
+        const __m512 p1 = _mm512_shuffle_f32x4(c, d, 0x88);                               \
+        const __m512 p2 = _mm512_shuffle_f32x4(a, b, 0xdd);                               \
+        const __m512 p3 = _mm512_shuffle_f32x4(c, d, 0xdd);                               \
+        _mm512_storeu_ps(dst + (i +  0)*dst_stride, _mm512_shuffle_f32x4(p0, p1, 0x88));   \
+        _mm512_storeu_ps(dst + (i +  4)*dst_stride, _mm512_shuffle_f32x4(p2, p3, 0x88));   \
+        _mm512_storeu_ps(dst + (i +  8)*dst_stride, _mm512_shuffle_f32x4(p0, p1, 0xdd));   \
+        _mm512_storeu_ps(dst + (i + 12)*dst_stride, _mm512_shuffle_f32x4(p2, p3, 0xdd));   \
+    } while (0)
+
+    GGML_STORE_TRANSPOSED_16X16(0, s0, s4, s8,  s12);
+    GGML_STORE_TRANSPOSED_16X16(1, s1, s5, s9,  s13);
+    GGML_STORE_TRANSPOSED_16X16(2, s2, s6, s10, s14);
+    GGML_STORE_TRANSPOSED_16X16(3, s3, s7, s11, s15);
+
+#undef GGML_STORE_TRANSPOSED_16X16
+}
+#endif
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9214,14 +9288,34 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
-            for (int tk = 0; tk < kv_tile; tk++) {
-                const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (kv_type == GGML_TYPE_F16) {
+            if (kv_type == GGML_TYPE_F16) {
+                int tk = 0;
+#if defined(__AVX512F__) && defined(__F16C__)
+                for (; tk + 16 <= kv_tile; tk += 16) {
+                    int64_t dk = 0;
+                    for (; dk + 16 <= DK; dk += 16) {
+                        const char * k_data = (const char *) k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3 + dk*nbk0;
+                        ggml_flash_attn_ext_pack_k_f16_16x16(
+                            k_data, nbk1, K_f32 + dk*KV_TILE_SZ + tk, KV_TILE_SZ);
+                    }
+                    for (; dk < DK; dk++) {
+                        for (int i = 0; i < 16; i++) {
+                            const char * k_data = (const char *) k->data + (ic + tk + i)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                            K_f32[dk * KV_TILE_SZ + tk + i] = GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) k_data)[dk]);
+                        }
+                    }
+                }
+#endif
+                for (; tk < kv_tile; tk++) {
+                    const char * k_data = (const char *) k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
                     }
-                } else {
+                }
+            } else {
+                for (int tk = 0; tk < kv_tile; tk++) {
+                    const char * k_data = (const char *) k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
                     const float * k_f32_src = (const float *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
@@ -12361,4 +12455,3 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
-
