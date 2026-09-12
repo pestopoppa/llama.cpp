@@ -609,9 +609,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-#ifdef GGML_USE_OPENMP
-    #pragma omp barrier
-#else
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -638,7 +635,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
-#endif
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
