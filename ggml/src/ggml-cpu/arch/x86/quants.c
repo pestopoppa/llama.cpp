@@ -1419,11 +1419,59 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const int nb = n / qk;
 
     assert(n % qk == 0);
+#if defined(__AVX2__)
+    assert(nrc == 1 || nrc == 2);
+#else
     assert(nrc == 1);
+#endif
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
+
+#if defined(__AVX2__)
+    if (nrc == 2) {
+        const block_q8_0 * GGML_RESTRICT x0 = vx;
+        const block_q8_0 * GGML_RESTRICT x1 = (const block_q8_0 *) ((const char *) vx + bx);
+        const block_q8_0 * GGML_RESTRICT y0 = vy;
+        const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const char *) vy + by);
+
+        __m256 acc00 = _mm256_setzero_ps();
+        __m256 acc01 = _mm256_setzero_ps();
+        __m256 acc10 = _mm256_setzero_ps();
+        __m256 acc11 = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const __m256i qx0 = _mm256_loadu_si256((const __m256i *) x0[ib].qs);
+            const __m256i qx1 = _mm256_loadu_si256((const __m256i *) x1[ib].qs);
+            const __m256i qy0 = _mm256_loadu_si256((const __m256i *) y0[ib].qs);
+            const __m256i qy1 = _mm256_loadu_si256((const __m256i *) y1[ib].qs);
+
+            const __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+            const __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+            const __m256 q00 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy0, qx0));
+            const __m256 q01 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(qy1, qx0));
+            const __m256 q10 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy0, qx1));
+            const __m256 q11 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy1, qx1));
+
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+            const float dy0 = GGML_CPU_FP16_TO_FP32(y0[ib].d);
+            const float dy1 = GGML_CPU_FP16_TO_FP32(y1[ib].d);
+
+            acc00 = _mm256_fmadd_ps(_mm256_set1_ps(dx0 * dy0), q00, acc00);
+            acc01 = _mm256_fmadd_ps(_mm256_set1_ps(dx0 * dy1), q01, acc01);
+            acc10 = _mm256_fmadd_ps(_mm256_set1_ps(dx1 * dy0), q10, acc10);
+            acc11 = _mm256_fmadd_ps(_mm256_set1_ps(dx1 * dy1), q11, acc11);
+        }
+
+        s[0]      = hsum_float_8(acc00);
+        s[1]      = hsum_float_8(acc10);
+        s[bs]     = hsum_float_8(acc01);
+        s[bs + 1] = hsum_float_8(acc11);
+        return;
+    }
+#endif
 
     const block_q8_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
