@@ -1454,6 +1454,22 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             const __m256 q10 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy0, qx1));
             const __m256 q11 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(qy1, qx1));
 
+#if defined(__F16C__)
+            const __m128 d = _mm_cvtph_ps(_mm_setr_epi16(
+                    (short) x0[ib].d, (short) x1[ib].d, (short) y0[ib].d, (short) y1[ib].d,
+                    0, 0, 0, 0));
+            const __m128 dx = _mm_shuffle_ps(d, d, _MM_SHUFFLE(1, 1, 0, 0));
+            const __m128 dy = _mm_shuffle_ps(d, d, _MM_SHUFFLE(3, 2, 3, 2));
+            const __m128 dxy = _mm_mul_ps(dx, dy);
+
+            acc00 = _mm256_fmadd_ps(_mm256_broadcastss_ps(dxy), q00, acc00);
+            acc01 = _mm256_fmadd_ps(_mm256_broadcastss_ps(
+                    _mm_shuffle_ps(dxy, dxy, _MM_SHUFFLE(1, 1, 1, 1))), q01, acc01);
+            acc10 = _mm256_fmadd_ps(_mm256_broadcastss_ps(
+                    _mm_shuffle_ps(dxy, dxy, _MM_SHUFFLE(2, 2, 2, 2))), q10, acc10);
+            acc11 = _mm256_fmadd_ps(_mm256_broadcastss_ps(
+                    _mm_shuffle_ps(dxy, dxy, _MM_SHUFFLE(3, 3, 3, 3))), q11, acc11);
+#else
             const float dx0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
             const float dx1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
             const float dy0 = GGML_CPU_FP16_TO_FP32(y0[ib].d);
@@ -1463,6 +1479,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             acc01 = _mm256_fmadd_ps(_mm256_set1_ps(dx0 * dy1), q01, acc01);
             acc10 = _mm256_fmadd_ps(_mm256_set1_ps(dx1 * dy0), q10, acc10);
             acc11 = _mm256_fmadd_ps(_mm256_set1_ps(dx1 * dy1), q11, acc11);
+#endif
         }
 
         s[0]      = hsum_float_8(acc00);
