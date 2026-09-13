@@ -812,6 +812,22 @@ struct DequantizerQ5K_AVX2 final : public BaseDequantizer<block_q5_K> {
     __m256i hbits;
 };
 
+#ifdef HAVE_FANCY_SIMD
+inline __m128i unpack_q4_scales(const uint8_t * scales) {
+    const __m128i packed = _mm_loadu_si128((const __m128i *)scales);
+    const __m128i ordered = _mm_shuffle_epi8(packed, _mm_setr_epi8(
+         0,  1,  2,  3,  8,  9, 10, 11,  4,  5,  6,  7,  8,  9, 10, 11));
+    const __m128i low = _mm_and_si128(ordered, _mm_setr_epi8(
+        0x3f, 0x3f, 0x3f, 0x3f, 0x0f, 0x0f, 0x0f, 0x0f,
+        0x3f, 0x3f, 0x3f, 0x3f, 0x0f, 0x0f, 0x0f, 0x0f));
+    const __m128i high = _mm_and_si128(_mm_srli_epi16(ordered, 4), _mm_set1_epi8(0x0f));
+    const __m128i upper = _mm_shuffle_epi8(
+        _mm_and_si128(_mm_srli_epi16(packed, 2), _mm_set1_epi8(0x30)),
+        _mm_setr_epi8(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7));
+    return _mm_or_si128(_mm_blend_epi32(low, high, 0x8), upper);
+}
+#endif
+
 template <typename Dequantizer, int nrc_y>
 static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n % QK_K == 0);
@@ -821,7 +837,9 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
 
     Dequantizer deq(vx, bx);
 
+#ifndef HAVE_FANCY_SIMD
     uint32_t utmp[4];
+#endif
     __m256  accd[nrc_y];
     __m256  scales[2];
     float   d8[8*nrc_y];
@@ -836,8 +854,6 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
         Dequantizer deq2(vx, bx);
         __m256 accd2[2][nrc_y];
         __m256 scales2[2][2];
-        uint32_t utmp2[2][4];
-
         int ix = 0;
         for (; ix + 1 < nrc_x; ix += 2) {
             for (int iy = 0; iy < nrc_y; ++iy) {
@@ -866,9 +882,9 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 for (int k = 0; k < 2; ++k) {
                     deqs[k]->d = GGML_FP16_TO_FP32(deqs[k]->x[i].d);
                     auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deqs[k]->x[i].dmin));
-                    make_q4_scales(deqs[k]->x[i].scales, utmp2[k]);
+                    const __m128i mins_and_scales = unpack_q4_scales(deqs[k]->x[i].scales);
                     auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
-                        _mm_loadl_epi64((const __m128i *)(utmp2[k] + 2)))));
+                        _mm_srli_si128(mins_and_scales, 8))));
                     mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins);
                     for (int iy = 0; iy < nrc_y; ++iy) {
                         __m256 my;
@@ -889,7 +905,7 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                     }
 
                     auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deqs[k]->d),
-                        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)utmp2[k]))));
+                        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mins_and_scales)));
                     scales2[k][0] = _mm256_set_m128(_mm256_castps256_ps128(all_scales),
                         _mm256_castps256_ps128(all_scales));
                     auto scales_h = _mm256_extractf128_ps(all_scales, 1);
@@ -958,8 +974,13 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
             auto prepare_block = [&](int i, BlockData& data) {
                 deq.d = GGML_FP16_TO_FP32(deq.x[i].d);
                 auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deq.x[i].dmin));
+#ifdef HAVE_FANCY_SIMD
+                const __m128i mins_and_scales = unpack_q4_scales(deq.x[i].scales);
+#else
                 make_q4_scales(deq.x[i].scales, utmp);
-                data.mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(utmp + 2)))));
+                const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)utmp);
+#endif
+                data.mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(mins_and_scales, 8))));
                 data.mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), data.mins);
 
                 auto d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+0].d)));
@@ -969,7 +990,7 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 auto m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[0][2*i+1].d+4)));
                 data.my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(MM256_SET_M128I(m4_2, m4_1)));
 
-                auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)utmp))));
+                auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mins_and_scales)));
                 auto scales_l = _mm256_set_m128(_mm256_castps256_ps128(all_scales), _mm256_castps256_ps128(all_scales));
                 auto scales_h = _mm256_extractf128_ps(all_scales, 1);
                 auto dy_l = _mm256_castps256_ps128(dy);
@@ -1033,8 +1054,13 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
 
             deq.d = GGML_FP16_TO_FP32(deq.x[i].d);
             auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deq.x[i].dmin));
+#ifdef HAVE_FANCY_SIMD
+            const __m128i mins_and_scales = unpack_q4_scales(deq.x[i].scales);
+#else
             make_q4_scales(deq.x[i].scales, utmp);
-            auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(utmp + 2)))));
+            const __m128i mins_and_scales = _mm_loadu_si128((const __m128i *)utmp);
+#endif
+            auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(mins_and_scales, 8))));
             mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins);
             for (int iy = 0; iy < nrc_y; ++iy) {
                 auto d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d)));
@@ -1048,7 +1074,7 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 accd[iy]  = _mm256_fmadd_ps(my, mins, accd[iy]);
             }
 
-            auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)utmp))));
+            auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mins_and_scales)));
             scales[0] = _mm256_set_m128(_mm256_castps256_ps128(all_scales), _mm256_castps256_ps128(all_scales));
             auto scales_h = _mm256_extractf128_ps(all_scales, 1);
             scales[1] = _mm256_set_m128(scales_h, scales_h);
