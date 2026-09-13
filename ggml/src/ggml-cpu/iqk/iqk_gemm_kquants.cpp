@@ -826,6 +826,24 @@ inline __m128i unpack_q4_scales(const uint8_t * scales) {
         _mm_setr_epi8(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7));
     return _mm_or_si128(_mm_blend_epi32(low, high, 0x8), upper);
 }
+
+inline __m256i unpack_q4_scales_2(const uint8_t * scales0, const uint8_t * scales1) {
+    const __m256i packed256 = MM256_SET_M128I(
+        _mm_loadu_si128((const __m128i *)scales1),
+        _mm_loadu_si128((const __m128i *)scales0));
+    const __m512i packed = _mm512_inserti32x8(_mm512_castsi256_si512(packed256), packed256, 1);
+    const __m512i ordered = _mm512_shuffle_epi8(packed, _mm512_broadcast_i32x4(_mm_setr_epi8(
+         0,  1,  2,  3,  8,  9, 10, 11,  4,  5,  6,  7,  8,  9, 10, 11)));
+    const __m512i low = _mm512_and_si512(ordered, _mm512_broadcast_i32x4(_mm_setr_epi8(
+        0x3f, 0x3f, 0x3f, 0x3f, 0x0f, 0x0f, 0x0f, 0x0f,
+        0x3f, 0x3f, 0x3f, 0x3f, 0x0f, 0x0f, 0x0f, 0x0f)));
+    const __m512i high = _mm512_and_si512(_mm512_srli_epi16(ordered, 4), _mm512_set1_epi8(0x0f));
+    const __m512i upper = _mm512_shuffle_epi8(
+        _mm512_and_si512(_mm512_srli_epi16(packed, 2), _mm512_set1_epi8(0x30)),
+        _mm512_broadcast_i32x4(_mm_setr_epi8(
+            -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7)));
+    return _mm512_castsi512_si256(_mm512_or_si512(_mm512_mask_blend_epi32(0x8888, low, high), upper));
+}
 #endif
 
 template <typename Dequantizer, int nrc_y>
@@ -867,6 +885,26 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
             for (int i = 0; i < nb; ++i) {
                 Dequantizer * deqs[2] = {&deq, &deq2};
 
+                const __m256i mins_and_scales_2 = unpack_q4_scales_2(
+                    deqs[0]->x[i].scales, deqs[1]->x[i].scales);
+                const __m128i dm01 = _mm_unpacklo_epi32(
+                    _mm_loadu_si32((const void *)&deqs[0]->x[i].d),
+                    _mm_loadu_si32((const void *)&deqs[1]->x[i].d));
+                const __m256i dm16 = _mm256_shuffle_epi8(
+                    MM256_SET_M128I(_mm_srli_si128(dm01, 4), dm01),
+                    _mm256_setr_epi8(
+                        0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3,
+                        0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3));
+                const __m512 dm = _mm512_cvtph_ps(dm16);
+                const __m128 d128[2] = {
+                    _mm512_extractf32x4_ps(dm, 0),
+                    _mm512_extractf32x4_ps(dm, 2),
+                };
+                const __m128 dmin128[2] = {
+                    _mm512_extractf32x4_ps(dm, 1),
+                    _mm512_extractf32x4_ps(dm, 3),
+                };
+
                 __m256 dy_shared;
                 __m256 my_shared;
                 if constexpr (nrc_y == 1) {
@@ -880,9 +918,11 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 }
 
                 for (int k = 0; k < 2; ++k) {
-                    deqs[k]->d = GGML_FP16_TO_FP32(deqs[k]->x[i].d);
-                    auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deqs[k]->x[i].dmin));
-                    const __m128i mins_and_scales = unpack_q4_scales(deqs[k]->x[i].scales);
+                    const __m256 vd = _mm256_set_m128(d128[k], d128[k]);
+                    const __m256 vm = _mm256_set_m128(dmin128[k], dmin128[k]);
+                    const __m128i mins_and_scales = k == 0
+                        ? _mm256_castsi256_si128(mins_and_scales_2)
+                        : _mm256_extracti128_si256(mins_and_scales_2, 1);
                     auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
                         _mm_srli_si128(mins_and_scales, 8))));
                     mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins);
@@ -904,7 +944,7 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                         accd2[k][iy] = _mm256_fmadd_ps(my, mins, accd2[k][iy]);
                     }
 
-                    auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deqs[k]->d),
+                    auto all_scales = _mm256_mul_ps(vd,
                         _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mins_and_scales)));
                     scales2[k][0] = _mm256_set_m128(_mm256_castps256_ps128(all_scales),
                         _mm256_castps256_ps128(all_scales));
