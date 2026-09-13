@@ -1000,6 +1000,54 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
             };
 
             auto compute_sums = [&](int i, __m256i * sums) {
+#ifdef HAVE_FANCY_SIMD
+                if constexpr (std::is_same_v<Dequantizer, DequantizerQ5K_AVX2>) {
+                    const __m256i q4_0 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 0);
+                    const __m256i q4_1 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 1);
+                    const __m256i q4_2 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 2);
+                    const __m256i q4_3 = _mm256_loadu_si256((const __m256i *)deq.x[i].qs + 3);
+                    const __m512i hbits = _mm512_broadcast_i32x8(_mm256_loadu_si256((const __m256i *)deq.x[i].qh));
+                    const __m512i ml = _mm512_set1_epi8(0xf);
+                    const __m512i mh = _mm512_set1_epi8(0x10);
+                    const __m512i hmask[4] = {
+                        _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi8(0x01)), _mm256_set1_epi8(0x10), 1),
+                        _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi8(0x02)), _mm256_set1_epi8(0x20), 1),
+                        _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi8(0x04)), _mm256_set1_epi8(0x40), 1),
+                        _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi8(0x08)), _mm256_set1_epi8((char)0x80), 1),
+                    };
+                    const __m512i q4_02 = _mm512_inserti32x8(_mm512_castsi256_si512(q4_0), q4_2, 1);
+                    const __m512i q4_13 = _mm512_inserti32x8(_mm512_castsi256_si512(q4_1), q4_3, 1);
+                    __m512i qx[4] = {
+                        _mm512_and_si512(q4_02, ml),
+                        _mm512_and_si512(_mm512_srli_epi16(q4_02, 4), ml),
+                        _mm512_and_si512(q4_13, ml),
+                        _mm512_and_si512(_mm512_srli_epi16(q4_13, 4), ml),
+                    };
+                    for (int k = 0; k < 4; ++k) {
+                        qx[k] = _mm512_mask_add_epi8(qx[k], _mm512_test_epi8_mask(hbits, hmask[k]), qx[k], mh);
+                    }
+
+                    const block_q8_2_x4& y0 = q8.y[0][2*i+0];
+                    const block_q8_2_x4& y1 = q8.y[0][2*i+1];
+                    __m512i qy[4];
+                    for (int k = 0; k < 4; ++k) {
+                        qy[k] = _mm512_inserti32x8(
+                            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)y0.qs + k)),
+                            _mm256_loadu_si256((const __m256i *)y1.qs + k), 1);
+                    }
+
+                    auto sumi1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[0], qy[0]);
+                    auto sumi2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[1], qy[1]);
+                    auto sumi3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[2], qy[2]);
+                    auto sumi4 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx[3], qy[3]);
+                    sumi1 = _mm512_add_epi32(_mm512_unpacklo_epi32(sumi1, sumi2), _mm512_unpackhi_epi32(sumi1, sumi2));
+                    sumi3 = _mm512_add_epi32(_mm512_unpacklo_epi32(sumi3, sumi4), _mm512_unpackhi_epi32(sumi3, sumi4));
+                    sumi1 = _mm512_add_epi32(_mm512_unpacklo_epi64(sumi1, sumi3), _mm512_unpackhi_epi64(sumi1, sumi3));
+                    sums[0] = _mm512_castsi512_si256(sumi1);
+                    sums[1] = _mm512_extracti32x8_epi32(sumi1, 1);
+                    return;
+                }
+#endif
                 for (int j = 0; j < QK_K/128; ++j) {
                     deq.prepare(i, j);
                     const block_q8_2_x4& y = q8.y[0][2*i+j];
