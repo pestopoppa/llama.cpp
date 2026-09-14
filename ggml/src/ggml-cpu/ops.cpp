@@ -11226,6 +11226,28 @@ static inline void ggml_vec_dot_f32_4_avx512(
         }
     }
 }
+
+static inline void ggml_vec_mad_f32_dual_store_avx512(
+        int n, float * y, float * y_copy, const float * x, float v) {
+    const int np = n & ~63;
+    const __m512 vv = _mm512_set1_ps(v);
+
+    for (int i = 0; i < np; i += 64) {
+        for (int j = 0; j < 4; ++j) {
+            const int offset = i + 16*j;
+            const __m512 value = _mm512_fmadd_ps(
+                _mm512_loadu_ps(x + offset), vv, _mm512_loadu_ps(y + offset));
+            _mm512_storeu_ps(y + offset, value);
+            _mm512_storeu_ps(y_copy + offset, value);
+        }
+    }
+
+    for (int i = np; i < n; ++i) {
+        const float value = y[i] + x[i]*v;
+        y[i] = value;
+        y_copy[i] = value;
+    }
+}
 #endif
 
 static void ggml_compute_forward_gated_delta_net_one_chunk(
@@ -11365,9 +11387,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
+            float * curr_state_o = nullptr;
+            if (K > 1) {
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    curr_state_o = state_out_base + target_slot * state_size_per_snap +
+                                   (iv3 * H + iv1) * S_v * S_v;
+                }
+            }
+
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
             for (int64_t j = 0; j < S_v; ++j) {
-                ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+#if defined(__AVX512F__)
+                if (curr_state_o) {
+                    ggml_vec_mad_f32_dual_store_avx512(
+                        S_v, &s_out[j * S_v], &curr_state_o[j * S_v], k_d, delta[j]);
+                } else
+#endif
+                {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+                }
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
@@ -11389,14 +11428,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
-            if (K > 1) {
-                const int64_t target_slot = n_tokens - 1 - t;
-                if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
-                }
+#if !defined(__AVX512F__)
+            if (curr_state_o) {
+                memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
             }
+#endif
         }
     }
 }
