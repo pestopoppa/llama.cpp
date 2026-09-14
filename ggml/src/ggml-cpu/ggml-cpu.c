@@ -17,6 +17,14 @@
 #include "ggml.h"
 #include "common.h"
 
+#if defined(GGML_USE_IQK_MULMAT)
+#include "iqk/iqk_config.h"
+#if defined(IQK_IMPLEMENT)
+#include "iqk/iqk_mul_mat.h"
+#include "iqk/iqk_quantize.h"
+#endif
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -4066,6 +4074,171 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+#if defined(GGML_USE_IQK_MULMAT) && defined(IQK_IMPLEMENT)
+    if (node->op == GGML_OP_MUL_MAT_ID && node_n + 2 < cgraph->n_nodes) {
+        struct ggml_tensor * up   = node;
+        struct ggml_tensor * gate = cgraph->nodes[node_n + 1];
+        struct ggml_tensor * glu  = cgraph->nodes[node_n + 2];
+
+        const struct ggml_tensor * up_w   = up->src[0];
+        const struct ggml_tensor * gate_w = gate->src[0];
+        const struct ggml_tensor * src    = up->src[1];
+        const struct ggml_tensor * ids    = up->src[2];
+
+        const char * iqk = getenv("GGML_IQK");
+        const bool qtype = up_w && (up_w->type == GGML_TYPE_Q4_K || up_w->type == GGML_TYPE_Q5_K);
+        const bool same_weights = qtype && gate_w && gate_w->type == up_w->type &&
+            memcmp(gate_w->ne, up_w->ne, sizeof(up_w->ne)) == 0 &&
+            memcmp(gate_w->nb, up_w->nb, sizeof(up_w->nb)) == 0;
+
+        if (iqk && atoi(iqk) != 0 &&
+            gate->op == GGML_OP_MUL_MAT_ID && glu->op == GGML_OP_GLU &&
+            (gate->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+            (glu->flags  & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+            ggml_node_has_n_uses(cgraph, node_n,     1) &&
+            ggml_node_has_n_uses(cgraph, node_n + 1, 1) &&
+            glu->src[0] == gate && glu->src[1] == up &&
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            gate->src[1] == src && gate->src[2] == ids &&
+            src && ids && src->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+            up->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 &&
+            same_weights && up_w->ne[0] == src->ne[0] && up_w->ne[1] >= 32 && up_w->ne[3] == 1 &&
+            up_w->ne[2] > 0 && src->ne[0] > 0 && src->ne[1] > 0 && src->ne[3] == 1 &&
+            ids->ne[0] > 0 && ids->ne[1] > 0 &&
+            ids->ne[2] == 1 && ids->ne[3] == 1 && ids->ne[1] == src->ne[2] &&
+            ids->ne[0] % src->ne[1] == 0 &&
+            ggml_are_same_shape(up, gate) && ggml_are_same_shape(up, glu) &&
+            ggml_is_contiguous(up_w) && ggml_is_contiguous(gate_w) &&
+            ggml_is_contiguous(src) && ggml_is_contiguous(ids) &&
+            ggml_is_contiguous(up) && ggml_is_contiguous(gate) && ggml_is_contiguous(glu) &&
+            up_w->ne[0] % QK_K == 0 &&
+            up_w->nb[0] == ggml_type_size(up_w->type) &&
+            up_w->nb[1] == ggml_row_size(up_w->type, up_w->ne[0]) &&
+            up_w->nb[2] == up_w->nb[1] * up_w->ne[1] &&
+            src->nb[0] == sizeof(float) && ids->nb[0] == sizeof(int32_t) &&
+            up->ne[0] == up_w->ne[1] && up->ne[1] == ids->ne[0] && up->ne[2] == ids->ne[1] &&
+            params->wdata != NULL) {
+
+            struct iqk_moe_row_mapping {
+                int32_t i1;
+                int32_t i2;
+            };
+
+            const int64_t ne10  = src->ne[0];
+            const int64_t ne11  = src->ne[1];
+            const int64_t ne12  = src->ne[2];
+            const int64_t n_ids = ids->ne[0];
+            const int64_t n_as  = up_w->ne[2];
+            const size_t act_row = (size_t) (ne10 / 32) * 36;
+            const size_t act_size = act_row * ne11 * ne12;
+
+            char * base = (char *) params->wdata;
+            char * cursor = base + GGML_PAD(act_size, sizeof(int64_t));
+            int64_t * row_counts = (int64_t *) cursor;
+            int64_t * direct = row_counts + n_as;
+            cursor += GGML_PAD((size_t) (n_as + 1) * sizeof(int64_t), sizeof(int64_t));
+            struct iqk_moe_row_mapping * rows = (struct iqk_moe_row_mapping *) cursor;
+            cursor += (size_t) n_as * n_ids * ids->ne[1] * sizeof(*rows);
+
+            if (params->wdata && params->wsize >= (size_t) (cursor - base)) {
+                if (params->ith == 0) {
+                    memset(row_counts, 0, (size_t) n_as * sizeof(*row_counts));
+                    for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                        for (int64_t id = 0; id < n_ids; ++id) {
+                            const int32_t expert = *(const int32_t *)
+                                ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                            if (expert < 0 || expert >= n_as) {
+                                continue;
+                            }
+                            const size_t offset = (size_t) expert * n_ids * ids->ne[1] + row_counts[expert]++;
+                            rows[offset].i1 = (int32_t) id;
+                            rows[offset].i2 = (int32_t) iid1;
+                        }
+                    }
+
+                    *direct = 1;
+                    const int rowexact_n = ggml_cpu_rowexact_n();
+                    const bool global_rowexact = !params->disable_rowexact &&
+                        ids->ne[1] > 1 && ids->ne[1] <= rowexact_n;
+                    for (int64_t expert = 0; expert < n_as; ++expert) {
+                        const int64_t nr = row_counts[expert];
+                        if (nr == 0) {
+                            continue;
+                        }
+                        const size_t map_offset = (size_t) expert * n_ids * ids->ne[1];
+                        const bool local_rowexact = nr > 1 && nr <= rowexact_n;
+                        if (local_rowexact != global_rowexact) {
+                            *direct = 0;
+                        }
+                        const bool up_direct = iqk_mul_mat_moe_rows(
+                                up_w->ne[1], nr, up_w->ne[0], (int) ne11,
+                                (int) up_w->type,
+                                (const char *) up_w->data + (size_t) expert * up_w->nb[2], up_w->nb[1],
+                                GGML_TYPE_Q8_2_X4, base, act_row,
+                                (float *) glu->data, glu->nb[1], glu->nb[2], rows + map_offset, 0, 0);
+                        const bool gate_direct = iqk_mul_mat_moe_rows(
+                                gate_w->ne[1], nr, gate_w->ne[0], (int) ne11,
+                                (int) gate_w->type,
+                                (const char *) gate_w->data + (size_t) expert * gate_w->nb[2], gate_w->nb[1],
+                                GGML_TYPE_Q8_2_X4, base, act_row,
+                                (float *) glu->data, glu->nb[1], glu->nb[2], rows + map_offset, 0, 0);
+                        if (!up_direct || !gate_direct) {
+                            *direct = 0;
+                        }
+                    }
+                }
+
+                ggml_barrier(params->threadpool);
+
+                if (*direct) {
+                    for (int64_t ir = params->ith; ir < ne11 * ne12; ir += params->nth) {
+                        const int64_t i12 = ir / ne11;
+                        const int64_t i11 = ir % ne11;
+                        quantize_row_q8_2_x4(
+                                (const float *) ((const char *) src->data + i12 * src->nb[2] + i11 * src->nb[1]),
+                                base + (size_t) ir * act_row, ne10);
+                    }
+
+                    if (params->ith == 0) {
+                        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                            for (int64_t id = 0; id < n_ids; ++id) {
+                                const int32_t expert = *(const int32_t *)
+                                    ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                                if (expert < 0 || expert >= n_as) {
+                                    memset((char *) glu->data + id * glu->nb[1] + iid1 * glu->nb[2],
+                                            0, (size_t) glu->ne[0] * sizeof(float));
+                                }
+                            }
+                        }
+                    }
+
+                    ggml_barrier(params->threadpool);
+
+                    for (int64_t expert = 0; expert < n_as; ++expert) {
+                        const int64_t nr = row_counts[expert];
+                        if (nr == 0) {
+                            continue;
+                        }
+                        const size_t map_offset = (size_t) expert * n_ids * ids->ne[1];
+                        const bool ok = iqk_moe_fused_up_gate(
+                                up_w->ne[1], nr, up_w->ne[0], (int) ne11, GGML_UNARY_OP_SILU,
+                                (int) up_w->type,
+                                (const char *) up_w->data   + (size_t) expert * up_w->nb[2],
+                                (const char *) gate_w->data + (size_t) expert * gate_w->nb[2],
+                                up_w->nb[1], GGML_TYPE_Q8_2_X4, base, act_row,
+                                NULL, NULL, (float *) glu->data, glu->nb[1], glu->nb[2],
+                                rows + map_offset, 0.0f, params->ith, params->nth);
+                        if (!ok) {
+                            GGML_ABORT("IQK fused up-gate preflight mismatch");
+                        }
+                    }
+                    return 2;
+                }
+            }
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
