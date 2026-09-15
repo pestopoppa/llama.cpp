@@ -4208,7 +4208,47 @@ static int ggml_cpu_try_fuse_ops(
 
                     ggml_barrier(params->threadpool);
 
+                    int64_t active_experts = 0;
+                    int64_t total_rows = 0;
                     for (int64_t expert = 0; expert < n_as; ++expert) {
+                        if (row_counts[expert] > 0) {
+                            ++active_experts;
+                            total_rows += row_counts[expert];
+                        }
+                    }
+
+                    int64_t expert_begin = 0;
+                    int64_t expert_end = n_as;
+                    int cohort_ith = params->ith;
+                    int cohort_nth = params->nth;
+                    if (active_experts > 1 && active_experts <= params->nth) {
+                        const int64_t extra_workers = params->nth - active_experts;
+                        int64_t active_before = 0;
+                        int64_t rows_before = 0;
+
+                        expert_begin = n_as;
+                        for (int64_t expert = 0; expert < n_as; ++expert) {
+                            const int64_t nr = row_counts[expert];
+                            if (nr == 0) {
+                                continue;
+                            }
+
+                            const int64_t cohort_begin = active_before + extra_workers * rows_before / total_rows;
+                            ++active_before;
+                            rows_before += nr;
+                            const int64_t cohort_end = active_before + extra_workers * rows_before / total_rows;
+                            if (params->ith >= cohort_begin && params->ith < cohort_end) {
+                                expert_begin = expert;
+                                expert_end = expert + 1;
+                                cohort_ith = params->ith - cohort_begin;
+                                cohort_nth = cohort_end - cohort_begin;
+                                break;
+                            }
+                        }
+                        GGML_ASSERT(expert_begin < n_as);
+                    }
+
+                    for (int64_t expert = expert_begin; expert < expert_end; ++expert) {
                         const int64_t nr = row_counts[expert];
                         if (nr == 0) {
                             continue;
@@ -4221,7 +4261,7 @@ static int ggml_cpu_try_fuse_ops(
                                 (const char *) gate_w->data + (size_t) expert * gate_w->nb[2],
                                 up_w->nb[1], GGML_TYPE_Q8_2_X4, base, act_row,
                                 NULL, NULL, (float *) glu->data, glu->nb[1], glu->nb[2],
-                                rows + map_offset, 0.0f, params->ith, params->nth);
+                                rows + map_offset, 0.0f, cohort_ith, cohort_nth);
                         if (!ok) {
                             GGML_ABORT("IQK fused up-gate preflight mismatch");
                         }
