@@ -576,12 +576,30 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         return true;
     }
 
-    for (int64_t i12 = 0; i12 < ne12; ++i12) {
-        for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+    const bool qact_2d_partition = mmid_rowexact &&
+        (tA == GGML_TYPE_Q4_K || tA == GGML_TYPE_Q5_K) &&
+        ne11 == 1 && ne12 > 1 && ne12 <= ggml_cpu_rowexact_n() && ne10 % 128 == 0;
+    if (qact_2d_partition) {
+        const int64_t grains_per_token = ne10 / 128;
+        const int64_t ngrains = ne12 * grains_per_token;
+        const int64_t grain0 = ngrains * ith / nth;
+        const int64_t grain1 = ngrains * (ith + 1) / nth;
+        for (int64_t grain = grain0; grain < grain1; ++grain) {
+            const int64_t i12 = grain / grains_per_token;
+            const int64_t i10 = (grain % grains_per_token) * 128;
             iqk_quantize_activation(
                     activation_type,
-                    (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
-                    qact + i12*nbw2 + i11*nbw1, ne10);
+                    (const float *)((const char *) src1->data + i12*src1->nb[2]) + i10,
+                    qact + i12*nbw2 + iqk_activation_row_size(activation_type, i10), 128);
+        }
+    } else {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                iqk_quantize_activation(
+                        activation_type,
+                        (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
+                        qact + i12*nbw2 + i11*nbw1, ne10);
+            }
         }
     }
     // 2) Zero inactive SER rows and build the valid per-expert row mapping.
