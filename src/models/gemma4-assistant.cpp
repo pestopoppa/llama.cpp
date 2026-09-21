@@ -11,6 +11,13 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.f_attention_scale = 1.0f;
 
+    // v9 ORDERING, restored. This arch is a STANDALONE NextN/MTP head: every block is a NextN
+    // block, so n_layer_nextn == n_layer_all and n_layer() == 0. The read must therefore happen
+    // HERE -- after every get_key_or_arr() above that sizes a per-layer array by n_layer() --
+    // and not in llama_model_base::load_hparams where upstream 9d817213a (#28159) moved it.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn == hparams.n_layer_all && "n_layer_nextn must be == n_layer_impl");
+
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,           hparams.rope_freq_base_train_swa, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,     hparams.n_swa);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);

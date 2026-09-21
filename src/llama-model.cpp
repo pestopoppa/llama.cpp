@@ -1102,8 +1102,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
-    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all);
+    // Upstream 9d817213a (#28159) reads n_layer_nextn HERE so that n_layer() is correct before the
+    // per-layer arrays below. That is right for a TRUNK + appended NextN/MTP block, where
+    // n_layer() = n_layer_all - n_layer_nextn is the trunk depth and the per-layer arrays are
+    // sized by the trunk.
+    //
+    // It is WRONG for a STANDALONE NextN/MTP head, where every block is a NextN block
+    // (n_layer_nextn == n_layer_all, so n_layer() == 0) yet the per-layer arrays are still sized
+    // by n_layer_all. Reading nextn this early makes those reads expect length 0 and the load
+    // fails with "head_count_kv has wrong array length; expected 0, got 4".
+    //
+    // Production v9 reads nextn for such archs in their own load_arch_hparams, AFTER these
+    // per-layer reads. Preserve that ordering for them; keep the early read for everyone else.
+    if (ml.get_arch() != LLM_ARCH_GEMMA4_ASSISTANT) {
+        ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+        GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
+    }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
