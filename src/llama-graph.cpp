@@ -2018,7 +2018,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // fused top-k weights: soft_max + argsort are monotonic, so the indices are
     // identical whether computed on logits or softmaxed logits, and the
     // get_rows + sum_rows + clamp + div normalization collapses into one op
+    // GGML_OP_MOE_TOPK_NORM is implemented ONLY by the CPU backend (ggml-cpu.c); there is no
+    // CUDA/HIP kernel for it. If any accelerator backend is present, the MoE routing node cannot
+    // execute there, so ggml_backend_sched splits the graph at EVERY MoE layer and round-trips the
+    // routing tensors through host memory.
+    //
+    // Measured 2026-09-21, Qwen3-VL-30B-A3B Q4_K_M (MoE) on MI210, llama-bench tg128:
+    //   v9 0db32c06e      114.12 t/s
+    //   champion (fused)   79.93 t/s   -30.0%
+    // git bisect over 89 revisions identified this fusion (ae6031aaa) as the first bad commit.
+    // DENSE models are unaffected, which is why the Qwen3.8-27B Q8_0 cell did not catch it.
+    //
+    // This fusion is a CPU optimisation (its own commit is prefixed "cpu:") and was measured on
+    // CPU. Emit it only when the whole graph runs on CPU, where the win is real and no split can
+    // occur. When an accelerator is present, fall back to the unfused path, which every backend
+    // implements.
+    bool all_backends_are_cpu = true;
+    if (sched != nullptr) {
+        const int n_backends = ggml_backend_sched_get_n_backends(sched);
+        for (int ib = 0; ib < n_backends; ++ib) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, ib);
+            ggml_backend_dev_t d = b ? ggml_backend_get_device(b) : nullptr;
+            if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                all_backends_are_cpu = false;
+                break;
+            }
+        }
+    }
+
     const bool fuse_moe_weights =
+        all_backends_are_cpu &&
         gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX &&
         norm_w &&
         selection_probs == probs &&
