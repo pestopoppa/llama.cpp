@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -54,12 +55,15 @@
 // Deliberately awkward to enable: the token is long, it is not a prefix or typo-neighbour of any
 // other accepted value, and every unrecognised value falls back to SPEC_EXACT_OFF -- which for a
 // DSpark/RS target still selects the SERIAL path. A typo therefore fails SAFE (exact, slow).
+//   row      - preserve ordinary prompt/decode arithmetic and enable row-exact CPU kernels only
+//              for a target batch whose rows are explicitly tracked speculative verification rows.
 enum spec_exact_mode {
     SPEC_EXACT_OFF = 0,
     SPEC_EXACT_DROP,
     SPEC_EXACT_REDECODE,
     SPEC_EXACT_SERIAL,
     SPEC_EXACT_BATCHED_UNSAFE,
+    SPEC_EXACT_ROW,
 };
 
 static const char * spec_exact_mode_name(spec_exact_mode m) {
@@ -68,6 +72,7 @@ static const char * spec_exact_mode_name(spec_exact_mode m) {
         case SPEC_EXACT_REDECODE:       return "redecode";
         case SPEC_EXACT_SERIAL:         return "serial";
         case SPEC_EXACT_BATCHED_UNSAFE: return "batched-greedy-inexact";
+        case SPEC_EXACT_ROW:            return "row";
         default:                        return "off";
     }
 }
@@ -91,9 +96,24 @@ static spec_exact_mode spec_exact_mode_from_env() {
     if (strcmp(v, "batched-greedy-inexact") == 0) {
         return SPEC_EXACT_BATCHED_UNSAFE;
     }
-    LOG_WRN("unknown LLAMA_SPEC_EXACT=%s (expected off|drop|redecode|serial|batched-greedy-inexact), "
+    if (strcmp(v, "row") == 0) {
+        return SPEC_EXACT_ROW;
+    }
+    LOG_WRN("unknown LLAMA_SPEC_EXACT=%s (expected off|drop|redecode|serial|row|batched-greedy-inexact), "
             "ignoring -- falling back to 'off', which keeps the EXACT (serial) greedy path\n", v);
     return SPEC_EXACT_OFF;
+}
+
+static bool rowexact_threshold_configured() {
+    const char * value = getenv("GGML_ROWEXACT_N");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long threshold = strtol(value, &end, 10);
+    return errno == 0 && end != value && *end == '\0' && threshold > 0;
 }
 
 // fix problem with std::min and std::max
@@ -1366,6 +1386,26 @@ private:
             SRV_WRN("%s", "*** Continuations may differ from an unaccelerated greedy run. This is a ***\n");
             SRV_WRN("%s", "*** MEASUREMENT mode (INF-77 DS41-T5/C1), not a serving default.         ***\n");
             SRV_WRN("%s", "***************************************************************************\n");
+        }
+
+        if (spec_exact == SPEC_EXACT_ROW) {
+            if (!rowexact_threshold_configured()) {
+                throw std::runtime_error("LLAMA_SPEC_EXACT=row requires GGML_ROWEXACT_N > 0");
+            }
+            if (params_base.n_parallel != 1) {
+                throw std::runtime_error("LLAMA_SPEC_EXACT=row currently requires -np 1 to prevent mixed prompt/verification batches");
+            }
+            if (params_base.n_gpu_layers != 0) {
+                throw std::runtime_error("LLAMA_SPEC_EXACT=row currently requires a CPU-only target (-ngl 0)");
+            }
+
+            // Row-exact kernels are only for target verification. Prompt tails can
+            // have the same width as a verification batch, so width is not a safe
+            // phase discriminator.
+            llama_set_rowexact(ctx_tgt, false);
+            if (ctx_dft != nullptr) {
+                llama_set_rowexact(ctx_dft, false);
+            }
         }
 
         // setup slots
@@ -3997,9 +4037,7 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
+                        // Embedding consumers require all tokens in the batch to be output.
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
@@ -4134,7 +4172,39 @@ private:
             n_empty_consecutive = 0;
         }
 
+        struct rowexact_reset {
+            llama_context * ctx;
+            bool active;
+            ~rowexact_reset() {
+                if (active) {
+                    llama_set_rowexact(ctx, false);
+                }
+            }
+        } reset_rowexact { ctx_tgt, spec_exact == SPEC_EXACT_ROW };
+
+        bool rowexact_verify = false;
+        if (spec_exact == SPEC_EXACT_ROW) {
+            int32_t n_verification_rows = 0;
+            iterate(slots, [&](server_slot & slot) {
+                for (const int32_t i : slot.spec_i_batch) {
+                    n_verification_rows += i >= off && i < off + batch_view.n_tokens;
+                }
+            });
+
+            if (n_verification_rows != 0 && n_verification_rows != batch_view.n_tokens) {
+                throw std::runtime_error("LLAMA_SPEC_EXACT=row refuses a mixed prompt/verification batch");
+            }
+            rowexact_verify = n_verification_rows == batch_view.n_tokens && n_verification_rows > 1;
+            llama_set_rowexact(ctx_tgt, rowexact_verify);
+            SRV_DBG("LLAMA_SPEC_EXACT=row verification_rows=%d batch_rows=%d enabled=%s\n",
+                    n_verification_rows, batch_view.n_tokens, rowexact_verify ? "true" : "false");
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (reset_rowexact.active) {
+            llama_set_rowexact(ctx_tgt, false);
+            reset_rowexact.active = false;
+        }
 
         metrics.on_decoded(slots);
 

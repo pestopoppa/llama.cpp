@@ -22,6 +22,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // disable optional row-exact small-batch kernels for this computation
+        bool disable_rowexact;
     };
 
     // numa strategies
@@ -136,6 +139,7 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+    GGML_BACKEND_API void ggml_backend_cpu_set_rowexact(ggml_backend_t backend_cpu, bool enabled);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
