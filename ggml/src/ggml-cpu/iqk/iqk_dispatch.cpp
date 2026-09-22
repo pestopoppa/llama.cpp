@@ -16,6 +16,7 @@
 
 #include "iqk_mul_mat.h"
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -61,6 +62,26 @@ inline bool iqk_q8_0_enabled() {
         return s && atoi(s) != 0;
     }();
     return e;
+}
+// Keep Q8_0 on the native path for small activation batches while allowing the
+// existing IQK Q8_0 implementation to serve larger prefill batches.  A value of
+// 1 preserves the historical GGML_IQK_Q8_0 behavior exactly.
+inline int64_t iqk_q8_0_min_rows() {
+    static const int64_t v = []() -> int64_t {
+        const char * s = getenv("GGML_IQK_Q8_0_MIN_ROWS");
+        if (s == nullptr || *s == '\0') {
+            return 1;
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        const long long parsed = strtoll(s, &end, 10);
+        return errno == 0 && end != s && *end == '\0' && parsed >= 1 ? (int64_t) parsed : 1;
+    }();
+    return v;
+}
+inline bool iqk_q8_0_eligible(int64_t logical_rows) {
+    return iqk_q8_0_enabled() && logical_rows >= iqk_q8_0_min_rows();
 }
 
 // INF-70 SYNC-15: GGML_QSPLIT / GGML_QSPLIT_MIN — the activation-quantization split.
@@ -236,11 +257,13 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
     if (src1->type != GGML_TYPE_F32) return false;          // Stage 1: F32 activations only
     if (!iqk_typeA_supported((int) src0->type)) return false;
     if (!iqk_shape_supported((int) src0->type, src0->ne[1])) return false;
-    if (src0->type == GGML_TYPE_Q8_0 && !iqk_q8_0_enabled()) return false;
-
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
     if (ne00 != ne10)   return false;
+    // ne11 is the row count of each logical matrix (the token axis for model
+    // projections). ne12/ne13 are broadcast/head batches and must not turn a
+    // one-token MLA projection into an apparent large prefill batch.
+    if (src0->type == GGML_TYPE_Q8_0 && !iqk_q8_0_eligible(ne11)) return false;
     const int activation_type = iqk_activation_type((int) src0->type);
     if (activation_type == GGML_TYPE_Q8_K ? ne00 % QK_K != 0 : ne00 % 32 != 0) return false;
 
@@ -343,7 +366,7 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
             nb2 / sizeof(float), nb3 / sizeof(float),
             (int) src0->type, src0->data, nb01,
             activation_type, wdata, row_size,
-            (float *) dst->data, nb1 / sizeof(float), ith, nth);
+            (float *) dst->data, nb1 / sizeof(float), !params->disable_rowexact, ith, nth);
 #ifdef GGML_CPU_PROF
     if (prof) {
         const int64_t p_t2 = ggml_time_us();
@@ -391,7 +414,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     if (!iqk_typeA_supported(tA)) return false;
     if (!iqk_shape_supported(tA, src0->ne[1])) return false;
     if (!iqk_mmid_shape_supported(tA, ids->ne[1])) return false;
-    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_enabled()) return false;
+    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_eligible(ids->ne[1])) return false;
 
     const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
@@ -403,6 +426,8 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int ith = params->ith, nth = params->nth;
     const int64_t n_ids = ids->ne[0];   // n_expert_used
     const int     n_as  = (int) ne02;   // n_expert
+    const bool mmid_rowexact = !params->disable_rowexact &&
+        ids->ne[1] > 1 && ids->ne[1] <= ggml_cpu_rowexact_n();
 
     // Carve wdata in the native layout: a Q8_K-sized activation region followed
     // by matrix_row_counts[n_as] and matrix_rows[n_as*n_ids*ids->ne[1]].
@@ -535,7 +560,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                         tA, A, src0->nb[1],
                         activation_type, qact_priv, act_row,
                         (float *) dst->data, dst->nb[1], dst->nb[2],
-                        b1_row + i, ith, nth)) {
+                        b1_row + i, mmid_rowexact, ith, nth)) {
                     return false; // gating should preclude; native re-runs from scratch on false
                 }
                 i = j;
@@ -598,7 +623,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                 tA, A, src0->nb[1],
                 activation_type, qact, act_row,
                 (float *) dst->data, dst->nb[1], dst->nb[2],
-                rmap, ith, nth)) {
+                rmap, mmid_rowexact, ith, nth)) {
             return false; // gating should preclude; native re-runs from scratch on false
         }
     }

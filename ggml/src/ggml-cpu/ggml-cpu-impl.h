@@ -31,6 +31,9 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // disable optional row-exact small-batch kernels for this computation
+    bool disable_rowexact;
 };
 
 

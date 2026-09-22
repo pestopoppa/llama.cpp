@@ -85,7 +85,8 @@ struct MulMat {
 #else
         constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
 #endif
-        if (const int n_y = nrc_y - info.cur_y; n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
+        if (const int n_y = nrc_y - info.cur_y;
+                info.allow_rowexact && n_y > 1 && n_y <= iqk_rowexact_n() && funcs[0]) {
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
                 auto this_info = info;
                 this_info.s += ix;
@@ -580,10 +581,10 @@ extern "C" IQK_API int iqk_dequant_type(int type, int Ny) {
     return MulMat::is_dequant_better(ggml_type(type), Ny);
 }
 
-extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
+static bool iqk_mul_mat_impl(long Nx, long Ny, long ne00,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
-        float * C, long stride_C, int ith, int nth) {
+        float * C, long stride_C, bool allow_rowexact, int ith, int nth) {
 
     constexpr int k_min_step = 32;
 
@@ -591,6 +592,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
 
     size_t row_size_qx = strideA; //*ggml_type_size(ggml_type(typeA));
     size_t row_size_qy = strideB; //*ggml_type_size(ggml_type(typeB));
+    const bool rowexact = allow_rowexact && Ny > 1 && Ny <= iqk_rowexact_n();
 
     if (Nx/nth < k_min_step) {
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
@@ -606,6 +608,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
             int nrc_x = std::min<int>(min_step, Nx - ix);
             int nrc_y = std::min<int>(min_step, Ny - iy);
             DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, iy, 1, nullptr, 0};
+            info.allow_rowexact = rowexact;
             mm.mul_mat_NxM(ne00, (const char *)A + ix*row_size_qx, row_size_qx, info, nrc_x, iy + nrc_y);
         }
         return true;
@@ -614,7 +617,6 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     int npt = (Nx + nth - 1)/nth;
 
     auto etypeA = ggml_type(typeA);
-    const bool rowexact = Ny > 1 && Ny <= iqk_rowexact_n();   // INF-70 GDN-ROWEXACT: stay on the Ny=1 kernel path
     if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); !rowexact && npt >= 16 &&
              dequant_type != etypeA && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny) &&
              Nx%MulMat::num_rows(ggml_type(dequant_type)) == 0) {
@@ -633,6 +635,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         size_t row_size_qy = strideB;
 
         DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+        info.allow_rowexact = rowexact;
 
         auto& f = thread_local_work_buffer();
 
@@ -670,12 +673,14 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
             auto first_x = ith*nrc_x;
             nrc_x = std::min(nrc_x, Nx - first_x);
             DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+            info.allow_rowexact = rowexact;
             mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny/2);
         } else {
             ith -= nth_new;
             auto first_x = ith*nrc_x;
             nrc_x = std::min(nrc_x, Nx - first_x);
             DataInfo info{C + first_x + (Ny/2)*stride_C, (const char *)B + (Ny/2)*row_size_qy, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+            info.allow_rowexact = rowexact;
             mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny/2);
         }
         return true;
@@ -686,10 +691,19 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
 
     DataInfo info{C + first_x*num_rows, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+    info.allow_rowexact = rowexact;
 
     mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x*num_rows, row_size_qx, info, nrc_x*num_rows, Ny);
 
     return true;
+}
+
+extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long stride_C, int ith, int nth) {
+    return iqk_mul_mat_impl(Nx, Ny, ne00, typeA, A, strideA, typeB, B, strideB,
+            C, stride_C, true, ith, nth);
 }
 
 namespace {
@@ -707,7 +721,7 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
         long nb02, long nb03, long nb12, long nb13, long nb2, long nb3,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
-        float * C, long stride_C, int ith, int nth) {
+        float * C, long stride_C, bool allow_rowexact, int ith, int nth) {
 
     auto r2 = ne12 / ne02;
     auto r3 = ne13 / ne03;
@@ -727,6 +741,7 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
                         int i02 = ichunk/nx32;
                         int ix = 32*(ichunk - i02*nx32);
                         DataInfo info{C + ix + r2*i02*nb2, (const char *)B + r2*i02*nb12, (size_t)nb2, (size_t)nb12, 0, 1, nullptr, 0};
+                        info.allow_rowexact = allow_rowexact;
                         mm.funcs[r2-1](ne00, (const void *)((const char *)A + ix*strideA + i02*nb02), strideA, info, 32);
                     }
                     return true;
@@ -735,10 +750,10 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
             for (int ichunk = ith; ichunk < nchunk; ichunk += nth) {
                 int i02 = ichunk/nx32;
                 int ix = ichunk - i02*nx32;
-                if (!iqk_mul_mat(32, r2, ne00,
+                if (!iqk_mul_mat_impl(32, r2, ne00,
                             typeA, (const char *)A + 32*ix*strideA + i02*nb02, strideA,
                             typeB, (const char *)B + i02*r2*nb12, nb12,
-                            C + 32*ix + r2*i02*nb2, nb2, 0, 1)) return false;
+                            C + 32*ix + r2*i02*nb2, nb2, allow_rowexact, 0, 1)) return false;
 
             }
             return true;
@@ -747,11 +762,11 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
         int counter = 0;
         for (int64_t i12 = 0; i12 < ne02; i12++) {
             if ((counter++ % gcd) == (ith%gcd)) {
-                if (!iqk_mul_mat(Nx, r2, ne00,
+                if (!iqk_mul_mat_impl(Nx, r2, ne00,
                             typeA, (const char *)A + i12*nb02, strideA,
                             typeB, (const char *)B + i12*r2*nb12, nb12,
                             C + r2*i12*nb2, nb2,
-                            ith/gcd, nth/gcd)) return false;
+                            allow_rowexact, ith/gcd, nth/gcd)) return false;
             }
         }
         return true;
@@ -769,6 +784,7 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
         for (int ix = first; ix < last; ++ix) {
             for (int i02 = 0; i02 < ne02; ++i02) {
                 DataInfo info{C + ix + i02*nb2, (const char *)B + i02*nb12, (size_t)nb2, (size_t)nb12, 0, 1, nullptr, 0};
+                info.allow_rowexact = allow_rowexact;
                 mm.funcs[0](ne00, (const void *)((const char *)A + ix*strideA + i02*nb02), nb02, info, 1);
             }
         }
@@ -780,11 +796,11 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             if ((counter++ % gcd) == (ith%gcd)) {
-                if (!iqk_mul_mat(Nx, Ny, ne00,
+                if (!iqk_mul_mat_impl(Nx, Ny, ne00,
                             typeA, (const char *)A + i12/r2*nb02 + i13/r3*nb03, strideA,
                             typeB, (const char *)B + i12*nb12 + i13*nb13, strideB,
                             C + i12*nb2 + i13*nb3, stride_C,
-                            ith/gcd, nth/gcd)) return false;
+                            allow_rowexact, ith/gcd, nth/gcd)) return false;
             }
         }
     }
@@ -794,7 +810,8 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
 extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
-        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth) {
+        float * C, long nb1, long nb2, const void * vrow_mapping,
+        bool allow_rowexact, int ith, int nth) {
     const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
     assert(row_mapping != nullptr);
 
@@ -803,7 +820,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     auto etypeA = ggml_type(typeA);
     //auto etypeB = ggml_type(typeB);
     // INF-70 GDN-ROWEXACT: the small-batch exact mode stays on the direct-kernel (Ny=1) path
-    auto dequant_type = (Ny > 1 && Ny <= iqk_rowexact_n()) ? etypeA : MulMat::is_dequant_better(etypeA, Ny);
+    auto dequant_type = allow_rowexact ? etypeA : MulMat::is_dequant_better(etypeA, Ny);
     //if (etypeB != GGML_TYPE_F32) {
     //    if (ith == 0) printf("%s: typeA = %s, typeB = %s, dequant_type = %s\n", __func__, ggml_type_name(etypeA), ggml_type_name(etypeB), ggml_type_name(dequant_type));
     //}
@@ -827,6 +844,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         size_t row_size_qy = strideB;
 
         DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
+        info.allow_rowexact = allow_rowexact;
 
         auto& f = thread_local_work_buffer();
 
@@ -860,6 +878,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
         row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
+    info.allow_rowexact = allow_rowexact;
     mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny);
     return true;
 }
@@ -1887,13 +1906,13 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long /*Nx*/, long /*Ny*/, long /*ne00*/,
         long /*nb02*/, long /*nb03*/, long /*nb12*/, long /*nb13*/, long /*nb2*/, long /*nb3*/,
         int /*typeA*/, const void * /*A*/, long /*strideA*/,
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
-        float * /*C*/, long /*stride_C*/, int /*ith*/, int /*nth*/) {
+        float * /*C*/, long /*stride_C*/, bool /*allow_rowexact*/, int /*ith*/, int /*nth*/) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
 
 extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
-        const void *, int, int) {
+        const void *, bool, int, int) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
