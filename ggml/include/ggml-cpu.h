@@ -146,6 +146,73 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    //
+    // gather_rows_e4m3_e8m0 profiling
+    //
+    // Counters for GGML_OP_GATHER_ROWS_E4M3_E8M0 only. Model-agnostic: a slot is keyed by the
+    // address of the table being gathered, so a caller that gathers from several tables gets
+    // one slot per table without this code knowing what a table means.
+    //
+    // COMPILE-TIME GATE: -DGGML_CPU_PROF, the same switch that gates the INF-70 per-node
+    // profiler in ggml-cpu.c and the host-phase profiler in llama-graph.cpp (cmake option
+    // GGML_CPU_PROF, OFF by default; ggml/CMakeLists.txt, ggml/src/ggml-cpu/CMakeLists.txt,
+    // src/CMakeLists.txt). A non-profiling build is the MEASURED build and must contain no
+    // counter code and no instrumentation symbol whatsoever, so the instrument can never be
+    // suspected of having moved a number it is absent from. A profiling build is a SEPARATE
+    // arm, never the measured one.
+    //
+    // Inside a profiling build it is still OFF by default at run time: at level 0 the forward
+    // pass costs one relaxed load of a static int per thread per node.
+    //
+    // Level 0: nothing.
+    // Level 1: calls, rows, source bytes, thread-0 span, summed per-thread CPU time, and a
+    //          log2-spaced histogram of the per-call thread-0 span. Two clock reads per thread
+    //          per node.
+    // Level 2: level 1 plus minor/major page faults attributed to the op, via
+    //          getrusage(RUSAGE_THREAD) around each thread's span. Two extra syscalls per
+    //          thread per node -- this PERTURBS what it measures and is a diagnostic mode, not
+    //          a steady-state one. Where RUSAGE_THREAD is unavailable it degrades to level 1
+    //          and reports fault_source = 0.
+    //
+#ifdef GGML_CPU_PROF
+
+#define GGML_GATHER_E4M3_PROF_MAX_TABLES 8
+#define GGML_GATHER_E4M3_PROF_NBUCKET    48
+
+    struct ggml_gather_e4m3_prof_table {
+        const void * table;           // src0->data: the identity of the gathered table
+        int64_t n_table_rows;         // src0->ne[1]
+        int64_t row_bytes;            // src0->ne[0], the PACKED row width
+        int64_t n_calls;              // node executions seen
+        int64_t n_rows;               // rows gathered, counting repeats
+        int64_t n_bytes_src;          // n_rows * row_bytes: packed bytes dereferenced
+        int64_t us_span_ith0;         // summed thread-0 spans (the node-wall proxy)
+        int64_t us_cpu;               // summed per-thread spans over every thread
+        int64_t n_thread_spans;       // how many thread spans went into us_cpu
+        int64_t minflt;               // level 2 only: summed RUSAGE_THREAD minor faults
+        int64_t majflt;               // level 2 only: summed RUSAGE_THREAD major faults
+        int64_t us_hist[GGML_GATHER_E4M3_PROF_NBUCKET]; // thread-0 span: bucket 0 is 0 us,
+                                      // bucket b > 0 covers [2^((b-1)/4), 2^(b/4)) us
+    };
+
+    struct ggml_gather_e4m3_prof {
+        int     level;
+        int     fault_source;         // 0 none, 1 getrusage(RUSAGE_THREAD)
+        int     n_tables;             // table slots in use
+        int64_t n_calls_unattributed; // calls dropped because every slot was taken
+        struct ggml_gather_e4m3_prof_table tables[GGML_GATHER_E4M3_PROF_MAX_TABLES];
+    };
+
+    // the level is also taken from the GGML_GATHER_PROF environment variable on first use
+    GGML_BACKEND_API void ggml_gather_rows_e4m3_e8m0_prof_set_level(int level);
+    GGML_BACKEND_API int  ggml_gather_rows_e4m3_e8m0_prof_get_level(void);
+
+    // snapshot; safe to call while the counters are live, at the cost of a torn read
+    GGML_BACKEND_API void ggml_gather_rows_e4m3_e8m0_prof_read (struct ggml_gather_e4m3_prof * out);
+    GGML_BACKEND_API void ggml_gather_rows_e4m3_e8m0_prof_reset(void);
+
+#endif // GGML_CPU_PROF
+
 #ifdef __cplusplus
 }
 #endif
