@@ -1214,6 +1214,23 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
+
+        //
+        // DeepSeek-V4.1 Engram (DS41-B8). Inert on V4: every dsv41_engram_rows[] is 0, so
+        // build_inp_dsv41_engram() returns nullptr and build_engram() is the identity.
+        //
+
+        // Per-batch n-gram hash input. Call once, before the layer loop.
+        llm_graph_input_dsv41_engram * build_inp_dsv41_engram(const llama_model & model) const;
+
+        // Per-layer injection, on the hc-EXPANDED stream [n_embd, hc_mult, n_tokens], applied
+        // at the TOP of the layer body -- before the MTP target-layer capture and before
+        // build_hc_pre (model.py:1262-1267). Returns `h` unchanged on a non-Engram layer.
+        ggml_tensor * build_engram(
+                const llama_model & model,
+                llm_graph_input_dsv41_engram * inp,
+                ggml_tensor * h,
+                int il) const;
     };
 
     struct graph_mtp : public graph {

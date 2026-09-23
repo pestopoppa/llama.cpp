@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-kv-cache-dsv4.h"
+
 #include "gguf.h"
 
 #include <cstdio>
@@ -217,6 +219,29 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
                 }
                 hparams.dsv41_engram_rows[il] = engram_rows[i];
             }
+
+            // The n-gram hash spec itself: token_map, primes, multipliers, pad_id. It is not
+            // hparams (the token_map is one entry per vocabulary token), so it hangs off the
+            // model. DS41-B8.
+            uint32_t n_vocab = 0;
+            ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab);
+
+            dsv41_engram.load(ml, n_vocab);
+
+            if (dsv41_engram.empty()) {
+                throw std::runtime_error("deepseek41: engram tables are declared but the "
+                                         "engram.* hash metadata is missing");
+            }
+
+            if (dsv41_engram.layer_ids != engram_layer_ids) {
+                throw std::runtime_error("deepseek41: engram.layer_ids disagrees with itself");
+            }
+
+            for (size_t i = 0; i < engram_layer_ids.size(); ++i) {
+                if (dsv41_engram.rows[i] != hparams.dsv41_engram_rows[engram_layer_ids[i]]) {
+                    throw std::runtime_error("deepseek41: engram.rows disagrees with itself");
+                }
+            }
         }
     }
 
@@ -339,6 +364,148 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
     }
+}
+
+//
+// DS41-B8 -- Engram conditional memory.
+//
+// Normative: DeepSeek-V4.1-Flash/inference/engram.py and inference/model.py:296-365
+// (ParallelEngramEmbedding + Engram). Working cross-check: antirez/ds4 @ 0aaea5a,
+// ds4_engram.c and ds4_deepseek41_cuda.cuh:179-202 (the gate kernel).
+//
+// Per BATCH, on the host: map token ids through engram.token_map, take the 4-token suffix
+// newest-first with a sticky blocked flag, and turn it into 24 table-row ids per token per
+// engram layer (llm_graph_input_dsv41_engram::set_input). There is no prefetch depth at
+// decode: the newest element of the n-gram is the token just sampled, so the row ids for step
+// t cannot be known before step t-1 has produced its token.
+//
+// Per TOKEN, in the graph: gather those 24 rows (256 dequantized floats each), project them
+// through engram_kv to hc_mult keys plus one shared value, and add the value into every
+// hyper-connection stream, scaled by a per-(token, stream) sigmoid gate.
+//
+
+llm_graph_input_dsv41_engram * llama_model_deepseek4::graph::build_inp_dsv41_engram(const llama_model & model) const {
+    const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+
+    llama_dsv41_engram_state * state = mctx_cur ? mctx_cur->get_engram_state() : nullptr;
+
+    if (state == nullptr) {
+        // V4, or a V4.1 GGUF with no engram tables
+        return nullptr;
+    }
+
+    const llama_dsv41_engram_spec * spec = &model.dsv41_engram;
+
+    GGML_ASSERT(!spec->empty());
+
+    auto inp = std::make_unique<llm_graph_input_dsv41_engram>(spec, state, (uint32_t) n_tokens);
+
+    inp->ids.resize(spec->n_engram);
+
+    for (uint32_t e = 0; e < spec->n_engram; ++e) {
+        inp->ids[e] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, spec->n_col, n_tokens);
+        ggml_set_input(inp->ids[e]);
+        ggml_format_name(inp->ids[e], "engram_ids_l%u", spec->layer_ids[e]);
+    }
+
+    inp->gate_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
+    ggml_set_input(inp->gate_mask);
+    ggml_set_name(inp->gate_mask, "engram_gate_mask");
+
+    return (llm_graph_input_dsv41_engram *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_engram(
+        const llama_model & model,
+        llm_graph_input_dsv41_engram * inp,
+        ggml_tensor * h,
+        int il) const {
+    if (inp == nullptr) {
+        return h;
+    }
+
+    const llama_dsv41_engram_spec & spec = model.dsv41_engram;
+
+    const int e = spec.index_of_layer((uint32_t) il);
+    if (e < 0) {
+        return h;
+    }
+
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.engram_embd   != nullptr);
+    GGML_ASSERT(layer.engram_kv     != nullptr);
+    GGML_ASSERT(layer.engram_q_norm != nullptr);
+    GGML_ASSERT(layer.engram_k_norm != nullptr);
+
+    const int64_t hc  = hparams.dsv4_hc_mult;
+    const float   eps = hparams.f_norm_rms_eps;
+
+    GGML_ASSERT(h->ne[0] == n_embd && h->ne[1] == hc && h->ne[2] == n_tokens);
+
+    // --- the lookup -----------------------------------------------------------------------
+    // engram_embd is the packed FP8 table, I8 [33*k, rows]. Only the gathered rows are read;
+    // the 189 GiB table is never scanned and never forced resident, and there is no LRU --
+    // antirez has none either (ds4_engram.c:276-277).
+    ggml_tensor * rows = ggml_gather_rows_e4m3_e8m0(ctx0, layer.engram_embd, inp->ids[e]);
+    cb(rows, "engram_rows", il);
+
+    // [head_dim, n_col, n_tokens] -> [n_col*head_dim, n_tokens]; engram.py:353 does the same
+    // flatten(-2), so column c occupies [c*head_dim, (c+1)*head_dim).
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, rows, rows->ne[0]*rows->ne[1], n_tokens);
+
+    GGML_ASSERT(flat->ne[0] == layer.engram_kv->ne[0]);
+    GGML_ASSERT(layer.engram_kv->ne[1] == n_embd*(hc + 1));
+
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.engram_kv, flat); // [n_embd*(hc+1), n_tokens]
+    cb(kv, "engram_kv", il);
+
+    // engram.py:354 splits [hc_mult*dim | dim]: hc_mult per-stream keys, then one shared value.
+    ggml_tensor * key = ggml_cont(ctx0, ggml_view_3d(ctx0, kv,
+                n_embd, hc, n_tokens,
+                kv->nb[0]*n_embd, kv->nb[1], 0));
+
+    ggml_tensor * val = ggml_cont(ctx0, ggml_view_2d(ctx0, kv,
+                n_embd, n_tokens,
+                kv->nb[1], kv->nb[0]*n_embd*hc));
+
+    // --- the gate -------------------------------------------------------------------------
+    // engram.py:356-362:
+    //   weight = q_weight * k_weight                       (only ever used as the product)
+    //   rstd   = rsqrt(mean(h^2) + eps) * rsqrt(mean(key^2) + eps)   per (token, stream)
+    //   dot    = (h * weight * key).sum(-1) * rstd * dim^-0.5
+    //   gate   = sigmoid(copysign(sqrt(clamp_min(|dot|, 1e-6)), dot))
+    // The two rsqrt terms are exactly what ggml_rms_norm applies, so folding them in keeps the
+    // normalization per (token, stream) over dim and NOT jointly across streams.
+    ggml_tensor * hn = ggml_rms_norm(ctx0, h,   eps);
+    ggml_tensor * kn = ggml_rms_norm(ctx0, key, eps);
+
+    ggml_tensor * w = ggml_mul(ctx0, layer.engram_q_norm, layer.engram_k_norm); // [n_embd, hc]
+
+    ggml_tensor * dot = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_mul(ctx0, hn, kn), w));
+    dot = ggml_scale(ctx0, dot, 1.0f/sqrtf((float) n_embd)); // [1, hc, n_tokens]
+    cb(dot, "engram_dot", il);
+
+    // signed sqrt. ggml_sgn(0) is 0 where torch.copysign(y, +0.0) is +y, so a dot of exactly
+    // +0.0f gives sigmoid(0) here and sigmoid(1e-3) in the reference -- a 2.5e-4 gate delta on
+    // a measure-zero input. Flagged in NOTES.md rather than papered over.
+    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, mag, ggml_sgn(ctx0, dot)));
+
+    // engram.py:363-364: a dead/image position passes through untouched.
+    gate = ggml_mul(ctx0, gate, inp->gate_mask);
+    cb(gate, "engram_gate", il);
+
+    // --- the write ------------------------------------------------------------------------
+    // engram.py:365: h + gate * value, the SAME value added to every stream.
+    ggml_tensor * v = ggml_repeat_4d(ctx0,
+            ggml_reshape_3d(ctx0, val, n_embd, 1, n_tokens),
+            n_embd, hc, n_tokens, 1);
+
+    ggml_tensor * out = ggml_add(ctx0, h, ggml_mul(ctx0, v, gate));
+    cb(out, "engram_out", il);
+
+    return out;
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
