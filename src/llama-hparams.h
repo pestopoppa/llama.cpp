@@ -205,6 +205,12 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    // DSpark draft-block filler token. DeepSeek's tokenizer has no MASK token, so the noise id
+    // (model.py:131 dspark_noise_token_id) has to come from GGUF metadata; -1 means "none" and
+    // the runtime falls back to the vocabulary's MASK.
+    int32_t  dflash_noise_token_id   = -1;
+    // "" (V4 DSpark, the legacy graph) or "v41" (DeepSeek-V4.1-Flash DSpark, model.py:1100-1156)
+    bool     dspark_v41              = false;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

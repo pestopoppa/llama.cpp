@@ -1378,6 +1378,10 @@ struct llama_model_eagle3 : public llama_model_base {
 };
 
 
+// DSpark Markov-bias chain + confidence head (src/models/dflash.cpp). Shared by the V4 and the
+// DeepSeek-V4.1 DSpark graphs; writes res->t_logits and res->t_h_nextn.
+void llama_model_dflash_build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens);
+
 struct llama_model_dflash : public llama_model_base {
     llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1401,6 +1405,31 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
         graph_dsv4(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // DeepSeek-V4.1-Flash DSpark (INF-77 DS41-B13), src/models/dflash-dspark41.cpp.
+    //
+    // Same dual-mode shape as graph_dsv4 -- an embd ubatch writes the window ring, a token ubatch
+    // runs the draft block -- but with the four V4.1 deltas spelled out in DESIGN.md section 3:
+    // the hyper-connection mix is LAGGED (model.py:968-994), the head collapse reuses the last
+    // stage's FFN mix because the checkpoint ships no output_hc_* (model.py:1143), there is no
+    // query head-norm (model.py:1057), and the block attends bidirectionally over
+    // [window | block] with the drafts' own KV never entering the ring (model.py:1020-1029,
+    // :1066-1067).
+    struct graph_dsv41 : public llama_model_deepseek4::graph {
+        graph_dsv41(const llama_model & model, const llm_graph_params & params);
+
+        // kv_norm(wkv(main_x)) with RoPE on the trailing rope dims -- the value the ring stores
+        // (model.py:1039-1041). Shared by both modes: the ring write and the block's own KV.
+        ggml_tensor * build_dspark_kv(
+                const llama_model & model,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        // The bidirectional block half of the mask: [n_block, n_block] of zeros, appended to the
+        // window half along dim 0. Built once and reused by every stage.
+        ggml_tensor * build_dspark_block_mask(int64_t n_block, ggml_type type) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

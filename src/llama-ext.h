@@ -124,3 +124,21 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// DSpark draft-block filler token (DeepSeek-V4.1 dspark_noise_token_id, model.py:131).
+// Returns -1 when the GGUF declares none, in which case the caller falls back to the
+// vocabulary's MASK token -- DeepSeek's tokenizer has no MASK, so a V4.1 DSpark GGUF must
+// declare it (INF-77 DS41-B13).
+LLAMA_API int32_t llama_model_dspark_noise_token(const struct llama_model * model);
+
+// trained DSpark/DFlash block size, or 0 when the GGUF declares none
+LLAMA_API int32_t llama_model_dspark_block_size(const struct llama_model * model);
+
+// true for a DeepSeek-V4.1-Flash DSpark drafter. Such a model has NO encoder graph: main_proj and
+// main_norm are stage-0 tensors applied inside the decoder's embd branch, so the caller feeds the
+// concatenated target features straight to llama_decode at width n_embd_inp_enc.
+LLAMA_API bool llama_model_dspark_is_v41(const struct llama_model * model);
+
+// The TARGET hidden size a DSpark drafter's own main_proj implies, or 0 when this is not a DSpark
+// v41 drafter. Use it in preference to assuming the draft and target hidden sizes are equal.
+LLAMA_API int32_t llama_model_dspark_target_hidden_size(const struct llama_model * model);

@@ -4,7 +4,132 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+// INF-77 DS41-B13. DeepSeek-V4.1-Flash DSpark ships as its own architecture
+// ("deepseek41-dspark", /mnt/raid0/llm/models/deepseek-ai/DeepSeek-V4.1-Flash-DSpark.gguf):
+// canonical llama.cpp KV names under that prefix, the port's own deepseek41 per-block tensor
+// names, DSpark-only keys under a `dspark.` infix, and token_embd/output carried in the file
+// rather than borrowed from the target. It is served by llama_model_dflash because the DSV4
+// DSpark graph and the block-parallel speculative driver are already here -- only loading
+// differs.
+//
+// The two structural differences from a DFlash drafter:
+//   * there is NO encoder. main_proj/main_norm are per-block-0 tensors and are applied inside
+//     the decoder's embd branch (model.py:1130), so the driver feeds the raw concatenated
+//     target features straight in instead of doing llama_encode + a second llama_decode.
+//   * the Markov/confidence heads use the checkpoint's own names and an [n_embd+rank] 1-D
+//     confidence projection.
+static void dsv41_dspark_load_hparams(llama_model_loader & ml, llama_hparams & hparams,
+        std::vector<int32_t> & target_layer_ids) {
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,          hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
+    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,           hparams.n_ff_exp);
+    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,                  hparams.n_expert_shared);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,                 hparams.expert_weights_scale);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,                  hparams.expert_weights_norm);
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,              hparams.swiglu_clamp_exp, hparams.n_layer_all);
+    hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
+
+    {
+        std::string scoring_func;
+        if (ml.get_key(LLM_KV_EXPERT_GATING_FUNC, scoring_func, false)) {
+            if (scoring_func != "sqrtsoftplus") {
+                throw std::runtime_error("deepseek41-dspark: unsupported scoring_func '" + scoring_func + "'");
+            }
+            hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
+        } else {
+            ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
+        }
+    }
+
+    // model.py:1034 -- DSparkAttention asserts compress_ratio == 0 on every stage.
+    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, false);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] != 0) {
+            throw std::runtime_error("deepseek41-dspark: every stage must have compress_ratio 0");
+        }
+    }
+
+    // DSpark-only keys, under the `dspark.` infix the converter writes.
+    {
+        uint32_t block_size = 0;
+        ml.get_key(LLM_KV_DSPARK_BLOCK_SIZE, block_size);
+        if (block_size == 0) {
+            throw std::runtime_error("deepseek41-dspark: dspark.block_size must be > 0");
+        }
+        hparams.dflash_block_size = block_size;
+
+        uint32_t noise_token_id = 0;
+        ml.get_key(LLM_KV_DSPARK_NOISE_TOKEN_ID, noise_token_id);
+        if (noise_token_id > (uint32_t) std::numeric_limits<int32_t>::max()) {
+            throw std::runtime_error("deepseek41-dspark: dspark.noise_token_id does not fit in int32_t");
+        }
+        hparams.dflash_noise_token_id = (int32_t) noise_token_id;
+    }
+
+    {
+        std::vector<int32_t> ids;
+        ml.get_arr(LLM_KV_DSPARK_TARGET_LAYER_IDS, ids);
+        if (ids.empty()) {
+            throw std::runtime_error("deepseek41-dspark: dspark.target_layer_ids is empty");
+        }
+        target_layer_ids = ids;
+
+        // model.py:1113 -- main_proj is Linear(target_hidden * len(target_layer_ids), dim). The
+        // AUTHORITATIVE width is the weight's own input dimension, not len(ids)*n_embd: those two
+        // agree only while the drafter and the target share a hidden size, which is a property of
+        // this checkpoint and not of the format. Take it from the tensor and derive the implied
+        // per-layer target width, so the driver can check a real number instead of a coincidence.
+        const struct ggml_tensor * main_proj_meta = ml.get_tensor_meta("blk.0.dspark_main_proj.weight");
+        if (main_proj_meta == nullptr) {
+            throw std::runtime_error("deepseek41-dspark: blk.0.dspark_main_proj.weight is missing");
+        }
+
+        const int64_t n_embd_inp_enc = main_proj_meta->ne[0];
+        if (n_embd_inp_enc <= 0 || n_embd_inp_enc > (int64_t) std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("deepseek41-dspark: main_proj input width is out of range");
+        }
+        if (n_embd_inp_enc % (int64_t) ids.size() != 0) {
+            throw std::runtime_error("deepseek41-dspark: main_proj input width " +
+                    std::to_string(n_embd_inp_enc) + " is not a multiple of the " +
+                    std::to_string(ids.size()) + " target layers");
+        }
+
+        hparams.n_embd_inp_enc_impl = (uint32_t) n_embd_inp_enc;
+
+        LLAMA_LOG_INFO("%s: DSpark main_proj: %lld -> %u (%zu target layers x %lld)\n", __func__,
+                (long long) n_embd_inp_enc, hparams.n_embd, ids.size(),
+                (long long) (n_embd_inp_enc/(int64_t) ids.size()));
+    }
+
+    hparams.dspark_v41 = true;
+
+    GGML_ASSERT(hparams.n_swa > 0);
+    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    hparams.set_swa_pattern(0);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = true;
+    }
+    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+    if (arch == LLM_ARCH_DEEPSEEK41_DSPARK) {
+        dsv41_dspark_load_hparams(ml, hparams, target_layer_ids);
+        type = LLM_TYPE_UNKNOWN;
+        return;
+    }
+
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
@@ -78,6 +203,45 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
             }
         }
 
+        // DS41-B13. The draft-block filler token: DeepSeek's tokenizer ships no MASK, so
+        // dspark_noise_token_id (model.py:131) has to travel as metadata. Optional, because the
+        // V4 DSpark drafters on this branch do use llama_vocab_mask().
+        {
+            uint32_t noise_token_id = 0;
+            if (ml.get_key(LLM_KV_DFLASH_NOISE_TOKEN_ID, noise_token_id, false)) {
+                if (noise_token_id > (uint32_t) std::numeric_limits<int32_t>::max()) {
+                    throw std::runtime_error("DSpark noise_token_id does not fit in int32_t");
+                }
+                hparams.dflash_noise_token_id = (int32_t) noise_token_id;
+            }
+        }
+
+        // "" / absent -> the V4 DSpark graph; "v41" -> DeepSeek-V4.1-Flash DSpark (model.py:1100).
+        {
+            std::string dspark_variant;
+            ml.get_key(LLM_KV_DFLASH_DSPARK_VARIANT, dspark_variant, false);
+            if (dspark_variant == "v41") {
+                hparams.dspark_v41 = true;
+            } else if (!dspark_variant.empty() && dspark_variant != "v4") {
+                throw std::runtime_error("unsupported dspark_variant '" + dspark_variant + "'");
+            }
+        }
+
+        if (hparams.dspark_v41) {
+            // model.py:1020-1029 -- the in-block mask is built for exactly dspark_block_size
+            // positions, and the whole draft is one block, so a block size is mandatory here
+            // even though plain DFlash defaults it in the driver.
+            if (hparams.dflash_block_size == 0) {
+                throw std::runtime_error("DSpark v41 draft requires 'block_size' in GGUF metadata");
+            }
+            if (hparams.dflash_noise_token_id < 0) {
+                throw std::runtime_error("DSpark v41 draft requires 'noise_token_id' in GGUF metadata");
+            }
+            if (hparams.dflash_selector_top_k != 0) {
+                throw std::runtime_error("DSpark v41 draft has no DFlash2 selector head");
+            }
+        }
+
         GGML_ASSERT(hparams.n_swa > 0);
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         hparams.set_swa_pattern(0);
@@ -109,6 +273,94 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // INF-77 DS41-B13: the DeepSeek-V4.1-Flash DSpark drafter, 83 tensors. The per-block set is
+    // byte-identical to the deepseek41 backbone's names, so the creation below is the DSV4 branch
+    // further down minus the compressor/indexer/engram tensors, plus the five DSpark-only ones
+    // and the two tied-but-carried embeddings.
+    if (arch == LLM_ARCH_DEEPSEEK41_DSPARK) {
+        const int64_t q_lora_rank     = hparams.n_lora_q;
+        const int64_t n_ff_exp        = hparams.n_ff_exp;
+        const int64_t n_expert_shared = hparams.n_expert_shared;
+        const int64_t n_embd_head     = hparams.n_embd_head_k();
+        const int64_t o_groups        = hparams.dsv4_o_group_count;
+        const int64_t o_lora_rank     = hparams.dsv4_o_lora_rank;
+        const int64_t hc_mult         = hparams.dsv4_hc_mult;
+        const int64_t hc_dim          = hc_mult*n_embd;
+        const int64_t hc_mix_dim      = (2 + hc_mult)*hc_mult;
+        const int64_t n_embd_inp_enc  = hparams.n_embd_inp_enc();
+
+        // model.py:1212-1213 -- tied to the backbone. The converter carries them byte-identically
+        // rather than making the drafter depend on ctx_other, so create them here; the graph then
+        // never touches cparams.ctx_other.
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+        output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, 0);
+
+        // NOT the backbone's norm: this is mtp.2.norm, the DSpark stage-2 norm the draft head
+        // uses (model.py:1145).
+        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+        // model.py:1113-1114, :1130 -- main_norm(main_proj(main_hidden)), on stage 0 only.
+        dspark_main_proj = create_tensor(tn(LLM_TENSOR_DSPARK_MAIN_PROJ, "weight", 0), {n_embd_inp_enc, n_embd}, 0);
+        dspark_main_norm = create_tensor(tn(LLM_TENSOR_DSPARK_MAIN_NORM, "weight", 0), {n_embd}, 0);
+
+        // model.py:1079-1097. Shapes match what build_dspark_markov_head already expects, so the
+        // V4 DSpark head code is reused unchanged; only the tensor NAMES differ.
+        {
+            const struct ggml_tensor * meta = ml.get_tensor_meta("dspark_markov_embd.weight");
+            if (meta == nullptr) {
+                throw std::runtime_error("deepseek41-dspark: dspark_markov_embd.weight is missing");
+            }
+            const int64_t markov_rank = meta->ne[0];
+
+            dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_EMBD, "weight"), {markov_rank, n_vocab}, 0);
+            dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_HEAD, "weight"), {markov_rank, n_vocab}, 0);
+
+            // [n_embd + rank], 1-D: ggml_mul_mat against a [n_embd+rank, n_blocks] feature block
+            // yields [1, n_blocks], which is what the confidence channel is.
+            dspark_conf_proj = create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_PROJ, "weight"), {n_embd + markov_rank}, 0);
+
+            LLAMA_LOG_INFO("%s: DeepSeek-V4.1 DSpark drafter: block=%u, noise=%d, markov rank=%lld\n",
+                    __func__, hparams.dflash_block_size, hparams.dflash_noise_token_id, (long long) markov_rank);
+        }
+
+        for (int i = 0; i < n_layer; ++i) {
+            auto & layer = layers[i];
+
+            layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
+            layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, 0);
+            layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, 0);
+            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
+            layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head*n_embd_head}, 0);
+            layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,       "weight", i), {n_embd, n_embd_head}, 0);
+            layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, 0);
+            layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head*n_embd_head/o_groups, o_lora_rank, o_groups}, TENSOR_ALLOW_RESHAPE);
+            layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups*o_lora_rank, n_embd}, 0);
+
+            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
+            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
+            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
+            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim}, 0);
+            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, 0);
+            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+
+            layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+            // the VL router bias rides along; registered so the loader accounts for it
+            create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
+
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+
+            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                    n_ff_exp*n_expert_shared}, 0);
+            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp*n_expert_shared, n_embd                   }, 0);
+            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                    n_ff_exp*n_expert_shared}, 0);
+        }
+
+        return;
+    }
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
@@ -263,10 +515,20 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
+            // deepseek41-dspark's projection is blk.0.dspark_main_proj / blk.0.dspark_main_norm
+            // rather than fc / output_norm_enc, so it builds its own encoder graph -- but it IS an
+            // encoder graph, because llama_context::encode is the only path whose batch allocator
+            // is sized at n_embd_inp_enc().
+            if (hparams.dspark_v41) {
+                return std::make_unique<graph_dsv41>(*this, params);
+            }
             return std::make_unique<graph<true>>(*this, params);
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
             if (hparams.dsv4_hc_mult > 0) {
+                if (hparams.dspark_v41) {
+                    return std::make_unique<graph_dsv41>(*this, params);
+                }
                 return std::make_unique<graph_dsv4>(*this, params);
             }
             return std::make_unique<graph<false>>(*this, params);
@@ -325,7 +587,11 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+//
+// Not static: the DeepSeek-V4.1 DSpark graph in dflash-dspark41.cpp reuses it verbatim, because
+// model.py:1145-1155 is the same operator (bias from output_ids[:,i], confidence from the
+// pre-norm collapsed hidden state).
+void llama_model_dflash_build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -337,9 +603,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
-    const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
-    const int64_t block_size = std::stoi(it->second);
+    // deepseek41-dspark writes the block size under `dspark.block_size`, which the loader has
+    // already put in hparams; the older DFlash/DSpark GGUFs only have the raw KV string.
+    int64_t block_size = (int64_t) g.hparams.dflash_block_size;
+    if (block_size <= 0) {
+        const auto it = model.gguf_kv.find("dflash.block_size");
+        GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires a block size in GGUF metadata");
+        block_size = std::stoi(it->second);
+    }
     GGML_ASSERT(block_size > 0);
 
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
@@ -728,7 +999,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // DSpark: bias the draft logits with the Markov head
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        llama_model_dflash_build_dspark_markov_head(*this, model, inp_tokens);
     }
 }
 
@@ -995,6 +1266,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, cur);
 
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        llama_model_dflash_build_dspark_markov_head(*this, model, inp_tokens);
     }
 }

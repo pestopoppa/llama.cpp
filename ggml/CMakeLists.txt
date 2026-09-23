@@ -128,6 +128,10 @@ option(GGML_CCACHE "ggml: use ccache if available"                   ON)
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
 option(GGML_ALL_WARNINGS_3RD_PARTY "ggml: enable all compiler warnings in 3rd party libs" OFF)
 option(GGML_GPROF                  "ggml: enable gprof"                                   OFF)
+# INF-77 DS41-C4: the INF-70 per-node CPU profiler is guarded by #ifdef GGML_CPU_PROF and
+# has never had a build switch, so it has never been compiled into any binary on this host.
+# OFF by default: a profiling build is a SEPARATE arm, never the measured one.
+option(GGML_CPU_PROF               "ggml: compile the per-node CPU profiler (INF-70)"     OFF)
 
 # build
 option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)

@@ -156,6 +156,22 @@ struct common_speculative_impl {
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
 
+    // INF-77 DS41-B13. n_acc_tokens_per_pos alone cannot give alpha: it is normalised by the
+    // number of accept calls, so a block the drafter never proposed (confidence truncation,
+    // p_min) is indistinguishable from one the target rejected. Measuring alpha rather than
+    // assuming it needs the denominator too.
+    std::vector<size_t> n_gen_tokens_per_pos;   // tokens PROPOSED at each draft position.
+    std::vector<size_t> n_trunc_per_pos;        // blocks the drafter stopped AT this position.
+    size_t n_bonus_tokens = 0;                  // cycles where every drafted token was accepted.
+    std::vector<size_t> n_last_proposed;        // [n_seq] block length proposed in the last cycle.
+
+    void record_trunc_at(size_t pos) {
+        if (n_trunc_per_pos.size() <= pos) {
+            n_trunc_per_pos.resize(pos + 1, 0);
+        }
+        n_trunc_per_pos[pos]++;
+    }
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -1304,6 +1320,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_token mask_token_id = 0;
 
     bool    is_dflash2     = false;
+    // DeepSeek-V4.1-Flash DSpark (arch "deepseek41-dspark"). Same two-phase hand-off as DFlash --
+    // llama_encode projects the concatenated target features, llama_decode writes the ring -- but
+    // the projection weights are blk.0.dspark_main_proj / dspark_main_norm (model.py:1113-1114,
+    // :1130) instead of fc / output_norm_enc. Used here only to make the target-width check real.
+    bool    is_dspark41    = false;
     int32_t selector_top_k = 0;
     std::vector<std::mt19937> selector_rng;
     std::vector<bool> selector_reset;
@@ -1351,6 +1372,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 throw std::runtime_error("DFlash has an invalid dflash.target_hidden_size metadata value");
             }
             n_embd_tgt_expected = (int32_t) n_embd_tgt_declared;
+        } else if (const int32_t n_embd_tgt_dspark = llama_model_dspark_target_hidden_size(model_dft)) {
+            // deepseek41-dspark writes no dflash.target_hidden_size. Rather than fall back to the
+            // DRAFT's hidden size -- which passes here only because both happen to be 5120 on this
+            // model, and would silently accept a mismatched pair on the next one -- take the width
+            // the drafter's own main_proj implies: main_proj->ne[0] / len(target_layer_ids).
+            n_embd_tgt_expected = n_embd_tgt_dspark;
+            LOG_INF("%s: target hidden size %d derived from the drafter's main_proj\n",
+                    __func__, n_embd_tgt_expected);
         } else {
             LOG_WRN(
                     "%s: missing dflash.target_hidden_size; using legacy draft hidden size %d and "
@@ -1379,7 +1408,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 is_dflash2 = selector_top_k > 0;
             }
         }
-        mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        // INF-77 DS41-B13. DeepSeek's tokenizer has no MASK token, so a DSpark draft GGUF
+        // declares its filler explicitly (dspark_noise_token_id = 128799, model.py:131). Fall
+        // back to the vocabulary's MASK for the DFlash/V4-DSpark drafters that use it.
+        {
+            const int32_t noise_token_id = llama_model_dspark_noise_token(model_dft);
+            mask_token_id = noise_token_id >= 0
+                ? (llama_token) noise_token_id
+                : llama_vocab_mask(llama_model_get_vocab(model_dft));
+        }
+
+        if (is_dspark && mask_token_id == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error(
+                    "DSpark draft model declares no noise_token_id and its vocabulary has no MASK "
+                    "token -- the draft block cannot be filled");
+        }
+
+        // The DSpark block layout is [id_last, NOISE x (B-1)] (model.py:1131-1132), so the
+        // trained block size is the number of draft positions, not block_size-1 as for DFlash.
+        // Trust the model's own metadata over the driver default when it is present.
+        {
+            const int32_t bs = llama_model_dspark_block_size(model_dft);
+            if (is_dspark && bs > 0) {
+                block_size = bs;
+            }
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
@@ -1396,6 +1449,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+        is_dspark41  = is_dspark && llama_model_dspark_is_v41(model_dft);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
         smpls.resize(n_seq);
@@ -1562,6 +1616,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
+                // llama_encode is the only path whose batch allocator is sized at
+                // n_embd_inp_enc() (llama-context.cpp:1709), so the wide feature rows must go
+                // through it -- for deepseek41-dspark exactly as for DFlash, even though its
+                // projection lives in blk.0.dspark_main_proj rather than fc.
                 int32_t rc = llama_encode(ctx_dft, enc_batch);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
@@ -1572,7 +1630,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions
+                // inject the draft decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
@@ -1717,6 +1775,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                        // model.py:1156 -- the confidence head TRUNCATES the proposal; it never
+                        // rejects a token. Counted separately so that alpha/pos (accepted over
+                        // proposed) is not polluted by positions that were never proposed.
+                        record_trunc_at((size_t) i);
                         break;
                     }
 
@@ -1736,6 +1798,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                 }
+
+                // DS41-B13 / DESIGN.md 3.4. model.py:1066-1067 CONCATENATES the block's own KV
+                // onto the window instead of storing it: the ring holds main_kv (target-derived)
+                // only. Our block does write into the draft cache, because that is what makes the
+                // non-causal SWA mask give in-block bidirectionality -- so the rows are dropped
+                // again here, before the next process() injects the real main_kv at the same
+                // positions. Without this the ring keeps draft K at positions the target may
+                // never have accepted, and the next injection would collide with live cells.
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) dp.n_past, -1);
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -3231,6 +3302,18 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    if (impl->n_gen_tokens_per_pos.size() < result.size()) {
+                        impl->n_gen_tokens_per_pos.resize(result.size(), 0);
+                    }
+                    for (size_t i = 0; i < result.size(); ++i) {
+                        impl->n_gen_tokens_per_pos[i]++;
+                    }
+
+                    if (impl->n_last_proposed.size() <= (size_t) seq_id) {
+                        impl->n_last_proposed.resize((size_t) seq_id + 1, 0);
+                    }
+                    impl->n_last_proposed[seq_id] = result.size();
                 }
             }
 
@@ -3273,6 +3356,15 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (n_accepted > 0) {
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
+        }
+
+        // n_accepted is |accepted| - 1, i.e. the number of DRAFT tokens the target confirmed.
+        // Equal to the number proposed in THIS cycle => the target also committed its own bonus
+        // token, so the cycle netted block+1 tokens for one target decode.
+        if ((size_t) seq_id < impl->n_last_proposed.size() &&
+                impl->n_last_proposed[seq_id] > 0 &&
+                n_accepted >= impl->n_last_proposed[seq_id]) {
+            impl->n_bonus_tokens++;
         }
 
         impl->accept(seq_id, n_accepted, false);
@@ -3346,6 +3438,64 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
+        // INF-77 DS41-B13: accepted/proposed per position -- the quantity a DSpark campaign has
+        // to MEASURE. Expected tokens per target decode is 1 + sum_i prod_{j<=i} alpha[j], which
+        // cannot be recovered from a scalar acceptance rate.
+        std::string str_alpha;
+        if (!impl->n_gen_tokens_per_pos.empty()) {
+            std::ostringstream acc;
+            std::ostringstream prop;
+            std::ostringstream alpha;
+            std::ostringstream trunc;
+            alpha << std::fixed << std::setprecision(4);
+            for (size_t i = 0; i < impl->n_gen_tokens_per_pos.size(); ++i) {
+                const size_t n_prop = impl->n_gen_tokens_per_pos[i];
+                const size_t n_acc  = i < impl->n_acc_tokens_per_pos.size() ? impl->n_acc_tokens_per_pos[i] : 0;
+                const size_t n_tr   = i < impl->n_trunc_per_pos.size()      ? impl->n_trunc_per_pos[i]      : 0;
+                if (i > 0) {
+                    acc << ","; prop << ","; alpha << ","; trunc << ",";
+                }
+                acc   << n_acc;
+                prop  << n_prop;
+                trunc << n_tr;
+                alpha << (n_prop > 0 ? (double) n_acc / (double) n_prop : 0.0);
+            }
+            // INF-77 DS41-B13 follow-up. `alpha/pos` above is a SURVIVAL rate, not a conditional
+            // one: acceptance is a prefix, so n_acc_tokens_per_pos[i] counts the blocks whose
+            // first i+1 draft tokens were ALL accepted. alpha/pos[i] is therefore
+            // prod_{j<=i} alpha_j -- exactly the term the expected-tokens sum needs, but it decays
+            // by construction and must NOT be read as "the drafter degrades with block depth".
+            //
+            // The conditional per-position rate is the ratio of successive survival counts:
+            //   cond/pos[0] = n_acc[0] / n_reach[0],   cond/pos[i] = n_acc[i] / n_reach[i]
+            // with n_reach[i] = the blocks that both survived position i-1 and proposed at i.
+            // FLAT cond/pos  -> every position is equally hard: a systematic defect.
+            // DECAYING       -> the drafter degrades with depth; the response is a smaller
+            //                   --spec-n-max, not a code fix.
+            std::ostringstream cond;
+            cond << std::fixed << std::setprecision(4);
+            for (size_t i = 0; i < impl->n_gen_tokens_per_pos.size(); ++i) {
+                const size_t n_acc  = i < impl->n_acc_tokens_per_pos.size() ? impl->n_acc_tokens_per_pos[i] : 0;
+                const size_t n_prev = i == 0
+                    ? impl->n_call_accept
+                    : (i - 1 < impl->n_acc_tokens_per_pos.size() ? impl->n_acc_tokens_per_pos[i - 1] : 0);
+                // a block that survived to i-1 but proposed nothing at i (confidence truncation)
+                // never gave position i a chance, so it must not sit in the denominator
+                const size_t n_reach = std::min(n_prev, impl->n_gen_tokens_per_pos[i]);
+                if (i > 0) {
+                    cond << ",";
+                }
+                cond << (n_reach > 0 ? (double) n_acc / (double) n_reach : 0.0);
+            }
+
+            str_alpha = ", #acc/pos = (" + acc.str() + ")"
+                        ", #prop/pos = (" + prop.str() + ")"
+                        ", alpha/pos = (" + alpha.str() + ")"
+                        ", cond/pos = (" + cond.str() + ")"
+                        ", #trunc/pos = (" + trunc.str() + ")"
+                        ", #bonus = " + std::to_string(impl->n_bonus_tokens);
+        }
+
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
@@ -3355,5 +3505,10 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+
+        if (!str_alpha.empty()) {
+            SPC_TRC("statistics %16s: %s\n",
+                    common_speculative_type_to_str(impl->type).c_str(), str_alpha.c_str());
+        }
     }
 }
