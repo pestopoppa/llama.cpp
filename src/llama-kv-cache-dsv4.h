@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-dsv41-engram.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
@@ -148,6 +149,11 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // DSV4.1 Engram n-gram history. nullptr for V4 and for a V4.1 GGUF with no engram tables.
+    // It lives here, and not on llama_context, because it is per-sequence state that must
+    // follow seq_rm / seq_cp / seq_keep / seq_add exactly as the KV cells do.
+    llama_dsv41_engram_state * get_engram_state() const;
+
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
@@ -170,6 +176,7 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+    std::unique_ptr<llama_dsv41_engram_state> engram_state;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
@@ -363,6 +370,10 @@ public:
     const llama_dsv4_comp_state       * get_hca_state() const;
     const llama_dsv4_comp_state       * get_lid_state() const;
 
+    // non-const: llm_graph_input_dsv41_engram::set_input commits the batch's compressed ids
+    // into it, exactly as engram.py:167 writes its cache before gathering any lookback.
+    llama_dsv41_engram_state          * get_engram_state() const;
+
     const comp_plan & get_csa_plan() const;
     const comp_plan & get_hca_plan() const;
     const comp_plan & get_lid_plan() const;
@@ -392,6 +403,7 @@ private:
     llama_dsv4_comp_state * csa_state = nullptr;
     llama_dsv4_comp_state * hca_state = nullptr;
     llama_dsv4_comp_state * lid_state = nullptr;
+    llama_dsv41_engram_state * engram_state = nullptr;
 
     stream_copy_info sc_info_csa;
     stream_copy_info sc_info_hca;

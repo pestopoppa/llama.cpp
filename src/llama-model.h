@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-arch.h"
+#include "llama-dsv41-engram.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
@@ -588,6 +589,11 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // DeepSeek-V4.1-Flash Engram n-gram hash layout (deepseek41.engram.*). Empty for every
+    // other architecture; it carries a token_map sized to the vocabulary, so it is loaded
+    // once here rather than living in llama_hparams (which is copied by value).
+    llama_dsv41_engram_spec dsv41_engram;
 
     // for classifier models
     std::vector<std::string> classifier_labels;

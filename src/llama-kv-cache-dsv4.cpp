@@ -1276,6 +1276,12 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
+    if (!model.dsv41_engram.empty()) {
+        LLAMA_LOG_INFO("%s: creating DSV4.1 Engram n-gram hash state\n", __func__);
+
+        engram_state = std::make_unique<llama_dsv41_engram_state>(n_seq_max);
+    }
+
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
@@ -1399,6 +1405,10 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
+
+    if (engram_state) {
+        engram_state->clear();
+    }
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
@@ -1421,6 +1431,10 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
             res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
 
+            if (res && engram_state) {
+                engram_state->seq_rm(seq_id, p0, -1);
+            }
+
             return res;
         }
 
@@ -1436,6 +1450,12 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
+
+            // an MTP rollback re-decodes these positions; dropping them keeps an n-gram from
+            // reading an id the sequence no longer contains
+            if (engram_state) {
+                engram_state->seq_rm(seq_id, p0, p1);
+            }
         }
 
         return res;
@@ -1445,6 +1465,10 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
     if (res) {
         clear_compressed(seq_id, true);
+
+        if (engram_state) {
+            engram_state->seq_rm(seq_id, p0, p1);
+        }
     }
 
     return res;
@@ -1462,6 +1486,10 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     hca_state->seq_cp(seq_id_src, seq_id_dst);
     lid_state->seq_cp(seq_id_src, seq_id_dst);
 
+    if (engram_state) {
+        engram_state->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
     }
@@ -1471,6 +1499,10 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
 
     kv_raw->seq_keep(seq_id);
+
+    if (engram_state) {
+        engram_state->seq_keep(seq_id);
+    }
 
     for (llama_seq_id id = 0; id < (llama_seq_id) n_seq_max; ++id) {
         if (id == seq_id) {
@@ -1484,6 +1516,10 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache_dsv4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     kv_raw->seq_add(seq_id, p0, p1, shift);
+
+    if (engram_state) {
+        engram_state->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -1633,6 +1669,10 @@ llama_kv_cache * llama_kv_cache_dsv4::get_lid() const {
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_csa_state() const {
     return csa_state.get();
+}
+
+llama_dsv41_engram_state * llama_kv_cache_dsv4::get_engram_state() const {
+    return engram_state.get();
 }
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_hca_state() const {
@@ -1951,6 +1991,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
+    engram_state(kv->get_engram_state()),
     reserve_plans(true),
     status(llama_memory_status_combine(
                 llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
@@ -1971,6 +2012,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
+    engram_state(kv->get_engram_state()),
     sc_info_csa(std::move(sc_info_csa)),
     sc_info_hca(std::move(sc_info_hca)),
     sc_info_lid(std::move(sc_info_lid)),
@@ -2024,6 +2066,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
+    engram_state(kv->get_engram_state()),
     status(ctx_raw->get_status()) {
     kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
@@ -2105,6 +2148,12 @@ const llama_dsv4_comp_state * llama_kv_cache_dsv4_context::get_csa_state() const
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return csa_state;
+}
+
+llama_dsv41_engram_state * llama_kv_cache_dsv4_context::get_engram_state() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    return engram_state;
 }
 
 const llama_dsv4_comp_state * llama_kv_cache_dsv4_context::get_hca_state() const {
