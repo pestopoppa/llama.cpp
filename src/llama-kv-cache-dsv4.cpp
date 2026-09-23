@@ -15,8 +15,34 @@
 #include <sstream>
 #include <stdexcept>
 
+// DeepSeek-V4's historical compressed-group ratios. They are now the defaults of
+// llama_dsv4_group_geometry rather than global constants; nothing outside
+// llama_dsv4_group_geometry_for() may assume them.
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
+
+llama_dsv4_group_geometry llama_dsv4_group_geometry_for(const llama_model & model) {
+    llama_dsv4_group_geometry geom;
+
+    if (model.arch != LLM_ARCH_DEEPSEEK41) {
+        // DeepSeek-V4: csa = overlapping ratio 4, hca = ratio 128, indexer keys on csa only.
+        geom.ratio_csa = DSV4_CSA_RATIO;
+        geom.ratio_hca = DSV4_HCA_RATIO;
+
+        return geom;
+    }
+
+    // DeepSeek-V4.1 (SPEC.md section 10): two non-overlapping groups, both owning indexer keys,
+    // and only kv_source_layer_ids get a plane.
+    geom.ratio_csa      = 2;
+    geom.ratio_hca      = 1;
+    geom.overlap_csa    = false;
+    geom.overlap_hca    = false;
+    geom.has_lid_b      = true;
+    geom.shared_sources = true;
+
+    return geom;
+}
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
@@ -428,6 +454,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
         bool overlap,
+        bool pad_blocks,
         uint32_t state_size,
         uint32_t kv_size,
         uint32_t n_stream,
@@ -544,7 +571,11 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty()) {
+    // Pad short ubatches up to the reserve plan's block count so a small-ratio group does not
+    // force a fresh graph at every block boundary. V4 enabled this for the ratio-4 CSA group
+    // only; it is now driven by the geometry so V4.1's ratio-2 and ratio-1 groups get it too.
+    // V4 passes pad_blocks == (ratio == DSV4_CSA_RATIO), so its behaviour is unchanged.
+    if (pad_blocks && !plan.state_pos.empty()) {
         assert(kv_size > 0);
 
         // Pad each stream to the reserve plan's block count.
@@ -696,6 +727,7 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         const std::vector<llama_ubatch> & ubatches,
         uint32_t ratio,
         bool overlap,
+        bool pad_blocks,
         uint32_t state_size,
         uint32_t kv_size,
         uint32_t n_stream,
@@ -705,7 +737,7 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, pad_blocks, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
     }
 
     return plans;
@@ -1174,6 +1206,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
     hparams_lid(model.hparams),
+    hparams_lid_b(model.hparams),
+    geom(llama_dsv4_group_geometry_for(model)),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
     rs_idx(n_seq_max, 0) {
@@ -1195,6 +1229,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_csa.n_layer_nextn = 0;
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
+    hparams_lid_b.n_layer_nextn = 0;
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
@@ -1216,65 +1251,87 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid.rope_type          = LLAMA_ROPE_TYPE_NEOX;
     dsv4_make_k_only(hparams_lid);
 
-    const layer_filter_cb filter_csa = [&](int32_t il) {
+    hparams_lid_b = hparams_lid;
+
+    // A layer gets a compressed plane when its ratio matches the group and -- for an arch with
+    // shared compressors (V4.1) -- when it is a kv_source layer. Every other layer of the group
+    // reads its source layer's plane in the graph (SPEC.md section 4.4).
+    const auto in_group = [&](int32_t il, uint32_t ratio) {
         if (filter && !filter(il)) {
             return false;
         }
 
-        return model.hparams.dsv4_compress_ratios[il] == DSV4_CSA_RATIO;
-    };
-
-    const layer_filter_cb filter_hca = [&](int32_t il) {
-        if (filter && !filter(il)) {
+        if (model.hparams.dsv4_compress_ratios[il] != ratio) {
             return false;
         }
 
-        return model.hparams.dsv4_compress_ratios[il] == DSV4_HCA_RATIO;
+        return !geom.shared_sources || model.hparams.dsv41_is_kv_source[il];
     };
+
+    const layer_filter_cb filter_csa = [&](int32_t il) { return in_group(il, geom.ratio_csa); };
+    const layer_filter_cb filter_hca = [&](int32_t il) { return in_group(il, geom.ratio_hca); };
 
     const bool unified_compressed = false;
 
-    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
+    // An overlapping group pools 2*ratio rows of a 2*n_embd wide projection; a non-overlapping
+    // one pools exactly `ratio` rows of a single-width projection (SPEC.md section 4.2).
+    const uint32_t state_csa   = geom.overlap_csa ? 2*geom.ratio_csa : geom.ratio_csa;
+    const uint32_t state_hca   = geom.overlap_hca ? 2*geom.ratio_hca : geom.ratio_hca;
+    const uint32_t n_embd_csa  = (geom.overlap_csa ? 2u : 1u)*model.hparams.n_embd_head_k();
+    const uint32_t n_embd_hca  = (geom.overlap_hca ? 2u : 1u)*model.hparams.n_embd_head_k();
+    const uint32_t n_embd_lid  = (geom.overlap_csa ? 2u : 1u)*model.hparams.indexer_head_size;
+
+    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, ratio = %u, size = %u cells\n",
+            __func__, geom.ratio_csa, dsv4_comp_size(kv_size, geom.ratio_csa));
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, geom.ratio_csa), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
-    LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
+    LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, ratio = %u, size = %u cells\n",
+            __func__, geom.ratio_hca, dsv4_comp_size(kv_size, geom.ratio_hca));
 
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, geom.ratio_hca), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
+            __func__, dsv4_comp_size(kv_size, geom.ratio_csa));
 
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, geom.ratio_csa), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+
+    if (geom.has_lid_b) {
+        LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache (hca group), size = %u cells\n",
+                __func__, dsv4_comp_size(kv_size, geom.ratio_hca));
+
+        kv_lid_b = std::make_unique<llama_kv_cache>(
+                model, hparams_lid_b, type_k, type_v,
+                v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, geom.ratio_hca), 256u), n_seq_max, n_pad,
+                0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+    }
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
+            model, offload, unified_compressed, n_seq_max, geom.ratio_csa, state_csa,
+            n_embd_csa, n_rs_seq, "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
-            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
+            model, offload, unified_compressed, n_seq_max, geom.ratio_hca, state_hca,
+            n_embd_hca, n_rs_seq, "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
+            model, offload, unified_compressed, n_seq_max, geom.ratio_csa, state_csa,
+            n_embd_lid, n_rs_seq, "lid", filter_csa);
 
     if (!model.dsv41_engram.empty()) {
         LLAMA_LOG_INFO("%s: creating DSV4.1 Engram n-gram hash state\n", __func__);
@@ -1427,9 +1484,12 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             bool res = true;
 
             res = res & kv_raw->seq_rm(seq_id, p0, -1);
-            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
-            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_csa->seq_rm(seq_id, p0/(llama_pos) geom.ratio_csa, -1);
+            res = res & kv_hca->seq_rm(seq_id, p0/(llama_pos) geom.ratio_hca, -1);
+            res = res & kv_lid->seq_rm(seq_id, p0/(llama_pos) geom.ratio_csa, -1);
+            if (kv_lid_b) {
+                res = res & kv_lid_b->seq_rm(seq_id, p0/(llama_pos) geom.ratio_hca, -1);
+            }
 
             if (res && engram_state) {
                 engram_state->seq_rm(seq_id, p0, -1);
@@ -1481,6 +1541,9 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_csa->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
+    if (kv_lid_b) {
+        kv_lid_b->seq_cp(seq_id_src, seq_id_dst, -1, -1);
+    }
 
     csa_state->seq_cp(seq_id_src, seq_id_dst);
     hca_state->seq_cp(seq_id_src, seq_id_dst);
@@ -1556,6 +1619,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     for (const auto & buft_size : kv_lid->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
+    if (kv_lid_b) {
+        for (const auto & buft_size : kv_lid_b->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     for (const auto & buft_size : csa_state->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
@@ -1586,15 +1654,23 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
         const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+            dsv4_state_n_used_k_rows(pos_max, geom.ratio_csa, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_max, geom.ratio_hca, kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, geom.ratio_csa, kv_lid->get_size()) : kv_lid->get_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
+
+        // appended only when this arch has a second indexer cache, so V4 state blobs are unchanged
+        if (kv_lid_b) {
+            const uint32_t n_rows_lid_b = seq_id >= 0 ?
+                dsv4_state_n_used_k_rows(pos_max, geom.ratio_hca, kv_lid_b->get_size()) : kv_lid_b->get_size();
+
+            dsv4_state_write_k_cache(io, kv_lid_b.get(), seq_id, flags, n_rows_lid_b);
+        }
     }
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
@@ -1633,10 +1709,16 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         kv_csa->clear(true);
         kv_hca->clear(true);
         kv_lid->clear(true);
+        if (kv_lid_b) {
+            kv_lid_b->clear(true);
+        }
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+        if (kv_lid_b) {
+            dsv4_state_read_k_cache(io, kv_lid_b.get(), seq_id, flags);
+        }
     }
 
     csa_state->state_read(io, seq_id, flags);
@@ -1665,6 +1747,14 @@ llama_kv_cache * llama_kv_cache_dsv4::get_hca() const {
 
 llama_kv_cache * llama_kv_cache_dsv4::get_lid() const {
     return kv_lid.get();
+}
+
+llama_kv_cache * llama_kv_cache_dsv4::get_lid_b() const {
+    return kv_lid_b.get();
+}
+
+const llama_dsv4_group_geometry & llama_kv_cache_dsv4::get_geom() const {
+    return geom;
 }
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_csa_state() const {
@@ -1713,6 +1803,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         kv_csa->clear(data);
         kv_hca->clear(data);
         kv_lid->clear(data);
+        if (kv_lid_b) {
+            kv_lid_b->clear(data);
+        }
     } else {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
@@ -1729,6 +1822,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         clear_seq(kv_csa.get());
         clear_seq(kv_hca.get());
         clear_seq(kv_lid.get());
+        if (kv_lid_b) {
+            clear_seq(kv_lid_b.get());
+        }
     }
 
     csa_state->clear(seq_id, data);
@@ -1981,13 +2077,17 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status sta
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         llama_kv_cache_dsv4 * kv) :
+    geom(kv->get_geom()),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
     ctx_csa_mem(kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
     ctx_lid_mem(kv->get_lid()->init_full()),
+    ctx_lid_b_mem(kv->get_lid_b() ? kv->get_lid_b()->init_full() : nullptr),
     ctx_csa(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_csa())),
     ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_hca())),
     ctx_lid(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid())),
+    ctx_lid_b(kv->get_lid_b() ?
+                std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid_b()) : nullptr),
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
@@ -2005,10 +2105,12 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
+    geom(kv->get_geom()),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
     ctx_lid_mem(kv->get_lid()->init_update(lctx, optimize)),
+    ctx_lid_b_mem(kv->get_lid_b() ? kv->get_lid_b()->init_update(lctx, optimize) : nullptr),
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
@@ -2032,13 +2134,16 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
     ubatches(std::move(ubatches)),
-    plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
+    geom(kv->get_geom()),
+    plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_geom().ratio_csa, kv->get_geom().overlap_csa, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
+    plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_geom().ratio_hca, kv->get_geom().overlap_hca,
+                // V4's ratio-128 group never padded; V4.1's ratio-1 group must, like csa.
+                kv->get_geom().ratio_hca != DSV4_HCA_RATIO,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_lid(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
+    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_geom().ratio_csa, kv->get_geom().overlap_csa, true,
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
@@ -2051,6 +2156,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     ctx_csa_mem(nullptr),
     ctx_hca_mem(nullptr),
     ctx_lid_mem(nullptr),
+    ctx_lid_b_mem(nullptr),
     ctx_csa(std::make_unique<llama_kv_cache_dsv4_comp_context>(
                 kv->get_csa(),
                 dsv4_build_comp_sinfos(this->ubatches, kv->get_csa()->get_n_stream()),
@@ -2063,6 +2169,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
                 kv->get_lid(),
                 dsv4_build_comp_sinfos(this->ubatches, kv->get_lid()->get_n_stream()),
                 this->ubatches)),
+    // lid_b shares the hca plan verbatim (same ratio, same layers), so it only needs its own
+    // slot infos and cache context -- see SPEC.md section 10.
+    ctx_lid_b(kv->get_lid_b() ?
+                std::make_unique<llama_kv_cache_dsv4_comp_context>(
+                    kv->get_lid_b(),
+                    dsv4_build_comp_sinfos(this->ubatches, kv->get_lid_b()->get_n_stream()),
+                    this->ubatches) : nullptr),
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
@@ -2080,6 +2193,9 @@ bool llama_kv_cache_dsv4_context::next() {
     ctx_csa->next();
     ctx_hca->next();
     ctx_lid->next();
+    if (ctx_lid_b) {
+        ctx_lid_b->next();
+    }
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -2099,6 +2215,9 @@ bool llama_kv_cache_dsv4_context::apply() {
         res = res & ctx_csa_mem->apply();
         res = res & ctx_hca_mem->apply();
         res = res & ctx_lid_mem->apply();
+        if (ctx_lid_b_mem) {
+            res = res & ctx_lid_b_mem->apply();
+        }
     }
 
     if (ubatches.empty()) {
@@ -2142,6 +2261,16 @@ const llama_kv_cache_dsv4_comp_context * llama_kv_cache_dsv4_context::get_lid() 
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ctx_lid.get();
+}
+
+const llama_kv_cache_dsv4_comp_context * llama_kv_cache_dsv4_context::get_lid_b() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    return ctx_lid_b.get();
+}
+
+const llama_dsv4_group_geometry & llama_kv_cache_dsv4_context::get_geom() const {
+    return geom;
 }
 
 const llama_dsv4_comp_state * llama_kv_cache_dsv4_context::get_csa_state() const {
@@ -2209,7 +2338,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_csa = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_CSA_RATIO, true,
+            ubatch, geom.ratio_csa, geom.overlap_csa,
             csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
 
     return reserve_plan_csa;
@@ -2223,7 +2352,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_hca = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_HCA_RATIO, false,
+            ubatch, geom.ratio_hca, geom.overlap_hca,
             hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(), hca_state->get_n_rs_seq());
 
     return reserve_plan_hca;
@@ -2237,7 +2366,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_lid = dsv4_build_reserve_comp_plan(
-            ubatch, DSV4_CSA_RATIO, true,
+            ubatch, geom.ratio_csa, geom.overlap_csa,
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;

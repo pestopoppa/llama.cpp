@@ -1211,6 +1211,17 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * weights,
                 int il) const;
 
+        // Compute this sublayer's (pre, post, comb) WITHOUT applying `pre`. V4 applies it
+        // immediately; V4.1 carries it to the next sublayer (SPEC.md section 2.1).
+        ggml_tensor * build_hc_mixes(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
+
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
@@ -1249,6 +1260,78 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // DeepSeek-V4.1. Reuses the V4 hyper-connection, attention-MHA and MoE helpers; everything
+    // that differs is spelled out in SPEC.md section 9.
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // Collapse the hc streams with the initial one-hot-on-stream-0 mix (SPEC.md section 1).
+        ggml_tensor * build_hc_stream0(ggml_tensor * x) const;
+
+        // Mean over the hc streams; what the MTP target layers read (model.py:1266).
+        ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+
+        ggml_tensor * build_attention_v41(
+                const llama_model * model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        // model.py:1166-1180 SharedAttentionRuntime: a source layer publishes, the layers after
+        // it reuse. Layers run in graph order, so one slot each is enough.
+        mutable ggml_tensor * shared_topk       = nullptr; // last index source's selection
+        mutable ggml_tensor * shared_candidates = nullptr; // candidate_source_layer's block mask
+
+        // Pool `ratio` rows of compressor state into one latent, normalise it, and hand it back
+        // BEFORE RoPE -- the indexer key is derived from the unrotated form (SPEC.md 4, 5.1).
+        // score_state == nullptr selects the ungated ratio-1 compressor (SPEC.md 4.1).
+        ggml_tensor * build_v41_compressed_kv_from_state(
+                ggml_tensor * kv_state,
+                ggml_tensor * score_state,
+                ggml_tensor * state_read_idxs,
+                ggml_tensor * comp_pos,
+                ggml_tensor * norm,
+                int64_t ratio,
+                int64_t n_embd_head,
+                const char * name,
+                int il) const;
+
+        // Level one of the two-level selection: an additive [n_comp, n_tokens] mask keeping only
+        // the top `candidate_topk_blocks` blocks, with the query's own newest block pinned
+        // (SPEC.md 6).
+        ggml_tensor * build_v41_candidate_mask(
+                ggml_tensor * scores,
+                ggml_tensor * n_visible,
+                int il) const;
+
+        ggml_tensor * build_v41_lid_top_k(
+                const llama_model * model,
+                const llm_graph_input_dsv4::comp_input & inp_idx,
+                const llama_kv_cache_dsv4_comp_context * idx_ctx,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int idx_src_il,
+                int il) const;
+
+        // The compressed-KV / indexer / candidate-block side of attention (SPEC.md 4-6).
+        // Returns the attention output, or nullptr when this layer has compress_ratio 0.
+        ggml_tensor * build_compressed_attention(
+                const llama_model * model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * q,
+                ggml_tensor * kv,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                float kq_scale,
+                int il) const;
+
+        // The ENGRAM injection is DS41-B8's: llama_model_deepseek4::graph::build_engram, declared
+        // above on the base graph. This graph only calls it -- see the layer loop.
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

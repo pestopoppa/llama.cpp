@@ -9,6 +9,29 @@
 #include <unordered_map>
 #include <vector>
 
+// Geometry of the two compressed-KV groups.
+//
+// DeepSeek-V4:   one OVERLAPPING ratio-4 group ("csa") and one non-overlapping ratio-128 group
+//                ("hca"); indexer keys exist only on the csa group ("lid").
+// DeepSeek-V4.1: a non-overlapping ratio-2 group and a non-overlapping ratio-1 group, and BOTH
+//                own indexer keys -- hence the second key cache `lid_b`, which shares the hca
+//                group's row scheduling exactly (same ratio, same layers, same plan).
+//
+// The defaults reproduce DeepSeek-V4 bit-for-bit. See SPEC.md section 10.
+struct llama_dsv4_group_geometry {
+    uint32_t ratio_csa   = 4;
+    uint32_t ratio_hca   = 128;
+    bool     overlap_csa = true;
+    bool     overlap_hca = false;
+    bool     has_lid_b   = false;
+    // when true, only layers in `kv_source_layer_ids` get a compressed plane and every other
+    // layer of the group reads its source's plane (V4.1). When false every layer of the ratio
+    // owns its own plane (V4).
+    bool     shared_sources = false;
+};
+
+llama_dsv4_group_geometry llama_dsv4_group_geometry_for(const llama_model & model);
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -145,6 +168,9 @@ public:
     llama_kv_cache      * get_csa() const;
     llama_kv_cache      * get_hca() const;
     llama_kv_cache      * get_lid() const;
+    // second indexer-key cache, keyed to the hca group; nullptr unless geom.has_lid_b
+    llama_kv_cache      * get_lid_b() const;
+    const llama_dsv4_group_geometry & get_geom() const;
     llama_dsv4_comp_state * get_csa_state() const;
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
@@ -163,6 +189,9 @@ private:
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
     llama_hparams hparams_lid;
+    llama_hparams hparams_lid_b;
+
+    const llama_dsv4_group_geometry geom;
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
@@ -173,6 +202,7 @@ private:
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;
     std::unique_ptr<llama_kv_cache>      kv_lid;
+    std::unique_ptr<llama_kv_cache>      kv_lid_b;
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
@@ -366,6 +396,9 @@ public:
     const llama_kv_cache_dsv4_comp_context * get_csa() const;
     const llama_kv_cache_dsv4_comp_context * get_hca() const;
     const llama_kv_cache_dsv4_comp_context * get_lid() const;
+    // the second indexer-key cache reuses the hca plan verbatim, so it has no plan of its own
+    const llama_kv_cache_dsv4_comp_context * get_lid_b() const;
+    const llama_dsv4_group_geometry & get_geom() const;
     const llama_dsv4_comp_state       * get_csa_state() const;
     const llama_dsv4_comp_state       * get_hca_state() const;
     const llama_dsv4_comp_state       * get_lid_state() const;
@@ -387,6 +420,8 @@ private:
 
     std::vector<llama_ubatch> ubatches;
 
+    llama_dsv4_group_geometry geom;
+
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;
     std::vector<comp_plan> plans_lid;
@@ -395,10 +430,12 @@ private:
     const llama_memory_context_ptr ctx_csa_mem;
     const llama_memory_context_ptr ctx_hca_mem;
     const llama_memory_context_ptr ctx_lid_mem;
+    const llama_memory_context_ptr ctx_lid_b_mem;
 
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_csa;
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_hca;
     const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lid;
+    const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lid_b;
 
     llama_dsv4_comp_state * csa_state = nullptr;
     llama_dsv4_comp_state * hca_state = nullptr;
