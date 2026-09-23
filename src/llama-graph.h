@@ -707,6 +707,26 @@ public:
 };
 
 //
+// INF-77 DS41-C4: host-side phase profiler (profiling builds only, #ifdef GGML_CPU_PROF).
+//
+// The INF-70 per-node profiler in ggml-cpu can only see work that is a GRAPH NODE.  A large
+// part of a decode token is not: llm_graph_input_*::set_input (the DeepSeek-V4.1 Engram n-gram
+// hash and its 48-row scatter live entirely there), the memory-context apply, graph build and
+// allocation, and sampling.  None of it appears in any op or node row, so a per-node profile
+// sums to less than the token and the difference has no name.
+//
+// This accumulates those phases by name, per phase class (decode = single-token ubatch), and
+// writes them into the same JSON the node profile goes to, so the two halves reconcile against
+// llama_perf_context's t_eval_us.  Costs one ggml_time_us() pair per phase per ubatch --
+// ~10 clock reads per token, against thousands for the node profiler.
+//
+// Not thread-safe by design: every call site is on the single llama_decode thread.
+//
+void llama_host_prof_add(const char * phase, int64_t us, bool decode);
+void llama_host_prof_set_eval(int64_t t_eval_us, int n_eval, int64_t t_p_eval_us, int n_p_eval);
+bool llama_host_prof_enabled();
+
+//
 // llm_graph_result
 //
 

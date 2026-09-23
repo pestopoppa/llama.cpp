@@ -41,19 +41,34 @@
 //              single-token row (one more target pass per round).
 //   serial   - verify every draft token with its own single-token decode (the DSpark serial path,
 //              opened to every drafter at temp 0). Exact by construction; no batching benefit.
+//
+// INF-77 DS41-T5/C1: the FOURTH shape runs the other way. Every mode above buys exactness by
+// giving up batching; `batched-greedy-inexact` gives up exactness to get the batching back. It
+// forces the BATCHED verification path at temp <= 0 even where use_serial_speculative_verify()
+// would otherwise select serial (an RS-rollback context with a DSpark drafter). It changes no
+// other behaviour: the path it selects is byte-for-byte the code that already runs every temp > 0
+// request, rollback included. It is a MEASUREMENT INSTRUMENT for "what does greedy output actually
+// cost if verification is batched", not a serving default -- greedy continuation is NOT bit-exact
+// under it. Mechanism: /mnt/raid0/llm/tmp/ds41-exactness/MECHANISM.md.
+//
+// Deliberately awkward to enable: the token is long, it is not a prefix or typo-neighbour of any
+// other accepted value, and every unrecognised value falls back to SPEC_EXACT_OFF -- which for a
+// DSpark/RS target still selects the SERIAL path. A typo therefore fails SAFE (exact, slow).
 enum spec_exact_mode {
     SPEC_EXACT_OFF = 0,
     SPEC_EXACT_DROP,
     SPEC_EXACT_REDECODE,
     SPEC_EXACT_SERIAL,
+    SPEC_EXACT_BATCHED_UNSAFE,
 };
 
 static const char * spec_exact_mode_name(spec_exact_mode m) {
     switch (m) {
-        case SPEC_EXACT_DROP:     return "drop";
-        case SPEC_EXACT_REDECODE: return "redecode";
-        case SPEC_EXACT_SERIAL:   return "serial";
-        default:                  return "off";
+        case SPEC_EXACT_DROP:           return "drop";
+        case SPEC_EXACT_REDECODE:       return "redecode";
+        case SPEC_EXACT_SERIAL:         return "serial";
+        case SPEC_EXACT_BATCHED_UNSAFE: return "batched-greedy-inexact";
+        default:                        return "off";
     }
 }
 
@@ -71,7 +86,13 @@ static spec_exact_mode spec_exact_mode_from_env() {
     if (strcmp(v, "serial") == 0) {
         return SPEC_EXACT_SERIAL;
     }
-    LOG_WRN("unknown LLAMA_SPEC_EXACT=%s (expected off|drop|redecode|serial), ignoring\n", v);
+    // INF-77 DS41-C1. Spelled out in full on purpose; there is no short alias and no bare
+    // "batched", so no existing launcher or muscle-memory value can reach it.
+    if (strcmp(v, "batched-greedy-inexact") == 0) {
+        return SPEC_EXACT_BATCHED_UNSAFE;
+    }
+    LOG_WRN("unknown LLAMA_SPEC_EXACT=%s (expected off|drop|redecode|serial|batched-greedy-inexact), "
+            "ignoring -- falling back to 'off', which keeps the EXACT (serial) greedy path\n", v);
     return SPEC_EXACT_OFF;
 }
 
@@ -1335,6 +1356,16 @@ private:
         if (spec_exact != SPEC_EXACT_OFF) {
             SRV_INF("speculative exactness mode (LLAMA_SPEC_EXACT) = %s, target seq_rm type = %d\n",
                     spec_exact_mode_name(spec_exact), (int) ctx_tgt_seq_rm_type);
+        }
+
+        // INF-77 DS41-C1: an inexact serving mode must announce itself unmissably, every launch.
+        if (spec_exact == SPEC_EXACT_BATCHED_UNSAFE) {
+            SRV_WRN("%s", "***************************************************************************\n");
+            SRV_WRN("%s", "*** LLAMA_SPEC_EXACT=batched-greedy-inexact -- GREEDY OUTPUT IS NOT EXACT ***\n");
+            SRV_WRN("%s", "*** temp<=0 requests take the BATCHED speculative verification path.     ***\n");
+            SRV_WRN("%s", "*** Continuations may differ from an unaccelerated greedy run. This is a ***\n");
+            SRV_WRN("%s", "*** MEASUREMENT mode (INF-77 DS41-T5/C1), not a serving default.         ***\n");
+            SRV_WRN("%s", "***************************************************************************\n");
         }
 
         // setup slots
@@ -2964,6 +2995,15 @@ private:
     }
 
     bool use_serial_speculative_verify(const server_slot & slot) const {
+        // INF-77 DS41-C1: the one opt-out. Forces the batched verification path at temp <= 0, which
+        // is exactly the path temp > 0 already takes -- so rollback, checkpointing and acceptance are
+        // unchanged and only the exactness guarantee is surrendered. Checked FIRST so it also overrides
+        // an explicit LLAMA_SPEC_EXACT=serial; the two are mutually exclusive by construction (one env
+        // var, one value), and this ordering makes that explicit rather than order-dependent.
+        if (spec_exact == SPEC_EXACT_BATCHED_UNSAFE) {
+            return false;
+        }
+
         // INF-70 E2a: LLAMA_SPEC_EXACT=serial opens the serial path to every drafter at temp 0. It never
         // decodes a rejected token, so it needs no rollback and works on every seq_rm type.
         if (spec_exact == SPEC_EXACT_SERIAL && slot.task->params.sampling.temp <= 0.0f) {

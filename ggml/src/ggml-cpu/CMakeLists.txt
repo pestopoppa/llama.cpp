@@ -67,6 +67,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # iqk port: kernels compiled in; runtime gate is env GGML_IQK (see iqk_dispatch.cpp)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_IQK_MULMAT)
 
+    # INF-77 DS41-C4: per-node CPU profiler (INF-70).  Runtime gate is env GGML_CPU_PROF;
+    # this only decides whether the code exists in libggml-cpu at all.
+    if (GGML_CPU_PROF)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_CPU_PROF)
+    endif()
+
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)

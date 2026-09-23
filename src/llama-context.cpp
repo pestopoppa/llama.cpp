@@ -1492,9 +1492,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 #ifdef GGML_CPU_PROF
     const int64_t t_graph = ggml_time_us();
-    if (getenv("GGML_CPU_PROF") != NULL) {
-        fprintf(stderr, "[phase_prof] n_tokens=%d mctx_apply=%.3f ms set_inputs=%.3f ms graph_compute=%.3f ms\n",
-                ubatch.n_tokens, (t_mctx - t_phase0)/1e3, (t_inputs - t_mctx)/1e3, (t_graph - t_inputs)/1e3);
+    // DS41-C4: these three spans used to be printed per ubatch and never summed, so they could
+    // not be compared with anything.  They are now accumulated by phase name and land in the
+    // host-profile JSON next to the per-node profile; the per-ubatch line is opt-in because on
+    // decode it is one stderr write per token.
+    if (llama_host_prof_enabled()) {
+        const bool decode = ubatch.n_tokens == 1;
+        llama_host_prof_add("ctx.mctx_apply",             t_mctx   - t_phase0, decode);
+        llama_host_prof_add("ctx.build_alloc_set_inputs", t_inputs - t_mctx,   decode);
+        llama_host_prof_add("ctx.graph_compute",          t_graph  - t_inputs, decode);
+        if (getenv("GGML_CPU_PROF_VERBOSE") != NULL) {
+            fprintf(stderr, "[phase_prof] n_tokens=%d mctx_apply=%.3f ms set_inputs=%.3f ms graph_compute=%.3f ms\n",
+                    ubatch.n_tokens, (t_mctx - t_phase0)/1e3, (t_inputs - t_mctx)/1e3, (t_graph - t_inputs)/1e3);
+        }
     }
 #endif
 
@@ -3519,6 +3529,11 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.t_load_ms   = 1e-3 * t_load_us;
     data.t_p_eval_ms = 1e-3 * t_p_eval_us;
     data.t_eval_ms   = 1e-3 * t_eval_us;
+#ifdef GGML_CPU_PROF
+    // DS41-C4: the reconciliation denominator.  t_eval_us / n_eval is the measured wall time of
+    // one decode token; the node profile and the host phases must account for it.
+    llama_host_prof_set_eval(t_eval_us, n_eval, t_p_eval_us, n_p_eval);
+#endif
     data.n_p_eval    = std::max(1, n_p_eval);
     data.n_eval      = std::max(1, n_eval);
     data.n_reused    = std::max(0, n_reused);

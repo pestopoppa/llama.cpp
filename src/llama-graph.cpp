@@ -16,6 +16,13 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#ifdef GGML_CPU_PROF
+#include <cstdlib>
+#include <cstdio>
+#include <typeinfo>
+#include <vector>
+#include <string>
+#endif
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -1320,7 +1327,134 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+#ifdef GGML_CPU_PROF
+// INF-77 DS41-C4: host-side phase profiler.  See llama-graph.h for why it exists.
+namespace {
+
+struct host_prof_row {
+    std::string name;
+    int64_t     us_decode  = 0;
+    int64_t     us_prefill = 0;
+    int64_t     n_decode   = 0;
+    int64_t     n_prefill  = 0;
+};
+
+struct host_prof_state {
+    std::vector<host_prof_row> rows;
+    int64_t t_eval_us   = 0;
+    int64_t n_eval      = 0;
+    int64_t t_p_eval_us = 0;
+    int64_t n_p_eval    = 0;
+    bool    registered  = false;
+};
+
+host_prof_state & host_prof() {
+    static host_prof_state st;
+    return st;
+}
+
+void host_prof_write() {
+    const char * path = getenv("LLAMA_HOST_PROF_JSON_FILE");
+    if (!path) {
+        return;
+    }
+    host_prof_state & st = host_prof();
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    // Reconciliation denominator: llama_context's own t_eval_us over n_eval is the wall time of
+    // llama_decode for single-token ubatches -- the same quantity llama_perf_context_print
+    // reports as "eval time ... ms per token".  The node profile's total_wall_us and these
+    // host phases are the two halves that must sum to it; whatever is left is named
+    // "unattributed_us" and is a coverage defect, not a rounding term.
+    const double nd = st.n_eval    > 0 ? (double) st.n_eval    : 1.0;
+    const double np = st.n_p_eval  > 0 ? (double) st.n_p_eval  : 1.0;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema\": \"llama-host-prof/1\",\n");
+    fprintf(f, "  \"units\": {\"time\": \"us\", \"per\": \"token\"},\n");
+    fprintf(f, "  \"n_eval\": %lld,\n",   (long long) st.n_eval);
+    fprintf(f, "  \"n_p_eval\": %lld,\n", (long long) st.n_p_eval);
+    fprintf(f, "  \"decode_us_per_token\": %.3f,\n",  st.t_eval_us   / nd);
+    fprintf(f, "  \"prefill_us_per_token\": %.3f,\n", st.t_p_eval_us / np);
+    fprintf(f, "  \"phases\": [");
+    bool first = true;
+    for (const auto & r : st.rows) {
+        fprintf(f, "%s\n    {\"phase\": \"%s\", \"decode_us_per_token\": %.3f, \"decode_calls\": %lld, "
+                   "\"prefill_us_total\": %.3f, \"prefill_calls\": %lld}",
+                first ? "" : ",", r.name.c_str(),
+                r.us_decode / nd, (long long) r.n_decode,
+                (double) r.us_prefill, (long long) r.n_prefill);
+        first = false;
+    }
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    fprintf(stderr, "[host_prof] wrote %s\n", path);
+}
+
+} // namespace
+
+bool llama_host_prof_enabled() {
+    static const bool e = getenv("GGML_CPU_PROF") != nullptr;
+    return e;
+}
+
+void llama_host_prof_add(const char * phase, int64_t us, bool decode) {
+    if (!llama_host_prof_enabled()) {
+        return;
+    }
+    host_prof_state & st = host_prof();
+    if (!st.registered) {
+        st.registered = true;
+        atexit(host_prof_write);
+    }
+    for (auto & r : st.rows) {
+        if (r.name == phase) {
+            if (decode) { r.us_decode  += us; r.n_decode++;  }
+            else        { r.us_prefill += us; r.n_prefill++; }
+            return;
+        }
+    }
+    host_prof_row r;
+    r.name = phase;
+    if (decode) { r.us_decode  = us; r.n_decode  = 1; }
+    else        { r.us_prefill = us; r.n_prefill = 1; }
+    st.rows.push_back(std::move(r));
+}
+
+void llama_host_prof_set_eval(int64_t t_eval_us, int n_eval, int64_t t_p_eval_us, int n_p_eval) {
+    if (!llama_host_prof_enabled()) {
+        return;
+    }
+    host_prof_state & st = host_prof();
+    st.t_eval_us   = t_eval_us;
+    st.n_eval      = n_eval;
+    st.t_p_eval_us = t_p_eval_us;
+    st.n_p_eval    = n_p_eval;
+}
+#else
+bool llama_host_prof_enabled() { return false; }
+void llama_host_prof_add(const char *, int64_t, bool) {}
+void llama_host_prof_set_eval(int64_t, int, int64_t, int) {}
+#endif
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+#ifdef GGML_CPU_PROF
+    // Per INPUT CLASS, not one lump: on DeepSeek-V4.1 the Engram n-gram hash and its 48-row
+    // scatter are a set_input, and they are the single largest host-side consumer.  typeid gives
+    // the mangled class name, which is stable and unambiguous; no demangling is done here so
+    // that the profiling build needs no <cxxabi.h>.
+    if (llama_host_prof_enabled()) {
+        const bool decode = ubatch->n_tokens == 1;
+        for (auto & input : inputs) {
+            const int64_t t0 = ggml_time_us();
+            input->set_input(ubatch);
+            llama_host_prof_add(typeid(*input).name(), ggml_time_us() - t0, decode);
+        }
+        return;
+    }
+#endif
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }

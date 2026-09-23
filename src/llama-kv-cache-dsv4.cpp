@@ -45,7 +45,12 @@ llama_dsv4_group_geometry llama_dsv4_group_geometry_for(const llama_model & mode
 }
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+// v2 (INF-77 DS41-B13): the blob now carries llama_dsv41_engram_state. Before v2 a state restore
+// silently kept the n-gram history of positions the restore was supposed to drop, which is a
+// speculative-decoding correctness bug on the server's checkpoint-rollback fallback path
+// (tools/server/server-context.cpp restores a saved state instead of a partial seq_rm when the
+// rollback exceeds n_rs_seq).
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
@@ -549,6 +554,15 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
             const llama_pos source_start = pos + 1 - ratio;
             const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
+
+            // DS41-B13 / DESIGN.md 4.2. The compressed-KV and indexer rows are deliberately NOT
+            // snapshotted for a speculative rollback. That is sound ONLY because the destination
+            // row is a pure function of the position and visibility is (pos+1)/ratio, so a row
+            // written by a rejected position is either never visible again or is rewritten by the
+            // re-decode of the same position before it is read. If this index ever gains a
+            // dependency on anything but `pos` and `ratio`, the rollback contract breaks
+            // silently.
+            GGML_ASSERT(pos >= 0 && ratio > 0 && "DSV4 compressed row index must stay a pure function of position");
 
             plan.state_write_idxs.push_back(cache_off + pos/ratio);
             plan.state_write_pos.push_back((int32_t) source_start);
@@ -1498,12 +1512,32 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
+        // DS41-B13. A refusal here is not an error -- the caller falls back to restoring a full
+        // state checkpoint (tools/server/server-context.cpp) -- but it is silently much slower,
+        // and a speculative campaign that runs the fallback path measures the wrong thing. Say so
+        // once, with the number that has to change.
+        static const auto warn_rollback = [](llama_pos rollback, uint32_t n_rs_seq_cur) {
+            static bool warned = false;
+            if (warned) {
+                return;
+            }
+            warned = true;
+            LLAMA_LOG_WARN("%s: DSV4 value-level rollback refused: need %d snapshot planes, have %u. "
+                    "Every rejection will fall back to a full state-checkpoint restore. "
+                    "Raise n_rs_seq (it is sized from the speculative n_max: --spec-n-max <= n_rs_seq).\n",
+                    __func__, (int) rollback, n_rs_seq_cur);
+        };
+
         if (n_rs_seq == 0) {
+            warn_rollback(pos_max - (p0 - 1), n_rs_seq);
             return false;
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+            if (rollback >= 1) {
+                warn_rollback(rollback, n_rs_seq);
+            }
             return false;
         }
 
@@ -1587,6 +1621,15 @@ void llama_kv_cache_dsv4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 
 void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_raw->seq_div(seq_id, p0, p1, d);
+
+    // llama_dsv41_engram_state is keyed by absolute position and has no seq_div, so a divided
+    // range would leave the n-gram ids of the OLD positions readable at the new ones. Dropping
+    // them is the only safe action: a DEAD entry contributes nothing (engram.py:363-364), where
+    // a misplaced one is silently wrong. Unreachable from the DSpark path (get_can_shift() is
+    // false), but the cost of being explicit is one call.
+    if (engram_state) {
+        engram_state->seq_rm(seq_id, p0, p1);
+    }
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
@@ -1676,6 +1719,19 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     csa_state->state_write(io, seq_id, flags, rs_idx);
     hca_state->state_write(io, seq_id, flags, rs_idx);
     lid_state->state_write(io, seq_id, flags, rs_idx);
+
+    // DS41-B13: the Engram n-gram hash state is per-position, per-sequence and destructively
+    // written by every decode (llm_graph_input_dsv41_engram::set_input), so it belongs in the
+    // blob exactly like the compressor accumulators. A one-byte presence flag keeps the format
+    // readable for a V4 cache, which has no engram state at all.
+    {
+        const uint8_t has_engram = engram_state ? 1 : 0;
+        io.write(&has_engram, sizeof(has_engram));
+
+        if (engram_state) {
+            engram_state->state_write(io, seq_id);
+        }
+    }
 }
 
 void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1724,6 +1780,19 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     csa_state->state_read(io, seq_id, flags);
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
+
+    {
+        uint8_t has_engram = 0;
+        io.read(&has_engram, sizeof(has_engram));
+
+        if (!!has_engram != !!engram_state) {
+            throw std::runtime_error("DSV4 state engram presence mismatch");
+        }
+
+        if (engram_state) {
+            engram_state->state_read(io, seq_id);
+        }
+    }
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);

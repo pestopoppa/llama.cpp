@@ -59,5 +59,12 @@ target_link_libraries(llama PUBLIC ggml)
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+
+# INF-77 DS41-C4: llama-context.cpp and llama-graph.cpp carry host-side phase timers guarded by
+# GGML_CPU_PROF.  That define is PRIVATE to the ggml-cpu target, so until now it could never
+# reach libllama and the host-side half of the profile did not exist in any binary.
+if (GGML_CPU_PROF)
+    target_compile_definitions(llama PRIVATE GGML_CPU_PROF)
+endif()
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()

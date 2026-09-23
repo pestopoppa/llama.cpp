@@ -3726,6 +3726,9 @@ struct ggml_cpu_prof_meta {
     int64_t s0_ne[3];
     int64_t ne[3];
     char    name[GGML_MAX_NAME];
+    // DS41-C4: a synthesized label for nodes whose own name is useless.  See
+    // ggml_cpu_prof_name_is_opaque() and ggml_cpu_prof_snapshot_meta().
+    char    label[GGML_MAX_NAME + 24];
 };
 static struct ggml_cpu_prof_meta * ggml_cpu_prof_meta = NULL;
 static int                         ggml_cpu_prof_meta_n = 0;
@@ -3736,6 +3739,42 @@ static int      ggml_cpu_prof_skip          = -1;
 static int      ggml_cpu_prof_nodes_written = 0;
 static int      ggml_cpu_prof_atexit_done   = 0;
 static int ggml_cpu_prof_last_nnodes = 0;
+static int ggml_cpu_prof_last_nth    = 0;
+
+// DS41-C4: verbosity gate for the per-eval stderr line (see its use site).
+static int ggml_cpu_prof_verbose = -1;
+static int ggml_cpu_prof_verbose_on(void) {
+    if (ggml_cpu_prof_verbose < 0) {
+        ggml_cpu_prof_verbose = getenv("GGML_CPU_PROF_VERBOSE") != NULL ? 1 : 0;
+    }
+    return ggml_cpu_prof_verbose;
+}
+
+// DS41-C4: shape census.  Per-node-index accumulators are only meaningful within ONE graph
+// shape, and with speculative decoding at least two shapes interleave (draft and trunk).  The
+// census records every shape SEEN and how many evals of it were ACCUMULATED, so a reader can
+// see at a glance that the node table describes one shape and how much of the run it covers.
+// Thread 0 only, at graph start, outside compute.
+#define GGML_CPU_PROF_NSHAPE 16
+static int      ggml_cpu_prof_shape_nn[GGML_CPU_PROF_NSHAPE];
+static uint64_t ggml_cpu_prof_shape_seen_cnt[GGML_CPU_PROF_NSHAPE];
+static uint64_t ggml_cpu_prof_shape_acc_cnt[GGML_CPU_PROF_NSHAPE];
+static int      ggml_cpu_prof_shape_n = 0;
+static void ggml_cpu_prof_shape_seen(int n_nodes, int acc) {
+    for (int i = 0; i < ggml_cpu_prof_shape_n; i++) {
+        if (ggml_cpu_prof_shape_nn[i] == n_nodes) {
+            ggml_cpu_prof_shape_seen_cnt[i]++;
+            if (acc) ggml_cpu_prof_shape_acc_cnt[i]++;
+            return;
+        }
+    }
+    if (ggml_cpu_prof_shape_n < GGML_CPU_PROF_NSHAPE) {
+        const int i = ggml_cpu_prof_shape_n++;
+        ggml_cpu_prof_shape_nn[i]       = n_nodes;
+        ggml_cpu_prof_shape_seen_cnt[i] = 1;
+        ggml_cpu_prof_shape_acc_cnt[i]  = acc ? 1 : 0;
+    }
+}
 
 // lm_head identification: the MUL_MAT whose src0 has ne[1] == the vocab size.  We do not
 // hardcode 248320: the widest MUL_MAT src0 ne[1] in the graph is the output projection.
@@ -3808,6 +3847,37 @@ static void ggml_cpu_prof_ensure_nt(int n_nodes, int nth) {
     ggml_cpu_prof_nt_ns  = (uint64_t *) calloc((size_t) n_nodes * (size_t) nth, sizeof(uint64_t));
 }
 
+// DS41-C4: a node's OWN name is not enough to identify it.
+//
+// Measured on the DeepSeek-V4.1 graph: the hottest nodes in several stages carry no usable
+// name.  ggml only names a tensor when the model code calls cb()/ggml_set_name; everything else
+// is either empty ("") or a name ggml derived from its source ("x (permuted) (cont)"), which is
+// neither unique nor informative.  Whole stages are affected -- the fused hyper-connection ops,
+// the flash-attention node, every KV-cache cpy/get_rows/set_rows, the candidate-block max-pool
+// chain, and the entire DSpark Markov and confidence head.  Worse, names COLLIDE: llama.cpp's
+// build_norm() names every RMS_NORM it makes "norm", so a layer has 4-7 nodes called "norm-14",
+// and build_v41_compressed_kv_from_state names three different tensors "comp_latent-<il>".
+//
+// The accumulators are keyed by node INDEX, so none of this loses a measurement -- but a reader
+// (or an AutoKernel planner) cannot tell what an unnamed hot node IS.  So each node also gets a
+// label: its own name when that name is usable, otherwise the nearest preceding usable name
+// plus the distance to it, e.g. "after:ffn_norm-14+3".  That localizes an anonymous node to the
+// stage it belongs to without the profiler needing to know anything about the model.
+//
+// Cost: once per process, at the meta snapshot.  Zero per-token cost.
+static int ggml_cpu_prof_name_is_opaque(const char * nm) {
+    if (nm == NULL || nm[0] == '\0') {
+        return 1;
+    }
+    // ggml's derived names all end in a parenthesised suffix: "(view)", "(cont)", "(permuted)",
+    // "(reshaped)", "(transposed)", "(copy)".  They carry no identity of their own.
+    const size_t n = strlen(nm);
+    if (n > 0 && nm[n-1] == ')') {
+        return 1;
+    }
+    return 0;
+}
+
 static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
     free(ggml_cpu_prof_meta);
     ggml_cpu_prof_meta   = (struct ggml_cpu_prof_meta *) calloc(cgraph->n_nodes, sizeof(struct ggml_cpu_prof_meta));
@@ -3823,6 +3893,27 @@ static void ggml_cpu_prof_snapshot_meta(const struct ggml_cgraph * cgraph) {
             m->ne[k]    = nd->ne[k];
         }
         snprintf(m->name, sizeof(m->name), "%s", nd->name);
+    }
+
+    // second pass: synthesize a label for every node whose own name is opaque
+    for (int i = 0; i < ggml_cpu_prof_meta_n; i++) {
+        struct ggml_cpu_prof_meta * m = &ggml_cpu_prof_meta[i];
+        if (!ggml_cpu_prof_name_is_opaque(m->name)) {
+            snprintf(m->label, sizeof(m->label), "%s", m->name);
+            continue;
+        }
+        int anchor = -1;
+        for (int j = i - 1; j >= 0; j--) {
+            if (!ggml_cpu_prof_name_is_opaque(ggml_cpu_prof_meta[j].name)) {
+                anchor = j;
+                break;
+            }
+        }
+        if (anchor >= 0) {
+            snprintf(m->label, sizeof(m->label), "after:%s+%d", ggml_cpu_prof_meta[anchor].name, i - anchor);
+        } else {
+            snprintf(m->label, sizeof(m->label), "anon:%s@%d", ggml_op_name((enum ggml_op) m->op), i);
+        }
     }
 }
 
@@ -3906,6 +3997,172 @@ static void ggml_cpu_prof_write_nodes(const struct ggml_cgraph * cgraph, int n_t
     if (f != stderr) {
         fclose(f);
     }
+}
+
+// DS41-C4: machine-readable per-run dump.
+//
+// The stderr OPTABLE/PATHTABLE/NODETABLE are for a human reading a terminal.  An AutoKernel
+// planner/critic loop needs a file it can parse without scraping a log that is interleaved with
+// llama-server output, so GGML_CPU_PROF_JSON_FILE writes ONE json object per process, at exit,
+// carrying exactly the same accumulators.
+//
+// Everything is per accumulated graph evaluation unless the key says otherwise.  Times are
+// microseconds (ggml_time_us).  "wall" includes this node's barrier wait and straggler
+// imbalance as seen by thread 0; "compute" is thread 0's own compute call.  Their difference is
+// reported as "dead_us" and is NOT a per-node property -- it is where the thread-0 view charges
+// imbalance created by other nodes' stragglers.
+//
+// Node identity is the node INDEX, which is stable only within one graph shape; "shapes" says
+// which shapes were seen and which were accumulated, so a reader can tell whether the node
+// table describes the whole run or one arm of it.
+static void ggml_cpu_prof_json_escape(FILE * f, const char * str) {
+    for (const char * c = str; *c; c++) {
+        switch (*c) {
+            case '"':  fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\n': fputs("\\n",  f); break;
+            case '\r': fputs("\\r",  f); break;
+            case '\t': fputs("\\t",  f); break;
+            default:
+                if ((unsigned char) *c < 0x20) {
+                    fprintf(f, "\\u%04x", (unsigned) (unsigned char) *c);
+                } else {
+                    fputc(*c, f);
+                }
+        }
+    }
+}
+
+static void ggml_cpu_prof_write_json(void) {
+    const char * path = getenv("GGML_CPU_PROF_JSON_FILE");
+    if (!path) {
+        return;
+    }
+    const uint64_t G = ggml_cpu_prof_graphs_acc;
+    if (G == 0) {
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "[cpu_prof] could not open GGML_CPU_PROF_JSON_FILE=%s\n", path);
+        return;
+    }
+    const double g = (double) G;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema\": \"ggml-cpu-prof/1\",\n");
+    fprintf(f, "  \"units\": {\"time\": \"us\", \"per\": \"accumulated_graph_eval\"},\n");
+    fprintf(f, "  \"graph_evals_seen\": %llu,\n",        (unsigned long long) ggml_cpu_prof_graph_idx);
+    fprintf(f, "  \"graph_evals_accumulated\": %llu,\n", (unsigned long long) G);
+    fprintf(f, "  \"skip_graphs\": %d,\n",               ggml_cpu_prof_skip_graphs());
+    fprintf(f, "  \"n_nodes\": %d,\n",                   ggml_cpu_prof_last_nnodes);
+    fprintf(f, "  \"n_threads\": %d,\n",                 ggml_cpu_prof_last_nth);
+    fprintf(f, "  \"per_thread_compute\": %s,\n",        ggml_cpu_prof_nt_ns ? "true" : "false");
+    fprintf(f, "  \"total_compute_us\": %.3f,\n",        ggml_cpu_prof_total_ns/g);
+    fprintf(f, "  \"total_wall_us\": %.3f,\n",           ggml_cpu_prof_total_wall_ns/g);
+    fprintf(f, "  \"barriers\": %.3f,\n",                ggml_cpu_prof_barriers/g);
+    fprintf(f, "  \"solo_runs\": %.3f,\n",               ggml_cpu_prof_solo_runs/g);
+    fprintf(f, "  \"solo_nodes\": %.3f,\n",              ggml_cpu_prof_solo_nodes/g);
+    fprintf(f, "  \"empty_skipped\": %.3f,\n",           ggml_cpu_prof_empty_skipped/g);
+    fprintf(f, "  \"fused\": {\"count\": %.3f, \"compute_us\": %.3f, \"wall_us\": %.3f},\n",
+            ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/g, ggml_cpu_prof_fused_wall_ns/g);
+
+    fprintf(f, "  \"shapes\": [");
+    for (int i = 0; i < ggml_cpu_prof_shape_n; i++) {
+        fprintf(f, "%s\n    {\"n_nodes\": %d, \"seen\": %llu, \"accumulated\": %llu}",
+                i ? "," : "", ggml_cpu_prof_shape_nn[i],
+                (unsigned long long) ggml_cpu_prof_shape_seen_cnt[i],
+                (unsigned long long) ggml_cpu_prof_shape_acc_cnt[i]);
+    }
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"ops\": [");
+    {
+        int first = 1;
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            if (ggml_cpu_prof_cnt[i] == 0) {
+                continue;
+            }
+            fprintf(f, "%s\n    {\"op\": \"%s\", \"count\": %.3f, \"compute_us\": %.3f, "
+                       "\"wall_us\": %.3f, \"pct_wall\": %.4f, \"n_tasks1_count\": %.3f}",
+                    first ? "" : ",", ggml_op_name((enum ggml_op) i),
+                    ggml_cpu_prof_cnt[i]/g, ggml_cpu_prof_ns[i]/g, ggml_cpu_prof_wall_ns[i]/g,
+                    ggml_cpu_prof_total_wall_ns ? 100.0*ggml_cpu_prof_wall_ns[i]/ggml_cpu_prof_total_wall_ns : 0.0,
+                    ggml_cpu_prof_t1_cnt[i]/g);
+            first = 0;
+        }
+    }
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"paths\": [");
+    {
+        static const char * pname[GGML_CPU_PROF_NPATH] = { "dense_mul_mat", "expert_mul_mat_id", "lm_head" };
+        int first = 1;
+        for (int i = 0; i < GGML_CPU_PROF_NPATH; i++) {
+            if (ggml_cpu_prof_path_cnt[i] == 0) {
+                continue;
+            }
+            const double bytes = ggml_cpu_prof_path_bytes[i]/g;
+            const double cus   = ggml_cpu_prof_path_ns[i]/g;
+            const double wus   = ggml_cpu_prof_path_wall_ns[i]/g;
+            fprintf(f, "%s\n    {\"path\": \"%s\", \"calls\": %.3f, \"compute_us\": %.3f, "
+                       "\"wall_us\": %.3f, \"bytes\": %.0f, \"GBs_on_compute\": %.3f, \"GBs_on_wall\": %.3f}",
+                    first ? "" : ",", pname[i], ggml_cpu_prof_path_cnt[i]/g, cus, wus, bytes,
+                    cus > 0 ? bytes/1e3/cus : 0.0, wus > 0 ? bytes/1e3/wus : 0.0);
+            first = 0;
+        }
+    }
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"nodes\": [");
+    if (ggml_cpu_prof_meta_n > 0 && ggml_cpu_prof_node_cap > 0) {
+        const int n = ggml_cpu_prof_meta_n < ggml_cpu_prof_node_cap ? ggml_cpu_prof_meta_n : ggml_cpu_prof_node_cap;
+        int first = 1;
+        for (int i = 0; i < n; i++) {
+            if (ggml_cpu_prof_node_cnt[i] == 0) {
+                continue;
+            }
+            const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[i];
+            double thr_max = 0, thr_mean = 0, thr_min = 0;
+            if (ggml_cpu_prof_nt_ns && ggml_cpu_prof_nt_nth > 0) {
+                const uint64_t * row = &ggml_cpu_prof_nt_ns[(size_t) i * (size_t) ggml_cpu_prof_nt_nth];
+                uint64_t mx = 0, mn = UINT64_MAX, sm = 0;
+                for (int t = 0; t < ggml_cpu_prof_nt_nth; t++) {
+                    if (row[t] > mx) mx = row[t];
+                    if (row[t] < mn) mn = row[t];
+                    sm += row[t];
+                }
+                const double gg = (double) ggml_cpu_prof_node_cnt[i];
+                thr_max  = mx/gg;
+                thr_min  = (mn == UINT64_MAX ? 0 : mn)/gg;
+                thr_mean = (double) sm / (double) ggml_cpu_prof_nt_nth / gg;
+            }
+            fprintf(f, "%s\n    {\"idx\": %d, \"op\": \"%s\", \"name\": \"", first ? "" : ",",
+                    i, ggml_op_name((enum ggml_op) md->op));
+            ggml_cpu_prof_json_escape(f, md->name);
+            fprintf(f, "\", \"label\": \"");
+            ggml_cpu_prof_json_escape(f, md->label);
+            fprintf(f, "\", \"src0_type\": \"%s\", \"src0_ne\": [%lld,%lld,%lld], "
+                       "\"dst_ne\": [%lld,%lld,%lld], \"compute_us\": %.3f, \"wall_us\": %.3f, "
+                       "\"dead_us\": %.3f, \"evals\": %llu, \"wall_max_us\": %llu, "
+                       "\"wall_max_eval\": %llu, \"spikes\": %llu, "
+                       "\"thr_max_us\": %.3f, \"thr_mean_us\": %.3f, \"thr_min_us\": %.3f}",
+                    md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
+                    (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
+                    (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
+                    ggml_cpu_prof_node_ns[i]/g, ggml_cpu_prof_node_wall_ns[i]/g,
+                    (double)(ggml_cpu_prof_node_wall_ns[i] - ggml_cpu_prof_node_ns[i])/g,
+                    (unsigned long long) ggml_cpu_prof_node_cnt[i],
+                    (unsigned long long) ggml_cpu_prof_node_wall_max[i],
+                    (unsigned long long) ggml_cpu_prof_node_wall_max_ev[i],
+                    (unsigned long long) ggml_cpu_prof_node_spikes[i],
+                    thr_max, thr_mean, thr_min);
+            first = 0;
+        }
+    }
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    fprintf(stderr, "[cpu_prof] wrote %s\n", path);
 }
 
 static void ggml_cpu_prof_dump(void) {
@@ -3995,7 +4252,7 @@ static void ggml_cpu_prof_dump(void) {
             const int k = idx[i];
             const struct ggml_cpu_prof_meta * md = &ggml_cpu_prof_meta[k];
             fprintf(stderr, "[cpu_prof] NODEROW\t%d\t%s\t%s\t%s\t%lld,%lld,%lld\t%lld,%lld,%lld\t%.2f\t%.2f\t%.2f\n",
-                    k, ggml_op_name((enum ggml_op) md->op), md->name,
+                    k, ggml_op_name((enum ggml_op) md->op), md->label,
                     md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
                     (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
                     (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
@@ -4006,7 +4263,7 @@ static void ggml_cpu_prof_dump(void) {
         if (pf) {
             FILE * f = fopen(pf, "w");
             if (f) {
-                fprintf(f, "idx\top\tname\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals"
+                fprintf(f, "idx\top\tname\tlabel\tsrc0_type\tsrc0_ne0\tsrc0_ne1\tsrc0_ne2\tdst_ne0\tdst_ne1\tdst_ne2\tcompute_us\twall_us\tevals"
                            "\twall_max_us\twall_max_ev\tspikes\tthr_max_us\tthr_mean_us\tthr_min_us\n");
                 for (int i = 0; i < n; i++) {
                     if (ggml_cpu_prof_node_cnt[i] == 0) continue;
@@ -4024,9 +4281,9 @@ static void ggml_cpu_prof_dump(void) {
                         thr_max = mx/gg; thr_min = (mn==UINT64_MAX?0:mn)/gg;
                         thr_sum = (double) sm / (double) ggml_cpu_prof_nt_nth / gg;
                     }
-                    fprintf(f, "%d\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu"
+                    fprintf(f, "%d\t%s\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%.3f\t%.3f\t%llu"
                                "\t%llu\t%llu\t%llu\t%.3f\t%.3f\t%.3f\n",
-                            i, ggml_op_name((enum ggml_op) md->op), md->name,
+                            i, ggml_op_name((enum ggml_op) md->op), md->name, md->label,
                             md->s0_type >= 0 ? ggml_type_name((enum ggml_type) md->s0_type) : "-",
                             (long long) md->s0_ne[0], (long long) md->s0_ne[1], (long long) md->s0_ne[2],
                             (long long) md->ne[0], (long long) md->ne[1], (long long) md->ne[2],
@@ -4043,6 +4300,8 @@ static void ggml_cpu_prof_dump(void) {
         free(idx);
     }
     fflush(stderr);
+
+    ggml_cpu_prof_write_json();
 }
 
 static void ggml_cpu_prof_atexit(void) {
@@ -4145,8 +4404,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_cpu_prof_graphs_acc++;
             ggml_cpu_prof_last_nnodes = cgraph->n_nodes;
         }
-        fprintf(stderr, "[cpu_prof] graph_eval idx=%llu n_nodes=%d nth=%d acc=%d\n",
-                (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
+        // DS41-C4: one stderr write per graph evaluation is one write per decode token.  It
+        // is useful when discovering graph shapes and is pure overhead afterwards, so it is
+        // now opt-in.  The shape census it provided is in the JSON dump's "shapes" array.
+        if (ggml_cpu_prof_verbose_on()) {
+            fprintf(stderr, "[cpu_prof] graph_eval idx=%llu n_nodes=%d nth=%d acc=%d\n",
+                    (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
+        }
+        ggml_cpu_prof_shape_seen(cgraph->n_nodes, prof_acc);
+        ggml_cpu_prof_last_nth = params.nth;
     }
 #endif
 

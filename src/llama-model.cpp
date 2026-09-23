@@ -305,6 +305,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DEEPSEEK41_DSPARK:
             return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
@@ -2185,6 +2186,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DEEPSEEK41_DSPARK:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
                 if (hparams.dsv4_hc_mult > 0) {
@@ -2710,6 +2712,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MELLUM:
             return LLAMA_ROPE_TYPE_NEOX;
 
+        case LLM_ARCH_DEEPSEEK41_DSPARK:
         case LLM_ARCH_DFLASH:
             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
             return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
@@ -2841,7 +2844,14 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DFLASH:
+        // INF-77 DS41-B13: deepseek41-dspark projects the target's concatenated hidden states
+        // through main_proj/main_norm in an ENCODER graph, exactly like DFlash's fc/output_norm_enc.
+        // This is not cosmetic: llama_context's ctor reads it to set cparams.n_outputs_max
+        // (llama-context.cpp:267), and llama_context::encode is the ONLY path that sizes the batch
+        // allocator at n_embd_inp_enc() rather than n_embd_inp() (:1709 vs :2020).
+        case LLM_ARCH_DEEPSEEK41_DSPARK:
+                                 return true;
         default:                 return false;
     }
 }
@@ -2937,4 +2947,28 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+int32_t llama_model_dspark_noise_token(const struct llama_model * model) {
+    return model->hparams.dflash_noise_token_id;
+}
+
+int32_t llama_model_dspark_block_size(const struct llama_model * model) {
+    return (int32_t) model->hparams.dflash_block_size;
+}
+
+bool llama_model_dspark_is_v41(const struct llama_model * model) {
+    return model->hparams.dspark_v41;
+}
+
+int32_t llama_model_dspark_target_hidden_size(const struct llama_model * model) {
+    const size_t n_layers = model->target_layer_ids.size();
+
+    if (!model->hparams.dspark_v41 || n_layers == 0) {
+        return 0;
+    }
+
+    // main_proj->ne[0] / len(target_layer_ids): what the drafter's own weights say the target's
+    // hidden size must be. Independent of this model's n_embd.
+    return (int32_t) (model->hparams.n_embd_inp_enc()/n_layers);
 }

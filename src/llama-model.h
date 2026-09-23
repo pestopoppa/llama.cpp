@@ -655,6 +655,11 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    // DeepSeek-V4.1-Flash DSpark (arch "deepseek41-dspark", INF-77 DS41-B13): main_proj/main_norm
+    // are stage-0 tensors, not a separate encoder (model.py:1113-1114, :1130).
+    struct ggml_tensor * dspark_main_proj = nullptr;
+    struct ggml_tensor * dspark_main_norm = nullptr;
+
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
