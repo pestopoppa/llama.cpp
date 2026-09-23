@@ -1224,6 +1224,19 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
+// DeepSeek-V4.1-Flash. Same trunk as V4 (hyper-connections, o-group output LoRA, sqrtsoftplus
+// MoE, lightning indexer), but the hyperparameters arrive under raw HF config names and several
+// V4 tensors are absent, so hparam and tensor loading are overridden. The graph is V4's for now:
+// see the V4.1 deltas flagged in load_arch_hparams().
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_deepseek2ocr : public llama_model_base {
     llama_model_deepseek2ocr(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
