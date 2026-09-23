@@ -290,10 +290,32 @@ namespace GGUFMeta {
         return true;
     }
 
+    std::string llama_model_loader::kv_name(enum llm_kv kid) const {
+        const std::string canonical = llm_kv(kid);
+
+        // an override is keyed by the canonical name and applies even to a key absent from the file
+        if (gguf_find_key(metadata, canonical.c_str()) >= 0 || kv_overrides.count(canonical) > 0) {
+            return canonical;
+        }
+
+        const char * alias_fmt = llm_arch_kv_alias(llm_kv.arch, kid);
+        if (alias_fmt == nullptr) {
+            return canonical;
+        }
+
+        std::string alias = ::format(alias_fmt, arch_name.c_str());
+        if (llm_kv.suffix != nullptr) {
+            alias += ".";
+            alias += llm_kv.suffix;
+        }
+
+        return gguf_find_key(metadata, alias.c_str()) >= 0 ? alias : canonical;
+    }
+
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
     llama_model_loader::get_arr_n(enum llm_kv kid, T & result, bool required) {
-        return get_arr_n(llm_kv(kid), result, required);
+        return get_arr_n(kv_name(kid), result, required);
     }
 
     template bool llama_model_loader::get_arr_n(enum llm_kv kid, uint32_t & result, bool required);
@@ -404,7 +426,7 @@ namespace GGUFMeta {
 
     template<typename T>
     bool llama_model_loader::get_arr(enum llm_kv kid, T & result, bool required) {
-        return get_arr(llm_kv(kid), result, required);
+        return get_arr(kv_name(kid), result, required);
     }
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
@@ -433,7 +455,7 @@ namespace GGUFMeta {
 
     template<typename T>
     bool llama_model_loader::get_key(enum llm_kv kid, T & result, bool required) {
-        return get_key(llm_kv(kid), result, required);
+        return get_key(kv_name(kid), result, required);
     }
 
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
@@ -496,11 +518,11 @@ namespace GGUFMeta {
 
     template<typename T>
     bool llama_model_loader::get_key_or_arr(enum llm_kv kid, T & result, uint32_t n, bool required) {
-        return get_key_or_arr(llm_kv(kid), result, n, required);
+        return get_key_or_arr(kv_name(kid), result, n, required);
     }
 
     bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
-        const std::string key = llm_kv(kid);
+        const std::string key = kv_name(kid);
 
         const int id = gguf_find_key(metadata, key.c_str());
 

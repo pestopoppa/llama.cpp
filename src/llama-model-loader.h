@@ -180,6 +180,11 @@ struct llama_model_loader {
 
     bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
 
+    // resolve an llm_kv to the key name actually present in this file: the canonical
+    // "<arch>.<field>" name, or the arch's raw-HF alias (llm_arch_kv_alias) when only that one is
+    // in the file. Every enum-keyed getter below goes through this.
+    std::string kv_name(enum llm_kv kid) const;
+
     std::string get_arch_name() const;
 
     enum llm_arch get_arch() const;

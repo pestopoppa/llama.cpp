@@ -80,6 +80,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
     { LLM_ARCH_DEEPSEEK32,       "deepseek32"       },
     { LLM_ARCH_DEEPSEEK4,        "deepseek4"        },
+    { LLM_ARCH_DEEPSEEK41,       "deepseek41"       },
     { LLM_ARCH_CHATGLM,          "chatglm"          },
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
@@ -279,6 +280,20 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PLE_IMAGE_TOKEN_ID,                     "%s.ple.image_token_id"                     },
 
     { LLM_KV_HASH_LAYER_COUNT,                       "%s.hash_layer_count"                       },
+
+    { LLM_KV_DSV41_KV_SOURCE_LAYERS,                 "%s.kv_source_layer_ids"                    },
+    { LLM_KV_DSV41_INDEX_SOURCE_LAYERS,              "%s.index_source_layer_ids"                 },
+    { LLM_KV_DSV41_CANDIDATE_SOURCE_LAYER,           "%s.candidate_source_layer_id"              },
+    { LLM_KV_DSV41_CANDIDATE_TOPK_BLOCKS,            "%s.candidate_topk_blocks"                  },
+    { LLM_KV_DSV41_CANDIDATE_BLOCK_SIZE,             "%s.candidate_block_size"                   },
+    { LLM_KV_DSV41_ENGRAM_LAYERS,                    "%s.engram.layer_ids"                       },
+    { LLM_KV_DSV41_ENGRAM_ROWS,                      "%s.engram.rows"                            },
+    { LLM_KV_DSV41_ENGRAM_ENCODING,                  "%s.engram.encoding"                        },
+    { LLM_KV_DSV41_ENGRAM_COMPRESSED_VOCAB_SIZE,     "%s.engram.compressed_vocab_size"           },
+    { LLM_KV_DSV41_ENGRAM_PAD_ID,                    "%s.engram.pad_id"                          },
+    { LLM_KV_DSV41_ENGRAM_TOKEN_MAP,                 "%s.engram.token_map"                       },
+    { LLM_KV_DSV41_ENGRAM_PRIMES,                    "%s.engram.primes"                          },
+    { LLM_KV_DSV41_ENGRAM_MULTIPLIERS,               "%s.engram.multipliers"                     },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,       "%s.rope.dimension_count_swa"             },
@@ -508,6 +523,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_COMPRESSOR_WGATE,                  "blk.%d.attn_compressor_gate" },
     { LLM_TENSOR_ATTN_COMPRESSOR_APE,                    "blk.%d.attn_compressor_ape" },
     { LLM_TENSOR_ATTN_COMPRESSOR_NORM,                   "blk.%d.attn_compressor_norm" },
+    { LLM_TENSOR_FFN_EXP_PROBS_B_VL,                     "blk.%d.exp_probs_b_vl" },
+    { LLM_TENSOR_ENGRAM_EMBD,                            "blk.%d.engram_embd" },
+    { LLM_TENSOR_ENGRAM_KV,                              "blk.%d.engram_kv" },
+    { LLM_TENSOR_ENGRAM_Q_NORM,                          "blk.%d.engram_q_norm" },
+    { LLM_TENSOR_ENGRAM_K_NORM,                          "blk.%d.engram_k_norm" },
     { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,                   "per_layer_token_embd" },
     { LLM_TENSOR_PER_LAYER_MODEL_PROJ,                   "per_layer_model_proj" },
     { LLM_TENSOR_PER_LAYER_PROJ_NORM,                    "per_layer_proj_norm" },
@@ -740,6 +760,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ATTN_COMPRESSOR_WGATE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_COMPRESSOR_APE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ATTN_COMPRESSOR_NORM,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_FFN_EXP_PROBS_B_VL,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_EMBD,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_ENGRAM_KV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ENGRAM_Q_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ENGRAM_K_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ATTN_K_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_V_B,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_SINKS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SCALE}},
@@ -996,6 +1021,66 @@ std::vector<llm_arch> llm_arch_all() {
     return ret;
 }
 
+// see llm_arch_kv_alias() in llama-arch.h
+//
+// deepseek41: antirez's converter (antirez/ds4, branch ds4.1flash) emits the raw HF
+// text_config field names. Only type-compatible keys are listed here; keys whose GGUF value type
+// does not match what the canonical reader expects (rope_theta / compress_rope_theta are UINT32
+// where we want float, rope_scaling.original_max_position_embeddings is FLOAT32 where we want
+// uint32, scoring_func is a STRING where we want the gating-func enum) are read explicitly in
+// llama_model_deepseek41::load_arch_hparams instead -- GKV::get_kv() throws on a type mismatch
+// regardless of `required`, so they must not go through the generic path.
+static const std::map<llm_arch, std::map<llm_kv, const char *>> LLM_KV_ALIASES = {
+    {
+        LLM_ARCH_DEEPSEEK41,
+        {
+            { LLM_KV_CONTEXT_LENGTH,                         "%s.max_position_embeddings" },
+            { LLM_KV_EMBEDDING_LENGTH,                       "%s.hidden_size"             },
+            { LLM_KV_BLOCK_COUNT,                            "%s.num_hidden_layers"       },
+            { LLM_KV_EXPERT_COUNT,                           "%s.n_routed_experts"        },
+            { LLM_KV_EXPERT_USED_COUNT,                      "%s.num_experts_per_tok"     },
+            { LLM_KV_EXPERT_FEED_FORWARD_LENGTH,             "%s.moe_intermediate_size"   },
+            { LLM_KV_EXPERT_SHARED_COUNT,                    "%s.n_shared_experts"        },
+            { LLM_KV_EXPERT_WEIGHTS_SCALE,                   "%s.routed_scaling_factor"   },
+            { LLM_KV_EXPERT_WEIGHTS_NORM,                    "%s.norm_topk_prob"          },
+            { LLM_KV_EXPERT_GATING_FUNC,                     "%s.scoring_func"            },
+            { LLM_KV_SWIGLU_CLAMP_EXP,                       "%s.swiglu_limit"            },
+            { LLM_KV_ATTENTION_HEAD_COUNT,                   "%s.num_attention_heads"     },
+            { LLM_KV_ATTENTION_HEAD_COUNT_KV,                "%s.num_key_value_heads"     },
+            { LLM_KV_ATTENTION_KEY_LENGTH,                   "%s.head_dim"                },
+            { LLM_KV_ATTENTION_VALUE_LENGTH,                 "%s.head_dim"                },
+            { LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,            "%s.rms_norm_eps"            },
+            { LLM_KV_ATTENTION_Q_LORA_RANK,                  "%s.q_lora_rank"             },
+            { LLM_KV_ATTENTION_SLIDING_WINDOW,               "%s.sliding_window"          },
+            { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.o_groups"                },
+            { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.o_lora_rank"             },
+            { LLM_KV_ATTENTION_COMPRESS_RATIOS,              "%s.compress_ratios"         },
+            { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.index_n_heads"           },
+            { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.index_head_dim"          },
+            { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.index_topk"              },
+            { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hc_mult"                 },
+            { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hc_sinkhorn_iters"       },
+            { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hc_eps"                  },
+            { LLM_KV_ROPE_DIMENSION_COUNT,                   "%s.qk_rope_head_dim"        },
+            { LLM_KV_ROPE_SCALING_FACTOR,                    "%s.rope_scaling.factor"     },
+        },
+    },
+};
+
+const char * llm_arch_kv_alias(llm_arch arch, llm_kv kv) {
+    const auto arch_it = LLM_KV_ALIASES.find(arch);
+    if (arch_it == LLM_KV_ALIASES.end()) {
+        return nullptr;
+    }
+
+    const auto kv_it = arch_it->second.find(kv);
+    if (kv_it == arch_it->second.end()) {
+        return nullptr;
+    }
+
+    return kv_it->second;
+}
+
 const char * llm_arch_name(llm_arch arch) {
     auto it = LLM_ARCH_NAMES.find(arch);
     if (it == LLM_ARCH_NAMES.end()) {
@@ -1053,6 +1138,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return true;
         default:
             return false;
@@ -1077,6 +1163,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
             return true;
@@ -1101,6 +1188,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:

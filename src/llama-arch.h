@@ -84,6 +84,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK2OCR,
     LLM_ARCH_DEEPSEEK32,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_DEEPSEEK41,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -283,6 +284,23 @@ enum llm_kv {
     LLM_KV_PLE_IMAGE_TOKEN_ID,
 
     LLM_KV_HASH_LAYER_COUNT,
+
+    // deepseek41 — keys with no canonical llama.cpp equivalent. The Engram hash keys
+    // (token_map / primes / multipliers / pad_id / compressed_vocab_size) are registered here for
+    // the Engram op (DS41-B7); the loader itself only reads layer_ids / rows / encoding.
+    LLM_KV_DSV41_KV_SOURCE_LAYERS,
+    LLM_KV_DSV41_INDEX_SOURCE_LAYERS,
+    LLM_KV_DSV41_CANDIDATE_SOURCE_LAYER,
+    LLM_KV_DSV41_CANDIDATE_TOPK_BLOCKS,
+    LLM_KV_DSV41_CANDIDATE_BLOCK_SIZE,
+    LLM_KV_DSV41_ENGRAM_LAYERS,
+    LLM_KV_DSV41_ENGRAM_ROWS,
+    LLM_KV_DSV41_ENGRAM_ENCODING,
+    LLM_KV_DSV41_ENGRAM_COMPRESSED_VOCAB_SIZE,
+    LLM_KV_DSV41_ENGRAM_PAD_ID,
+    LLM_KV_DSV41_ENGRAM_TOKEN_MAP,
+    LLM_KV_DSV41_ENGRAM_PRIMES,
+    LLM_KV_DSV41_ENGRAM_MULTIPLIERS,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
@@ -571,6 +589,11 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_COMPRESSOR_WGATE,
     LLM_TENSOR_ATTN_COMPRESSOR_APE,
     LLM_TENSOR_ATTN_COMPRESSOR_NORM,
+    LLM_TENSOR_FFN_EXP_PROBS_B_VL, // deepseek41, VL router bias (unused in a text-only graph)
+    LLM_TENSOR_ENGRAM_EMBD,    // deepseek41
+    LLM_TENSOR_ENGRAM_KV,      // deepseek41
+    LLM_TENSOR_ENGRAM_Q_NORM,  // deepseek41
+    LLM_TENSOR_ENGRAM_K_NORM,  // deepseek41
     LLM_TENSOR_ATTN_SUB_NORM,
     LLM_TENSOR_FFN_SUB_NORM,
     LLM_TENSOR_DEC_ATTN_NORM,
@@ -740,6 +763,13 @@ struct llm_tensor_info {
 std::vector<llm_arch> llm_arch_all();
 
 const char * llm_arch_name(llm_arch arch);
+
+// Some third-party GGUFs publish an architecture's hyperparameters under the raw HuggingFace
+// config field names instead of the canonical llama.cpp ones (deepseek41 is the first such arch
+// on this tree). Returns the alias key format string for (arch, kv) -- same "%s.<field>" shape as
+// LLM_KV_NAMES -- or nullptr when that arch has no alias for that key. Only consulted when the
+// canonical key is absent from the file, so a GGUF written with canonical names is unaffected.
+const char * llm_arch_kv_alias(llm_arch arch, llm_kv kv);
 
 llm_arch llm_arch_from_string(const std::string & name);
 

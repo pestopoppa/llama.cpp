@@ -246,6 +246,18 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // DeepSeek-V4.1 (deepseek41). The compressor/indexer weights live only on the SOURCE layers
+    // listed below; every other layer reads the state those layers produced. Which source a
+    // non-source layer reads from is a graph decision and is deliberately not encoded here.
+    std::array<bool, LLAMA_MAX_LAYERS>     dsv41_is_kv_source    = {};
+    std::array<bool, LLAMA_MAX_LAYERS>     dsv41_is_index_source = {};
+    // rows of the Engram table on each layer; 0 = no Engram on that layer
+    std::array<uint64_t, LLAMA_MAX_LAYERS> dsv41_engram_rows     = {};
+    uint32_t dsv41_engram_row_bytes        = 0; // packed FP8 row stride, from engram.encoding
+    uint32_t dsv41_candidate_source_layer  = 0;
+    uint32_t dsv41_candidate_topk_blocks   = 0;
+    uint32_t dsv41_candidate_block_size    = 0;
+
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
 

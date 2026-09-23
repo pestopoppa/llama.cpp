@@ -495,6 +495,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // DeepSeek-V4.1 Engram (see src/models/deepseek41.cpp; the compute op is DS41-B7)
+    struct ggml_tensor * engram_embd   = nullptr; // packed FP8 n-gram table, stored as I8 rows
+    struct ggml_tensor * engram_kv     = nullptr;
+    struct ggml_tensor * engram_q_norm = nullptr; // learned gate vector, not a norm
+    struct ggml_tensor * engram_k_norm = nullptr; // learned gate vector, not a norm
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
