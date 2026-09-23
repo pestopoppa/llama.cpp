@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 class llama_model_loader;
@@ -107,6 +108,124 @@ private:
     // [seq][pos] -> compressed id, or DEAD. 4 bytes per position per sequence.
     std::vector<std::vector<int32_t>> seqs;
 };
+
+//
+// Engram profiling -- the port-specific half.
+//
+// The model-agnostic half lives with the op (ggml-cpu.h, gather_rows_e4m3_e8m0 profiling): it
+// answers "what did the gather cost", keyed by table address, and knows nothing about engrams.
+// This half answers the questions that only make sense here -- per engram LAYER, which n-gram
+// column produced which row, how often a row would have been found in a cache, and how much of
+// a decode step the gather accounts for -- and folds the op's counters into one artifact.
+//
+// COMPILE-TIME GATE: -DGGML_CPU_PROF, the same cmake option (OFF by default) that gates the
+// INF-70 per-node profiler in ggml-cpu.c, the host-phase profiler in llama-graph.cpp, and the
+// op half in ops.cpp.  With the option off none of this exists: no struct, no call site in
+// set_input, no environment-variable string.  The measured build is therefore provably
+// uninstrumented, and a profiling build is a SEPARATE arm.
+//
+// Inside a profiling build everything is still off at run time unless
+// LLAMA_ENGRAM_PROF_JSON_FILE names an output path.  No state is allocated and no counter is
+// touched until then, so an un-enabled profiling build pays one pointer test per ubatch.
+//
+//   LLAMA_ENGRAM_PROF_JSON_FILE output path for the JSON artifact; naming it also ENABLES the
+//                               profiler.  Written once per process, at exit (and on an
+//                               explicit flush).  Same shape of switch as
+//                               GGML_CPU_PROF_JSON_FILE and LLAMA_HOST_PROF_JSON_FILE.
+//   LLAMA_ENGRAM_PROFILE        legacy alias for the path, honoured only if the above is unset
+//   LLAMA_ENGRAM_PROFILE_LEVEL  1 (default) counters only
+//                               2 also sets the op profiler to level 2, i.e. per-thread
+//                                 getrusage fault attribution -- PERTURBING, diagnostic only
+//   GGML_GATHER_PROF            the op profiler's own level, if it is to be set independently
+//
+#ifdef GGML_CPU_PROF
+struct llama_dsv41_engram_prof {
+    // Row-cache simulation capacities, in ROWS. Direct-mapped on the low bits of the row id,
+    // which is a LOWER bound on an LRU cache of the same capacity: a reported hit rate that is
+    // already too low to justify a cache settles the question, a high one does not by itself
+    // prove an LRU cache would do as well or better.
+    static const int N_CAP = 4;
+
+    static const int N_HIST = 1024; // row-index histogram buckets, spanning [0, rows[e])
+
+    enum { PHASE_PREFILL = 0, PHASE_DECODE = 1, N_PHASE = 2 };
+
+    // Per (phase, engram layer). Counts are over rows EMITTED by the hash, which is also the
+    // number of rows the op is asked to gather.
+    struct layer_phase_stats {
+        uint64_t n_calls   = 0;   // ubatches
+        uint64_t n_tokens  = 0;
+        uint64_t n_gated   = 0;   // tokens whose gate mask is 0: rows read, contribution zero
+        uint64_t rows      = 0;   // = n_tokens * n_col
+        uint64_t rows_uniq_in_token  = 0; // distinct row ids within one token's n_col ids
+        uint64_t rows_uniq_in_ubatch = 0; // distinct row ids within the whole ubatch
+        uint64_t rows_same_as_prev   = 0; // same row as the previous token in the same column
+        uint64_t cache_hit[N_CAP] = { 0, 0, 0, 0 };
+    };
+
+    // Per engram layer, phase-independent: the simulated cache and the index histogram.
+    struct layer_state {
+        std::vector<int32_t>  cache_tag[N_CAP]; // -1 = empty
+        std::vector<int32_t>  prev_row;         // [n_col]
+        std::vector<uint64_t> index_hist;       // [N_HIST]
+        std::vector<uint64_t> col_rows;         // [n_col]
+        std::vector<uint64_t> col_same_as_prev; // [n_col]
+    };
+
+    // The op's counters, differenced per ubatch and attributed to the phase that ran them.
+    struct op_phase_stats {
+        uint64_t n_calls        = 0;
+        uint64_t n_rows         = 0;
+        uint64_t n_bytes_src    = 0;
+        uint64_t us_span_ith0   = 0;
+        uint64_t us_cpu         = 0;
+        uint64_t n_thread_spans = 0;
+        uint64_t minflt         = 0;
+        uint64_t majflt         = 0;
+    };
+
+    static llama_dsv41_engram_prof & get();
+
+    bool enabled() const { return level > 0; }
+
+    // idempotent; safe to call on every ubatch
+    void configure(const llama_dsv41_engram_spec & spec);
+
+    // Called once per ubatch from set_input, AFTER the row ids for it have been computed.
+    // `rows` is [n_tokens][n_engram][n_col], exactly the buffer set_input builds.
+    void observe(const llama_dsv41_engram_spec & spec,
+                 uint32_t n_tokens, uint32_t n_gated,
+                 const int32_t * rows, int64_t us_hash);
+
+    // Write the artifact. Called explicitly and, failing that, at process exit.
+    void flush();
+
+    int         level = 0;
+    std::string path;
+
+    uint32_t n_engram = 0;
+    uint32_t n_col    = 0;
+
+    std::vector<layer_state>       lstate;  // [n_engram]
+    std::vector<layer_phase_stats> lstats;  // [N_PHASE][n_engram], flattened
+    std::vector<op_phase_stats>    opstats; // [N_PHASE][n_op_slot], flattened
+
+    // op slot -> engram layer, matched on the table's row count (spec.rows[e]); -1 if unknown
+    std::vector<int>      op_slot_layer;
+    std::vector<uint64_t> op_rows;   // spec.rows, the row count of each layer's table
+
+    uint64_t us_hash      = 0;  // host-side hashing time in set_input
+    uint64_t us_observe   = 0;  // the profiler's own cost, so it can be subtracted
+    uint64_t us_step_span = 0;  // summed decode-step wall: set_input(t) -> set_input(t+1)
+    uint64_t n_step_span  = 0;
+
+    int64_t  t_last_set_input = 0;
+    int      phase_last       = -1;
+
+    bool configured = false;
+    bool flushed    = false;
+};
+#endif // GGML_CPU_PROF
 
 //
 // Graph input: the per-batch row ids, plus the per-token gate mask.

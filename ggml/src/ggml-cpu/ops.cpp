@@ -14,6 +14,23 @@
 #include <cstring>
 #include <cmath>
 
+// The gather_rows_e4m3_e8m0 profiler, and everything it needs, exists only in a profiling
+// build (-DGGML_CPU_PROF, cmake option GGML_CPU_PROF).  The measured build must carry none of
+// it -- not the counters, not their headers, not their strings.
+#ifdef GGML_CPU_PROF
+#include <atomic>
+#include <mutex>
+
+// gather_rows_e4m3_e8m0 level-2 profiling attributes page faults to the op through per-thread
+// rusage. Everything else in that profiler is portable; this is the one piece that is not.
+#if defined(__linux__)
+#include <sys/resource.h>
+#if defined(RUSAGE_THREAD)
+#define GGML_GATHER_PROF_RUSAGE 1
+#endif
+#endif
+#endif // GGML_CPU_PROF
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -5453,6 +5470,275 @@ static inline float ggml_cpu_e4m3_to_fp32(uint8_t x) {
     return result;
 }
 
+#ifdef GGML_CPU_PROF
+//
+// gather_rows_e4m3_e8m0 profiling. Contract and levels: ggml-cpu.h.
+//
+// Compiled ONLY into a profiling build (cmake -DGGML_CPU_PROF=ON), the same gate the INF-70
+// per-node profiler in ggml-cpu.c uses. With the option off, none of the code below, and none
+// of its strings, reaches the binary -- which is what makes the measured build provably
+// uninstrumented.
+//
+// Kept entirely inside this op rather than in the ggml_graph_compute_thread choke point,
+// because the questions this answers -- rows, packed bytes, faults attributable to the
+// gather -- are properties of the gather and not of a node index, and because the generic
+// per-node profiler in ggml-cpu.c is behind a -DGGML_CPU_PROF macro that no CMakeLists
+// defines, so it is not a surface anything can rely on being compiled in.
+//
+
+namespace {
+
+struct gather_prof_slot {
+    std::atomic<const void *> table;
+    std::atomic<int64_t> n_table_rows;
+    std::atomic<int64_t> row_bytes;
+    std::atomic<int64_t> n_calls;
+    std::atomic<int64_t> n_rows;
+    std::atomic<int64_t> n_bytes_src;
+    std::atomic<int64_t> us_span_ith0;
+    std::atomic<int64_t> us_cpu;
+    std::atomic<int64_t> n_thread_spans;
+    std::atomic<int64_t> minflt;
+    std::atomic<int64_t> majflt;
+    std::atomic<int64_t> us_hist[GGML_GATHER_E4M3_PROF_NBUCKET];
+};
+
+// namespace-scope atomics are zero-initialized before any dynamic initialization runs, so
+// there is no ordering hazard between a first gather and the profiler's own construction.
+gather_prof_slot     g_gather_prof_slots[GGML_GATHER_E4M3_PROF_MAX_TABLES];
+std::atomic<int>     g_gather_prof_n_tables;
+std::atomic<int64_t> g_gather_prof_unattributed;
+std::atomic<int>     g_gather_prof_level;      // -1 = not yet read from the environment
+std::mutex           g_gather_prof_claim_mutex;
+
+int gather_prof_level() {
+    int lvl = g_gather_prof_level.load(std::memory_order_relaxed);
+
+    if (lvl < 0) {
+        const char * s = getenv("GGML_GATHER_PROF");
+
+        lvl = s ? atoi(s) : 0;
+
+        if (lvl < 0) {
+            lvl = 0;
+        }
+
+        // benign race: two threads may both read the environment and store the same value
+        g_gather_prof_level.store(lvl, std::memory_order_relaxed);
+    }
+
+    return lvl;
+}
+
+// bucket 0 is exactly 0 us; bucket b > 0 covers [2^((b-1)/4), 2^(b/4)) us
+int gather_prof_bucket(int64_t us) {
+    if (us <= 0) {
+        return 0;
+    }
+
+    int b = 1 + (int) (4.0*std::log2((double) us));
+
+    if (b < 1) {
+        b = 1;
+    }
+
+    if (b >= GGML_GATHER_E4M3_PROF_NBUCKET) {
+        b = GGML_GATHER_E4M3_PROF_NBUCKET - 1;
+    }
+
+    return b;
+}
+
+// a slot is keyed by the table's data pointer, so the caller's own notion of which table is
+// which (a layer, a shard, anything) never enters this file
+int gather_prof_slot_for(const void * table, int64_t n_table_rows, int64_t row_bytes) {
+    const int n = g_gather_prof_n_tables.load(std::memory_order_acquire);
+
+    for (int i = 0; i < n; ++i) {
+        if (g_gather_prof_slots[i].table.load(std::memory_order_relaxed) == table) {
+            return i;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_gather_prof_claim_mutex);
+
+    const int n2 = g_gather_prof_n_tables.load(std::memory_order_relaxed);
+
+    for (int i = 0; i < n2; ++i) {
+        if (g_gather_prof_slots[i].table.load(std::memory_order_relaxed) == table) {
+            return i;
+        }
+    }
+
+    if (n2 >= GGML_GATHER_E4M3_PROF_MAX_TABLES) {
+        return -1;
+    }
+
+    g_gather_prof_slots[n2].table       .store(table,        std::memory_order_relaxed);
+    g_gather_prof_slots[n2].n_table_rows.store(n_table_rows, std::memory_order_relaxed);
+    g_gather_prof_slots[n2].row_bytes   .store(row_bytes,    std::memory_order_relaxed);
+
+    g_gather_prof_n_tables.store(n2 + 1, std::memory_order_release);
+
+    return n2;
+}
+
+// One of these per thread per node execution. At level 0 it does nothing but load one int.
+struct gather_prof_scope {
+    int     level     = 0;
+    int     slot      = -1;
+    int     ith       = 0;
+    int64_t t0        = 0;
+    int64_t n_rows    = 0;
+    int64_t row_bytes = 0;
+
+#ifdef GGML_GATHER_PROF_RUSAGE
+    struct rusage ru0;
+#endif
+
+    gather_prof_scope(const void * table, int64_t n_table_rows, int64_t row_bytes_,
+                      int64_t n_rows_, int ith_) {
+        level = gather_prof_level();
+
+        if (level <= 0) {
+            return;
+        }
+
+        ith       = ith_;
+        n_rows    = n_rows_;
+        row_bytes = row_bytes_;
+        slot      = gather_prof_slot_for(table, n_table_rows, row_bytes_);
+
+        if (slot < 0) {
+            if (ith == 0) {
+                g_gather_prof_unattributed.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            return;
+        }
+
+#ifdef GGML_GATHER_PROF_RUSAGE
+        if (level >= 2) {
+            getrusage(RUSAGE_THREAD, &ru0);
+        }
+#endif
+
+        t0 = ggml_time_us();
+    }
+
+    ~gather_prof_scope() {
+        if (level <= 0 || slot < 0) {
+            return;
+        }
+
+        const int64_t dt = ggml_time_us() - t0;
+
+        gather_prof_slot & s = g_gather_prof_slots[slot];
+
+        s.us_cpu        .fetch_add(dt, std::memory_order_relaxed);
+        s.n_thread_spans.fetch_add(1,  std::memory_order_relaxed);
+
+#ifdef GGML_GATHER_PROF_RUSAGE
+        if (level >= 2) {
+            struct rusage ru1;
+
+            getrusage(RUSAGE_THREAD, &ru1);
+
+            s.minflt.fetch_add((int64_t) (ru1.ru_minflt - ru0.ru_minflt), std::memory_order_relaxed);
+            s.majflt.fetch_add((int64_t) (ru1.ru_majflt - ru0.ru_majflt), std::memory_order_relaxed);
+        }
+#endif
+
+        // Per-CALL aggregates are thread 0's alone -- the same discipline the per-node
+        // profiler in ggml-cpu.c uses. dt for ith == 0 is a node-wall PROXY, not the node
+        // wall: every thread enters at the same barrier, but thread 0 may finish ahead of a
+        // straggler. us_cpu/n_thread_spans bounds the skew.
+        if (ith == 0) {
+            s.n_calls     .fetch_add(1,                 std::memory_order_relaxed);
+            s.n_rows      .fetch_add(n_rows,            std::memory_order_relaxed);
+            s.n_bytes_src .fetch_add(n_rows*row_bytes,  std::memory_order_relaxed);
+            s.us_span_ith0.fetch_add(dt,                std::memory_order_relaxed);
+
+            s.us_hist[gather_prof_bucket(dt)].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
+} // namespace
+
+void ggml_gather_rows_e4m3_e8m0_prof_set_level(int level) {
+    g_gather_prof_level.store(level < 0 ? 0 : level, std::memory_order_relaxed);
+}
+
+int ggml_gather_rows_e4m3_e8m0_prof_get_level(void) {
+    return gather_prof_level();
+}
+
+void ggml_gather_rows_e4m3_e8m0_prof_read(struct ggml_gather_e4m3_prof * out) {
+    memset(out, 0, sizeof(*out));
+
+    out->level = gather_prof_level();
+
+#ifdef GGML_GATHER_PROF_RUSAGE
+    out->fault_source = 1;
+#else
+    out->fault_source = 0;
+#endif
+
+    const int n = g_gather_prof_n_tables.load(std::memory_order_acquire);
+
+    out->n_tables             = n;
+    out->n_calls_unattributed = g_gather_prof_unattributed.load(std::memory_order_relaxed);
+
+    for (int i = 0; i < n; ++i) {
+        const gather_prof_slot & s = g_gather_prof_slots[i];
+
+        struct ggml_gather_e4m3_prof_table & d = out->tables[i];
+
+        d.table          = s.table         .load(std::memory_order_relaxed);
+        d.n_table_rows   = s.n_table_rows  .load(std::memory_order_relaxed);
+        d.row_bytes      = s.row_bytes     .load(std::memory_order_relaxed);
+        d.n_calls        = s.n_calls       .load(std::memory_order_relaxed);
+        d.n_rows         = s.n_rows        .load(std::memory_order_relaxed);
+        d.n_bytes_src    = s.n_bytes_src   .load(std::memory_order_relaxed);
+        d.us_span_ith0   = s.us_span_ith0  .load(std::memory_order_relaxed);
+        d.us_cpu         = s.us_cpu        .load(std::memory_order_relaxed);
+        d.n_thread_spans = s.n_thread_spans.load(std::memory_order_relaxed);
+        d.minflt         = s.minflt        .load(std::memory_order_relaxed);
+        d.majflt         = s.majflt        .load(std::memory_order_relaxed);
+
+        for (int b = 0; b < GGML_GATHER_E4M3_PROF_NBUCKET; ++b) {
+            d.us_hist[b] = s.us_hist[b].load(std::memory_order_relaxed);
+        }
+    }
+}
+
+void ggml_gather_rows_e4m3_e8m0_prof_reset(void) {
+    // The table identities are kept: resetting between phases must not renumber the slots a
+    // caller has already mapped to its own layers.
+    const int n = g_gather_prof_n_tables.load(std::memory_order_acquire);
+
+    for (int i = 0; i < n; ++i) {
+        gather_prof_slot & s = g_gather_prof_slots[i];
+
+        s.n_calls       .store(0, std::memory_order_relaxed);
+        s.n_rows        .store(0, std::memory_order_relaxed);
+        s.n_bytes_src   .store(0, std::memory_order_relaxed);
+        s.us_span_ith0  .store(0, std::memory_order_relaxed);
+        s.us_cpu        .store(0, std::memory_order_relaxed);
+        s.n_thread_spans.store(0, std::memory_order_relaxed);
+        s.minflt        .store(0, std::memory_order_relaxed);
+        s.majflt        .store(0, std::memory_order_relaxed);
+
+        for (int b = 0; b < GGML_GATHER_E4M3_PROF_NBUCKET; ++b) {
+            s.us_hist[b].store(0, std::memory_order_relaxed);
+        }
+    }
+
+    g_gather_prof_unattributed.store(0, std::memory_order_relaxed);
+}
+#endif // GGML_CPU_PROF
+
 // Gather rows out of a packed FP8 table and dequantize them (see ggml.h).
 //
 // Row layout, 33 bytes per group of 32 values: [32*k code bytes][k scale bytes].
@@ -5492,6 +5778,12 @@ void ggml_compute_forward_gather_rows_e4m3_e8m0(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+#ifdef GGML_CPU_PROF
+    // Profiling build only. A no-op at level 0 beyond one relaxed int load. Scoped so that the
+    // span it times is exactly this thread's share of this node, including its page faults.
+    const gather_prof_scope prof(src0->data, ne01, ne00, nr, ith);
+#endif
 
     // chunk granularity 32: a chunk covers whole scale groups, so [ic0, ic1) is
     // always a range of complete groups
