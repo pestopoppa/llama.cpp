@@ -1121,6 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "GATHER_ROWS_E4M3_E8M0",
 
     "UNARY",
 
@@ -1138,7 +1139,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1238,6 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "gather_rows_e4m3_e8m0(table, ids)",
 
     "unary(x)",
 
@@ -1255,7 +1257,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6572,6 +6574,38 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_gather_rows_e4m3_e8m0
+
+struct ggml_tensor * ggml_gather_rows_e4m3_e8m0(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(table->type == GGML_TYPE_I8);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+
+    // the table is a flat 2D byte matrix; only rows are addressed
+    GGML_ASSERT(table->nb[0] == ggml_type_size(table->type));
+    GGML_ASSERT(table->ne[2] == 1);
+    GGML_ASSERT(table->ne[3] == 1);
+
+    GGML_ASSERT(ids->ne[2] == 1);
+    GGML_ASSERT(ids->ne[3] == 1);
+
+    // 32 E4M3 code bytes + 1 E8M0 scale byte per group of 32 values
+    GGML_ASSERT(table->ne[0] > 0);
+    GGML_ASSERT(table->ne[0] % 33 == 0);
+
+    const int64_t nc = (table->ne[0]/33)*32;
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, ids->ne[0], ids->ne[1]);
+
+    result->op     = GGML_OP_GATHER_ROWS_E4M3_E8M0;
+    result->src[0] = table;
+    result->src[1] = ids;
 
     return result;
 }
