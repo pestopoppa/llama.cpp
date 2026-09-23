@@ -24,6 +24,7 @@ struct llama_memory_context_i;
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsv4_raw_context;
+class llama_kv_cache_dsv4_comp_context;
 class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -554,6 +555,10 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
+        // per-token count of visible compressed rows, as a float. Built only when the arch needs
+        // it (V4.1's candidate-block pin, SPEC.md section 6); nullptr everywhere else.
+        ggml_tensor * n_visible  = nullptr; // F32 [1, n_batch/n_stream, 1, n_stream]
+
         ggml_tensor * k_rot      = nullptr;
     };
 
@@ -575,12 +580,15 @@ public:
     const comp_input & get_csa() const { return inp_csa; }
     const comp_input & get_hca() const { return inp_hca; }
     const comp_input & get_lid() const { return inp_lid; }
+    // second indexer-key group (V4.1 only); scheduled by the hca plan, see SPEC.md section 10
+    const comp_input & get_lid_b() const { return inp_lid_b; }
 
     std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw;
 
     comp_input inp_csa;
     comp_input inp_hca;
     comp_input inp_lid;
+    comp_input inp_lid_b;
 
     const llama_cparams cparams;
 
