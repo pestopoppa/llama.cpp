@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_GATHER_ROWS_E4M3_E8M0,
 
         GGML_OP_UNARY,
 
@@ -2664,6 +2665,28 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // gather_rows_e4m3_e8m0: gather and dequantize rows of a packed FP8 table.
+    //
+    // The table is carried as GGML_TYPE_I8 raw bytes, ne = [33*k, n_rows]: each row is
+    // 32*k E4M3 (OCP FP8, signed, bias 7, no inf) code bytes followed by k E8M0
+    // exponent-only scale bytes, one scale per 32 consecutive codes. This is the row
+    // layout GGUF tags `e4m3_e8m0_32_row264` (k = 8 -> 264 bytes, 256 values).
+    //
+    //   value[j] = ldexpf(e4m3_to_f32(code[j]), scale[j/32] - 127)
+    //
+    // NaN guard: a code with (code & 0x7F) == 0x7F, or a scale of 0xFF, yields 0.0f,
+    // following ggml_ue4m3_to_fp32()'s treatment of its own NaN pattern.
+    //
+    // table [33*k, n_rows] I8, ids [n_ids, n_seq] I32 -> [32*k, n_ids, n_seq] F32
+    //   result[:, i, s] = dequantize(table row ids[i, s])
+    //
+    // Only the gathered rows are read, so the table may stay a lazily mapped range.
+    //
+    GGML_API struct ggml_tensor * ggml_gather_rows_e4m3_e8m0(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * ids);
 
     // custom operators
 

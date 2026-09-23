@@ -5429,6 +5429,126 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+// ggml_compute_forward_gather_rows_e4m3_e8m0
+
+// One E4M3 code byte (OCP FP8 E4M3: 1 sign, 4 exponent bits with bias 7, 3 mantissa
+// bits, no infinities) to f32. The caller filters the two NaN patterns (0x7F, 0xFF)
+// before calling, so this handles only finite codes.
+static inline float ggml_cpu_e4m3_to_fp32(uint8_t x) {
+    const int exp = (x >> 3) & 0x0F;
+    const int man =  x       & 0x07;
+
+    // magnitude: subnormal 2^-6 * man/8 == man * 2^-9, normal (1 + man/8) * 2^(exp-7)
+    const float mag = exp == 0
+        ? ldexpf((float) man, -9)
+        : ldexpf(1.0f + (float) man*0.125f, exp - 7);
+
+    // graft the sign bit on, so code 0x80 gives -0.0f
+    uint32_t bits;
+    memcpy(&bits, &mag, sizeof(bits));
+    bits |= (uint32_t)(x & 0x80) << 24;
+
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+// Gather rows out of a packed FP8 table and dequantize them (see ggml.h).
+//
+// Row layout, 33 bytes per group of 32 values: [32*k code bytes][k scale bytes].
+// Work is split over (row, column-chunk) pairs with the same helper get_rows uses,
+// because the hot node here gathers few rows (tens) of a fixed width, so a row-only
+// split would idle most threads. Every output element is written by exactly one
+// thread from the same source bytes as a single-threaded pass, so the result is
+// bit-identical to it by construction.
+//
+// Only the gathered rows are dereferenced: the table is never scanned, so a lazily
+// mapped table stays as resident as the access pattern makes it and no more.
+void ggml_compute_forward_gather_rows_e4m3_e8m0(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // table, I8  [33*k, n_rows]
+    const ggml_tensor * src1 = dst->src[1];  // ids,   I32 [n_ids, n_seq]
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I8);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(nb00 == sizeof(int8_t));
+    GGML_ASSERT(nb0  == sizeof(float));
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(ne12 == 1 && ne13 == 1);
+    GGML_ASSERT(ne00 % 33 == 0);
+
+    const int64_t nbk = ne00/33;   // groups of 32 values per row
+    const int64_t nc  = nbk*32;    // dequantized values per row
+    const int64_t nr  = ne10*ne11; // rows gathered
+
+    GGML_ASSERT(ne0 == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // chunk granularity 32: a chunk covers whole scale groups, so [ic0, ic1) is
+    // always a range of complete groups
+    const struct ggml_get_rows_split split = ggml_get_rows_split_init(nr, nc, ith, nth, 32);
+
+    for (int64_t t = split.t0; t < split.t1; ++t) {
+        const int64_t i   = t/split.ncc;
+        const int64_t ic0 = (t - i*split.ncc)*split.cstep;
+        const int64_t ic1 = MIN(ic0 + split.cstep, nc);
+
+        if (ic0 >= ic1) {
+            continue;
+        }
+
+        const int64_t i11 = i/ne10;
+        const int64_t i10 = i - i11*ne10;
+        const int64_t i01 = *(const int32_t *) ((const char *) src1->data + i10*nb10 + i11*nb11);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        const uint8_t * row    = (const uint8_t *) ((const char *) src0->data + i01*nb01);
+        const uint8_t * codes  = row;
+        const uint8_t * scales = row + nc;
+
+        float * out = (float *) ((char *) dst->data + i10*nb1 + i11*nb2) + ic0;
+
+        for (int64_t ib = ic0/32; ib < ic1/32; ++ib) {
+            float * o = out + (ib*32 - ic0);
+
+            const uint8_t s = scales[ib];
+
+            // NaN guard: an all-ones E8M0 scale kills its whole group
+            if (s == 0xFF) {
+                for (int j = 0; j < 32; ++j) {
+                    o[j] = 0.0f;
+                }
+                continue;
+            }
+
+            // exact power of two: 2^(s-127), s in [0, 254]. Multiplying by it is
+            // one correctly-rounded operation, identical to ldexpf(mag, s - 127).
+            const float d = ldexpf(1.0f, (int) s - 127);
+
+            const uint8_t * c = codes + ib*32;
+
+            // AVX2/AVX-512 would replace this inner loop with a table lookup of the
+            // 256 E4M3 codes (a 1 KiB f32 LUT, gathered 8/16 lanes at a time) and a
+            // broadcast multiply by d. Left scalar here: the vectorized form is a
+            // champion lever to be measured, not asserted.
+            for (int j = 0; j < 32; ++j) {
+                // NaN guard: E4M3 codes 0x7F and 0xFF are the only NaN patterns
+                o[j] = (c[j] & 0x7F) == 0x7F ? 0.0f : ggml_cpu_e4m3_to_fp32(c[j])*d;
+            }
+        }
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void ggml_compute_forward_set_rows_impl(
         const ggml_compute_params * params,
