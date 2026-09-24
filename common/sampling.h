@@ -81,16 +81,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+// if out_dists is non-null, one entry is appended per returned token, holding a sorted
+// (descending probability) snapshot of the post-chain candidate distribution at the target
+// idx used to accept that token -- i.e. the same distribution common_sampler_get_candidates()
+// would report had that token been sampled outside of speculative verification. Passing
+// nullptr (the default) skips the snapshot entirely, so non-probability callers pay nothing.
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, std::vector<std::vector<llama_token_data>> * out_dists = nullptr);
 
 // maximal-coupling verification for stochastic speculative decoding
+//
+// out_dists: see the overload above -- same contract, one snapshot per returned token.
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         const std::vector<common_speculative_token_dist> & dists,
-        bool grammar_first = false);
+        bool grammar_first = false,
+        std::vector<std::vector<llama_token_data>> * out_dists = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(

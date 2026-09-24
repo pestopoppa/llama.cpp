@@ -4121,6 +4121,24 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // TD-1d.2: the speculative-accept path used to leave every accepted token's
+            // probabilities unset (result.prob = 1.0f, result.probs empty), regardless of
+            // n_probs -- so a request combining speculative decoding with n_probs silently
+            // got no probabilities for ~all of its tokens (only tokens sampled outside of
+            // speculation, if any, went through populate_token_probs). These come from the
+            // TARGET model's distribution at the verified position, never the draft's.
+            const bool want_probs             = slot.task->params.sampling.n_probs > 0;
+            const bool want_post_sampling_dist = want_probs && slot.task->params.post_sampling_probs;
+
+            // ctx_tgt logits row used to accept each token (raw-logits probabilities); valid
+            // until the next llama_decode(), which is why it's captured before spec_i_batch
+            // is cleared below.
+            std::vector<int32_t> verify_idxs;
+            // sorted post-chain candidate snapshot per accepted token (post-sampling
+            // probabilities); the live sampler can't be replayed after the fact because it
+            // has already accepted every token through the end of the round.
+            std::vector<std::vector<llama_token_data>> verify_dists;
+
             // verify and try to accept the draft
             {
                 const bool serial_verify = use_serial_speculative_verify(slot);
@@ -4131,24 +4149,50 @@ private:
                 // checkpoint restore may need to replay verification.
                 common_sampler_ptr smpl_save;
                 if (serial_verify) {
+                    // TODO(TD-1d.2): the serial DSpark-exactness verify path re-decodes
+                    // ctx_tgt one token at a time, overwriting its own logits every step, so
+                    // it needs its own in-loop capture -- out of scope here (the reported
+                    // defect is the draft-mtp / batched-verify path below). n_probs stays
+                    // empty for tokens accepted through this path.
                     accepted = sample_and_accept_dspark_serial(slot, off);
                 } else {
                     smpl_save.reset(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+                    if (want_probs) {
+                        verify_idxs = slot.spec_i_batch;
+                    }
+
                     const bool can_rollback =
                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                    std::vector<std::vector<llama_token_data>> * out_dists = want_post_sampling_dist ? &verify_dists : nullptr;
                     accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
                                     slot.spec_dists.size() == slot.spec_draft.size()
                         ? common_sampler_sample_and_accept_n(
-                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists,
+                                false, out_dists)
                         : common_sampler_sample_and_accept_n(
-                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                false, out_dists);
                     slot.spec_i_batch.clear();
 
                     if (spec_exact == SPEC_EXACT_DROP || spec_exact == SPEC_EXACT_REDECODE) {
                         exact_handled = spec_exact_bonus(slot, accepted, smpl_save);
+
+                        if (exact_handled && spec_exact == SPEC_EXACT_REDECODE) {
+                            // the bonus row was rewound and redecoded from scratch (see
+                            // spec_exact_bonus): the pre-redecode capture above no longer
+                            // corresponds to ctx_tgt's current state for that row, but the
+                            // kept prefix rows are untouched and stay valid.
+                            if (verify_idxs.size() == n_draft + 1) {
+                                verify_idxs.resize(n_draft);
+                            }
+                            if (verify_dists.size() == n_draft + 1) {
+                                verify_dists.resize(n_draft);
+                            }
+                        }
                     }
                 }
 
@@ -4239,9 +4283,38 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = 1.0f; // overwritten below when n_probs > 0 and a capture is available
 
-                // TODO: set result.probs
+                // TD-1d.2: mirror populate_token_probs(), but from the TARGET-model
+                // distribution captured at the moment this token was verified/accepted,
+                // since by now slot.smpl has moved past every token in this round.
+                if (want_post_sampling_dist && i < verify_dists.size()) {
+                    const auto & cur_p = verify_dists[i];
+
+                    for (const auto & cand : cur_p) {
+                        if (cand.id == result.tok) {
+                            result.prob = cand.p;
+                            break;
+                        }
+                    }
+
+                    const size_t n_probs_request = slot.task->params.sampling.n_probs;
+                    const size_t n_top = std::min(cur_p.size(), n_probs_request);
+                    result.probs.reserve(n_top);
+                    for (size_t k = 0; k < n_top; ++k) {
+                        // see populate_token_probs(): filter 0.0 probabilities for consistency
+                        if (cur_p[k].p == 0.0f) {
+                            break;
+                        }
+                        result.probs.push_back({
+                            cur_p[k].id,
+                            common_token_to_piece(ctx_tgt, cur_p[k].id, params_base.special),
+                            cur_p[k].p
+                        });
+                    }
+                } else if (want_probs && !want_post_sampling_dist && i < verify_idxs.size()) {
+                    populate_token_probs(slot, result, false, params_base.special, verify_idxs[i]);
+                }
 
                 slot.n_decoded += 1;
 
