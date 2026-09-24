@@ -634,7 +634,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, std::vector<std::vector<llama_token_data>> * out_dists) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -678,6 +678,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        if (out_dists) {
+            const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+            out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+        }
+
         if (draft[i] != id) {
             break;
         }
@@ -691,7 +696,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        if (out_dists) {
+            const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+            out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+        }
     }
+
+    GGML_ASSERT(!out_dists || out_dists->size() == result.size());
 
     return result;
 }
@@ -711,7 +723,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         const std::vector<common_speculative_token_dist> & dists,
-        bool grammar_first) {
+        bool grammar_first,
+        std::vector<std::vector<llama_token_data>> * out_dists) {
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(dists.size() == draft.size());
 
@@ -749,6 +762,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            if (out_dists) {
+                const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+                out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+            }
+
             continue;
         }
 
@@ -766,6 +785,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         }
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+
+        if (out_dists) {
+            const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+            out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+        }
+
         break;
     }
 
@@ -773,7 +798,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
+
+        if (out_dists) {
+            const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+            out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+        }
     }
+
+    GGML_ASSERT(!out_dists || out_dists->size() == result.size());
 
     return result;
 }

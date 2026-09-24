@@ -166,6 +166,75 @@ def test_with_ctx_shift():
     assert res.body["truncated"] == True
 
 
+def test_n_probs_with_speculative_decoding():
+    # TD-1d.2: the speculative-accept path used to leave every accepted token's
+    # probabilities unset (prob = 1.0, no top_logprobs), regardless of n_probs --
+    # so a request combining speculative decoding with n_probs silently got no
+    # probabilities for the (typically large majority of) tokens that were
+    # accepted from the draft instead of sampled directly. Greedy decoding
+    # (temperature 0) with a matched tiny draft model reproduces a high
+    # acceptance rate deterministically, so this exercises the non-post-sampling
+    # (raw target-logits) branch of the fix on essentially every predicted token.
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "n_probs": 10,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    })
+    assert res.status_code == 200
+    # sanity check that speculative decoding actually ran for this request --
+    # otherwise this test would pass trivially via the non-speculative path.
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] > 0
+
+    assert "completion_probabilities" in res.body
+    assert len(res.body["completion_probabilities"]) == 16
+    for tok in res.body["completion_probabilities"]:
+        assert "id" in tok and tok["id"] > 0
+        assert "token" in tok and type(tok["token"]) == str
+        assert "logprob" in tok and tok["logprob"] <= 0.0
+        assert len(tok["top_logprobs"]) == 10
+        for prob in tok["top_logprobs"]:
+            assert "id" in prob and prob["id"] > 0
+            assert "token" in prob and type(prob["token"]) == str
+            assert "logprob" in prob and prob["logprob"] <= 0.0
+
+
+def test_n_probs_post_sampling_with_speculative_decoding():
+    # Same defect as test_n_probs_with_speculative_decoding(), but for the
+    # post_sampling_probs branch, which snapshots the TARGET model's post-chain
+    # candidate distribution at accept time (common_sampler_sample_and_accept_n's
+    # out_dists) rather than reading raw logits by index.
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Today was the day. Today I would finally become a",
+        "n_probs": 10,
+        "temperature": 1.0,
+        "n_predict": 16,
+        "post_sampling_probs": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+
+    assert "completion_probabilities" in res.body
+    assert len(res.body["completion_probabilities"]) == 16
+    for tok in res.body["completion_probabilities"]:
+        assert "id" in tok and tok["id"] > 0
+        assert "token" in tok and type(tok["token"]) == str
+        assert "prob" in tok and 0.0 < tok["prob"] <= 1.0
+        assert "top_probs" in tok and type(tok["top_probs"]) == list
+        assert len(tok["top_probs"]) > 0
+        for prob in tok["top_probs"]:
+            assert "id" in prob and prob["id"] > 0
+            assert "token" in prob and type(prob["token"]) == str
+            # 0.0 probability tokens should never be returned by the server
+            assert "prob" in prob and 0.0 < prob["prob"] <= 1.0
+
+
 @pytest.mark.parametrize("n_slots,n_requests", [
     (1, 2),
     (2, 2),
