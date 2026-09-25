@@ -582,6 +582,7 @@ struct common_params {
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
+    int32_t n_load_threads = 0;     // parallel model reader when !use_mmap (0 = auto, 1 = single-threaded)
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation

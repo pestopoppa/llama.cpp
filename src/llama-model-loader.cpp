@@ -7,11 +7,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <regex>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1521,6 +1530,238 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Parallel tensor reader (fast CPU model loading, 2026-09-25)
+//
+// Without mmap, every tensor destined for a host (CPU) buffer used to be read with one
+// seek + fread on the loading thread. On a big CPU model that is ~2 GB/s: one core doing the
+// page-cache copy plus first-touch page faults of the destination. This reads those tensors
+// concurrently instead: the host-buffer tensors are cut into <= 64 MiB byte ranges, ordered by
+// file offset, and N workers pread() them, each through its own descriptor (own readahead state).
+//
+// The workers are an OpenMP team from the CPU backend (ggml_cpu_parallel_run), not std::threads:
+// with OMP_PROC_BIND set, libgomp binds the initial thread to ONE place at startup, and threads
+// spawned with std::thread from it inherit that single-CPU mask -- N readers would share one core.
+// An OpenMP team is spread over the places of the process envelope (taskset/numactl --physcpubind).
+//
+// Page placement: the destination buffers are already allocated (ggml_aligned_malloc applied its
+// madvise at allocation time); the readers only first-touch them. Under numactl --interleave the
+// task memory policy is inherited by every thread, so pages interleave no matter which thread
+// faults them in -- the placement is the policy's, as with the single reader.
+//
+// Tensors in non-host buffers (GPU, CPU_REPACK) keep the sequential path below, which also keeps
+// the repack's own OpenMP parallel-for un-nested. Direct I/O keeps the sequential path.
+// n_load_threads: 0 = auto (min(32, OpenMP default team)), 1 = the old single-threaded path.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+struct llama_par_chunk {
+    ggml_tensor * tensor;
+    uint32_t      file_idx;
+    size_t        file_offs;
+    size_t        dst_offs;
+    size_t        len;
+};
+
+struct llama_par_read_ctx {
+    std::vector<llama_par_chunk> chunks;
+    std::vector<std::string>     paths;      // per file; "" -> use the shared descriptor
+    std::vector<int>             shared_fds; // per file
+    std::atomic<size_t>          next  {0};
+    std::atomic<size_t>          bytes {0};
+    std::atomic<bool>            abort {false};
+    std::atomic<int>             n_workers {0};
+    std::mutex                   err_mtx;
+    std::string                  err;
+    bool                         cancelled = false; // written by thread 0 only
+
+    llama_progress_callback progress_callback = nullptr;
+    void *                  progress_callback_user_data = nullptr;
+    size_t                  size_base = 0;
+    size_t                  size_data = 1;
+
+    void fail(const std::string & msg) {
+        std::lock_guard<std::mutex> lock(err_mtx);
+        if (err.empty()) {
+            err = msg;
+        }
+        abort = true;
+    }
+};
+
+#ifndef _WIN32
+static void llama_par_read_worker(int ith, int nth, void * user_data) {
+    auto & c = *(llama_par_read_ctx *) user_data;
+    GGML_UNUSED(nth);
+    c.n_workers++;
+
+    std::vector<int>  fds(c.paths.size(), -1);
+    std::vector<bool> own(c.paths.size(), false);
+
+    while (!c.abort.load(std::memory_order_relaxed)) {
+        const size_t i = c.next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= c.chunks.size()) {
+            break;
+        }
+        const llama_par_chunk & ch = c.chunks[i];
+
+        int fd = fds[ch.file_idx];
+        if (fd == -1) {
+            if (!c.paths[ch.file_idx].empty()) {
+                fd = ::open(c.paths[ch.file_idx].c_str(), O_RDONLY | O_CLOEXEC);
+                own[ch.file_idx] = fd != -1;
+            }
+            if (fd == -1) {
+                fd = c.shared_fds[ch.file_idx]; // pread is thread-safe on a shared descriptor
+            }
+            fds[ch.file_idx] = fd;
+        }
+
+        char * dst = (char *) ch.tensor->data + ch.dst_offs;
+        size_t done = 0;
+        while (done < ch.len) {
+            const ssize_t ret = ::pread(fd, dst + done, ch.len - done, (off_t) (ch.file_offs + done));
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                c.fail(format("read error on tensor '%s': %s", ggml_get_name(ch.tensor), strerror(errno)));
+                break;
+            }
+            if (ret == 0) {
+                c.fail(format("unexpectedly reached end of file reading tensor '%s'", ggml_get_name(ch.tensor)));
+                break;
+            }
+            done += (size_t) ret;
+        }
+        if (done < ch.len) {
+            break;
+        }
+
+        const size_t total = c.bytes.fetch_add(ch.len, std::memory_order_relaxed) + ch.len;
+
+        // thread 0 is the calling thread in both the OpenMP and the std::thread team, so the
+        // progress callback keeps running on the thread that always ran it
+        if (ith == 0 && c.progress_callback) {
+            if (!c.progress_callback((float) (c.size_base + total) / c.size_data, c.progress_callback_user_data)) {
+                c.cancelled = true;
+                c.abort     = true;
+            }
+        }
+    }
+
+    for (size_t f = 0; f < fds.size(); f++) {
+        if (own[f]) {
+            ::close(fds[f]);
+        }
+    }
+}
+#endif
+
+static int llama_resolve_load_threads(int32_t requested) {
+    int n = requested;
+    if (n == 0) {
+        // library-level override, so callers that do not go through common (llama-bench, bindings)
+        // can also select the old path or a fixed count
+        if (const char * env = getenv("LLAMA_ARG_LOAD_THREADS")) {
+            n = std::max(0, atoi(env));
+        }
+    }
+    return n == 0 ? -32 : n; // auto: min(32, OpenMP default team) -- see ggml_cpu_parallel_run
+}
+
+} // namespace
+
+// Reads every host-buffer tensor of ctx concurrently. Returns false only if cancelled by the
+// progress callback; throws on a read error. Fills `loaded` with the tensors it read.
+bool llama_model_loader::load_all_data_parallel(
+        struct ggml_context * ctx,
+        std::unordered_set<const ggml_tensor *> & loaded,
+        size_t & bytes_loaded,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data) {
+    bytes_loaded = 0;
+#ifdef _WIN32
+    GGML_UNUSED(ctx); GGML_UNUSED(loaded); GGML_UNUSED(progress_callback); GGML_UNUSED(progress_callback_user_data);
+    return true;
+#else
+    if (use_mmap || n_load_threads == 1) {
+        return true;
+    }
+    for (const auto & file : files) {
+        if (file->has_direct_io()) {
+            return true;
+        }
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+    auto * parallel_run = cpu_reg ? (decltype(ggml_cpu_parallel_run) *)
+        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_parallel_run") : nullptr;
+    if (!parallel_run) {
+        return true;
+    }
+
+    constexpr size_t chunk_max = 64u * 1024 * 1024;
+
+    llama_par_read_ctx c;
+    std::vector<ggml_tensor *> tensors;
+    size_t total = 0;
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr || cur->data == nullptr || cur->buffer == nullptr ||
+            !ggml_backend_buffer_is_host(cur->buffer)) {
+            continue;
+        }
+        const size_t n_size = ggml_nbytes(cur);
+        for (size_t off = 0; off < n_size; off += chunk_max) {
+            c.chunks.push_back({ cur, (uint32_t) weight->idx, weight->offs + off, off, std::min(chunk_max, n_size - off) });
+        }
+        tensors.push_back(cur);
+        total += n_size;
+    }
+
+    // not worth a team for a handful of small tensors
+    if (total < 256u * 1024 * 1024 || c.chunks.size() < 2) {
+        return true;
+    }
+
+    std::sort(c.chunks.begin(), c.chunks.end(), [](const llama_par_chunk & a, const llama_par_chunk & b) {
+        return a.file_idx != b.file_idx ? a.file_idx < b.file_idx : a.file_offs < b.file_offs;
+    });
+
+    for (const auto & file : files) {
+        c.paths.push_back(file->path());
+        c.shared_fds.push_back(file->file_id());
+    }
+    c.progress_callback           = progress_callback;
+    c.progress_callback_user_data = progress_callback_user_data;
+    c.size_base                   = size_done;
+    c.size_data                   = std::max<size_t>(size_data, 1);
+
+    const int n_req = llama_resolve_load_threads(n_load_threads);
+    const int64_t t_start_us = ggml_time_us();
+    parallel_run(n_req, llama_par_read_worker, &c);
+    const int64_t t_us = std::max<int64_t>(ggml_time_us() - t_start_us, 1);
+
+    if (!c.err.empty()) {
+        throw std::runtime_error(c.err);
+    }
+    if (c.cancelled) {
+        return false;
+    }
+    GGML_ASSERT(c.bytes == total);
+
+    LLAMA_LOG_INFO("%s: read %zu tensors (%.2f GiB) with %d threads in %.2f s (%.2f GiB/s)\n", __func__,
+        tensors.size(), total / 1024.0 / 1024.0 / 1024.0, c.n_workers.load(), t_us / 1e6,
+        total / 1024.0 / 1024.0 / 1024.0 / (t_us / 1e6));
+
+    loaded.insert(tensors.begin(), tensors.end());
+    bytes_loaded = total;
+    return true;
+#endif
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1537,6 +1778,16 @@ bool llama_model_loader::load_all_data(
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+
+    // host-buffer tensors read concurrently up front (no-op for mmap, direct I/O, n_load_threads=1)
+    std::unordered_set<const ggml_tensor *> preloaded;
+    {
+        size_t bytes_preloaded = 0;
+        if (!load_all_data_parallel(ctx, preloaded, bytes_preloaded, progress_callback, progress_callback_user_data)) {
+            return false;
+        }
+        size_done += bytes_preloaded; // accounted up front so reported progress stays monotonic
+    }
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1643,7 +1894,9 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
-        if (progress_callback) {
+        const bool is_preloaded = !preloaded.empty() && preloaded.count(cur) > 0;
+
+        if (progress_callback && !is_preloaded) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
@@ -1683,8 +1936,10 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                if (!is_preloaded) {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1756,7 +2011,9 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_done += n_size;
+        if (!is_preloaded) {
+            size_done += n_size;
+        }
     }
 
     // free temporary resources used for async uploads

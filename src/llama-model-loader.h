@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -85,6 +86,10 @@ struct llama_model_loader {
 
     // set by the caller before the create_tensor() calls
     enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
+
+    // parallel reader for !use_mmap loads into host buffers (llama_model_params::n_load_threads):
+    // 0 = auto, 1 = single-threaded path. Callers other than llama_model_load keep the old path.
+    int32_t n_load_threads = 1;
 
     // target model a draft head borrows token_embd / output / output_norm from
     const struct llama_model * model_shared = nullptr;
@@ -213,6 +218,15 @@ struct llama_model_loader {
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;
+
+    // parallel pread of the host-buffer tensors of ctx (see llama-model-loader.cpp); returns false
+    // if cancelled by progress_callback, fills `loaded` with the tensors it read
+    bool load_all_data_parallel(
+            struct ggml_context * ctx,
+            std::unordered_set<const ggml_tensor *> & loaded,
+            size_t & bytes_loaded,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data);
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(

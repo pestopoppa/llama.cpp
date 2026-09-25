@@ -2469,6 +2469,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.model_shared                =*/ nullptr,
+        /*.n_load_threads              =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

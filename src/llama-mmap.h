@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include <cstdio>
+#include <string>
 
 struct llama_file;
 struct llama_mmap;
@@ -35,6 +36,10 @@ struct llama_file {
     void write_u32(uint32_t val) const;
 
     size_t read_alignment() const;
+
+    // path the file was opened from ("" if unknown, e.g. Windows or a FILE*-constructed file);
+    // lets concurrent readers open their own descriptors (own readahead state)
+    std::string path() const;
     bool has_direct_io() const;
 private:
     struct impl;

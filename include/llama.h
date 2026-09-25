@@ -342,6 +342,11 @@ extern "C" {
         // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
         const struct llama_model * model_shared;
 
+        // threads that read tensor data from the file when not using mmap and the destination is a
+        // host (CPU) buffer: 0 = auto (hardware-derived, capped), 1 = the single-threaded path,
+        // N > 1 = N readers. Env override for any caller: LLAMA_ARG_LOAD_THREADS.
+        int32_t n_load_threads;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible

@@ -406,6 +406,14 @@ size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
+
+std::string llama_file::path() const {
+#ifdef _WIN32
+    return {};
+#else
+    return pimpl->owns_fp || pimpl->fd != -1 ? pimpl->fname : std::string();
+#endif
+}
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
 int llama_file::file_id() const {
