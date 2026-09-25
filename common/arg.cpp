@@ -2493,6 +2493,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--load-threads"}, "N",
+        string_format("threads that read the model file when mmap is disabled and weights go to CPU (host) buffers\n"
+                      "(0 = auto: hardware-derived, capped at 32; 1 = single-threaded; default: %d)", params.n_load_threads),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--load-threads must be >= 0");
+            }
+            params.n_load_threads = value;
+        }
+    ).set_env("LLAMA_ARG_LOAD_THREADS"));
+    add_opt(common_arg(
         {"--tensor-read-lazy"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"

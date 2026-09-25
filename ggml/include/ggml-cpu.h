@@ -139,6 +139,17 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    // Run fn(ith, nth, user_data) on a team of n_threads CPU threads and return when all have
+    // finished; nth is the team size actually granted. n_threads == 0: the runtime default (the
+    // OpenMP default team size, i.e. the process CPU envelope); n_threads < 0: the runtime default
+    // capped at -n_threads.
+    // With OpenMP the team is an OpenMP team, so it honours OMP_PROC_BIND/OMP_PLACES and the
+    // process affinity envelope -- unlike threads spawned with std::thread from a thread that
+    // libgomp has already bound to a single place. Used by the model loader's parallel reader.
+    // fn must not throw. Reachable as proc address "ggml_backend_cpu_parallel_run".
+    typedef void (*ggml_cpu_parallel_fn_t)(int ith, int nth, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_parallel_run(int n_threads, ggml_cpu_parallel_fn_t fn, void * user_data);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);

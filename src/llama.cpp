@@ -283,6 +283,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.tensor_read_lazy = params.tensor_read_lazy;
+        ml.n_load_threads   = params.n_load_threads;
         ml.model_shared     = params.model_shared;
 
         ml.print_info();

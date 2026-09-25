@@ -8,7 +8,13 @@
 
 #include <cctype>
 #include <string>
+#include <algorithm>
 #include <vector>
+#include <thread>
+
+#ifdef GGML_USE_OPENMP
+#include <omp.h>
+#endif
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -642,6 +648,40 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+void ggml_cpu_parallel_run(int n_threads, ggml_cpu_parallel_fn_t fn, void * user_data) {
+#ifdef GGML_USE_OPENMP
+    if (n_threads <= 0) {
+        const int n_def = omp_get_max_threads();
+        n_threads = n_threads == 0 ? n_def : std::min(n_def, -n_threads);
+    }
+    if (n_threads > 1 && !omp_in_parallel()) {
+        #pragma omp parallel num_threads(n_threads)
+        {
+            fn(omp_get_thread_num(), omp_get_num_threads(), user_data);
+        }
+        return;
+    }
+#else
+    if (n_threads <= 0) {
+        const int n_def = (int) std::max(1u, std::thread::hardware_concurrency());
+        n_threads = n_threads == 0 ? n_def : std::min(n_def, -n_threads);
+    }
+    if (n_threads > 1) {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads - 1);
+        for (int i = 1; i < n_threads; i++) {
+            workers.emplace_back(fn, i, n_threads, user_data);
+        }
+        fn(0, n_threads, user_data);
+        for (auto & w : workers) {
+            w.join();
+        }
+        return;
+    }
+#endif
+    fn(0, 1, user_data);
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -665,6 +705,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, "ggml_backend_cpu_parallel_run") == 0) {
+        return (void *)ggml_cpu_parallel_run;
     }
 
     // threadpool - TODO:  move to ggml-base
