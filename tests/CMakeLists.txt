@@ -366,6 +366,18 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
     llama_build_and_test(test-gather-rows-e4m3-e8m0.cpp)
+
+    # parallel tensor repack: 1 vs N threads byte-identical for every parallelized repack
+    llama_build_and_test(test-repack-parallel.cpp)
+    target_include_directories(test-repack-parallel PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    if (GGML_OPENMP)
+        find_package(OpenMP)
+        if (OpenMP_CXX_FOUND)
+            target_link_libraries(test-repack-parallel PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+    endif()
 endif()
 
 # libmtmd
