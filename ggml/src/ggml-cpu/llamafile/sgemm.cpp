@@ -1534,7 +1534,7 @@ class tinyBLAS_Q0_AVX {
             int64_t ii = m0 + job / xtiles * 4;
             int64_t jj = n0 + job % xtiles * RN;
             __m256 Cv[RN][4] = {};
-            for (int64_t l = 0; l < k; ++l) {
+            for (int64_t l = 0; l + 1 < k; l += 2) {
                 uint64_t a_delta = ((uint64_t)A[lda * (ii + 3) + l].d << 48) | ((uint64_t)A[lda * (ii + 2) + l].d << 32) | ((uint64_t)A[lda * (ii + 1) + l].d << 16) | (A[lda * (ii + 0) + l].d);
                 // Convert delta values for four blocks to float values
                 __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
@@ -1563,6 +1563,62 @@ class tinyBLAS_Q0_AVX {
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
                                     updot(_mm256_sign_epi8(avec3, avec3),
                                             _mm256_sign_epi8(load(B + ldb * (jj + j) + l), avec3)),
+                                    Cv[j][3]);
+                }
+                a_delta = ((uint64_t)A[lda * (ii + 3) + l + 1].d << 48) | ((uint64_t)A[lda * (ii + 2) + l + 1].d << 32) | ((uint64_t)A[lda * (ii + 1) + l + 1].d << 16) | (A[lda * (ii + 0) + l + 1].d);
+                da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                avec0 = load(A + lda * (ii + 0) + l + 1);
+                avec1 = load(A + lda * (ii + 1) + l + 1);
+                avec2 = load(A + lda * (ii + 2) + l + 1);
+                avec3 = load(A + lda * (ii + 3) + l + 1);
+                for (int64_t j = 0; j < RN; ++j) {
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 1].d));
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(load(B + ldb * (jj + j) + l + 1), avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + l + 1), avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + l + 1), avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + l + 1), avec3)),
+                                    Cv[j][3]);
+                }
+            }
+            if (k % 2 == 1) {
+                uint64_t a_delta = ((uint64_t)A[lda * (ii + 3) + k - 1].d << 48) | ((uint64_t)A[lda * (ii + 2) + k - 1].d << 32) | ((uint64_t)A[lda * (ii + 1) + k - 1].d << 16) | (A[lda * (ii + 0) + k - 1].d);
+                __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                __m256i avec0 = load(A + lda * (ii + 0) + k - 1);
+                __m256i avec1 = load(A + lda * (ii + 1) + k - 1);
+                __m256i avec2 = load(A + lda * (ii + 2) + k - 1);
+                __m256i avec3 = load(A + lda * (ii + 3) + k - 1);
+                for (int64_t j = 0; j < RN; ++j) {
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + k - 1].d));
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(load(B + ldb * (jj + j) + k - 1), avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + k - 1), avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + k - 1), avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                            _mm256_sign_epi8(load(B + ldb * (jj + j) + k - 1), avec3)),
                                     Cv[j][3]);
                 }
             }
