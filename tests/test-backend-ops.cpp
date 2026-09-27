@@ -11518,6 +11518,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // MMQ tile-width (J) window: on CDNA, ne11 in 33..128 selects the J the per-type caps change.
+    // m = 4096 takes the aligned src0 path and m = 4000 the out-of-bounds fallback. MoE at
+    // bs 384/768 with 32 experts, 4 used, puts about 48/96 tokens on each expert.
+    for (ggml_type type_a : all_types) {
+        if (!ggml_is_quantized(type_a)) {
+            continue;
+        }
+        for (int bs : {48, 64, 96, 128}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4000, bs, 14336, {1, 1}, {1, 1}));
+        }
+        for (int bs : {384, 768}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, false, 1792, bs, 2048));
+        }
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
