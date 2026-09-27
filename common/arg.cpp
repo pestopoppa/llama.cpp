@@ -2495,7 +2495,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--load-threads"}, "N",
         string_format("threads that read the model file when mmap is disabled and weights go to CPU (host) buffers\n"
-                      "(0 = auto: hardware-derived, capped at 32; 1 = single-threaded; default: %d)", params.n_load_threads),
+                      "(0 = auto: the compute thread count -t, else hardware-derived capped at 32; 1 = single-threaded; default: %d)", params.n_load_threads),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--load-threads must be >= 0");

@@ -1630,7 +1630,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
-    mparams.n_load_threads  = params.n_load_threads;
+    // auto (0): the reader team follows the compute thread count (-t). A reader team of a
+    // different size under a wider OMP_PLACES list leaves libgomp's later compute team
+    // sleeping at barriers (DS41-C57: min(32, ...) readers before 48 compute threads on
+    // 96 places cost ~10% decode). Explicit --load-threads / LLAMA_ARG_LOAD_THREADS wins.
+    mparams.n_load_threads  = params.n_load_threads != 0 ? params.n_load_threads
+                            : params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : 0;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
