@@ -1535,6 +1535,10 @@ class tinyBLAS_Q0_AVX {
             int64_t jj = n0 + job % xtiles * RN;
             __m256 Cv[RN][4] = {};
             for (int64_t l = 0; l + 1 < k; l += 2) {
+                if (l + 8 < k) {
+                    for (int64_t i = 0; i < 4; ++i)
+                        __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
+                }
                 uint64_t a_delta = ((uint64_t)A[lda * (ii + 3) + l].d << 48) | ((uint64_t)A[lda * (ii + 2) + l].d << 32) | ((uint64_t)A[lda * (ii + 1) + l].d << 16) | (A[lda * (ii + 0) + l].d);
                 // Convert delta values for four blocks to float values
                 __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
