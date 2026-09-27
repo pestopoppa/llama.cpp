@@ -813,6 +813,22 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
 
         for (int i = 0; i < nb; ++i) {
 
+            {
+                const char * pf;
+                if (i + 8 < nb) {
+                    pf = (const char *)(deq.x + i + 8);
+                } else if (ix + 1 < nrc_x) {
+                    pf = (const char *)deq.x + deq.bx + (i + 8 - nb) * sizeof(*deq.x);
+                } else {
+                    pf = nullptr;
+                }
+                if (pf) {
+                    __builtin_prefetch(pf + 0);
+                    __builtin_prefetch(pf + 64);
+                    __builtin_prefetch(pf + 128);
+                }
+            }
+
             deq.d = GGML_FP16_TO_FP32(deq.x[i].d);
             auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deq.x[i].dmin));
             make_q4_scales(deq.x[i].scales, utmp);
