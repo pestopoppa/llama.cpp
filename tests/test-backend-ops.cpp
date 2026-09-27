@@ -10470,6 +10470,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // MMQ tile-width (J) selection around the CDNA per-type J caps, on both src0 row paths
+    // (m % 128 == 0 and the out-of-bounds fallback), dense and MoE. k = 1024 spans several
+    // k iterations, so the stream-k fixup path runs too.
+    for (ggml_type type_a : all_types) {
+        if (!ggml_is_quantized(type_a)) {
+            continue;
+        }
+        for (int m : {256, 200}) {
+            for (int n : {33, 48, 49, 64, 65, 100, 128}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+            }
+            for (int n : {96, 256}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, m, n, 1024));
+            }
+        }
+    }
+
 
 #if 0
     {
