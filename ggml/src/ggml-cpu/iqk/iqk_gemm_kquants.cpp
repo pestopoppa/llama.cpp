@@ -818,7 +818,7 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 if (i + 8 < nb) {
                     pf = (const char *)(deq.x + i + 8);
                 } else if (ix + 1 < nrc_x) {
-                    pf = (const char *)deq.x + deq.bx + (i + 8 - nb) * sizeof(*deq.x);
+                    pf = (const char *)(deq.x + nb) + (i + 8 - nb) * sizeof(*deq.x);
                 } else {
                     pf = nullptr;
                 }
