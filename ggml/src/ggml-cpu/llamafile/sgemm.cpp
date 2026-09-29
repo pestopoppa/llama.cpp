@@ -1540,7 +1540,234 @@ class tinyBLAS_Q0_AVX {
             const __m256i m128 = _mm256_set1_epi32(-128);
             const __m256i zero = _mm256_setzero_si256();
 #endif
-            for (int64_t l = 0; l + 1 < k; l += 2) {
+            const int64_t l4 = (k / 4) * 4;
+            for (int64_t l = 0; l < l4; l += 4) {
+                if (l + 8 < k) {
+                    for (int64_t i = 0; i < 4; ++i)
+                        __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
+                }
+                uint64_t a_delta = ((uint64_t)A[lda * (ii + 3) + l].d << 48) | ((uint64_t)A[lda * (ii + 2) + l].d << 32) | ((uint64_t)A[lda * (ii + 1) + l].d << 16) | (A[lda * (ii + 0) + l].d);
+                // Convert delta values for four blocks to float values
+                __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                __m256i avec0 = load(A + lda * (ii + 0) + l);
+                __m256i avec1 = load(A + lda * (ii + 1) + l);
+                __m256i avec2 = load(A + lda * (ii + 2) + l);
+                __m256i avec3 = load(A + lda * (ii + 3) + l);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                {
+                const __m256i a0o = _mm256_xor_si256(avec0, off8);
+                const __m256i a1o = _mm256_xor_si256(avec1, off8);
+                const __m256i a2o = _mm256_xor_si256(avec2, off8);
+                const __m256i a3o = _mm256_xor_si256(avec3, off8);
+#endif
+                for (int64_t j = 0; j < RN; ++j) {
+                        const __m256i bvec0 = load(B + ldb * (jj + j) + l);
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + l].d));
+                        // Computation of product of delta values for four blocks and replicate it across 256 bit lane
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
+                        // Computation of dot product and multiplication with appropriate delta value products
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    Cv[j][3]);
+#else
+                        // Computation of dot product and multiplication with appropriate delta value products
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(bvec0, avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                          _mm256_sign_epi8(bvec0, avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                          _mm256_sign_epi8(bvec0, avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                          _mm256_sign_epi8(bvec0, avec3)),
+                                    Cv[j][3]);
+#endif
+                }
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                }
+#endif
+                a_delta = ((uint64_t)A[lda * (ii + 3) + l + 1].d << 48) | ((uint64_t)A[lda * (ii + 2) + l + 1].d << 32) | ((uint64_t)A[lda * (ii + 1) + l + 1].d << 16) | (A[lda * (ii + 0) + l + 1].d);
+                da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                avec0 = load(A + lda * (ii + 0) + l + 1);
+                avec1 = load(A + lda * (ii + 1) + l + 1);
+                avec2 = load(A + lda * (ii + 2) + l + 1);
+                avec3 = load(A + lda * (ii + 3) + l + 1);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                {
+                const __m256i a0o = _mm256_xor_si256(avec0, off8);
+                const __m256i a1o = _mm256_xor_si256(avec1, off8);
+                const __m256i a2o = _mm256_xor_si256(avec2, off8);
+                const __m256i a3o = _mm256_xor_si256(avec3, off8);
+#endif
+                for (int64_t j = 0; j < RN; ++j) {
+                        const __m256i bvec0 = load(B + ldb * (jj + j) + l + 1);
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 1].d));
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    Cv[j][3]);
+#else
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(bvec0, avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                          _mm256_sign_epi8(bvec0, avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                          _mm256_sign_epi8(bvec0, avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                          _mm256_sign_epi8(bvec0, avec3)),
+                                    Cv[j][3]);
+#endif
+                }
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                }
+#endif
+                a_delta = ((uint64_t)A[lda * (ii + 3) + l + 2].d << 48) | ((uint64_t)A[lda * (ii + 2) + l + 2].d << 32) | ((uint64_t)A[lda * (ii + 1) + l + 2].d << 16) | (A[lda * (ii + 0) + l + 2].d);
+                da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                avec0 = load(A + lda * (ii + 0) + l + 2);
+                avec1 = load(A + lda * (ii + 1) + l + 2);
+                avec2 = load(A + lda * (ii + 2) + l + 2);
+                avec3 = load(A + lda * (ii + 3) + l + 2);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                {
+                const __m256i a0o = _mm256_xor_si256(avec0, off8);
+                const __m256i a1o = _mm256_xor_si256(avec1, off8);
+                const __m256i a2o = _mm256_xor_si256(avec2, off8);
+                const __m256i a3o = _mm256_xor_si256(avec3, off8);
+#endif
+                for (int64_t j = 0; j < RN; ++j) {
+                        const __m256i bvec0 = load(B + ldb * (jj + j) + l + 2);
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 2].d));
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    Cv[j][3]);
+#else
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(bvec0, avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                          _mm256_sign_epi8(bvec0, avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                          _mm256_sign_epi8(bvec0, avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                          _mm256_sign_epi8(bvec0, avec3)),
+                                    Cv[j][3]);
+#endif
+                }
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                }
+#endif
+                a_delta = ((uint64_t)A[lda * (ii + 3) + l + 3].d << 48) | ((uint64_t)A[lda * (ii + 2) + l + 3].d << 32) | ((uint64_t)A[lda * (ii + 1) + l + 3].d << 16) | (A[lda * (ii + 0) + l + 3].d);
+                da = _mm_cvtph_ps(_mm_set_epi64x(0, a_delta));
+                avec0 = load(A + lda * (ii + 0) + l + 3);
+                avec1 = load(A + lda * (ii + 1) + l + 3);
+                avec2 = load(A + lda * (ii + 2) + l + 3);
+                avec3 = load(A + lda * (ii + 3) + l + 3);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                {
+                const __m256i a0o = _mm256_xor_si256(avec0, off8);
+                const __m256i a1o = _mm256_xor_si256(avec1, off8);
+                const __m256i a2o = _mm256_xor_si256(avec2, off8);
+                const __m256i a3o = _mm256_xor_si256(avec3, off8);
+#endif
+                for (int64_t j = 0; j < RN; ++j) {
+                        const __m256i bvec0 = load(B + ldb * (jj + j) + l + 3);
+                        __m128 db = _mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 3].d));
+                        __m256 dvec =  _mm256_castps128_ps256(_mm_mul_ps(da, db));
+                        dvec = _mm256_permute2f128_ps(dvec ,dvec, 0);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    Cv[j][3]);
+#else
+                        Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
+                                    updot(_mm256_sign_epi8(avec0, avec0),
+                                          _mm256_sign_epi8(bvec0, avec0)),
+                                    Cv[j][0]);
+                        Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
+                                    updot(_mm256_sign_epi8(avec1, avec1),
+                                          _mm256_sign_epi8(bvec0, avec1)),
+                                    Cv[j][1]);
+                        Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
+                                    updot(_mm256_sign_epi8(avec2, avec2),
+                                          _mm256_sign_epi8(bvec0, avec2)),
+                                    Cv[j][2]);
+                        Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
+                                    updot(_mm256_sign_epi8(avec3, avec3),
+                                          _mm256_sign_epi8(bvec0, avec3)),
+                                    Cv[j][3]);
+#endif
+                }
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                }
+#endif
+            }
+            for (int64_t l = l4; l + 1 < k; l += 2) {
                 if (l + 8 < k) {
                     for (int64_t i = 0; i < 4; ++i)
                         __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
