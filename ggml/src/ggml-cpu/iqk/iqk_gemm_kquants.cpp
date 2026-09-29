@@ -804,6 +804,9 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
     __m256  accd[nrc_y];
     __m256  scales[2];
     float   d8[8*nrc_y];
+#ifdef HAVE_FANCY_SIMD
+    const __m512i sumi_perm = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 28, 20, 12, 4, 24, 16, 8, 0);
+#endif
 
     for (int ix = 0; ix < nrc_x; ++ix) {
 
@@ -858,13 +861,15 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     const block_q8_2_x4& y = q8.y[iy][2*i+j];
 #ifdef HAVE_FANCY_SIMD
-                    auto sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), deq.bits.values[0], _mm256_loadu_si256((const __m256i*)y.qs+0));
-                    auto sumi2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), deq.bits.values[1], _mm256_loadu_si256((const __m256i*)y.qs+1));
-                    auto sumi3 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), deq.bits.values[2], _mm256_loadu_si256((const __m256i*)y.qs+2));
-                    auto sumi4 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), deq.bits.values[3], _mm256_loadu_si256((const __m256i*)y.qs+3));
-                    sumi1 = _mm256_add_epi32(_mm256_unpacklo_epi32(sumi1, sumi2), _mm256_unpackhi_epi32(sumi1, sumi2));
-                    sumi3 = _mm256_add_epi32(_mm256_unpacklo_epi32(sumi3, sumi4), _mm256_unpackhi_epi32(sumi3, sumi4));
-                    sumi1 = _mm256_add_epi32(_mm256_unpacklo_epi64(sumi1, sumi3), _mm256_unpackhi_epi64(sumi1, sumi3));
+                    const __m512i v01 = _mm512_inserti32x8(_mm512_castsi256_si512(deq.bits.values[0]), deq.bits.values[1], 1);
+                    const __m512i v23 = _mm512_inserti32x8(_mm512_castsi256_si512(deq.bits.values[2]), deq.bits.values[3], 1);
+                    const __m512i pA = _mm512_dpbusd_epi32(_mm512_setzero_si512(), v01, _mm512_loadu_si512((const __m512i*)y.qs+0));
+                    const __m512i pB = _mm512_dpbusd_epi32(_mm512_setzero_si512(), v23, _mm512_loadu_si512((const __m512i*)y.qs+1));
+                    auto sa = _mm512_add_epi32(pA, _mm512_shuffle_epi32(pA, _MM_PERM_ENUM(0xb1)));
+                    sa = _mm512_add_epi32(sa, _mm512_shuffle_epi32(sa, _MM_PERM_ENUM(0x4e)));
+                    auto sb = _mm512_add_epi32(pB, _mm512_shuffle_epi32(pB, _MM_PERM_ENUM(0xb1)));
+                    sb = _mm512_add_epi32(sb, _mm512_shuffle_epi32(sb, _MM_PERM_ENUM(0x4e)));
+                    auto sumi1 = _mm512_castsi512_si256(_mm512_permutex2var_epi32(sa, sumi_perm, sb));
 #else
                     auto sumi1 = _mm256_maddubs_epi16(deq.bits.values[0], _mm256_loadu_si256((const __m256i*)y.qs+0));
                     auto sumi2 = _mm256_maddubs_epi16(deq.bits.values[1], _mm256_loadu_si256((const __m256i*)y.qs+1));
