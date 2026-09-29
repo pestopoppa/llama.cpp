@@ -1573,16 +1573,16 @@ class tinyBLAS_Q0_AVX {
                         __m512 dvec = _mm512_castps256_ps512(_mm256_mul_ps(da8, bbs));
                         const __m512i seed = _mm512_mullo_epi32(_mm512_dpbusd_epi32(zerob, one8b, bz), m128b);
                         Cw[j][0] = madd(_mm512_permutexvar_ps(prm0, dvec),
-                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a0o, bz), seed)),
+                                    _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(seed, a0o, bz)),
                                     Cw[j][0]);
                         Cw[j][1] = madd(_mm512_permutexvar_ps(prm1, dvec),
-                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a1o, bz), seed)),
+                                    _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(seed, a1o, bz)),
                                     Cw[j][1]);
                         Cw[j][2] = madd(_mm512_permutexvar_ps(prm2, dvec),
-                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a2o, bz), seed)),
+                                    _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(seed, a2o, bz)),
                                     Cw[j][2]);
                         Cw[j][3] = madd(_mm512_permutexvar_ps(prm3, dvec),
-                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a3o, bz), seed)),
+                                    _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(seed, a3o, bz)),
                                     Cw[j][3]);
                 }
             }
@@ -1625,16 +1625,16 @@ class tinyBLAS_Q0_AVX {
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         // Computation of dot product and multiplication with appropriate delta value products
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         // Computation of dot product and multiplication with appropriate delta value products
@@ -1680,16 +1680,16 @@ class tinyBLAS_Q0_AVX {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
@@ -1734,16 +1734,16 @@ class tinyBLAS_Q0_AVX {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
@@ -1788,16 +1788,16 @@ class tinyBLAS_Q0_AVX {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
@@ -1851,16 +1851,16 @@ class tinyBLAS_Q0_AVX {
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         // Computation of dot product and multiplication with appropriate delta value products
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         // Computation of dot product and multiplication with appropriate delta value products
@@ -1906,16 +1906,16 @@ class tinyBLAS_Q0_AVX {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
@@ -1962,16 +1962,16 @@ class tinyBLAS_Q0_AVX {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
                         const __m256i seed = _mm256_mullo_epi32(_mm256_dpbusd_epi32(zero, one8, bvec0), m128);
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a0o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a0o, bvec0)),
                                     Cv[j][0]);
                         Cv[j][1] = madd(_mm256_shuffle_ps(dvec, dvec, 85),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a1o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a1o, bvec0)),
                                     Cv[j][1]);
                         Cv[j][2] = madd(_mm256_shuffle_ps(dvec, dvec, 170),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a2o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a2o, bvec0)),
                                     Cv[j][2]);
                         Cv[j][3] = madd(_mm256_shuffle_ps(dvec, dvec, 255),
-                                    _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_dpbusd_epi32(zero, a3o, bvec0), seed)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(seed, a3o, bvec0)),
                                     Cv[j][3]);
 #else
                         Cv[j][0] = madd(_mm256_shuffle_ps(dvec, dvec, 0),
