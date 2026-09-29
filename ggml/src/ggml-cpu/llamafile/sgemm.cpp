@@ -1541,7 +1541,62 @@ class tinyBLAS_Q0_AVX {
             const __m256i zero = _mm256_setzero_si256();
 #endif
             const int64_t l4 = (k / 4) * 4;
-            for (int64_t l = 0; l < l4; l += 4) {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+            const int64_t l8 = (k / 8) * 8;
+            {
+            // Widen the dot product to zmm by packing two consecutive blocks per register
+            __m512 Cw[RN][4] = {};
+            const __m512i off8b = _mm512_set1_epi8((int8_t)0x80);
+            const __m512i one8b = _mm512_set1_epi8(1);
+            const __m512i m128b = _mm512_set1_epi32(-128);
+            const __m512i zerob = _mm512_setzero_si512();
+            const __m512i prm0 = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4);
+            const __m512i prm1 = _mm512_setr_epi32(1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 5, 5, 5, 5);
+            const __m512i prm2 = _mm512_setr_epi32(2, 2, 2, 2, 2, 2, 2, 2, 6, 6, 6, 6, 6, 6, 6, 6);
+            const __m512i prm3 = _mm512_setr_epi32(3, 3, 3, 3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7);
+            for (int64_t l = 0; l < l8; l += 2) {
+                if (l + 8 < k) {
+                    for (int64_t i = 0; i < 4; ++i)
+                        __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
+                }
+                // Low half of each zmm holds block l, high half holds block l + 1
+                uint64_t a_delta0 = ((uint64_t)A[lda * (ii + 3) + l].d << 48) | ((uint64_t)A[lda * (ii + 2) + l].d << 32) | ((uint64_t)A[lda * (ii + 1) + l].d << 16) | (A[lda * (ii + 0) + l].d);
+                uint64_t a_delta1 = ((uint64_t)A[lda * (ii + 3) + l + 1].d << 48) | ((uint64_t)A[lda * (ii + 2) + l + 1].d << 32) | ((uint64_t)A[lda * (ii + 1) + l + 1].d << 16) | (A[lda * (ii + 0) + l + 1].d);
+                __m256 da8 = _mm256_cvtph_ps(_mm_set_epi64x(a_delta1, a_delta0));
+                const __m512i a0o = _mm512_xor_si512(_mm512_inserti64x4(_mm512_castsi256_si512(load(A + lda * (ii + 0) + l)), load(A + lda * (ii + 0) + l + 1), 1), off8b);
+                const __m512i a1o = _mm512_xor_si512(_mm512_inserti64x4(_mm512_castsi256_si512(load(A + lda * (ii + 1) + l)), load(A + lda * (ii + 1) + l + 1), 1), off8b);
+                const __m512i a2o = _mm512_xor_si512(_mm512_inserti64x4(_mm512_castsi256_si512(load(A + lda * (ii + 2) + l)), load(A + lda * (ii + 2) + l + 1), 1), off8b);
+                const __m512i a3o = _mm512_xor_si512(_mm512_inserti64x4(_mm512_castsi256_si512(load(A + lda * (ii + 3) + l)), load(A + lda * (ii + 3) + l + 1), 1), off8b);
+                for (int64_t j = 0; j < RN; ++j) {
+                        const __m512i bz = _mm512_inserti64x4(_mm512_castsi256_si512(load(B + ldb * (jj + j) + l)), load(B + ldb * (jj + j) + l + 1), 1);
+                        __m256 bbs = _mm256_set_m128(_mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 1].d)), _mm_set1_ps(unhalf(B[ldb * (jj + j) + l].d)));
+                        __m512 dvec = _mm512_castps256_ps512(_mm256_mul_ps(da8, bbs));
+                        const __m512i seed = _mm512_mullo_epi32(_mm512_dpbusd_epi32(zerob, one8b, bz), m128b);
+                        Cw[j][0] = madd(_mm512_permutexvar_ps(prm0, dvec),
+                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a0o, bz), seed)),
+                                    Cw[j][0]);
+                        Cw[j][1] = madd(_mm512_permutexvar_ps(prm1, dvec),
+                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a1o, bz), seed)),
+                                    Cw[j][1]);
+                        Cw[j][2] = madd(_mm512_permutexvar_ps(prm2, dvec),
+                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a2o, bz), seed)),
+                                    Cw[j][2]);
+                        Cw[j][3] = madd(_mm512_permutexvar_ps(prm3, dvec),
+                                    _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_dpbusd_epi32(zerob, a3o, bz), seed)),
+                                    Cw[j][3]);
+                }
+            }
+            for (int64_t j = 0; j < RN; ++j)
+                for (int64_t i = 0; i < 4; ++i) {
+                    const __m512i cib = _mm512_castps_si512(Cw[j][i]);
+                    Cv[j][i] = add(Cv[j][i], add(_mm256_castsi256_ps(_mm512_castsi512_si256(cib)),
+                                                 _mm256_castsi256_ps(_mm512_extracti64x4_epi64(cib, 1))));
+                }
+            }
+#else
+            const int64_t l8 = 0;
+#endif
+            for (int64_t l = l8; l < l4; l += 4) {
                 if (l + 8 < k) {
                     for (int64_t i = 0; i < 4; ++i)
                         __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
