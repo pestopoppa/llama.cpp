@@ -1554,6 +1554,7 @@ class tinyBLAS_Q0_AVX {
             const __m512i prm1 = _mm512_setr_epi32(1, 1, 1, 1, 1, 1, 1, 1, 5, 5, 5, 5, 5, 5, 5, 5);
             const __m512i prm2 = _mm512_setr_epi32(2, 2, 2, 2, 2, 2, 2, 2, 6, 6, 6, 6, 6, 6, 6, 6);
             const __m512i prm3 = _mm512_setr_epi32(3, 3, 3, 3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7);
+            const __m256i prmb = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
             for (int64_t l = 0; l < l8; l += 2) {
                 if (l + 8 < k) {
                     for (int64_t i = 0; i < 4; ++i)
@@ -1569,7 +1570,7 @@ class tinyBLAS_Q0_AVX {
                 const __m512i a3o = _mm512_xor_si512(_mm512_inserti64x4(_mm512_castsi256_si512(load(A + lda * (ii + 3) + l)), load(A + lda * (ii + 3) + l + 1), 1), off8b);
                 for (int64_t j = 0; j < RN; ++j) {
                         const __m512i bz = _mm512_inserti64x4(_mm512_castsi256_si512(load(B + ldb * (jj + j) + l)), load(B + ldb * (jj + j) + l + 1), 1);
-                        __m256 bbs = _mm256_set_m128(_mm_set1_ps(unhalf(B[ldb * (jj + j) + l + 1].d)), _mm_set1_ps(unhalf(B[ldb * (jj + j) + l].d)));
+                        __m256 bbs = _mm256_permutevar8x32_ps(_mm256_cvtph_ps(_mm_cvtsi32_si128((int)(((uint32_t)B[ldb * (jj + j) + l + 1].d << 16) | (uint32_t)B[ldb * (jj + j) + l].d))), prmb);
                         __m512 dvec = _mm512_castps256_ps512(_mm256_mul_ps(da8, bbs));
                         const __m512i seed = _mm512_mullo_epi32(_mm512_dpbusd_epi32(zerob, one8b, bz), m128b);
                         Cw[j][0] = madd(_mm512_permutexvar_ps(prm0, dvec),
