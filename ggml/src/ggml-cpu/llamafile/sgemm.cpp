@@ -1560,7 +1560,7 @@ class tinyBLAS_Q0_AVX {
             const __m512i prm2 = _mm512_setr_epi32(2, 2, 2, 2, 2, 2, 2, 2, 6, 6, 6, 6, 6, 6, 6, 6);
             const __m512i prm3 = _mm512_setr_epi32(3, 3, 3, 3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7);
             const __m256i prmb = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
-            for (int64_t l = 0; l < l8; l += 2) {
+            auto block_pair = [&](int64_t l) __attribute__((always_inline)) {
                 if (l + 8 < k) {
                     for (int64_t i = 0; i < RM; ++i)
                         __builtin_prefetch(A + lda * (ii + i) + l + 8, 0, 1);
@@ -1593,7 +1593,14 @@ class tinyBLAS_Q0_AVX {
                                         Cw[j][3]);
                         }
                 }
+            };
+            int64_t l = 0;
+            for (; l + 3 < l8; l += 4) {
+                block_pair(l);
+                block_pair(l + 2);
             }
+            for (; l < l8; l += 2)
+                block_pair(l);
             for (int64_t j = 0; j < RN; ++j)
                 for (int64_t i = 0; i < RM; ++i) {
                     const __m512i cib = _mm512_castps_si512(Cw[j][i]);
