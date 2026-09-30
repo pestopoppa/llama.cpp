@@ -551,13 +551,13 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         return true;
     }
 
-    for (int64_t i12 = 0; i12 < ne12; ++i12) {
-        for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-            iqk_quantize_activation(
-                    activation_type,
-                    (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
-                    qact + i12*nbw2 + i11*nbw1, ne10);
-        }
+    for (int64_t row = ith; row < ne12*ne11; row += nth) {
+        const int64_t i12 = row / ne11;
+        const int64_t i11 = row % ne11;
+        iqk_quantize_activation(
+                activation_type,
+                (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
+                qact + i12*nbw2 + i11*nbw1, ne10);
     }
     // 2) Zero inactive SER rows and build the valid per-expert row mapping.
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
