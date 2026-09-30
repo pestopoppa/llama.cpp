@@ -587,6 +587,20 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     ggml_barrier(params->threadpool);
 
     // 3) per-expert GEMM via iqk
+    const int64_t slab_gran = iqk_mul_mat_moe_row_granularity(tA);
+    bool slab_ok = iqk_mmid_slab_enabled() && slab_gran > 0 && ne01 > 0 && ne01 % slab_gran == 0;
+    int64_t n_active = 0;
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        const int64_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) continue;
+        ++n_active;
+        if (iqk_dequant_type(tA, cne1) != tA) slab_ok = false;
+    }
+    const int64_t units_per_expert = slab_ok ? ne01 / slab_gran : 0;
+    const int64_t units_total = n_active * units_per_expert;
+    const int64_t u0 = units_total * ith / nth;
+    const int64_t u1 = units_total * (ith + 1) / nth;
+    int64_t expert_u0 = 0;
     bool engaged = false;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -594,6 +608,22 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         engaged = true;
         const char * A = (const char *) src0->data + (size_t) cur_a * src0->nb[2];
         const iqk_mmid * rmap = matrix_rows + (size_t) cur_a * n_ids * ids->ne[1];
+        if (slab_ok) {
+            const int64_t first = u0 <= expert_u0 ? 0 :
+                (u0 >= expert_u0 + units_per_expert ? units_per_expert : u0 - expert_u0);
+            const int64_t end = u1 <= expert_u0 ? 0 :
+                (u1 >= expert_u0 + units_per_expert ? units_per_expert : u1 - expert_u0);
+            // Empty ranges still select the kernel on every thread.
+            if (!iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
+                    tA, A, src0->nb[1],
+                    activation_type, qact, act_row,
+                    (float *) dst->data, dst->nb[1], dst->nb[2],
+                    rmap, first * slab_gran, (end - first) * slab_gran)) {
+                return false;
+            }
+            expert_u0 += units_per_expert;
+            continue;
+        }
         if (!iqk_mul_mat_moe(ne01, cne1, ne10, (int) ne11,
                 tA, A, src0->nb[1],
                 activation_type, qact, act_row,
