@@ -601,6 +601,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int64_t u0 = units_total * ith / nth;
     const int64_t u1 = units_total * (ith + 1) / nth;
     int64_t expert_u0 = 0;
+    uint64_t selected_cne1 = 0;
     bool engaged = false;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -613,7 +614,22 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                 (u0 >= expert_u0 + units_per_expert ? units_per_expert : u0 - expert_u0);
             const int64_t end = u1 <= expert_u0 ? 0 :
                 (u1 >= expert_u0 + units_per_expert ? units_per_expert : u1 - expert_u0);
-            // Empty ranges still select the kernel on every thread.
+            bool selected = false;
+            if (cne1 < 64) {
+                const uint64_t bit = uint64_t{1} << cne1;
+                selected = (selected_cne1 & bit) != 0;
+                selected_cne1 |= bit;
+            } else {
+                for (int prev_a = 0; prev_a < cur_a; ++prev_a) {
+                    if (matrix_row_counts[prev_a] == cne1) {
+                        selected = true;
+                        break;
+                    }
+                }
+            }
+            expert_u0 += units_per_expert;
+            // Retain the first selection for each row count on every thread.
+            if (first == end && selected) continue;
             if (!iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
                     tA, A, src0->nb[1],
                     activation_type, qact, act_row,
@@ -621,7 +637,6 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                     rmap, first * slab_gran, (end - first) * slab_gran)) {
                 return false;
             }
-            expert_u0 += units_per_expert;
             continue;
         }
         if (!iqk_mul_mat_moe(ne01, cne1, ne10, (int) ne11,
