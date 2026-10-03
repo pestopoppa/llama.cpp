@@ -1426,6 +1426,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    exl3_aux         (params.exl3_aux),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1453,6 +1454,16 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    if (ggml_type_is_exl3(w->type)) {
+        // EXL3: the input/output Hadamard vectors are part of the operator (src2 = svh, src3 = suh)
+        const auto it = exl3_aux ? exl3_aux->find(w) : llama_exl3_aux_map::const_iterator();
+        if (!exl3_aux || it == exl3_aux->end()) {
+            GGML_ABORT("EXL3 weight %s has no suh/svh in the model's aux map", w->name);
+        }
+        res->src[2] = it->second.svh;
+        res->src[3] = it->second.suh;
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1485,6 +1496,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+
+    if (ggml_type_is_exl3(w->type)) {
+        // EXL3 experts: svh [n, n_expert] and suh [k, n_expert] ride on the op (src3 / src4)
+        const auto it = exl3_aux ? exl3_aux->find(w) : llama_exl3_aux_map::const_iterator();
+        if (!exl3_aux || it == exl3_aux->end()) {
+            GGML_ABORT("EXL3 expert weight %s has no suh/svh in the model's aux map", w->name);
+        }
+        res->src[3] = it->second.svh;
+        res->src[4] = it->second.suh;
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

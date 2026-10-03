@@ -578,6 +578,9 @@ struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
+    // EXL3 weight -> {suh, svh} (empty unless the GGUF carries GGML_TYPE_EXL3_* tensors)
+    llama_exl3_aux_map exl3_aux;
+
     std::string name = "n/a";
 
     llama_hparams hparams = {};
