@@ -798,6 +798,7 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const uint8_t * KV_live_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -820,6 +821,7 @@ static __global__ void flash_attn_tile(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    const uint8_t * GGML_CUDA_RESTRICT KV_live = KV_live_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
@@ -831,7 +833,7 @@ static __global__ void flash_attn_tile(
 #endif // GGML_USE_WMMA_FATTN
             (use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))
     ) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_live, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -958,15 +960,26 @@ static __global__ void flash_attn_tile(
 
     // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // KV chunks that are fully masked for all Q columns of this block (e.g. other sequences in a unified KV cache) are
+    // skipped by advancing the loop index over them, which keeps the loop bodies unchanged:
+    const uint8_t * KV_live_row = KV_live ? KV_live + int64_t(sequence*gridDim.x + blockIdx.x)*(ne11/FATTN_KQ_STRIDE) : nullptr;
+    const auto next_live = [&](int k) -> int {
+        if (KV_live_row) {
+            while (k < k_VKQ_max && flash_attn_kv_chunk_is_dead<nbatch_fa>(KV_live_row, k)) {
+                k += gridDim.y*nbatch_fa;
+            }
+        }
+        return k;
+    };
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
-        int k_VKQ_0 = blockIdx.y*nbatch_fa;
+        int k_VKQ_0 = next_live(blockIdx.y*nbatch_fa);
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
-            k_VKQ_0 += gridDim.y*nbatch_fa;
+            k_VKQ_0 = next_live(k_VKQ_0 + gridDim.y*nbatch_fa);
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
@@ -976,7 +989,7 @@ static __global__ void flash_attn_tile(
         }
     } else {
         // Branch without out-of-bounds checks.
-        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+        for (int k_VKQ_0 = next_live(blockIdx.y*nbatch_fa); k_VKQ_0 < k_VKQ_max; k_VKQ_0 = next_live(k_VKQ_0 + gridDim.y*nbatch_fa)) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
@@ -1138,7 +1151,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

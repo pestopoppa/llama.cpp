@@ -8561,6 +8561,128 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the mask and K/V layout of a unified KV cache shared by several sequences
+// (--kv-unified): the cells of each sequence are contiguous runs of `run` cells, interleaved with the runs of
+// the other sequences, and the last `n_free` cells belong to no sequence (released cells). The query tokens
+// are split into n_seq contiguous groups, one per sequence, and see the causal prefix of their own sequence only.
+// This produces both KV blocks that are fully masked for a whole query tile (foreign or free cells) and blocks
+// that are partially masked (run boundaries, causal edge), which is what the masked-KV-block skip must handle.
+// K and V are cell-major views of a larger cache tensor, as returned by llama_kv_cache::get_k/get_v.
+struct test_flash_attn_ext_unified : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;     // num KV heads
+    const int64_t nr2;    // GQA ratio
+    const int64_t kv;     // n_kv (cells visible to the op)
+    const int64_t nb;     // number of query tokens
+    const int64_t n_seq;  // number of sequences sharing the cache
+    const int64_t run;    // contiguous cells per sequence run
+    const int64_t n_free; // trailing cells that belong to no sequence
+    const float max_bias;
+    const float logit_softcap;
+    const ggml_type type_K;
+    const ggml_type type_V;
+
+    std::string vars() override {
+        return VARS_TO_STR13(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh*nr2 * nb * (hsk + hsv) * kv;
+    }
+
+    test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
+                                int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
+                                ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16)
+        : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
+          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_K, hsk*nh, kv_size, 1);
+        ggml_set_name(k_cache, "k_cache");
+        ggml_tensor * k = ggml_view_4d(ctx, k_cache, hsk, nh, kv, 1,
+                ggml_row_size(type_K, hsk), ggml_row_size(type_K, hsk*nh), ggml_row_size(type_K, hsk*nh*kv_size), 0);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = nullptr;
+        if (hsk == 576 && hsv == 512 && type_K == type_V) {
+            // MLA: V is a view of the first hsv elements of each K head, as for DeepSeek-style models
+            v = ggml_view_4d(ctx, k_cache, hsv, nh, kv, 1,
+                    ggml_row_size(type_K, hsk), ggml_row_size(type_K, hsk*nh), ggml_row_size(type_K, hsk*nh*kv_size), 0);
+        } else {
+            ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, type_V, hsv*nh, kv_size, 1);
+            ggml_set_name(v_cache, "v_cache");
+            v = ggml_view_4d(ctx, v_cache, hsv, nh, kv, 1,
+                    ggml_row_size(type_V, hsv), ggml_row_size(type_V, hsv*nh), ggml_row_size(type_V, hsv*nh*kv_size), 0);
+        }
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            // owner sequence and position of each cell
+            std::vector<int>     owner(kv, -1);
+            std::vector<int64_t> pos(kv, -1);
+            std::vector<int64_t> n_cells(n_seq, 0);
+            for (int64_t c = 0; c < kv - n_free; ++c) {
+                const int s = (c / run) % n_seq;
+                owner[c] = s;
+                pos[c]   = n_cells[s]++;
+            }
+
+            std::mt19937 gen = suite_seed_rng();
+            std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+            std::vector<float> data(kv*nb);
+            const int64_t group = (nb + n_seq - 1) / n_seq;
+            for (int64_t i = 0; i < nb; ++i) {
+                const int     s     = std::min<int64_t>(i / group, n_seq - 1);
+                const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
+                // the tokens of the batch are the last n_grp cells of their sequence
+                const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                for (int64_t c = 0; c < kv; ++c) {
+                    const bool visible = owner[c] == s && pos[c] <= pos_q;
+                    data[i*kv + c] = visible ? dis(gen) : -INFINITY;
+                }
+            }
+
+            std::vector<ggml_fp16_t> data_f16(kv*nb);
+            ggml_fp32_to_fp16_row(data.data(), data_f16.data(), kv*nb);
+            ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11215,6 +11337,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+
+    // unified KV cache shared by several sequences: fully masked KV blocks of other sequences and released cells
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_BF16}) {
+        for (int64_t nb : {1, 2, 4, 8, 32, 75}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, nb, 4, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV));
+        }
+    }
+    for (int64_t hs : {64, 256}) {
+        for (int64_t nb : {1, 2, 8, 512}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 12288, nb, 3, 2048, 2560, 0.0f, 0.0f, type_KV, type_KV));
+            }
+        }
+    }
+    // interleaved runs that do not align to the 256-cell blocks, many sequences, a single KV head
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 1, 8, 8192, 1, 8, 300, 1792));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 1, 8, 8192, 16, 8, 300, 1792));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 2, 4, 8192, 64, 16, 64, 512));
+    // one sequence owns a large span, the others are idle neighbours (the decode shape of a busy unified server)
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 1, 4, 4096, 0));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 8, 4, 4096, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // ALiBi, softcap, other head sizes (tile, MMA and MLA paths)
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(80, 80, 4, 4, 8192, 8, 4, 1024, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(40, 40, 4, 4, 8192, 3, 4, 1024, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(192, 128, 2, 8, 8192, 4, 4, 1024, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(576, 512, 1, 16, 8192, 4, 4, 1024, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(512, 512, 1, 8, 8192, 4, 4, 1024, 1024));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

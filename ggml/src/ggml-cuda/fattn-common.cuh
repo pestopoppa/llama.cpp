@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "dequantize.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -25,6 +26,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const uint8_t * __restrict__ KV_live,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -718,6 +720,332 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Masked KV block skip.
+//
+// With a unified KV cache (--kv-unified) the cells of all sequences share one buffer, and every FlashAttention call
+// attends over all occupied cells. Cells that belong to other sequences are masked with -INF. The KV_max scan above
+// only trims the masked TAIL of the mask. The scan below records, for each query tile and each block of
+// FATTN_KQ_STRIDE KV cells, whether any query row in the tile has a non -INF mask value in the block ("live").
+// The kernels skip dead blocks (tile and WMMA by advancing their loop index over them, vec and MMA with one uniform
+// branch per KV chunk), and K/V are converted to FP16 only for the blocks that some tile reads. A dead block
+// contributes exactly nothing in the unpatched kernels (exp(-INF - max) == 0, max and sums unchanged), so skipping it
+// does not change the result: the output with the skip is bit-identical to the output with GGML_CUDA_FA_MASK_SKIP=0.
+//
+// Layout of KV_live: [n_seq][ntiles_x][n_kv_blocks] bytes, 1 == live, with n_kv_blocks = ne11/FATTN_KQ_STRIDE.
+// Index of the row for a tile: (sequence*ntiles_x + tile)*n_kv_blocks, i.e. the same tile indexing as KV_max.
+
+// Returns true if the KV chunk [k_VKQ_0, k_VKQ_0 + nbatch) is fully masked for every query row of the tile.
+// k_VKQ_0 must be a multiple of nbatch, and nbatch must divide FATTN_KQ_STRIDE, so a chunk never straddles two flags.
+template <int nbatch>
+static __device__ __forceinline__ bool flash_attn_kv_chunk_is_dead(const uint8_t * __restrict__ KV_live_row, const int k_VKQ_0) {
+    static_assert(nbatch > 0 && FATTN_KQ_STRIDE % nbatch == 0, "KV chunk size must divide FATTN_KQ_STRIDE");
+    return KV_live_row[k_VKQ_0 / FATTN_KQ_STRIDE] == 0;
+}
+
+// One warp per (KV block, query tile, sequence). Each lane checks FATTN_KQ_STRIDE/warp_size consecutive mask values
+// of each of the ncols1 query rows of the tile. Rows >= n_rows (padding of the last tile) are ignored.
+template <int ncols1>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_KV_live(
+        const half * __restrict__ mask, uint8_t * __restrict__ KV_live,
+        const int n_kv_blocks, const int n_rows, const int ne33, const int64_t s31, const int64_t s33) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = 256/warp_size;
+    constexpr int ne_lane   = FATTN_KQ_STRIDE/warp_size; // mask values per lane
+    static_assert(ne_lane % 2 == 0 && ne_lane <= 8, "bad ne_lane");
+
+    ggml_cuda_pdl_sync();
+
+    const int warp     = threadIdx.x / warp_size;
+    const int lane     = threadIdx.x % warp_size;
+    const int kb       = blockIdx.x*nwarps + warp;
+    const int jt       = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    if (kb >= n_kv_blocks) {
+        return;
+    }
+
+    const half * mask_tile = mask + (sequence % ne33)*s33 + int64_t(jt)*ncols1*s31 + kb*FATTN_KQ_STRIDE + lane*ne_lane;
+
+    int live = 0;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        if (jt*ncols1 + j >= n_rows) {
+            break;
+        }
+        uint16_t vals[ne_lane];
+        ggml_cuda_memcpy_1<ne_lane*sizeof(half)>(vals, mask_tile + j*s31);
+#pragma unroll
+        for (int l = 0; l < ne_lane; ++l) {
+            live |= vals[l] != 0xFC00u; // bit pattern of -INF in fp16
+        }
+    }
+
+    live = warp_reduce_any<warp_size>(live);
+
+    if (lane == 0) {
+        KV_live[(int64_t(sequence)*gridDim.y + jt)*n_kv_blocks + kb] = live ? 1 : 0;
+    }
+}
+
+// Dequantize K or V to FP16 only for the KV blocks that are live for at least one query tile.
+// The values written are produced by the same expressions as the corresponding ggml_get_to_fp16_cuda converter, so
+// the converted data is bit-identical for every block that a kernel reads. Requires a cell-major, contiguously
+// allocated tensor (the KV cache view): the elements of cell c are [c*ne_cell, (c+1)*ne_cell).
+template <ggml_type type>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_convert_live_f16(
+        const char * __restrict__ src, half * __restrict__ dst, const uint8_t * __restrict__ KV_live,
+        const int n_live_rows, const int n_kv_blocks, const int64_t ne_cell) {
+    const int kb = blockIdx.x;
+
+    int live = 0;
+    for (int r = threadIdx.x; r < n_live_rows; r += blockDim.x) {
+        live |= KV_live[int64_t(r)*n_kv_blocks + kb];
+    }
+    if (!__syncthreads_or(live)) {
+        return;
+    }
+
+    const int64_t ne_block = ne_cell*FATTN_KQ_STRIDE; // elements per KV block
+    const int64_t i_start  = int64_t(kb)*ne_block;
+
+    if constexpr (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) {
+        typedef std::conditional_t<type == GGML_TYPE_F32, float, nv_bfloat16> src_t;
+        const src_t * x = (const src_t *) src;
+        for (int64_t i = i_start + blockIdx.y*blockDim.x + threadIdx.x; i < i_start + ne_block; i += int64_t(gridDim.y)*blockDim.x) {
+            dst[i] = ggml_cuda_cast<half>(x[i]);
+        }
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        // same arithmetic as dequantize_block_q8_0_f16 (fp16 multiply), or dequantize_q8_0 without fast fp16
+        const block_q8_0 * x = (const block_q8_0 *) src;
+        for (int64_t i = i_start + 2*(blockIdx.y*blockDim.x + threadIdx.x); i < i_start + ne_block; i += 2*int64_t(gridDim.y)*blockDim.x) {
+            const int64_t ib  = i / QK8_0;
+            const int     iqs = i % QK8_0;
+#ifdef FP16_AVAILABLE
+            const half d = x[ib].d;
+            *((half2 *) (dst + i)) = __hmul2(make_half2(x[ib].qs[iqs + 0], x[ib].qs[iqs + 1]), __half2half2(d));
+#else
+            float2 v;
+            dequantize_q8_0(x, ib, iqs, v);
+            dst[i + 0] = ggml_cuda_cast<half>(v.x);
+            dst[i + 1] = ggml_cuda_cast<half>(v.y);
+#endif // FP16_AVAILABLE
+        }
+    } else if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) {
+        // same arithmetic as dequantize_block_q4_0 / dequantize_block_q4_1
+        constexpr int qk = 32;
+        for (int64_t i = i_start + 2*(blockIdx.y*blockDim.x + threadIdx.x); i < i_start + ne_block; i += 2*int64_t(gridDim.y)*blockDim.x) {
+            const int64_t ib  = i / qk;
+            const int     iqs = (i % qk) / 2; // 0..15, the element pair is (iqs, iqs + 16)
+            half * y = dst + ib*qk + iqs;
+            if constexpr (type == GGML_TYPE_Q4_0) {
+                const block_q4_0 * x = (const block_q4_0 *) src + ib;
+                const float d  = __half2float(x->d);
+                const float dm = -8*d;
+                const uint8_t q = x->qs[iqs];
+                y[ 0] = ggml_cuda_cast<half>(d * (q & 0xF) + dm);
+                y[16] = ggml_cuda_cast<half>(d * (q >>  4) + dm);
+            } else {
+                const block_q4_1 * x = (const block_q4_1 *) src + ib;
+                const float2 d = __half22float2(x->dm);
+                const uint8_t q = x->qs[iqs];
+                y[ 0] = ggml_cuda_cast<half>(d.x * (q & 0xF) + d.y);
+                y[16] = ggml_cuda_cast<half>(d.x * (q >>  4) + d.y);
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) {
+        // same arithmetic as dequantize_block_cont_cuda<QK5_x, QR5_x, dequantize_q5_x>
+        constexpr int qk = 32;
+        constexpr int qr = 2;
+        for (int64_t i = i_start + 2*(blockIdx.y*blockDim.x + threadIdx.x); i < i_start + ne_block; i += 2*int64_t(gridDim.y)*blockDim.x) {
+            const int64_t ib   = i / qk;
+            const int     iqs  = (i % qk) / qr;
+            const int64_t iybs = i - i % qk;
+            float2 v;
+            if constexpr (type == GGML_TYPE_Q5_0) {
+                dequantize_q5_0(src, ib, iqs, v);
+            } else {
+                dequantize_q5_1(src, ib, iqs, v);
+            }
+            dst[iybs + iqs + 0]    = ggml_cuda_cast<half>(v.x);
+            dst[iybs + iqs + qk/2] = ggml_cuda_cast<half>(v.y);
+        }
+    } else {
+        static_assert(type == GGML_TYPE_COUNT, "unsupported type");
+    }
+}
+
+// Q8_0 -> FP16 for the live KV blocks only: a copy of dequantize_block_q8_0_f16 (convert.cu, the converter that
+// ggml_get_to_fp16_cuda returns for Q8_0 when FP16 is available), with a liveness check per 2048-element chunk.
+#define FATTN_Q8_0_NE_ALIGN 2048
+static __global__ void flash_attn_convert_live_q8_0_f16(
+        const void * __restrict__ vx, half * __restrict__ y, const uint8_t * __restrict__ KV_live,
+        const int n_live_rows, const int n_kv_blocks, const int64_t ne_block, const int n_chunks) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+    constexpr int nint = FATTN_Q8_0_NE_ALIGN/sizeof(int) + WARP_SIZE;
+
+    __shared__ int vals[nint];
+
+    // Grid-stride loop over the 2048-element chunks so that dead chunks cost one flag check, not one block launch:
+    for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gridDim.x) {
+        const int64_t i0 = int64_t(FATTN_Q8_0_NE_ALIGN)*chunk;
+        const int kb = i0 / ne_block;
+
+        int live = 0;
+        for (int r = threadIdx.x; r < n_live_rows; r += blockDim.x) {
+            live |= KV_live[int64_t(r)*n_kv_blocks + kb];
+        }
+        if (!__syncthreads_or(live)) {
+            continue;
+        }
+
+        const int * x0 = ((const int *) vx) + int64_t(chunk) * nint;
+        half2 * y2 = (half2 *) (y + i0);
+
+#pragma unroll
+        for (int ix0 = 0; ix0 < nint; ix0 += WARP_SIZE) {
+            const int ix = ix0 + threadIdx.x;
+            vals[ix] = x0[ix];
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (int iy = 0; iy < FATTN_Q8_0_NE_ALIGN; iy += 2*WARP_SIZE) {
+            const half * b0 = ((const half  *) vals) + (sizeof(block_q8_0)/sizeof(half)) * ((iy + 2*threadIdx.x)/QK8_0);
+            const half    d = *b0;
+            const char2  qs = ((const char2 *) (b0 + 1))[threadIdx.x % (QK8_0/2)];
+
+            y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
+        }
+
+        __syncthreads(); // vals is reused by the next chunk
+    }
+#else
+    GGML_UNUSED_VARS(vx, y, KV_live, n_live_rows, n_kv_blocks, ne_block, n_chunks);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+}
+
+static bool ggml_cuda_fattn_convert_live_supported(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Converts only the live KV blocks of t (K or V) to FP16. Returns false if t does not have the cell-major layout of a
+// KV cache view or its type is not supported, in which case the caller converts the whole tensor.
+static bool ggml_cuda_fattn_convert_live(
+        const ggml_tensor * t, half * dst, const uint8_t * KV_live, const int n_live_rows, cudaStream_t stream) {
+    const ggml_type type = t->type;
+    if (!ggml_cuda_fattn_convert_live_supported(type) || t->ne[3] != 1 || t->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(type);
+    const int64_t bs = ggml_blck_size(type);
+    // [D, n_kv, n_head_kv, 1] view with the heads of one cell adjacent: nb0 = element, nb2 = one head, nb1 = one cell.
+    if (t->nb[0] != ts || t->ne[0] % bs != 0 || t->nb[2] != size_t(t->ne[0]/bs)*ts || t->nb[1] != t->nb[2]*t->ne[2]) {
+        return false;
+    }
+
+    const int n_kv_blocks = t->ne[1] / FATTN_KQ_STRIDE;
+    const int64_t ne_cell = t->ne[0]*t->ne[2];
+
+    if (type == GGML_TYPE_Q8_0 && fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+            (ne_cell*FATTN_KQ_STRIDE) % FATTN_Q8_0_NE_ALIGN == 0) {
+        const int64_t ne_block = ne_cell*FATTN_KQ_STRIDE;
+        const int n_chunks   = ggml_nelements(t) / FATTN_Q8_0_NE_ALIGN;
+        const int num_blocks = std::min(n_chunks, 32*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+        flash_attn_convert_live_q8_0_f16<<<num_blocks, WARP_SIZE, 0, stream>>>(
+            t->data, dst, KV_live, n_live_rows, n_kv_blocks, ne_block, n_chunks);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
+    const dim3 block_dim(256, 1, 1);
+    const int nsplit = std::max<int64_t>(1, std::min<int64_t>(64, ne_cell*FATTN_KQ_STRIDE / (2*4*256)));
+    const dim3 block_nums(n_kv_blocks, nsplit, 1);
+    const char * src = (const char *) t->data;
+
+    switch (type) {
+        case GGML_TYPE_F32:
+            flash_attn_convert_live_f16<GGML_TYPE_F32><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_BF16:
+            flash_attn_convert_live_f16<GGML_TYPE_BF16><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_Q4_0:
+            flash_attn_convert_live_f16<GGML_TYPE_Q4_0><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_Q4_1:
+            flash_attn_convert_live_f16<GGML_TYPE_Q4_1><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_Q5_0:
+            flash_attn_convert_live_f16<GGML_TYPE_Q5_0><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_Q5_1:
+            flash_attn_convert_live_f16<GGML_TYPE_Q5_1><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        case GGML_TYPE_Q8_0:
+            flash_attn_convert_live_f16<GGML_TYPE_Q8_0><<<block_nums, block_dim, 0, stream>>>(src, dst, KV_live, n_live_rows, n_kv_blocks, ne_cell);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// Whether to scan the mask for dead KV blocks. GGML_CUDA_FA_MASK_SKIP=0 disables the skip (A/B and debugging),
+// GGML_CUDA_FA_MASK_SKIP_MIN_KV sets the smallest KV length for which the extra scan launch is worth its overhead.
+static bool ggml_cuda_fattn_mask_skip_enabled(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * mask) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_MASK_SKIP");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    static const int64_t min_kv = [] {
+        const char * env = getenv("GGML_CUDA_FA_MASK_SKIP_MIN_KV");
+        return env ? (int64_t) atoll(env) : (int64_t) 4096;
+    }();
+    return enabled && mask && mask->type == GGML_TYPE_F16 &&
+        K->ne[1] >= min_kv && K->ne[1] % FATTN_KQ_STRIDE == 0 && mask->ne[0] >= K->ne[1] && mask->ne[2] == 1 &&
+        mask->ne[1] >= Q->ne[1] && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0 && uintptr_t(mask->data) % 16 == 0;
+}
+
+// Launches the scan; returns the number of KV_live rows (n_seq*ntiles_x).
+template <int ncols1>
+static int ggml_cuda_fattn_compute_KV_live(
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * mask, uint8_t * KV_live, cudaStream_t stream) {
+    const int warp_size   = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int nwarps      = 256 / warp_size;
+    const int ntiles_x    = (Q->ne[1] + ncols1 - 1) / ncols1;
+    const int n_kv_blocks = K->ne[1] / FATTN_KQ_STRIDE;
+
+    const dim3 block_dim(256, 1, 1);
+    const dim3 blocks_num((n_kv_blocks + nwarps - 1) / nwarps, ntiles_x, Q->ne[3]);
+    const int64_t s31 = mask->nb[1] / sizeof(half);
+    const int64_t s33 = mask->nb[3] / sizeof(half);
+
+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_mask_to_KV_live<ncols1>, launch_params,
+        (const half *) mask->data, KV_live, n_kv_blocks, int(Q->ne[1]), int(mask->ne[3]), s31, s33);
+    CUDA_CHECK(cudaGetLastError());
+
+    return ntiles_x*Q->ne[3];
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -972,7 +1300,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool kv_skip_supported = true // false if the kernel cannot skip dead KV blocks (see flash_attn_mask_to_KV_live)
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1006,8 +1335,17 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<uint8_t> KV_live(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+
+    // Scan the mask for KV blocks that are fully masked for a whole query tile (other sequences in a unified KV cache).
+    int n_KV_live_rows = 0;
+    if (kv_skip_supported && ggml_cuda_fattn_mask_skip_enabled(Q, K, mask)) {
+        const int ntiles_x_live = (Q->ne[1] + ncols1 - 1) / ncols1;
+        KV_live.alloc(size_t(ntiles_x_live)*Q->ne[3]*(K->ne[1]/FATTN_KQ_STRIDE));
+        n_KV_live_rows = ggml_cuda_fattn_compute_KV_live<ncols1>(Q, K, mask, KV_live.ptr, main_stream);
+    }
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1026,8 +1364,11 @@ void launch_fattn(
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+            // With a KV_live scan only the KV blocks that some query tile reads are converted:
+            if (!KV_live.ptr || !ggml_cuda_fattn_convert_live(K, K_f16, KV_live.ptr, n_KV_live_rows, main_stream)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+            }
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
@@ -1060,8 +1401,10 @@ void launch_fattn(
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                if (!KV_live.ptr || !ggml_cuda_fattn_convert_live(V, V_f16, KV_live.ptr, n_KV_live_rows, main_stream)) {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                    to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                }
                 V_data = (char *) V_f16;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
@@ -1091,7 +1434,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // Not needed with KV_live: the dead tail blocks are skipped like any other dead block.
+    if (!KV_live.ptr && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1215,6 +1559,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        KV_live.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

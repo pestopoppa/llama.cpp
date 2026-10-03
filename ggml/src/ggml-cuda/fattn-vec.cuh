@@ -25,6 +25,7 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const uint8_t * KV_live_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -48,6 +49,7 @@ static __global__ void flash_attn_ext_vec(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    const uint8_t * GGML_CUDA_RESTRICT KV_live = KV_live_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
@@ -60,7 +62,7 @@ static __global__ void flash_attn_ext_vec(
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_live, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -255,12 +257,18 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    const uint8_t * KV_live_row = KV_live ? KV_live + int64_t(sequence*gridDim.x + blockIdx.x)*(ne11/FATTN_KQ_STRIDE) : nullptr;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        // Skip KV chunks that are fully masked for all Q columns of this block (e.g. other sequences in a unified KV cache):
+        if (KV_live_row && flash_attn_kv_chunk_is_dead<nthreads>(KV_live_row, k_VKQ_0)) {
+            continue;
+        }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -570,7 +578,7 @@ static __global__ void flash_attn_ext_vec(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -644,6 +652,12 @@ static bool launch_flash_attn_ext_vec_fused_combine(ggml_backend_cuda_context & 
     CUDA_CHECK(cudaMemsetAsync(
         scratch.ptr + completion_offset, 0, ggml_nrows(dst)*sizeof(unsigned int), ctx.stream()));
 
+    ggml_cuda_pool_alloc<uint8_t> KV_live(ctx.pool());
+    if (ggml_cuda_fattn_mask_skip_enabled(Q, K, mask)) {
+        KV_live.alloc(size_t(Q->ne[1])*Q->ne[3]*(K->ne[1]/FATTN_KQ_STRIDE));
+        ggml_cuda_fattn_compute_KV_live<ncols>(Q, K, mask, KV_live.ptr, ctx.stream());
+    }
+
     float scale    = 1.0f;
     float max_bias = 0.0f;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -664,6 +678,7 @@ static bool launch_flash_attn_ext_vec_fused_combine(ggml_backend_cuda_context & 
         mask ? (const char *) mask->data : nullptr,
         sinks ? (const char *) sinks->data : nullptr,
         nullptr,
+        KV_live.ptr,
         (float *) dst->data,
         (float2 *) scratch.ptr,
         scale, max_bias, m0, m1, n_head_log2, 0.0f,

@@ -30,6 +30,7 @@ static __global__ void flash_attn_ext_f16(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const uint8_t * KV_live_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -52,6 +53,7 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    const uint8_t * GGML_CUDA_RESTRICT KV_live = KV_live_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
     // Skip unused kernel variants for faster compilation:
@@ -198,7 +200,18 @@ static __global__ void flash_attn_ext_f16(
 
     // Iterate over ne11 == previous tokens:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    for (int k_VKQ_0 = blockIdx.y*FATTN_KQ_STRIDE; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*FATTN_KQ_STRIDE) {
+    const uint8_t * KV_live_row = KV_live ? KV_live + int64_t(sequence*gridDim.x + blockIdx.x)*(ne11/FATTN_KQ_STRIDE) : nullptr;
+    // KV blocks that are fully masked for all Q columns of this block (e.g. other sequences in a unified KV cache) are
+    // skipped by advancing the loop index, which keeps the loop body unchanged:
+    const auto next_live = [&](int k) -> int {
+        if (KV_live_row) {
+            while (k < k_VKQ_max && flash_attn_kv_chunk_is_dead<FATTN_KQ_STRIDE>(KV_live_row, k)) {
+                k += gridDim.y*FATTN_KQ_STRIDE;
+            }
+        }
+        return k;
+    };
+    for (int k_VKQ_0 = next_live(blockIdx.y*FATTN_KQ_STRIDE); k_VKQ_0 < k_VKQ_max; k_VKQ_0 = next_live(k_VKQ_0 + gridDim.y*FATTN_KQ_STRIDE)) {
         // Calculate tile of KQ:
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < FATTN_KQ_STRIDE; i_KQ_0 += KQ_stride_tc) {
@@ -502,7 +515,7 @@ static __global__ void flash_attn_ext_f16(
         dst_meta[j_dst_unrolled] = dst_meta_val;
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
