@@ -4158,8 +4158,9 @@ static void ggml_compute_forward_rms_norm_f32(
                         y[i00] = x[i00] * scale * w[i00];
                     }
                 } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        y[i00] = x[i00] * scale;
+                    }
                 }
             }
         }
