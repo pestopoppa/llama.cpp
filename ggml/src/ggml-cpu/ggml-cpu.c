@@ -3360,6 +3360,22 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+#if defined(GGML_USE_IQK_MULMAT)
+// iqk port: the iqk mul_mat / mul_mat_id hooks quantize src1 into THEIR activation format
+// (Q8_2_X4, 36 B per 32, or Q8_K), and the MoE hook carves a Q8_K-sized region of
+// nelements(src1). For weight types whose stock vec_dot_type is Q8_0 (34 B per 32: Q4_0,
+// Q5_0, Q8_0, IQ4_NL, MXFP4) the stock sizing is short of that, and both hooks then fall
+// back to the native path silently on their wsize guards. Upper bound of either iqk
+// format, rounded up to whole Q8_K blocks (no blck-size assert for odd nelements).
+static size_t ggml_iqk_act_size(enum ggml_type type0, int64_t n) {
+    if (!ggml_is_quantized(type0)) {
+        return 0;
+    }
+    const int64_t bk = ggml_blck_size(GGML_TYPE_Q8_K);
+    return (size_t) ((n + bk - 1) / bk) * ggml_type_size(GGML_TYPE_Q8_K);
+}
+#endif
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3433,6 +3449,9 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+#if defined(GGML_USE_IQK_MULMAT)
+                            cur = MAX(cur, ggml_iqk_act_size(node->src[0]->type, ggml_nelements(node->src[1])));
+#endif
                             // INF-70 D1: at a single src1 row every thread quantizes the whole row
                             // into its own private slice (no internal barrier), so the buffer holds
                             // n_tasks copies of it. This is a superset of the runtime predicate:
@@ -3452,12 +3471,16 @@ struct ggml_cplan ggml_graph_plan(
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            size_t act = ggml_row_size(vec_dot_type, ggml_nelements(src1));
+#if defined(GGML_USE_IQK_MULMAT)
+                            act = MAX(act, ggml_iqk_act_size(src0->type, ggml_nelements(src1)));
+#endif
+                            cur += act + sizeof(int64_t);
                             // INF-70 D1: at a single token every thread quantizes the activations
                             // into its own private slice (no internal barrier). Superset of the
                             // runtime predicate: the forward falls back if wsize is short.
                             if (ids->ne[1] == 1) {
-                                cur += (size_t) (n_tasks - 1) * ggml_row_size(vec_dot_type, ggml_nelements(src1));
+                                cur += (size_t) (n_tasks - 1) * act;
                             }
                         }
                         // matrix_row_counts

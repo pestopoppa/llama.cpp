@@ -132,6 +132,10 @@ constexpr bool iqk_typeA_supported(int t) {
         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:   // note: Q6_0 is ik-only, not in v6
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS:
+        // 32-element non-linear 4-bit families: same Q8_2_X4 activation and the same
+        // legacy-quant kernels / Q8_0_R8 dequant path as Q4_0 (iqk_gemm_legacy_quants.cpp,
+        // IQ4_NL_UnpackerU / MXFP4_Unpacker; iqk_convert_legacy_quants_q8_r8).
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_MXFP4:
             return true;
         default: return false;
     }
@@ -142,6 +146,8 @@ constexpr bool iqk_typeA_supported(int t) {
 static_assert(!iqk_typeA_supported(GGML_TYPE_Q2_K));
 static_assert(!iqk_typeA_supported(GGML_TYPE_Q3_K));
 static_assert(iqk_typeA_supported(GGML_TYPE_IQ4_XS));
+static_assert(iqk_typeA_supported(GGML_TYPE_IQ4_NL));
+static_assert(iqk_typeA_supported(GGML_TYPE_MXFP4));
 
 constexpr bool iqk_weight_uses_q8_k(int t) {
     // Q8_K is enabled only for the validated IQ families. Q2_K/Q3_K are
@@ -159,6 +165,8 @@ static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_Q3_K));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ2_XXS));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ3_XXS));
 static_assert(iqk_weight_uses_q8_k(GGML_TYPE_IQ4_XS));
+static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_IQ4_NL));   // Q8_2_X4 activation
+static_assert(!iqk_weight_uses_q8_k(GGML_TYPE_MXFP4));
 
 constexpr bool iqk_shape_supported(int weight_type, int64_t n_rows) {
     // The imported IQ3_XXS kernel exceeds the backend NMSE limit for some tiny

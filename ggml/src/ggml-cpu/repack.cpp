@@ -4563,6 +4563,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS:
+                case GGML_TYPE_IQ4_NL: case GGML_TYPE_MXFP4:   // else iq4_nl_8x8 / mxfp4_8x8 (AVX2) claim them
                     return nullptr;
                 default: break;
             }
