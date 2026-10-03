@@ -111,10 +111,16 @@ ISA tiers: scalar reference (always built), AVX-512 VNNI, AVX-512 VBMI (Zen 5 de
 `GGML_EXL3_ISA=scalar|vnni|vbmi` caps for tests). K1..K8 are compile-time specialised; the 3.05
 branch uses K3 and K5.
 
-**Threading.** Static partition of the unit list (contiguous ranges, deterministic). Decode
-MoE gate/up at N=1 has only 10 experts x 5 bands = 50 units per op — under-subscribed at 96
-threads; follow-ups (not in v1): merged gate|up (`suh` per segment) and split-K with a
-reduction. Recorded as a performance item, not a correctness one.
+**Threading.** Units are handed out with the threadpool chunk counter (first unit = thread
+index, then `chunk_add`); every unit is computed entirely by one thread, so the assignment never
+changes the arithmetic. **GEMV split-K**: decode ops with few bands (attn_k/v 4, ssm_out and
+attn_output 20, shared expert 5/20, MoE gate/up 50 units at N=1) would idle most of 96 threads,
+so for ops with ≤ 64 instances the k range is split into S slices (S from the op's shape and
+routing only — target 192 units, cap k/256; `GGML_EXL3_SPLITK_TARGET`, 1 disables); slices write
+raw partials, one barrier, then a fixed-order reduction + the shared epilogue. Outputs are
+bit-identical for every thread count and ISA tier (tested). Not in v1: merged gate|up with
+per-segment `suh`, fusing prep into the previous op (each EXL3 op costs one extra barrier, two
+with split-K).
 
 ## 4. Dense path
 
@@ -167,9 +173,17 @@ Propositions, each with its own oracle (EXL3-R10):
    (first-N-layers) model within a declared KLD / top-1 envelope; then full generation.
    Token equality alone never stands in for (1)–(3).
 
+## 7a. Evidence
+
+`tools/exl3/emit_verifier.py` runs `test-exl3 --json` pinned and seals one
+`epyc.exl3.verifier.v1` row per proposition through the research repo's single EXL3 writer
+(producer `epyc.exl3.evidence/v1`), so the rows project through root's `exl3-verifier` Vidya
+adapter. Model-level KLD receipts (measurement schema) are left to the booked windows.
+
 ## 8. What is deliberately not done in v1
 
 MCG / 3INST codebooks, padded (non-128) dims, the EXL3 n-gram rows, MTP, the INF-64 fused
 single-token decode path (`qwen4exp-fused.cpp` is bypassed when the model has EXL3 tensors —
-it calls vec_dot directly), HIP. Each is a refusal at load or a documented fallback, never a
+it calls vec_dot directly; it is single-threaded and production recipes already disable it with
+`GGML_FUSED_DECODE_OFF=1`, so EXL3 and the GGUF anchors both run the graph path), HIP. Each is a refusal at load or a documented fallback, never a
 silent wrong answer.
