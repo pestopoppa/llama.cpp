@@ -32,6 +32,12 @@ void         ggml_cpu_exl3_set_splitk_target(int target);
 static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { std::printf("FAIL: " __VA_ARGS__); std::printf("\n"); ++g_fail; } } while (0)
 
+// machine-readable proposition results (--json): consumed by tools/exl3/emit_verifier.py
+struct Prop { std::string fixture, path, proposition; double value, envelope; bool pass; };
+static std::vector<Prop> g_props;
+static int g_isa_cmp = 0, g_isa_bad = 0, g_thr_cmp = 0, g_thr_bad = 0;
+static double g_worst[2] = { 0, 0 };
+
 // ---------------------------------------------------------------- independent reference
 
 static float h2f(uint16_t h) { return ggml_fp16_to_fp32(h); }
@@ -228,14 +234,17 @@ static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int th
                     worst = std::max(worst, rel_l2(y.data() + size_t(r) * n, yr.data(), n));
                 }
                 const double env = path == 0 ? 0.02 : 2e-3;
+                g_worst[path] = std::max(g_worst[path], worst);
                 CHECK(worst <= env, "dense K%d %dx%d rows%d %s: rel-L2 vs canonical %.3e > %.0e",
                       K, k, n, rows, path ? "gemm" : "gemv", worst, env);
                 std::printf("  dense K%d %4dx%-4d rows %2d %s: canonical rel-L2 %.2e\n", K, k, n, rows, path ? "gemm" : "gemv", worst);
             } else {
                 const bool same = std::memcmp(y.data(), y_scalar.data(), y.size() * 4) == 0;
+                g_isa_cmp++; g_isa_bad += !same;
                 CHECK(same, "dense K%d %dx%d rows%d %s: ISA %s differs from scalar", K, k, n, rows, path ? "gemm" : "gemv", isa);
                 // thread-count independence (split-K S and unit plans never depend on nth)
                 const auto y1 = run_ggml({ m }, x, rows, nullptr, 0, 0, 1);
+                g_thr_cmp++; g_thr_bad += std::memcmp(y.data(), y1.data(), y.size() * 4) != 0;
                 CHECK(std::memcmp(y.data(), y1.data(), y.size() * 4) == 0,
                       "dense K%d %dx%d rows%d %s ISA %s: %d threads differs from 1 thread", K, k, n, rows, path ? "gemm" : "gemv", isa, threads);
             }
@@ -279,12 +288,14 @@ static void test_experts(std::mt19937 & rng, int K, int k, int n, int E, int nu,
                     }
                 }
                 const double env = path == 0 ? 0.02 : 2e-3;
+                g_worst[path] = std::max(g_worst[path], worst);
                 CHECK(worst <= env, "experts K%d %dx%d E%d nu%d T%d nx%d %s: rel-L2 %.3e > %.0e",
                       K, k, n, E, nu, T, nx, path ? "gemm" : "gemv", worst, env);
                 std::printf("  experts K%d %4dx%-4d E%d nu%d T%2d nx%d %s: canonical rel-L2 %.2e\n",
                             K, k, n, E, nu, T, nx, path ? "gemm" : "gemv", worst);
             } else {
                 const bool same = std::memcmp(y.data(), y_scalar.data(), y.size() * 4) == 0;
+                g_isa_cmp++; g_isa_bad += !same;
                 CHECK(same, "experts K%d T%d %s: ISA %s differs from scalar", K, T, path ? "gemm" : "gemv", isa);
             }
         }
@@ -364,6 +375,10 @@ static void test_fixture(const std::string & dir, int K) {
         }
         const double env = path == 0 ? 0.02 : 2e-3;
         CHECK(worst <= env, "fixture %s %s: rel-L2 %.3e > %.0e", dir.c_str(), path ? "gemm" : "gemv", worst, env);
+        g_props.push_back({ dir.substr(dir.find_last_of('/') + 1), path ? "exl3_cpu_gemm_fp32" : "exl3_cpu_gemv_int8",
+                            std::string("llama.cpp CPU EXL3 executor (") + (path ? "fp32 GEMM prefill" : "int8 GEMV decode") +
+                            ") output on the real fixture activations is within relative-L2 " + (path ? "2e-3" : "0.02") +
+                            " of the fixture's canonical operator outputs (materialized_weight_fp32_fma_v1)", worst, env, worst <= env });
         std::printf("  real fixture %s %s: rel-L2 vs canonical outputs %.2e (oracle self-check %.1e)\n",
                     dir.substr(dir.find_last_of('/') + 1).c_str(), path ? "gemm" : "gemv", worst, self);
     }
@@ -428,7 +443,12 @@ int main(int argc, char ** argv) {
         bench(5, 2560, 1280, 128, threads, 5);
         return 0;
     }
-    const std::string fix = argc > 1 ? argv[1] : "/workspace/repos/epyc-inference-research/scripts/kernel_rnd/exl3/fixtures";
+    std::string fix = "/workspace/repos/epyc-inference-research/scripts/kernel_rnd/exl3/fixtures";
+    std::string json_out;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--json" && i + 1 < argc) json_out = argv[++i];
+        else fix = argv[i];
+    }
     std::printf("EXL3 CPU executor tests; best ISA on this host: %s\n", ggml_cpu_exl3_isa());
     std::mt19937 rng(1234);
     test_fixture(fix + "/real-mul1-k3", 3);
@@ -457,6 +477,29 @@ int main(int argc, char ** argv) {
     test_dense(rng, 5, 640, 384, 3, 3);
     test_experts(rng, 3, 256, 128, 6, 3, 1, 1, 5);
     ggml_cpu_exl3_set_splitk_target(192);
+    g_props.push_back({ "synthetic-k1-k8", "exl3_cpu_isa_tiers",
+                        std::string("every enabled ISA tier (") + ggml_cpu_exl3_isa() + " and below) produces bit-identical outputs to the scalar tier on all synthetic dense and expert cases (GEMV and GEMM paths)",
+                        double(g_isa_bad), 0.0, g_isa_bad == 0 && g_isa_cmp > 0 });
+    g_props.push_back({ "synthetic-k1-k8", "exl3_cpu_thread_count",
+                        "outputs are bit-identical between the multi-thread and the single-thread run on all synthetic dense cases",
+                        double(g_thr_bad), 0.0, g_thr_bad == 0 && g_thr_cmp > 0 });
+    g_props.push_back({ "synthetic-k1-k8", "exl3_cpu_gemv_int8",
+                        "int8 GEMV output is within relative-L2 0.02 of an independent canonical reference on all synthetic cases",
+                        g_worst[0], 0.02, g_worst[0] <= 0.02 });
+    g_props.push_back({ "synthetic-k1-k8", "exl3_cpu_gemm_fp32",
+                        "fp32 GEMM output is within relative-L2 2e-3 of an independent canonical reference on all synthetic cases",
+                        g_worst[1], 2e-3, g_worst[1] <= 2e-3 });
+    if (!json_out.empty()) {
+        FILE * f = std::fopen(json_out.c_str(), "w");
+        std::fprintf(f, "{\"isa\": \"%s\", \"failures\": %d, \"isa_comparisons\": %d, \"thread_comparisons\": %d, \"props\": [", ggml_cpu_exl3_isa(), g_fail, g_isa_cmp, g_thr_cmp);
+        for (size_t i = 0; i < g_props.size(); ++i) {
+            const Prop & p = g_props[i];
+            std::fprintf(f, "%s{\"fixture\": \"%s\", \"path\": \"%s\", \"proposition\": \"%s\", \"value\": %.9g, \"envelope\": %.9g, \"pass\": %s}",
+                         i ? ", " : "", p.fixture.c_str(), p.path.c_str(), p.proposition.c_str(), p.value, p.envelope, p.pass ? "true" : "false");
+        }
+        std::fprintf(f, "]}\n");
+        std::fclose(f);
+    }
     if (g_fail) {
         std::printf("%d FAILURES\n", g_fail);
         return 1;
