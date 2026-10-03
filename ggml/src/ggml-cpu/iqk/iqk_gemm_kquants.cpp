@@ -800,7 +800,6 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
 
     Dequantizer deq(vx, bx);
 
-    uint32_t utmp[4];
     __m256  accd[nrc_y];
     __m256  scales[2];
     if (nrc_x <= 0) return;
@@ -854,15 +853,25 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
 
             deq.d = GGML_FP16_TO_FP32(deq.x[i].d);
             auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deq.x[i].dmin));
-            make_q4_scales(deq.x[i].scales, utmp);
-            auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(utmp + 2)))));
+            auto packed = _mm_loadl_epi64((const __m128i *)deq.x[i].scales);
+            uint32_t tail;
+            memcpy(&tail, deq.x[i].scales + 8, sizeof(tail));
+            auto last = _mm_cvtsi32_si128(tail);
+            auto lo = _mm_and_si128(packed, _mm_set1_epi8(0x3f));
+            auto hi = _mm_or_si128(
+                _mm_and_si128(_mm_unpacklo_epi32(last, _mm_srli_epi32(last, 4)), _mm_set1_epi8(0x0f)),
+                _mm_and_si128(_mm_srli_epi32(packed, 2), _mm_set1_epi8(0x30)));
+            auto unpacked = _mm_unpacklo_epi32(lo, hi);
+            auto scale_i = _mm256_cvtepu8_epi32(unpacked);
+            auto min_i = _mm256_cvtepu8_epi32(_mm_srli_si128(unpacked, 8));
+            auto mins = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(min_i));
             mins = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins);
             for (int iy = 0; iy < nrc_y; ++iy) {
                 auto my = _mm256_loadu_ps(metadata[size_t(i)*nrc_y + iy].my);
                 accd[iy]  = _mm256_fmadd_ps(my, mins, accd[iy]);
             }
 
-            auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)utmp))));
+            auto all_scales = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(scale_i));
             scales[0] = _mm256_set_m128(_mm256_castps256_ps128(all_scales), _mm256_castps256_ps128(all_scales));
             auto scales_h = _mm256_extractf128_ps(all_scales, 1);
             scales[1] = _mm256_set_m128(scales_h, scales_h);
