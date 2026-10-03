@@ -203,7 +203,7 @@ def copy_kv(w: gguf.GGUFWriter, r0: gguf.GGUFReader, n_layer_new: int | None):
             n_layer_old = int(f.contents())
     for f in r0.fields.values():
         name = f.name
-        if name.startswith("GGUF.") or name.startswith("split.") or name in ("general.architecture", "general.file_type"):
+        if name.startswith("GGUF.") or name.startswith("split.") or name in ("general.architecture", "general.file_type", "general.name"):
             continue
         vtype = f.types[0]
         val = f.contents()
@@ -418,7 +418,9 @@ def main():
             f, s = line.split()
             if f.endswith(".safetensors"):
                 sha[f] = s
-    used = sorted({os.path.basename(v.path) for v in st.files.values()})
+    # the model shards (the only files EXL3 tensors are read from; ngram/mtp files are not used)
+    used = sorted({os.path.basename(v.path) for v in st.files.values()
+                   if os.path.basename(v.path).startswith("model-") and v.path.endswith(".safetensors")})
 
     def kv(w):
         copy_kv(w, r0, args.layers)
