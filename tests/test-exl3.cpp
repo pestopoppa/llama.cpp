@@ -437,9 +437,13 @@ int main(int argc, char ** argv) {
             bench(3, 2560, 640, 4, threads, it);
             bench(3, 2560, 640, 8, threads, it);
         }
-        ggml_cpu_exl3_set_gemv_max_rows(0);
         ggml_cpu_exl3_set_isa(nullptr);
-        bench(3, 2560, 640, 32, threads, 30);
+        ggml_cpu_exl3_set_gemv_max_rows(1 << 20);
+        std::printf("GEMV int8 path:\n");
+        for (int r : { 2, 4, 8, 12, 16 }) bench(3, 2560, 640, r, threads, 100);
+        ggml_cpu_exl3_set_gemv_max_rows(0);
+        std::printf("GEMM fp32 path:\n");
+        for (int r : { 2, 4, 8, 12, 16, 32 }) bench(3, 2560, 640, r, threads, 100);
         bench(5, 2560, 1280, 128, threads, 5);
         return 0;
     }
