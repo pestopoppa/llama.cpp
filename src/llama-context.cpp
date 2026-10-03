@@ -1388,7 +1388,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // any failure falls through to the graph path below
     // the fused path produces logits only; it exports no t_h_nextn, so an MTP
     // draft target must stay on the graph path or the draft head sees no hidden state
-    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() &&
+    // EXL3 weights need the matrix executor's aux sources; the fused path calls vec_dot directly
+    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() && model.exl3_aux.empty() &&
             gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
         // snapshot the previous graph's per-layer inputs (the fused path may
@@ -2802,6 +2803,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.exl3_aux    =*/ &model.exl3_aux,
     };
 }
 

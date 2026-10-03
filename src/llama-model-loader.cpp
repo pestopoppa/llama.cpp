@@ -1239,6 +1239,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            if (ggml_type_is_exl3(t_meta->type)) {
+                skip_exl3_aux(t_meta);
+            }
 
             return nullptr;
         }
@@ -1451,9 +1454,64 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+        if (ggml_type_is_exl3(tensor->type)) {
+            create_exl3_aux(ctx, tensor);
+        }
     }
 
     return tensor;
+}
+
+static std::string llama_exl3_aux_name(const char * weight_name, const char * suffix) {
+    std::string base = weight_name;
+    const std::string w = ".weight";
+    if (base.size() > w.size() && base.compare(base.size() - w.size(), w.size(), w) == 0) {
+        base.resize(base.size() - w.size());
+    }
+    return base + "." + suffix;
+}
+
+void llama_model_loader::create_exl3_aux(ggml_context * ctx, ggml_tensor * w) {
+    if (!exl3_layout_checked) {
+        // the trellis byte order is a property of the file, not of the type id (EXL3-CPU-DESIGN.md s.1)
+        const int kid = gguf_find_key(metadata, "exl3.layout");
+        const std::string layout = kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_STRING ? gguf_get_val_str(metadata, kid) : "";
+        if (layout != "band8-v1") {
+            throw std::runtime_error(format("EXL3 tensor %s but exl3.layout is '%s' (expected band8-v1)", w->name, layout.c_str()));
+        }
+        exl3_layout_checked = true;
+    }
+    if (w->ne[0] % 128 || w->ne[1] % 128 || w->ne[3] != 1) {
+        throw std::runtime_error(format("EXL3 tensor %s: dims [%" PRId64 ", %" PRId64 "] not multiples of 128", w->name, w->ne[0], w->ne[1]));
+    }
+    ggml_tensor * out[2] = { nullptr, nullptr };
+    const char * suffixes[2] = { "exl3_suh", "exl3_svh" };
+    const int64_t widths[2] = { w->ne[0], w->ne[1] };
+    for (int i = 0; i < 2; ++i) {
+        const std::string name = llama_exl3_aux_name(w->name, suffixes[i]);
+        const ggml_tensor * meta = get_tensor_meta(name.c_str());
+        if (!meta) {
+            throw std::runtime_error(format("EXL3 tensor %s has no %s", w->name, name.c_str()));
+        }
+        if (meta->type != GGML_TYPE_F16 || meta->ne[0] != widths[i] || meta->ne[1] != w->ne[2] || meta->ne[2] != 1 || meta->ne[3] != 1) {
+            throw std::runtime_error(format("EXL3 aux %s: expected f16 [%" PRId64 ", %" PRId64 "]", name.c_str(), widths[i], w->ne[2]));
+        }
+        ggml_tensor * t = ggml_dup_tensor(ctx, meta);
+        ggml_set_name(t, name.c_str());
+        n_created++;
+        out[i] = t;
+    }
+    exl3_aux[w] = { out[0], out[1] };
+}
+
+void llama_model_loader::skip_exl3_aux(const ggml_tensor * w_meta) {
+    for (const char * suffix : { "exl3_suh", "exl3_svh" }) {
+        const std::string name = llama_exl3_aux_name(w_meta->name, suffix);
+        if (const ggml_tensor * meta = get_tensor_meta(name.c_str())) {
+            size_data -= ggml_nbytes(meta);
+            n_created++;
+        }
+    }
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

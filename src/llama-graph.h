@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -90,6 +91,14 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+// EXL3 weights (GGML_TYPE_EXL3_*): the per-tensor Hadamard vectors that ride on the matmul as
+// extra sources (EXL3-CPU-DESIGN.md). Filled by the model loader, keyed by the weight tensor.
+struct llama_exl3_aux {
+    ggml_tensor * suh;
+    ggml_tensor * svh;
+};
+using llama_exl3_aux_map = std::unordered_map<const ggml_tensor *, llama_exl3_aux>;
 
 //
 // llm_graph_input
@@ -791,6 +800,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const llama_exl3_aux_map * exl3_aux = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1008,6 +1019,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_exl3_aux_map     * exl3_aux = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
