@@ -1595,12 +1595,17 @@ class tinyBLAS_Q0_AVX {
                 }
             };
             int64_t l = 0;
-            for (; l + 3 < l8; l += 4) {
-                block_pair(l);
-                block_pair(l + 2);
+            if constexpr (RN == 3 && RM == 4) {
+                for (; l < l8; l += 2)
+                    block_pair(l);
+            } else {
+                for (; l + 3 < l8; l += 4) {
+                    block_pair(l);
+                    block_pair(l + 2);
+                }
+                for (; l < l8; l += 2)
+                    block_pair(l);
             }
-            for (; l < l8; l += 2)
-                block_pair(l);
             for (int64_t j = 0; j < RN; ++j)
                 for (int64_t i = 0; i < RM; ++i) {
                     const __m512i cib = _mm512_castps_si512(Cw[j][i]);
