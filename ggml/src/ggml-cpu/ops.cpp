@@ -8926,6 +8926,29 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// Masked KV skip: with a unified KV cache the mask of a query row is -INF over long runs of cells that belong to other
+// sequences. Test a run of mask values for -INF with wide integer compares instead of one fp16->fp32 conversion and
+// compare per cell. Skipping these cells is exact: the per-cell paths skip -INF cells already.
+static constexpr int64_t GGML_FA_MASK_RUN = 64;
+
+static inline bool ggml_fa_mask_run_is_neginf(const ggml_fp16_t * mp, const int64_t n) {
+    static_assert(sizeof(ggml_fp16_t) == 2, "unexpected ggml_fp16_t size");
+    constexpr uint64_t neginf4 = 0xFC00FC00FC00FC00ull; // 4x fp16 -INF
+    int64_t i = 0;
+    uint64_t diff = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint64_t w;
+        memcpy(&w, mp + i, sizeof(w));
+        diff |= w ^ neginf4;
+    }
+    for (; i < n; ++i) {
+        uint16_t h;
+        memcpy(&h, mp + i, sizeof(h));
+        diff |= h ^ 0xFC00u;
+    }
+    return diff == 0;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9051,6 +9074,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            // skip whole aligned runs of -INF mask values (e.g. cells of other sequences in a unified KV cache)
+            if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic_end && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
+                ic += GGML_FA_MASK_RUN - 1;
+                continue;
+            }
+
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9312,6 +9341,16 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
+                // fast check on the raw fp16 values first (e.g. cells of other sequences in a unified KV cache)
+                bool all_neginf = true;
+                for (int tq = 0; tq < tile_rows && all_neginf; tq++) {
+                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    all_neginf = ggml_fa_mask_run_is_neginf(mp_row + ic, kv_tile);
+                }
+                if (all_neginf) {
+                    continue;
+                }
+
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
