@@ -6289,6 +6289,94 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// EXL3 trellis weights: MUL_MAT / MUL_MAT_ID with the Hadamard vectors attached as extra sources
+// (MUL_MAT: src2 = svh, src3 = suh; MUL_MAT_ID: src3 = svh, src4 = suh). EXL3-CPU-DESIGN.md.
+// The CPU executor quantizes activations to int8 per 128-block on its decode path, so a backend
+// computing in fp16/fp32 differs at the ~1e-4 NMSE level.
+struct test_exl3_mul_mat : public test_case {
+    const int bits;
+    const int n_mats;   // 0 = dense MUL_MAT
+    const int n_used;
+    const bool b;       // broadcast b (MUL_MAT_ID)
+    const int64_t m, n, k;
+
+    std::string vars() override {
+        return VARS_TO_STR7(bits, n_mats, n_used, b, m, n, k);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * std::max(1, n_used);
+    }
+
+    test_exl3_mul_mat(int bits = 3, int n_mats = 0, int n_used = 1, bool b = false,
+                      int64_t m = 256, int64_t n = 1, int64_t k = 512)
+        : bits(bits), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const ggml_type type = ggml_type(GGML_TYPE_EXL3_1 + bits - 1);
+        if (n_mats == 0) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_set_name(w, "w");
+            ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
+            ggml_set_name(suh, "suh");
+            ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, m);
+            ggml_set_name(svh, "svh");
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(x, "x");
+            ggml_tensor * out = ggml_mul_mat(ctx, w, x);
+            out->src[2] = svh;
+            out->src[3] = suh;
+            ggml_set_name(out, "out");
+            return out;
+        }
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+        ggml_set_name(w, "w");
+        ggml_tensor * suh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n_mats);
+        ggml_set_name(suh, "suh");
+        ggml_tensor * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m, n_mats);
+        ggml_set_name(svh, "svh");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, w, x, ids);
+        out->src[3] = svh;
+        out->src[4] = suh;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng = suite_seed_rng();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_type_is_exl3(t->type)) {
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                for (auto & v : bytes) v = uint8_t(rng());
+                ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+            } else if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) data[i] = i % std::max(1, n_mats);
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (strcmp(t->name, "suh") == 0) {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else if (strcmp(t->name, "svh") == 0) {
+                init_tensor_uniform(t, -1.5f, 1.5f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -11252,6 +11340,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  3, 2592, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
+    // EXL3 (mul1 trellis): dense decode/verify/prefill and routed experts (b broadcast and per-slot)
+    for (int bits : { 3, 5 }) {
+        for (int64_t n : { 1, 4, 16 }) {
+            test_cases.emplace_back(new test_exl3_mul_mat(bits, 0, 1, false, 256, n, 512));
+        }
+        for (int64_t n : { 1, 9 }) {
+            test_cases.emplace_back(new test_exl3_mul_mat(bits, 8, 2, true,  256, n, 512));
+            test_cases.emplace_back(new test_exl3_mul_mat(bits, 8, 2, false, 512, n, 256));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
