@@ -27,6 +27,8 @@ GGML_BACKEND_API const char * ggml_cpu_exl3_isa(void);
 GGML_BACKEND_API void ggml_cpu_exl3_set_isa(const char * name);
 // test hook: largest per-expert instance count still routed to the int8 GEMV path (default 8)
 GGML_BACKEND_API void ggml_cpu_exl3_set_gemv_max_rows(int rows);
+// test hook: GEMV split-K target unit count (default 192, env GGML_EXL3_SPLITK_TARGET); 1 disables
+GGML_BACKEND_API void ggml_cpu_exl3_set_splitk_target(int target);
 
 #ifdef __cplusplus
 }

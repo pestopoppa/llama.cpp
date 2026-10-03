@@ -66,6 +66,16 @@ static_assert(C0 == -3.453125f, "c0 must be exact");
 
 int g_gemv_max_rows = 8;
 
+// GEMV split-K (decode / verify): ops with few 128-output bands (attn_k/v, ssm_out, MoE gate/up
+// at N=1, shared expert) would leave most threads idle, so the k range is split into S slices
+// whose raw partials are reduced in a fixed order after a barrier. S depends only on the op's
+// shape and routing (never on the thread count), so results stay thread-count independent.
+constexpr int64_t SPLITK_MAX_INST = 64;
+int g_splitk_target = []{
+    const char * e = std::getenv("GGML_EXL3_SPLITK_TARGET");
+    return e ? std::max(1, std::atoi(e)) : 192;
+}();
+
 enum class Isa { scalar = 0, vnni = 1, vbmi = 2 };
 
 // -------------------------------------------------------------------------------------------
@@ -287,11 +297,11 @@ struct RowsQ8 {
 };
 
 template <int bits>
-void gemv_band_scalar(const uint16_t * band, int tiles_k, int m, const RowsQ8 & rq, float (*out)[HB]) {
+void gemv_band_scalar(const uint16_t * band, int kb0, int kb1, int m, const RowsQ8 & rq, float (*out)[HB]) {
     constexpr auto perm = make_tc_perm();
     constexpr int words = 16 * bits;
     int32_t acc[MAX_M][HB];
-    for (int kb = 0; kb < tiles_k / 8; ++kb) {
+    for (int kb = kb0; kb < kb1; ++kb) {
         std::memset(acc, 0, sizeof(acc));
         for (int kk = 0; kk < 8; ++kk) {
             const int kt = kb * 8 + kk;
@@ -474,9 +484,9 @@ EXL3_T_VNNI EXL3_INLINE void vnni_rows(__m512i p0, __m512i p1, __m512i p2, __m51
 
 // one pass over tiles [b0, b0+B) of the band for all k
 template <int bits, int M, int B, bool VBMI>
-EXL3_T_VBMI void gemv_pass(const uint16_t * band, int tiles_k, int b0, const RowsQ8 & rq, float (*out)[HB]) {
+EXL3_T_VBMI void gemv_pass(const uint16_t * band, int kb0, int kb1, int b0, const RowsQ8 & rq, float (*out)[HB]) {
     constexpr int words = 16 * bits;
-    for (int kb = 0; kb < tiles_k / 8; ++kb) {
+    for (int kb = kb0; kb < kb1; ++kb) {
         __m512i acc[B][M];
         for (int b = 0; b < B; ++b) {
             for (int i = 0; i < M; ++i) acc[b][i] = _mm512_setzero_si512();
@@ -508,12 +518,12 @@ EXL3_T_VBMI void gemv_pass(const uint16_t * band, int tiles_k, int b0, const Row
 }
 
 template <int bits, int M, bool VBMI>
-void gemv_band_simd(const uint16_t * band, int tiles_k, const RowsQ8 & rq, float (*out)[HB]) {
+void gemv_band_simd(const uint16_t * band, int kb0, int kb1, const RowsQ8 & rq, float (*out)[HB]) {
     if constexpr (M <= 2) {
-        gemv_pass<bits, M, 8, VBMI>(band, tiles_k, 0, rq, out);
+        gemv_pass<bits, M, 8, VBMI>(band, kb0, kb1, 0, rq, out);
     } else {
-        gemv_pass<bits, M, 4, VBMI>(band, tiles_k, 0, rq, out);
-        gemv_pass<bits, M, 4, VBMI>(band, tiles_k, 4, rq, out);
+        gemv_pass<bits, M, 4, VBMI>(band, kb0, kb1, 0, rq, out);
+        gemv_pass<bits, M, 4, VBMI>(band, kb0, kb1, 4, rq, out);
     }
 }
 
@@ -635,7 +645,7 @@ Isa detect_isa() {
 Isa g_hw_isa = detect_isa();
 std::atomic<int> g_isa { int(g_hw_isa) };
 
-using GemvFn = void (*)(const uint16_t *, int, const RowsQ8 &, float (*)[HB]);
+using GemvFn = void (*)(const uint16_t *, int, int, const RowsQ8 &, float (*)[HB]);
 
 template <int bits>
 GemvFn gemv_for(Isa isa, int m) {
@@ -674,20 +684,20 @@ GemvFn gemv_dispatch(int bits, Isa isa, int m) {
     }
 }
 
-void gemv_band(int bits, Isa isa, const uint16_t * band, int tiles_k, int m, const RowsQ8 & rq, float (*out)[HB]) {
+void gemv_band(int bits, Isa isa, const uint16_t * band, int kb0, int kb1, int m, const RowsQ8 & rq, float (*out)[HB]) {
     if (isa != Isa::scalar) {
-        gemv_dispatch(bits, isa, m)(band, tiles_k, rq, out);
+        gemv_dispatch(bits, isa, m)(band, kb0, kb1, rq, out);
         return;
     }
     switch (bits) {
-        case 1: gemv_band_scalar<1>(band, tiles_k, m, rq, out); break;
-        case 2: gemv_band_scalar<2>(band, tiles_k, m, rq, out); break;
-        case 3: gemv_band_scalar<3>(band, tiles_k, m, rq, out); break;
-        case 4: gemv_band_scalar<4>(band, tiles_k, m, rq, out); break;
-        case 5: gemv_band_scalar<5>(band, tiles_k, m, rq, out); break;
-        case 6: gemv_band_scalar<6>(band, tiles_k, m, rq, out); break;
-        case 7: gemv_band_scalar<7>(band, tiles_k, m, rq, out); break;
-        default: gemv_band_scalar<8>(band, tiles_k, m, rq, out); break;
+        case 1: gemv_band_scalar<1>(band, kb0, kb1, m, rq, out); break;
+        case 2: gemv_band_scalar<2>(band, kb0, kb1, m, rq, out); break;
+        case 3: gemv_band_scalar<3>(band, kb0, kb1, m, rq, out); break;
+        case 4: gemv_band_scalar<4>(band, kb0, kb1, m, rq, out); break;
+        case 5: gemv_band_scalar<5>(band, kb0, kb1, m, rq, out); break;
+        case 6: gemv_band_scalar<6>(band, kb0, kb1, m, rq, out); break;
+        case 7: gemv_band_scalar<7>(band, kb0, kb1, m, rq, out); break;
+        default: gemv_band_scalar<8>(band, kb0, kb1, m, rq, out); break;
     }
 }
 
@@ -777,8 +787,18 @@ bool aux_ok(const ggml_tensor * t, int64_t width, int64_t experts) {
 }
 
 struct Layout {
-    size_t off_xf, off_splat, off_fb, off_cb, off_thread, per_thread, total;
+    size_t off_xf, off_splat, off_fb, off_cb, off_part, off_thread, per_thread, total;
 };
+
+// upper bound on S for this op (the plan may choose less once routing is known)
+int splitk_cap(const Geometry & g) {
+    if (g.n_inst > SPLITK_MAX_INST) return 1;
+    const int64_t bands = g.n / HB;
+    const int64_t kb_n  = g.k / HB;
+    if (bands >= g_splitk_target || kb_n < 2) return 1;
+    const int64_t s = (g_splitk_target + bands - 1) / bands;
+    return int(std::max<int64_t>(1, std::min<int64_t>(s, kb_n / 2)));
+}
 
 Layout layout(const Geometry & g, int nth) {
     auto pad = [](size_t v) { return (v + 63) & ~size_t(63); };
@@ -788,6 +808,8 @@ Layout layout(const Geometry & g, int nth) {
     l.off_splat = o; o = pad(o + size_t(g.n_inst) * g.k * sizeof(int32_t));
     l.off_fb    = o; o = pad(o + size_t(g.n_inst) * (g.k / HB) * sizeof(float));
     l.off_cb    = o; o = pad(o + size_t(g.n_inst) * (g.k / HB) * sizeof(float));
+    const int cap = splitk_cap(g);
+    l.off_part  = o; o = pad(o + (cap > 1 ? size_t(g.n_inst) * g.n * cap * sizeof(float) : 0));
     l.off_thread = o;
     // per thread: GEMM weight chunk [KC][128] + accumulators [rows_max][128] (+ GEMV out [MAX_M][128])
     const size_t rows = std::max<int64_t>(g.n_rows_max, MAX_M);
@@ -813,9 +835,11 @@ struct Unit {
     int32_t group;
     int32_t band;
     int32_t chunk;   // GEMV: rows [chunk*MAX_M, ...); GEMM: -1
+    int32_t ks;      // GEMV split-K slice
 };
 
-void build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> & inst,
+// returns S, the GEMV split-K factor
+int build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> & inst,
                 std::vector<Group> & groups, std::vector<Unit> & units, int gemv_max) {
     inst.clear();
     groups.clear();
@@ -874,17 +898,29 @@ void build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> &
         }
     }
     const int32_t bands = int32_t(g.n / HB);
+    int64_t gemv_units = 0;
+    for (const Group & gr : groups) {
+        if (gr.count <= gemv_max) gemv_units += int64_t(bands) * ((gr.count + MAX_M - 1) / MAX_M);
+    }
+    int S = 1;
+    const int cap = splitk_cap(g);
+    if (cap > 1 && gemv_units > 0 && gemv_units < g_splitk_target) {
+        S = int(std::min<int64_t>(cap, (g_splitk_target + gemv_units - 1) / gemv_units));
+    }
     for (int32_t gi = 0; gi < int32_t(groups.size()); ++gi) {
         const Group & gr = groups[gi];
         if (gr.count <= gemv_max) {
             const int32_t chunks = (gr.count + MAX_M - 1) / MAX_M;
             for (int32_t b = 0; b < bands; ++b) {
-                for (int32_t c = 0; c < chunks; ++c) units.push_back({ gi, b, c });
+                for (int32_t c = 0; c < chunks; ++c) {
+                    for (int32_t ks = 0; ks < S; ++ks) units.push_back({ gi, b, c, ks });
+                }
             }
         } else {
-            for (int32_t b = 0; b < bands; ++b) units.push_back({ gi, b, -1 });
+            for (int32_t b = 0; b < bands; ++b) units.push_back({ gi, b, -1, 0 });
         }
     }
+    return S;
 }
 
 } // namespace
@@ -942,6 +978,10 @@ void ggml_cpu_exl3_set_gemv_max_rows(int rows) {
     g_gemv_max_rows = std::max(0, rows);
 }
 
+void ggml_cpu_exl3_set_splitk_target(int target) {
+    g_splitk_target = std::max(1, target);
+}
+
 void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_cpu_exl3_supports(dst));
     const Geometry g = geometry(dst);
@@ -963,7 +1003,8 @@ void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggm
     static thread_local std::vector<Inst>  inst;
     static thread_local std::vector<Group> groups;
     static thread_local std::vector<Unit>  units;
-    build_plan(g, dst, inst, groups, units, gemv_max);
+    const int S = build_plan(g, dst, inst, groups, units, gemv_max);
+    float * PART = (float *) (base + L.off_part);   // [S][n_inst][n] raw GEMV partials (S > 1)
 
     const int64_t k = g.k;
     const int64_t kb_n = k / HB;
@@ -1022,9 +1063,17 @@ void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggm
             }
             float (*out)[HB] = reinterpret_cast<float (*)[HB]>(abuf);
             std::memset(abuf, 0, sizeof(float) * HB * m);
-            gemv_band(g.bits, isa, band, tiles_k, m, rq, out);
-            for (int i = 0; i < m; ++i) {
-                epilogue(out[i], corr_of(prep_of(r0 + i), kb_n), svh, inst[r0 + i].y + un.band * HB);
+            const int kb0 = int(int64_t(un.ks) * kb_n / S);
+            const int kb1 = int(int64_t(un.ks + 1) * kb_n / S);
+            gemv_band(g.bits, isa, band, kb0, kb1, m, rq, out);
+            if (S == 1) {
+                for (int i = 0; i < m; ++i) {
+                    epilogue(out[i], corr_of(prep_of(r0 + i), kb_n), svh, inst[r0 + i].y + un.band * HB);
+                }
+            } else {
+                for (int i = 0; i < m; ++i) {
+                    std::memcpy(PART + (size_t(un.ks) * g.n_inst + r0 + i) * g.n + un.band * HB, out[i], sizeof(float) * HB);
+                }
             }
         } else {
             const int m = gr.count;
@@ -1039,5 +1088,29 @@ void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggm
             }
         }
         u = nth > 1 ? ggml_threadpool_chunk_add(params->threadpool, 1) : u + 1;
+    }
+
+    // ---- phase 3 (split-K only): fixed-order reduction + output epilogue per (instance, band) ----
+    if (S > 1) {
+        if (nth > 1) ggml_barrier(params->threadpool);
+        const int64_t bands = g.n / HB;
+        int64_t task = 0;
+        float acc[HB];
+        for (const Group & gr : groups) {
+            if (gr.count > gemv_max) continue;
+            const ggml_fp16_t * svh0 = (const ggml_fp16_t *) ((const char *) g.svh->data + gr.expert * g.svh->nb[1]);
+            for (int32_t j = 0; j < gr.count; ++j) {
+                const int64_t i = int64_t(gr.first) + j;
+                for (int64_t b = 0; b < bands; ++b, ++task) {
+                    if (task % nth != ith) continue;
+                    std::memcpy(acc, PART + size_t(i) * g.n + b * HB, sizeof(acc));
+                    for (int ks = 1; ks < S; ++ks) {
+                        const float * pp = PART + (size_t(ks) * g.n_inst + i) * g.n + b * HB;
+                        for (int c = 0; c < HB; ++c) acc[c] = acc[c] + pp[c];
+                    }
+                    epilogue(acc, corr_of(prep_of(i), kb_n), svh0 + b * HB, inst[i].y + b * HB);
+                }
+            }
+        }
     }
 }
