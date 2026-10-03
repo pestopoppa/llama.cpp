@@ -480,7 +480,7 @@ int main(int argc, char ** argv) {
     test_dense(rng, 3, 384, 256, 1, 4);
     test_dense(rng, 5, 640, 384, 3, 3);
     test_experts(rng, 3, 256, 128, 6, 3, 1, 1, 5);
-    ggml_cpu_exl3_set_splitk_target(192);
+    ggml_cpu_exl3_set_splitk_target(64);
     g_props.push_back({ "synthetic-k1-k8", "exl3_cpu_isa_tiers",
                         std::string("every enabled ISA tier (") + ggml_cpu_exl3_isa() + " and below) produces bit-identical outputs to the scalar tier on all synthetic dense and expert cases (GEMV and GEMM paths)",
                         double(g_isa_bad), 0.0, g_isa_bad == 0 && g_isa_cmp > 0 });

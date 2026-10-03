@@ -114,10 +114,12 @@ branch uses K3 and K5.
 **Threading.** Units are handed out with the threadpool chunk counter (first unit = thread
 index, then `chunk_add`); every unit is computed entirely by one thread, so the assignment never
 changes the arithmetic. **GEMV split-K**: decode ops with few bands (attn_k/v 4, ssm_out and
-attn_output 20, shared expert 5/20, MoE gate/up 50 units at N=1) would idle most of 96 threads,
-so for ops with ≤ 64 instances the k range is split into S slices (S from the op's shape and
-routing only — target 192 units, cap k/256; `GGML_EXL3_SPLITK_TARGET`, 1 disables); slices write
-raw partials, one barrier, then a fixed-order reduction + the shared epilogue. Outputs are
+attn_output 20, shared expert 5/20) stream from too few cores to reach DRAM bandwidth,
+so for ops with ≤ 64 instances and fewer than 32 GEMV units the k range is split into S slices
+(S from the op's shape and routing only — S = ceil(64 / units), cap k/256;
+`GGML_EXL3_SPLITK_TARGET`, default 64, 1 disables); slices write raw partials, one barrier, then a
+fixed-order reduction + the shared epilogue. Ops that already have ≥ 32 units (attn_qkv 80,
+MoE gate/up 50, MoE down 200 at N=1) stream from enough cores and skip the extra barrier. Outputs are
 bit-identical for every thread count and ISA tier (tested). Not in v1: merged gate|up with
 per-segment `suh`, fusing prep into the previous op (each EXL3 op costs one extra barrier, two
 with split-K).

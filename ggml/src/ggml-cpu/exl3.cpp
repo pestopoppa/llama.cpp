@@ -66,14 +66,16 @@ static_assert(C0 == -3.453125f, "c0 must be exact");
 
 int g_gemv_max_rows = 8;
 
-// GEMV split-K (decode / verify): ops with few 128-output bands (attn_k/v, ssm_out, MoE gate/up
-// at N=1, shared expert) would leave most threads idle, so the k range is split into S slices
-// whose raw partials are reduced in a fixed order after a barrier. S depends only on the op's
-// shape and routing (never on the thread count), so results stay thread-count independent.
+// GEMV split-K (decode / verify): ops with few 128-output bands (attn_k/v 4, ssm_out/attn_output
+// 20, shared expert 5/20) stream from too few cores to reach DRAM bandwidth, so the k range is
+// split into S slices whose raw partials are reduced in a fixed order after one extra barrier.
+// Ops with >= target/2 GEMV units (attn_qkv 80, MoE gate/up 50, MoE down 200 at N=1) already
+// stream from enough cores and do not pay the barrier. S depends only on the op's shape and
+// routing (never on the thread count), so results stay thread-count independent.
 constexpr int64_t SPLITK_MAX_INST = 64;
 int g_splitk_target = []{
     const char * e = std::getenv("GGML_EXL3_SPLITK_TARGET");
-    return e ? std::max(1, std::atoi(e)) : 192;
+    return e ? std::max(1, std::atoi(e)) : 64;
 }();
 
 enum class Isa { scalar = 0, vnni = 1, vbmi = 2 };
@@ -795,7 +797,7 @@ int splitk_cap(const Geometry & g) {
     if (g.n_inst > SPLITK_MAX_INST) return 1;
     const int64_t bands = g.n / HB;
     const int64_t kb_n  = g.k / HB;
-    if (bands >= g_splitk_target || kb_n < 2) return 1;
+    if (2 * bands >= g_splitk_target || kb_n < 2) return 1;
     const int64_t s = (g_splitk_target + bands - 1) / bands;
     return int(std::max<int64_t>(1, std::min<int64_t>(s, kb_n / 2)));
 }
@@ -905,7 +907,7 @@ int build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> & 
     }
     int S = 1;
     const int cap = splitk_cap(g);
-    if (cap > 1 && gemv_units > 0 && gemv_units < g_splitk_target) {
+    if (cap > 1 && gemv_units > 0 && 2 * gemv_units < g_splitk_target) {
         S = int(std::min<int64_t>(cap, (g_splitk_target + gemv_units - 1) / gemv_units));
     }
     for (int32_t gi = 0; gi < int32_t(groups.size()); ++gi) {
