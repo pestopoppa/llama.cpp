@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-model.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1171,6 +1172,15 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
     }
 
     LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
+
+    // an EXL3 tensor brings its Hadamard vectors along (the draft's graph attaches them)
+    if (ggml_type_is_exl3(src->type)) {
+        const auto it = model_shared->exl3_aux.find(src);
+        if (it == model_shared->exl3_aux.end()) {
+            throw std::runtime_error(format("%s: target's EXL3 tensor '%s' has no suh/svh", __func__, name.c_str()));
+        }
+        exl3_aux[src] = { it->second.suh, it->second.svh };
+    }
 
     // not counted in n_created/size_data: not in this file, neither allocated nor freed here
     return src;
