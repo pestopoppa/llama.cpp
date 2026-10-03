@@ -26,6 +26,7 @@ extern "C" {
 const char * ggml_cpu_exl3_isa(void);
 void         ggml_cpu_exl3_set_isa(const char * name);
 void         ggml_cpu_exl3_set_gemv_max_rows(int rows);
+void         ggml_cpu_exl3_set_splitk_target(int target);
 }
 
 static int g_fail = 0;
@@ -233,6 +234,10 @@ static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int th
             } else {
                 const bool same = std::memcmp(y.data(), y_scalar.data(), y.size() * 4) == 0;
                 CHECK(same, "dense K%d %dx%d rows%d %s: ISA %s differs from scalar", K, k, n, rows, path ? "gemm" : "gemv", isa);
+                // thread-count independence (split-K S and unit plans never depend on nth)
+                const auto y1 = run_ggml({ m }, x, rows, nullptr, 0, 0, 1);
+                CHECK(std::memcmp(y.data(), y1.data(), y.size() * 4) == 0,
+                      "dense K%d %dx%d rows%d %s ISA %s: %d threads differs from 1 thread", K, k, n, rows, path ? "gemm" : "gemv", isa, threads);
             }
         }
     }
@@ -365,7 +370,64 @@ static void test_fixture(const std::string & dir, int K) {
     ggml_cpu_exl3_set_gemv_max_rows(8);
 }
 
+// cache-resident single-matrix timing (diagnostic only, not a measurement-constitution result)
+static void bench(int K, int k, int n, int rows, int threads, int iters) {
+    std::mt19937 rng(7);
+    Mat m = random_mat(rng, K, k, n);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x(size_t(k) * rows);
+    for (auto & v : x) v = nd(rng);
+    size_t mem = m.native.size() * 2 + size_t(k + n) * 2 + x.size() * 4 + size_t(n) * rows * 4 + 64 * 1024 * 1024;
+    ggml_init_params ip = { mem, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, ggml_type(GGML_TYPE_EXL3_1 + K - 1), k, n);
+    ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
+    ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n);
+    const auto b8 = to_band8(m);
+    std::memcpy(w->data, b8.data(), ggml_nbytes(w));
+    std::memcpy(suh->data, m.suh.data(), k * 2);
+    std::memcpy(svh->data, m.svh.data(), n * 2);
+    ggml_tensor * xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
+    std::memcpy(xt->data, x.data(), x.size() * 4);
+    ggml_tensor * out = ggml_mul_mat(ctx, w, xt);
+    out->src[2] = svh;
+    out->src[3] = suh;
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_cplan plan = ggml_graph_plan(gf, threads, nullptr);
+    std::vector<uint8_t> work(plan.work_size + 64);
+    plan.work_data = work.data();
+    ggml_graph_compute(gf, &plan);   // warm
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; i < iters; ++i) ggml_graph_compute(gf, &plan);
+    const double us = double(ggml_time_us() - t0) / iters;
+    const double bytes = double(ggml_nbytes(w));
+    std::printf("bench K%d %5dx%-5d rows %d threads %d isa %s: %.1f us/op, %.2f GB/s weights, %.2f Gw/s\n",
+                K, k, n, rows, threads, ggml_cpu_exl3_isa(), us, bytes / us / 1e3, double(k) * n / us / 1e3);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        ggml_time_init();
+        const int threads = argc > 2 ? std::atoi(argv[2]) : 1;
+        for (const char * isa : { "vbmi", "vnni", "scalar" }) {
+            ggml_cpu_exl3_set_isa(isa);
+            if (std::strcmp(ggml_cpu_exl3_isa(), isa) != 0) continue;
+            const int it = std::strcmp(isa, "scalar") == 0 ? 3 : 300;
+            bench(3, 2560, 640, 1, threads, it);
+            bench(3, 640, 2560, 1, threads, it);
+            bench(4, 2560, 640, 1, threads, it);
+            bench(5, 2560, 1280, 1, threads, it);
+            bench(3, 2560, 640, 4, threads, it);
+            bench(3, 2560, 640, 8, threads, it);
+        }
+        ggml_cpu_exl3_set_gemv_max_rows(0);
+        ggml_cpu_exl3_set_isa(nullptr);
+        bench(3, 2560, 640, 32, threads, 30);
+        bench(5, 2560, 1280, 128, threads, 5);
+        return 0;
+    }
     const std::string fix = argc > 1 ? argv[1] : "/workspace/repos/epyc-inference-research/scripts/kernel_rnd/exl3/fixtures";
     std::printf("EXL3 CPU executor tests; best ISA on this host: %s\n", ggml_cpu_exl3_isa());
     std::mt19937 rng(1234);
@@ -383,6 +445,18 @@ int main(int argc, char ** argv) {
     test_experts(rng, 3, 128, 256, 6, 3, 1, 3, 3);    // decode: per-slot input (down_proj shape)
     test_experts(rng, 3, 256, 128, 6, 3, 7, 1, 4);    // small batch
     test_experts(rng, 4, 128, 256, 8, 4, 24, 4, 6);   // prefill-ish, mixed group sizes
+    // split-K heavy shapes (kb_n = 20: S up to 10)
+    test_dense(rng, 3, 2560, 256, 1, 6);
+    test_dense(rng, 5, 2560, 128, 2, 5);
+    test_experts(rng, 3, 2560, 128, 4, 2, 1, 1, 6);
+    test_experts(rng, 3, 2560, 128, 5, 3, 2, 3, 4);
+    // the same with split-K disabled (S = 1 path)
+    ggml_cpu_exl3_set_splitk_target(1);
+    std::printf("split-K disabled:\n");
+    test_dense(rng, 3, 384, 256, 1, 4);
+    test_dense(rng, 5, 640, 384, 3, 3);
+    test_experts(rng, 3, 256, 128, 6, 3, 1, 1, 5);
+    ggml_cpu_exl3_set_splitk_target(192);
     if (g_fail) {
         std::printf("%d FAILURES\n", g_fail);
         return 1;
