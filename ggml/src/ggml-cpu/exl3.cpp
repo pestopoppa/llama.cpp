@@ -861,7 +861,8 @@ int build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> & 
         const ggml_tensor * ids = g.ids;
         const int64_t n_used = ids->ne[0], n_tok = ids->ne[1];
         // counting sort by expert (deterministic order: expert asc, then token, slot)
-        std::vector<int32_t> cnt(g.n_exp + 1, 0);
+        static thread_local std::vector<int32_t> cnt, start, fill;
+        cnt.assign(g.n_exp + 1, 0);
         auto expert_at = [&](int64_t t, int64_t s) {
             int32_t e;
             std::memcpy(&e, (const char *) ids->data + t * ids->nb[1] + s * ids->nb[0], sizeof(e));
@@ -874,12 +875,12 @@ int build_plan(const Geometry & g, const ggml_tensor * dst, std::vector<Inst> & 
                 cnt[e + 1]++;
             }
         }
-        std::vector<int32_t> start(g.n_exp + 1, 0);
+        start.assign(g.n_exp + 1, 0);
         for (int64_t e = 1; e <= g.n_exp; ++e) start[e] = start[e - 1] + cnt[e];
         // instances with e == -1 are placed at the end (zero output)
         const int32_t n_valid = start[g.n_exp];
         inst.resize(size_t(n_valid) + cnt[0]);
-        std::vector<int32_t> fill(start.begin(), start.end());
+        fill.assign(start.begin(), start.end());
         int32_t neg = n_valid;
         for (int64_t t = 0; t < n_tok; ++t) {
             for (int64_t s = 0; s < n_used; ++s) {
