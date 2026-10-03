@@ -4115,9 +4115,28 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+                double sum4 = 0.0, sum5 = 0.0, sum6 = 0.0, sum7 = 0.0;
+                int64_t i00 = 0;
+                for (; i00 + 7 < ne00; i00 += 8) {
+                    sum0 += (double)(x[i00 + 0] * x[i00 + 0]);
+                    sum1 += (double)(x[i00 + 1] * x[i00 + 1]);
+                    sum2 += (double)(x[i00 + 2] * x[i00 + 2]);
+                    sum3 += (double)(x[i00 + 3] * x[i00 + 3]);
+                    sum4 += (double)(x[i00 + 4] * x[i00 + 4]);
+                    sum5 += (double)(x[i00 + 5] * x[i00 + 5]);
+                    sum6 += (double)(x[i00 + 6] * x[i00 + 6]);
+                    sum7 += (double)(x[i00 + 7] * x[i00 + 7]);
+                }
+                ggml_float sum = sum0;
+                sum += sum1;
+                sum += sum2;
+                sum += sum3;
+                sum += sum4;
+                sum += sum5;
+                sum += sum6;
+                sum += sum7;
+                for (; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
 
