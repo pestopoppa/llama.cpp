@@ -493,6 +493,54 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_EXL3M_1] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_3] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_4] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_5] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_6] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_7] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3M_8] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {

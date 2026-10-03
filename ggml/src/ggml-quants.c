@@ -5662,6 +5662,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_EXL3_6:
         case GGML_TYPE_EXL3_7:
         case GGML_TYPE_EXL3_8:
+        case GGML_TYPE_EXL3M_1:
+        case GGML_TYPE_EXL3M_2:
+        case GGML_TYPE_EXL3M_3:
+        case GGML_TYPE_EXL3M_4:
+        case GGML_TYPE_EXL3M_5:
+        case GGML_TYPE_EXL3M_6:
+        case GGML_TYPE_EXL3M_7:
+        case GGML_TYPE_EXL3M_8:
             // nothing to validate (EXL3: every packed bit pattern is a valid trellis)
             break;
         default:

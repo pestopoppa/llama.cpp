@@ -4774,6 +4774,15 @@ class GGMLQuantizationType(IntEnum):
     EXL3_6  = 65
     EXL3_7  = 66
     EXL3_8  = 67
+    # same tiles, mcg codebook
+    EXL3M_1 = 68
+    EXL3M_2 = 69
+    EXL3M_3 = 70
+    EXL3M_4 = 71
+    EXL3M_5 = 72
+    EXL3M_6 = 73
+    EXL3M_7 = 74
+    EXL3M_8 = 75
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4964,6 +4973,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_6:  (16, 2 * 6),
     GGMLQuantizationType.EXL3_7:  (16, 2 * 7),
     GGMLQuantizationType.EXL3_8:  (16, 2 * 8),
+    GGMLQuantizationType.EXL3M_1: (16, 2 * 1),
+    GGMLQuantizationType.EXL3M_2: (16, 2 * 2),
+    GGMLQuantizationType.EXL3M_3: (16, 2 * 3),
+    GGMLQuantizationType.EXL3M_4: (16, 2 * 4),
+    GGMLQuantizationType.EXL3M_5: (16, 2 * 5),
+    GGMLQuantizationType.EXL3M_6: (16, 2 * 6),
+    GGMLQuantizationType.EXL3M_7: (16, 2 * 7),
+    GGMLQuantizationType.EXL3M_8: (16, 2 * 8),
 }
 
 

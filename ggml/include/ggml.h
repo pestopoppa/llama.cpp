@@ -444,14 +444,27 @@ extern "C" {
         GGML_TYPE_EXL3_6  = 65,
         GGML_TYPE_EXL3_7  = 66,
         GGML_TYPE_EXL3_8  = 67,
-        GGML_TYPE_COUNT   = 68,
+        // same tiles with the "mcg" codebook (ids match buun-llama.cpp's GGML_TYPE_EXL3M_*)
+        GGML_TYPE_EXL3M_1 = 68,
+        GGML_TYPE_EXL3M_2 = 69,
+        GGML_TYPE_EXL3M_3 = 70,
+        GGML_TYPE_EXL3M_4 = 71,
+        GGML_TYPE_EXL3M_5 = 72,
+        GGML_TYPE_EXL3M_6 = 73,
+        GGML_TYPE_EXL3M_7 = 74,
+        GGML_TYPE_EXL3M_8 = 75,
+        GGML_TYPE_COUNT   = 76,
     };
 
+    // EXL3 helpers: the type encodes K and the codebook (0 = mul1: EXL3_*, 1 = mcg: EXL3M_*)
     static inline bool ggml_type_is_exl3(enum ggml_type type) {
-        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8;
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3M_8;
     }
     static inline int ggml_exl3_bits(enum ggml_type type) {
-        return (int) type - (int) GGML_TYPE_EXL3_1 + 1;
+        return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
+    }
+    static inline int ggml_exl3_codebook(enum ggml_type type) {
+        return ((int) type - (int) GGML_TYPE_EXL3_1) / 8;
     }
 
     // precision

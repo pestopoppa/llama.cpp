@@ -62,6 +62,11 @@ static uint16_t window(const uint16_t * tile, int K, int i) {   // EXL3-1: MSB-f
     return uint16_t(v);
 }
 
+static float mcg(uint16_t s) {   // EXL3-1 oracle: half(half(lo) + half(hi)) of the mixed product
+    const uint32_t m = ((uint32_t(s) * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    return hround(float(double(h2f(uint16_t(m & 0xffff))) + double(h2f(uint16_t(m >> 16)))));
+}
+
 static float mul1(uint16_t s) {
     const uint32_t x = uint32_t(s) * 0x83DCD12Du;
     const int bs = int(x & 255) + int((x >> 8) & 255) + int((x >> 16) & 255) + int(x >> 24);
@@ -71,6 +76,7 @@ static float mul1(uint16_t s) {
 
 struct Mat {
     int K, k, n;
+    int cb = 0;                     // 0 = mul1, 1 = mcg
     std::vector<uint16_t> native;   // [k/16][n/16][16K]
     std::vector<uint16_t> suh, svh; // fp16
 };
@@ -84,7 +90,8 @@ static std::vector<float> materialize(const Mat & m) {
             const uint16_t * tile = m.native.data() + (size_t(kt) * nn + nt) * 16 * m.K;
             for (int r = 0; r < 16; ++r) {
                 for (int c = 0; c < 16; ++c) {
-                    q[size_t(kt * 16 + r) * n + nt * 16 + c] = mul1(window(tile, m.K, state_index(r, c)));
+                    const uint16_t st = window(tile, m.K, state_index(r, c));
+                    q[size_t(kt * 16 + r) * n + nt * 16 + c] = m.cb ? mcg(st) : mul1(st);
                 }
             }
         }
@@ -126,8 +133,8 @@ static std::vector<uint16_t> to_band8(const Mat & m) {
     return out;
 }
 
-static Mat random_mat(std::mt19937 & rng, int K, int k, int n) {
-    Mat m{K, k, n, {}, {}, {}};
+static Mat random_mat(std::mt19937 & rng, int K, int k, int n, int cb = 0) {
+    Mat m{K, k, n, cb, {}, {}, {}};
     m.native.resize(size_t(k / 16) * (n / 16) * 16 * K);
     for (auto & w : m.native) w = uint16_t(rng());
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -159,7 +166,7 @@ static std::vector<float> run_ggml(const std::vector<Mat> & ms, const std::vecto
     mem += 64 * 1024 * 1024;
     ggml_init_params ip = { mem, nullptr, false };
     ggml_context * ctx = ggml_init(ip);
-    const ggml_type type = ggml_type(GGML_TYPE_EXL3_1 + m0.K - 1);
+    const ggml_type type = ggml_type((m0.cb ? GGML_TYPE_EXL3M_1 : GGML_TYPE_EXL3_1) + m0.K - 1);
     ggml_tensor * w   = ggml_new_tensor_3d(ctx, type, m0.k, m0.n, E);
     ggml_tensor * suh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m0.k, E);
     ggml_tensor * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m0.n, E);
@@ -213,8 +220,8 @@ static const char * ISAS[] = { "scalar", "vnni", "vbmi" };
 
 // ---------------------------------------------------------------- tests
 
-static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int threads) {
-    Mat m = random_mat(rng, K, k, n);
+static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int threads, int cb = 0) {
+    Mat m = random_mat(rng, K, k, n, cb);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x(size_t(k) * rows);
     for (auto & v : x) v = nd(rng);
@@ -233,11 +240,11 @@ static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int th
                     const auto yr = ref_dense(W, k, n, x.data() + size_t(r) * k);
                     worst = std::max(worst, rel_l2(y.data() + size_t(r) * n, yr.data(), n));
                 }
-                const double env = path == 0 ? 0.02 : 2e-3;
-                g_worst[path] = std::max(g_worst[path], worst);
-                CHECK(worst <= env, "dense K%d %dx%d rows%d %s: rel-L2 vs canonical %.3e > %.0e",
-                      K, k, n, rows, path ? "gemm" : "gemv", worst, env);
-                std::printf("  dense K%d %4dx%-4d rows %2d %s: canonical rel-L2 %.2e\n", K, k, n, rows, path ? "gemm" : "gemv", worst);
+                const double env = (path == 0 && cb == 0) ? 0.02 : 2e-3;   // mcg never takes the int8 path
+                if (cb == 0) g_worst[path] = std::max(g_worst[path], worst);
+                CHECK(worst <= env, "dense %s K%d %dx%d rows%d %s: rel-L2 vs canonical %.3e > %.0e",
+                      cb ? "mcg" : "mul1", K, k, n, rows, path ? "gemm" : "gemv", worst, env);
+                std::printf("  dense %s K%d %4dx%-4d rows %2d %s: canonical rel-L2 %.2e\n", cb ? "mcg " : "mul1", K, k, n, rows, path ? "gemm" : "gemv", worst);
             } else {
                 const bool same = std::memcmp(y.data(), y_scalar.data(), y.size() * 4) == 0;
                 g_isa_cmp++; g_isa_bad += !same;
@@ -254,9 +261,9 @@ static void test_dense(std::mt19937 & rng, int K, int k, int n, int rows, int th
     ggml_cpu_exl3_set_gemv_max_rows(8);
 }
 
-static void test_experts(std::mt19937 & rng, int K, int k, int n, int E, int nu, int T, int nx, int threads) {
+static void test_experts(std::mt19937 & rng, int K, int k, int n, int E, int nu, int T, int nx, int threads, int cb = 0) {
     std::vector<Mat> ms;
-    for (int e = 0; e < E; ++e) ms.push_back(random_mat(rng, K, k, n));
+    for (int e = 0; e < E; ++e) ms.push_back(random_mat(rng, K, k, n, cb));
     std::vector<std::vector<float>> Ws;
     for (auto & m : ms) Ws.push_back(materialize(m));
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -287,12 +294,12 @@ static void test_experts(std::mt19937 & rng, int K, int k, int n, int E, int nu,
                         worst = std::max(worst, rel_l2(y.data() + (size_t(t) * nu + s) * n, yr.data(), n));
                     }
                 }
-                const double env = path == 0 ? 0.02 : 2e-3;
-                g_worst[path] = std::max(g_worst[path], worst);
+                const double env = (path == 0 && cb == 0) ? 0.02 : 2e-3;
+                if (cb == 0) g_worst[path] = std::max(g_worst[path], worst);
                 CHECK(worst <= env, "experts K%d %dx%d E%d nu%d T%d nx%d %s: rel-L2 %.3e > %.0e",
                       K, k, n, E, nu, T, nx, path ? "gemm" : "gemv", worst, env);
-                std::printf("  experts K%d %4dx%-4d E%d nu%d T%2d nx%d %s: canonical rel-L2 %.2e\n",
-                            K, k, n, E, nu, T, nx, path ? "gemm" : "gemv", worst);
+                std::printf("  experts %s K%d %4dx%-4d E%d nu%d T%2d nx%d %s: canonical rel-L2 %.2e\n",
+                            cb ? "mcg " : "mul1", K, k, n, E, nu, T, nx, path ? "gemm" : "gemv", worst);
             } else {
                 const bool same = std::memcmp(y.data(), y_scalar.data(), y.size() * 4) == 0;
                 g_isa_cmp++; g_isa_bad += !same;
@@ -334,7 +341,7 @@ static std::vector<char> slurp(const std::string & path) {
     return std::vector<char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
-static void test_fixture(const std::string & dir, int K) {
+static void test_fixture(const std::string & dir, int K, int cb = 0) {
     const auto tr = slurp(dir + "/trellis.bin");
     const auto su = slurp(dir + "/suh.bin");
     const auto sv = slurp(dir + "/svh.bin");
@@ -343,7 +350,7 @@ static void test_fixture(const std::string & dir, int K) {
         CHECK(false, "real fixture %s missing (fixtures never skip silently)", dir.c_str());
         return;
     }
-    Mat m{K, 128, 128, {}, {}, {}};
+    Mat m{K, 128, 128, cb, {}, {}, {}};
     m.native.resize(tr.size() / 2);
     std::memcpy(m.native.data(), tr.data(), tr.size());
     m.suh.resize(128); std::memcpy(m.suh.data(), su.data(), 256);
@@ -373,12 +380,16 @@ static void test_fixture(const std::string & dir, int K) {
             std::vector<float> fo(outs[r].begin(), outs[r].end());
             worst = std::max(worst, rel_l2(y.data() + r * 128, fo.data(), 128));
         }
-        const double env = path == 0 ? 0.02 : 2e-3;
+        const double env = (path == 0 && cb == 0) ? 0.02 : 2e-3;
         CHECK(worst <= env, "fixture %s %s: rel-L2 %.3e > %.0e", dir.c_str(), path ? "gemm" : "gemv", worst, env);
-        g_props.push_back({ dir.substr(dir.find_last_of('/') + 1), path ? "exl3_cpu_gemm_fp32" : "exl3_cpu_gemv_int8",
-                            std::string("llama.cpp CPU EXL3 executor (") + (path ? "fp32 GEMM prefill" : "int8 GEMV decode") +
-                            ") output on the real fixture activations is within relative-L2 " + (path ? "2e-3" : "0.02") +
-                            " of the fixture's canonical operator outputs (materialized_weight_fp32_fma_v1)", worst, env, worst <= env });
+        if (cb == 0 || path == 1) {
+            const bool fp32 = path == 1 || cb != 0;
+            g_props.push_back({ dir.substr(dir.find_last_of('/') + 1), fp32 ? "exl3_cpu_gemm_fp32" : "exl3_cpu_gemv_int8",
+                                std::string("llama.cpp CPU EXL3 executor (") + (fp32 ? "fp32 GEMM path" : "int8 GEMV decode") +
+                                ", " + (cb ? "mcg" : "mul1") + ") output on the real fixture activations is within relative-L2 " +
+                                (fp32 ? "2e-3" : "0.02") + " of the fixture's canonical operator outputs (materialized_weight_fp32_fma_v1)",
+                                worst, env, worst <= env });
+        }
         std::printf("  real fixture %s %s: rel-L2 vs canonical outputs %.2e (oracle self-check %.1e)\n",
                     dir.substr(dir.find_last_of('/') + 1).c_str(), path ? "gemm" : "gemv", worst, self);
     }
@@ -457,6 +468,12 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(1234);
     test_fixture(fix + "/real-mul1-k3", 3);
     test_fixture(fix + "/real-mul1-k4", 4);
+    test_fixture(fix + "/real-mcg-k4", 4, 1);
+    for (int K : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+        test_dense(rng, K, 256, 256, 1, 3, 1);
+    }
+    test_dense(rng, 4, 2560, 256, 3, 6, 1);
+    test_experts(rng, 4, 256, 128, 6, 3, 2, 3, 4, 1);
     for (int K : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
         test_dense(rng, K, 256, 256, 1, 3);
     }
