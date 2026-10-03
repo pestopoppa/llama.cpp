@@ -16,6 +16,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "exl3.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -435,6 +436,54 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    [GGML_TYPE_EXL3_1] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,   // matrix executor only (exl3.cpp)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
     },
 };
 
@@ -1331,6 +1380,11 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_type_is_exl3(src0->type)) {
+        ggml_cpu_exl3_compute(params, dst);
+        return;
+    }
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
@@ -1714,6 +1768,11 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+
+    if (ggml_type_is_exl3(src0->type)) {
+        ggml_cpu_exl3_compute(params, dst);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -3428,6 +3487,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(node->type)*n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT:
+                    if (ggml_type_is_exl3(node->src[0]->type)) {
+                        cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                    } else
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
@@ -3443,6 +3505,9 @@ struct ggml_cplan ggml_graph_plan(
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
+                    if (ggml_type_is_exl3(node->src[0]->type)) {
+                        cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                    } else
                     {
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];

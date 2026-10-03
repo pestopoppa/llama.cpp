@@ -4764,6 +4764,16 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # EXL3 trellis tiles, mul1 codebook, K = 1..8 bits (ids shared with buun-llama.cpp).
+    # Rows are not independently decodable; see EXL3-CPU-DESIGN.md.
+    EXL3_1  = 60
+    EXL3_2  = 61
+    EXL3_3  = 62
+    EXL3_4  = 63
+    EXL3_5  = 64
+    EXL3_6  = 65
+    EXL3_7  = 66
+    EXL3_8  = 67
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4946,6 +4956,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.EXL3_1:  (16, 2 * 1),
+    GGMLQuantizationType.EXL3_2:  (16, 2 * 2),
+    GGMLQuantizationType.EXL3_3:  (16, 2 * 3),
+    GGMLQuantizationType.EXL3_4:  (16, 2 * 4),
+    GGMLQuantizationType.EXL3_5:  (16, 2 * 5),
+    GGMLQuantizationType.EXL3_6:  (16, 2 * 6),
+    GGMLQuantizationType.EXL3_7:  (16, 2 * 7),
+    GGMLQuantizationType.EXL3_8:  (16, 2 * 8),
 }
 
 

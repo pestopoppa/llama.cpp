@@ -430,8 +430,29 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // 43..59: reserved (ids used by the buun-llama.cpp donor for other formats; unused here)
+        // EXL3 (exllamav3) trellis-coded weights, mul1 codebook, K = 1..8 bits per weight:
+        // 16x16 tiles of 256 weights, stored band8 (EXL3-CPU-DESIGN.md). Rows are NOT
+        // independently decodable: the only consumer is the MUL_MAT / MUL_MAT_ID matrix
+        // executor, with svh/suh attached as extra sources (MUL_MAT: src2 = svh, src3 = suh;
+        // MUL_MAT_ID: src3 = svh, src4 = suh). Ids match buun-llama.cpp's GGML_TYPE_EXL3_*.
+        GGML_TYPE_EXL3_1  = 60,
+        GGML_TYPE_EXL3_2  = 61,
+        GGML_TYPE_EXL3_3  = 62,
+        GGML_TYPE_EXL3_4  = 63,
+        GGML_TYPE_EXL3_5  = 64,
+        GGML_TYPE_EXL3_6  = 65,
+        GGML_TYPE_EXL3_7  = 66,
+        GGML_TYPE_EXL3_8  = 67,
+        GGML_TYPE_COUNT   = 68,
     };
+
+    static inline bool ggml_type_is_exl3(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8;
+    }
+    static inline int ggml_exl3_bits(enum ggml_type type) {
+        return (int) type - (int) GGML_TYPE_EXL3_1 + 1;
+    }
 
     // precision
     enum ggml_prec {

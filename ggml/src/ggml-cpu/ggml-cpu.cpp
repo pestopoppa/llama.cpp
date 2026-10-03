@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
+#include "exl3.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
@@ -432,6 +433,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
+    }
+
+    // EXL3 tiles have a matrix executor and no row dequantizer: MUL_MAT / MUL_MAT_ID only
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && ggml_type_is_exl3(op->src[i]->type)) {
+            // never in an extra (repacking) buffer: those have no EXL3 repack and would assert
+            const bool extra = op->src[0]->buffer && ggml_backend_cpu_is_extra_buffer_type(op->src[0]->buffer->buft);
+            return i == 0 && !extra && ggml_cpu_exl3_supports(op);
+        }
     }
 
     // check extra buffer types

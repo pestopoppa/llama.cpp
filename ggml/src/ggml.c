@@ -978,6 +978,79 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [43] = { .type_name = "RESERVED_43", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [44] = { .type_name = "RESERVED_44", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [45] = { .type_name = "RESERVED_45", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [46] = { .type_name = "RESERVED_46", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [47] = { .type_name = "RESERVED_47", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [48] = { .type_name = "RESERVED_48", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [49] = { .type_name = "RESERVED_49", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [50] = { .type_name = "RESERVED_50", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [51] = { .type_name = "RESERVED_51", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [52] = { .type_name = "RESERVED_52", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [53] = { .type_name = "RESERVED_53", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [54] = { .type_name = "RESERVED_54", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [55] = { .type_name = "RESERVED_55", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [56] = { .type_name = "RESERVED_56", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [57] = { .type_name = "RESERVED_57", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [58] = { .type_name = "RESERVED_58", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [59] = { .type_name = "RESERVED_59", .blck_size = 0, .type_size = 0, .is_quantized = false },
+    [GGML_TYPE_EXL3_1] = {
+        .type_name                = "exl3_1",
+        .blck_size                = 16,
+        .type_size                = 2 * 1,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_2] = {
+        .type_name                = "exl3_2",
+        .blck_size                = 16,
+        .type_size                = 2 * 2,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .type_name                = "exl3_3",
+        .blck_size                = 16,
+        .type_size                = 2 * 3,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .type_name                = "exl3_4",
+        .blck_size                = 16,
+        .type_size                = 2 * 4,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .type_name                = "exl3_5",
+        .blck_size                = 16,
+        .type_size                = 2 * 5,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .type_name                = "exl3_6",
+        .blck_size                = 16,
+        .type_size                = 2 * 6,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .type_name                = "exl3_7",
+        .blck_size                = 16,
+        .type_size                = 2 * 7,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .type_name                = "exl3_8",
+        .blck_size                = 16,
+        .type_size                = 2 * 8,
+        .is_quantized             = true,
+        // no to_float/from_float: tiles span 16 rows, only the MUL_MAT executor decodes
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
