@@ -743,10 +743,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q5_K:
                 return log_decision(ne11 <= 3);
+            // akm-gfx90a-kq-mmvq-route-m5-8: K-quant / IQ4 / IQ3_S at ne11 5..8 (the DFlash2
+            // verify width) previously ran the mul_mat_vec_q<type,5..8> cells (1 warp, 2 rows,
+            // 112-128 VGPR, ~54 VMEM instr per 8 B of Q4_K): 9-15% of HBM roofline on the
+            // 2026-10-03 rocprof, vs 23-31% for the same matrices on MMQ at ne11=16. Switch to
+            // MMQ at ne11>=5, matching Q8_0. ne11<=4 is unchanged (not profiled).
             case GGML_TYPE_Q4_K:
-                return log_decision(ne11 <= MMVQ_MAX_BATCH_SIZE);
             case GGML_TYPE_Q6_K:
-                return log_decision(ne11 <= 5);
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ3_S:
+                return log_decision(ne11 <= 4);
             // akm-cdna2-q8-b4-mmvq-route: route Q8_0 at ne11<=4 (MTP verify width) through the
             // ncols_dst<=4 mul_mat_vec_q templates instead of mul_mat_q. At ne11=4 MMQ pads to
             // J=8 and runs occupancy-1 128-row stream-k tiles for 4 real columns, leaving the
