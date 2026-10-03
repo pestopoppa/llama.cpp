@@ -35,11 +35,13 @@ From EXL3-1 (`epyc-inference-research` `scripts/kernel_rnd/exl3`, commit `bc9ac4
 
 ## 1. GGUF carriage
 
-**Types.** Eight ggml types `GGML_TYPE_EXL3_1 .. GGML_TYPE_EXL3_8` (ids 60..67, names
-`exl3_1..exl3_8`, `blck_size 16`, `type_size 2*K` bytes) — the same ids, names and per-block
-size as the buun-llama.cpp donor (intake-1575, MIT), so the two trees agree on what a type id
-means. The type encodes K and the `mul1` codebook (buun reserves 68..75 for MCG and 76..83 for
-3INST; we leave those ids unused and the loader refuses them). K is per tensor, so mixed-K
+**Types.** `GGML_TYPE_EXL3_1 .. GGML_TYPE_EXL3_8` (ids 60..67, `mul1`) and
+`GGML_TYPE_EXL3M_1 .. GGML_TYPE_EXL3M_8` (ids 68..75, `mcg`), names `exl3_K` / `exl3m_K`,
+`blck_size 16`, `type_size 2*K` bytes — the same ids, names and per-block size as the
+buun-llama.cpp donor (intake-1575, MIT), so the two trees agree on what a type id means. The
+type encodes K and the codebook (buun's 76..83 = 3INST stay unused). `mcg` is not affine in a
+byte sum, so it always runs the fp32 path (validated on EXL3-1's real GLM-5.3 MCG fixture); the
+importer handles `mul1` checkpoints only (Q38FN is `mul1`). K is per tensor, so mixed-K
 models need nothing extra. Rows are **not** independently decodable: `to_float` is not provided
 for row use; the only consumer is the matrix executor (section 3).
 
@@ -184,7 +186,7 @@ adapter. Model-level KLD receipts (measurement schema) are left to the booked wi
 
 ## 8. What is deliberately not done in v1
 
-MCG / 3INST codebooks, padded (non-128) dims, the EXL3 n-gram rows, MTP, the INF-64 fused
+3INST codebook, MCG in the importer (the executor has it), padded (non-128) dims, the EXL3 n-gram rows, MTP, the INF-64 fused
 single-token decode path (`qwen4exp-fused.cpp` is bypassed when the model has EXL3 tensors —
 it calls vec_dot directly; it is single-threaded and production recipes already disable it with
 `GGML_FUSED_DECODE_OFF=1`, so EXL3 and the GGUF anchors both run the graph path), HIP. Each is a refusal at load or a documented fallback, never a

@@ -1,4 +1,4 @@
-// EXL3 (exllamav3 trellis, mul1 codebook) matrix executor for the ggml CPU backend.
+// EXL3 (exllamav3 trellis; mul1 and mcg codebooks) matrix executor for the ggml CPU backend.
 //
 // Design and correctness contract: EXL3-CPU-DESIGN.md (repository root).
 //
@@ -27,6 +27,7 @@
 //   GEMV:  acc_b[c] = sum_{k in b} bytesum(state(k,c)*0x83DCD12D) * x8[k]   (int32, exact)
 //          accf[c] = fma(float(acc_b[c]), f_b, accf[c]) in ascending b;  y' = accf + corr
 //   GEMM:  W = canonical fp16 codebook (exact), y'[c] = fma chain over ascending k of x'[k]*W[k][c]
+//          (the only path for the mcg codebook, which is not affine in a byte sum)
 //   out:   y = (H128(y') * (1/sqrt128)) * svh     per 128-output block (butterfly order fixed)
 
 #include "exl3.h"
@@ -213,6 +214,14 @@ inline float fp16_round(float x) {
 // canonical codebook value (exactly the one-rounding fp16 FMA of the format)
 inline float mul1_canonical(int bs) {
     return fp16_round(std::fma(float(1024 + bs), K_INV, C_HALF));
+}
+
+// canonical mcg value: binary16 sum of the two halves of ((s*0xCBAC1FED) & 0x8FFF8FFF) ^ 0x3B603B60,
+// one RNE rounding (both halves have exponents 12..15, so the fp32 sum is exact)
+constexpr uint32_t MCG_MULT = 0xCBAC1FEDu;
+inline float mcg_canonical(uint32_t state) {
+    const uint32_t p = ((state * MCG_MULT) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    return fp16_round(GGML_CPU_FP16_TO_FP32(ggml_fp16_t(p & 0xffff)) + GGML_CPU_FP16_TO_FP32(ggml_fp16_t(p >> 16)));
 }
 
 inline void had128(float * v) {
@@ -531,7 +540,7 @@ void gemv_band_simd(const uint16_t * band, int kb0, int kb1, const RowsQ8 & rq, 
 
 // ---- band decode to fp32 (prefill), canonical codebook ----
 
-template <int bits, int R>
+template <int bits, int CB, int R>
 EXL3_T_VBMI EXL3_INLINE void decode_rows(__m512i p0, __m512i p1, __m512i p2, __m512i p3, bool vbmi, float * dst /* row stride HB */) {
     if constexpr (R < 16) {
         __m512i code;
@@ -540,24 +549,34 @@ EXL3_T_VBMI EXL3_INLINE void decode_rows(__m512i p0, __m512i p1, __m512i p2, __m
         } else {
             code = extract_row_dword<bits, R>(p0, p1, p2, p3);
         }
-        const __m512i prod = _mm512_mullo_epi32(code, _mm512_set1_epi32(int32_t(MUL1_MULT)));
-        const __m512i bs   = _mm512_dpbusd_epi32(_mm512_set1_epi32(1024), prod, _mm512_set1_epi32(0x01010101));
-        const __m512  v    = _mm512_fmadd_ps(_mm512_cvtepi32_ps(bs), _mm512_set1_ps(K_INV), _mm512_set1_ps(C_HALF));
-        const __m512  h    = _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        __m512 v;
+        if constexpr (CB == 0) {
+            const __m512i prod = _mm512_mullo_epi32(code, _mm512_set1_epi32(int32_t(MUL1_MULT)));
+            const __m512i bs   = _mm512_dpbusd_epi32(_mm512_set1_epi32(1024), prod, _mm512_set1_epi32(0x01010101));
+            v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(bs), _mm512_set1_ps(K_INV), _mm512_set1_ps(C_HALF));
+        } else {
+            const __m512i p = _mm512_xor_si512(_mm512_and_si512(_mm512_mullo_epi32(code, _mm512_set1_epi32(int32_t(MCG_MULT))),
+                                                                _mm512_set1_epi32(int32_t(0x8FFF8FFFu))),
+                                               _mm512_set1_epi32(0x3B603B60));
+            const __m256i lo = _mm512_cvtepi32_epi16(p);
+            const __m256i hi = _mm512_cvtepi32_epi16(_mm512_srli_epi32(p, 16));
+            v = _mm512_add_ps(_mm512_cvtph_ps(lo), _mm512_cvtph_ps(hi));
+        }
+        const __m512 h = _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         _mm512_storeu_ps(dst + R * HB, h);
-        decode_rows<bits, R + 1>(p0, p1, p2, p3, vbmi, dst);
+        decode_rows<bits, CB, R + 1>(p0, p1, p2, p3, vbmi, dst);
     }
 }
 
 // decode k-tiles [kt0, kt0+nkt) of a band into w[(kt-kt0)*16 + r][128]
-template <int bits>
+template <int bits, int CB>
 EXL3_T_VBMI void decode_band_simd(const uint16_t * band, int kt0, int nkt, bool vbmi, float * w) {
     constexpr int words = 16 * bits;
     for (int kt = kt0; kt < kt0 + nkt; ++kt) {
         for (int b = 0; b < 8; ++b) {
             __m512i p0, p1, p2, p3;
             load_tile<bits>(band + (size_t(kt) * 8 + b) * words, p0, p1, p2, p3);
-            decode_rows<bits, 0>(p0, p1, p2, p3, vbmi, w + size_t(kt - kt0) * 16 * HB + b * 16);
+            decode_rows<bits, CB, 0>(p0, p1, p2, p3, vbmi, w + size_t(kt - kt0) * 16 * HB + b * 16);
         }
     }
 }
@@ -593,7 +612,7 @@ EXL3_T_BW void gemm_block(const float * x, int64_t xs, int kc, const float * w, 
 #endif // EXL3_X86
 
 template <int bits>
-void decode_band_scalar(const uint16_t * band, int kt0, int nkt, float * w) {
+void decode_band_scalar(const uint16_t * band, int kt0, int nkt, int cb, float * w) {
     constexpr auto perm = make_tc_perm();
     constexpr int words = 16 * bits;
     for (int kt = kt0; kt < kt0 + nkt; ++kt) {
@@ -602,7 +621,8 @@ void decode_band_scalar(const uint16_t * band, int kt0, int nkt, float * w) {
             for (int t = 0; t < 256; ++t) {
                 const int pos = perm[t];
                 const int r = pos / 16, c = pos % 16;
-                w[(size_t(kt - kt0) * 16 + r) * HB + b * 16 + c] = mul1_canonical(bytesum_mul1(state_scalar(tile, bits, t)));
+                const uint16_t st = state_scalar(tile, bits, t);
+                w[(size_t(kt - kt0) * 16 + r) * HB + b * 16 + c] = cb == 0 ? mul1_canonical(bytesum_mul1(st)) : mcg_canonical(st);
             }
         }
     }
@@ -703,31 +723,40 @@ void gemv_band(int bits, Isa isa, const uint16_t * band, int kb0, int kb1, int m
     }
 }
 
-void decode_band(int bits, Isa isa, const uint16_t * band, int kt0, int nkt, float * w) {
+#if EXL3_X86
+template <int CB>
+void decode_band_simd_cb(int bits, const uint16_t * band, int kt0, int nkt, bool vbmi, float * w) {
+    switch (bits) {
+        case 1: decode_band_simd<1, CB>(band, kt0, nkt, vbmi, w); return;
+        case 2: decode_band_simd<2, CB>(band, kt0, nkt, vbmi, w); return;
+        case 3: decode_band_simd<3, CB>(band, kt0, nkt, vbmi, w); return;
+        case 4: decode_band_simd<4, CB>(band, kt0, nkt, vbmi, w); return;
+        case 5: decode_band_simd<5, CB>(band, kt0, nkt, vbmi, w); return;
+        case 6: decode_band_simd<6, CB>(band, kt0, nkt, vbmi, w); return;
+        case 7: decode_band_simd<7, CB>(band, kt0, nkt, vbmi, w); return;
+        default: decode_band_simd<8, CB>(band, kt0, nkt, vbmi, w); return;
+    }
+}
+#endif
+
+void decode_band(int bits, int cb, Isa isa, const uint16_t * band, int kt0, int nkt, float * w) {
 #if EXL3_X86
     if (isa != Isa::scalar) {
         const bool vbmi = isa == Isa::vbmi;
-        switch (bits) {
-            case 1: decode_band_simd<1>(band, kt0, nkt, vbmi, w); return;
-            case 2: decode_band_simd<2>(band, kt0, nkt, vbmi, w); return;
-            case 3: decode_band_simd<3>(band, kt0, nkt, vbmi, w); return;
-            case 4: decode_band_simd<4>(band, kt0, nkt, vbmi, w); return;
-            case 5: decode_band_simd<5>(band, kt0, nkt, vbmi, w); return;
-            case 6: decode_band_simd<6>(band, kt0, nkt, vbmi, w); return;
-            case 7: decode_band_simd<7>(band, kt0, nkt, vbmi, w); return;
-            default: decode_band_simd<8>(band, kt0, nkt, vbmi, w); return;
-        }
+        if (cb == 0) decode_band_simd_cb<0>(bits, band, kt0, nkt, vbmi, w);
+        else         decode_band_simd_cb<1>(bits, band, kt0, nkt, vbmi, w);
+        return;
     }
 #endif
     switch (bits) {
-        case 1: decode_band_scalar<1>(band, kt0, nkt, w); break;
-        case 2: decode_band_scalar<2>(band, kt0, nkt, w); break;
-        case 3: decode_band_scalar<3>(band, kt0, nkt, w); break;
-        case 4: decode_band_scalar<4>(band, kt0, nkt, w); break;
-        case 5: decode_band_scalar<5>(band, kt0, nkt, w); break;
-        case 6: decode_band_scalar<6>(band, kt0, nkt, w); break;
-        case 7: decode_band_scalar<7>(band, kt0, nkt, w); break;
-        default: decode_band_scalar<8>(band, kt0, nkt, w); break;
+        case 1: decode_band_scalar<1>(band, kt0, nkt, cb, w); break;
+        case 2: decode_band_scalar<2>(band, kt0, nkt, cb, w); break;
+        case 3: decode_band_scalar<3>(band, kt0, nkt, cb, w); break;
+        case 4: decode_band_scalar<4>(band, kt0, nkt, cb, w); break;
+        case 5: decode_band_scalar<5>(band, kt0, nkt, cb, w); break;
+        case 6: decode_band_scalar<6>(band, kt0, nkt, cb, w); break;
+        case 7: decode_band_scalar<7>(band, kt0, nkt, cb, w); break;
+        default: decode_band_scalar<8>(band, kt0, nkt, cb, w); break;
     }
 }
 
@@ -757,6 +786,7 @@ struct Geometry {
     const ggml_tensor * w, * x, * ids, * svh, * suh;
     int64_t k, n, n_exp;
     int bits;
+    int codebook;     // 0 = mul1, 1 = mcg
     int64_t n_inst;   // dense: rows; grouped: ids->ne[0]*ids->ne[1]
     int64_t n_rows_max; // largest possible per-expert instance count
 };
@@ -773,6 +803,7 @@ Geometry geometry(const ggml_tensor * dst) {
     g.n = g.w->ne[1];
     g.n_exp = g.w->ne[2];
     g.bits = ggml_exl3_bits(g.w->type);
+    g.codebook = ggml_exl3_codebook(g.w->type);
     if (g.grouped) {
         g.n_inst = g.ids->ne[0] * g.ids->ne[1];
         g.n_rows_max = g.ids->ne[1];
@@ -993,7 +1024,8 @@ void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggm
     const Layout L = layout(g, nth);
     GGML_ASSERT(params->wsize >= L.total);
     const Isa isa = Isa(g_isa.load());
-    const int gemv_max = g_gemv_max_rows;
+    // the int8 GEMV relies on mul1's affine byte-sum codebook; mcg always takes the fp32 path
+    const int gemv_max = g.codebook == 0 ? g_gemv_max_rows : 0;
 
     char * base = (char *) params->wdata;
     base = (char *) (((uintptr_t) base + 63) & ~uintptr_t(63));
@@ -1083,7 +1115,7 @@ void ggml_cpu_exl3_compute(const struct ggml_compute_params * params, struct ggm
             std::memset(abuf, 0, sizeof(float) * HB * m);
             for (int kt0 = 0; kt0 < tiles_k; kt0 += KC / 16) {
                 const int nkt = std::min(KC / 16, tiles_k - kt0);
-                decode_band(g.bits, isa, band, kt0, nkt, wbuf);
+                decode_band(g.bits, g.codebook, isa, band, kt0, nkt, wbuf);
                 gemm_rows(isa, XF + int64_t(gr.first) * k + kt0 * 16, k, m, nkt * 16, wbuf, abuf);
             }
             for (int i = 0; i < m; ++i) {
