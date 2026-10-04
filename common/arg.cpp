@@ -2177,6 +2177,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_YARN_ORIG_CTX"));
     add_opt(common_arg(
+        {"--dca-chunk-size"}, "N",
+        "Dual Chunk Attention: chunk size, 0 = off (default: 0) [EXPERIMENTAL; qwen2, qwen35, qwen35moe]",
+        [](common_params & params, int value) {
+            params.dca_chunk_size = value;
+        }
+    ).set_env("LLAMA_ARG_DCA_CHUNK_SIZE"));
+    add_opt(common_arg(
+        {"--dca-local-size"}, "N",
+        "Dual Chunk Attention: local window; keys are roped at pos mod (chunk - local) (default: 0)",
+        [](common_params & params, int value) {
+            params.dca_local_size = value;
+        }
+    ).set_env("LLAMA_ARG_DCA_LOCAL_SIZE"));
+    add_opt(common_arg(
+        {"--dca-orig-ctx"}, "N",
+        "Dual Chunk Attention: logit temperature max(1, 0.1*ln(n/N)+1), 0 = none (default: 0)",
+        [](common_params & params, int value) {
+            params.dca_orig_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_DCA_ORIG_CTX"));
+    add_opt(common_arg(
         {"--yarn-ext-factor"}, "N",
         string_format("YaRN: extrapolation mix factor (default: %.2f, 0.0 = full interpolation)", (double)params.yarn_ext_factor),
         [](common_params & params, const std::string & value) {

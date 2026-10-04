@@ -14,6 +14,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -122,7 +123,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    // the buffer is unset when no node reads the positions (e.g. Dual Chunk Attention ropes from its own input)
+    if (ubatch->pos && pos && pos->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         if (ubatch->token && n_pos_per_embd == 4) {
@@ -480,6 +482,63 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
+    }
+
+    set_input_dca(mctx, ubatch);
+}
+
+void llm_graph_input_attn_kv::set_input_dca(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    // Dual Chunk Attention: the key selection and the remapped positions
+    if (dca_sel && dca_sel->buffer) {
+        const uint32_t chunk_len = cparams.dca_chunk_size - cparams.dca_local_size;
+        kv->set_input_dca_sel(dca_sel, ubatch, chunk_len);
+    }
+
+    if (dca_pos && dca_pos->buffer) {
+        const llama_pos chunk_size = (llama_pos) cparams.dca_chunk_size;
+        const llama_pos chunk_len  = (llama_pos) (cparams.dca_chunk_size - cparams.dca_local_size);
+
+        // the inter-chunk query position is the successive-chunk position of the chunk's last row
+        // (ChunkLlama: qc_t[chunk_len - 1]; vLLM: cos_sin_qc_cache[chunk_len - 1]); == chunk_size unless local >= chunk_len
+        const llama_pos q_inter = std::min(2*chunk_len - 1, chunk_size);
+
+        const int64_t n_tokens = ubatch->n_tokens;
+        const int64_t npe      = dca_n_pos_per_embd;
+        const int64_t n_pos    = n_tokens*npe;
+
+        GGML_ASSERT(dca_pos->ne[0] == 3*n_pos);
+
+        std::vector<int32_t> data(3*n_pos);
+        for (int64_t sec = 0; sec < npe; ++sec) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                // M-RoPE with text tokens: the 3 first sections carry the 1D position, the 4th is 0
+                // (see llm_graph_input_pos::set_input); DCA remaps the temporal/1D sections only
+                llama_pos p;
+                if (npe == 4 && ubatch->token) {
+                    p = sec < 3 ? ubatch->pos[i] : 0;
+                } else {
+                    p = ubatch->pos[sec*n_tokens + i];
+                }
+                const bool remap = npe == 1 || sec < 3;
+                const llama_pos r = p % chunk_len;
+                data[0*n_pos + sec*n_tokens + i] = remap ? r                                  : p;
+                data[1*n_pos + sec*n_tokens + i] = remap ? std::min(r + chunk_len, chunk_size) : p;
+                data[2*n_pos + sec*n_tokens + i] = remap ? q_inter                            : p;
+            }
+        }
+        ggml_backend_tensor_set(dca_pos, data.data(), 0, data.size()*sizeof(int32_t));
+    }
+
+    if (dca_qscale && dca_qscale->buffer) {
+        // s = max(1, 0.1*ln(n/orig) + 1), n = the sequence length seen by this token (pos + 1);
+        // vLLM uses the cache length at decode (identical) and the whole prompt length at prefill
+        const int64_t n_tokens = ubatch->n_tokens;
+        std::vector<float> data(n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const double n = (double) ubatch->pos[i] + 1.0;
+            data[i] = (float) std::max(1.0, 0.1*std::log(n/(double) cparams.dca_orig_ctx) + 1.0);
+        }
+        ggml_backend_tensor_set(dca_qscale, data.data(), 0, data.size()*sizeof(float));
     }
 }
 
@@ -1036,6 +1095,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_v_rot) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
+
+    // Dual Chunk Attention inputs (no-op unless cparams.dca_chunk_size > 0)
+    inp_attn->set_input_dca(mctx->get_attn(), ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2764,6 +2826,25 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    if (cparams.dca_chunk_size > 0) {
+        const ggml_tensor * m = inp->self_kq_mask;
+
+        inp->dca_sel = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, m->ne[0], m->ne[1], m->ne[3], 3);
+        ggml_set_input(inp->dca_sel);
+        ggml_set_name(inp->dca_sel, "attn_inp_dca_sel");
+
+        inp->dca_n_pos_per_embd = hparams.n_pos_per_embd();
+        inp->dca_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 3*(int64_t) ubatch.n_tokens*inp->dca_n_pos_per_embd);
+        ggml_set_input(inp->dca_pos);
+        ggml_set_name(inp->dca_pos, "attn_inp_dca_pos");
+
+        if (cparams.dca_orig_ctx > 0) {
+            inp->dca_qscale = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, ubatch.n_tokens);
+            ggml_set_input(inp->dca_qscale);
+            ggml_set_name(inp->dca_qscale, "attn_inp_dca_qscale");
+        }
+    }
+
     return inp;
 }
 
@@ -2843,6 +2924,123 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_dca(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   n_rot_l,
+                int * rope_sections,
+              float   kq_scale,
+                int   il) const {
+    GGML_ASSERT(inp->dca_sel != nullptr && inp->dca_pos != nullptr && "DCA inputs missing (dca_chunk_size == 0?)");
+    GGML_ASSERT(inp->self_k_rot == nullptr && inp->self_v_rot == nullptr && "DCA: KV rotation is not supported");
+
+    cb(q_cur, "dca_q_in", il);
+    cb(k_cur, "dca_k_in", il);
+    cb(v_cur, "dca_v_in", il);
+
+    // the three remapped position vectors: [0] keys and intra-chunk queries (pos mod chunk_len),
+    // [1] successive-chunk queries (min(pos mod chunk_len + chunk_len, chunk_size)), [2] inter-chunk
+    // queries (min(2*chunk_len - 1, chunk_size), a constant)
+    const int64_t n_pos = inp->dca_pos->ne[0]/3;
+    auto pos_v = [&](int v) {
+        return ggml_view_1d(ctx0, inp->dca_pos, n_pos, v*n_pos*ggml_element_size(inp->dca_pos));
+    };
+    auto rope = [&](ggml_tensor * x, ggml_tensor * p) {
+        if (rope_sections) {
+            return ggml_rope_multi(ctx0, x, p, nullptr, n_rot_l, rope_sections, rope_type,
+                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        }
+        return ggml_rope_ext(ctx0, x, p, nullptr, n_rot_l, rope_type,
+                n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    };
+
+    ggml_tensor * k_rope = rope(k_cur, pos_v(0));
+    ggml_tensor * q_rope[3] = {
+        rope(q_cur, pos_v(0)),
+        rope(q_cur, pos_v(1)),
+        rope(q_cur, pos_v(2)),
+    };
+    if (inp->dca_qscale) {
+        for (auto & q : q_rope) {
+            q = ggml_mul(ctx0, q, inp->dca_qscale);
+        }
+    }
+    cb(k_rope,    "dca_k",       il);
+    cb(q_rope[0], "dca_q_intra", il);
+    cb(q_rope[1], "dca_q_succ",  il);
+    cb(q_rope[2], "dca_q_inter", il);
+
+    for (auto * q : q_rope) {
+        ggml_build_forward_expand(gf, q);
+    }
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_rope);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to the KV cache: K is roped at its chunk-local position, so the cache is chunk-periodic
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_rope, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur,  inp->get_v_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const int64_t n_stream = k->ne[3];
+
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    // one KQ per query variant, then per key the variant its chunk distance selects; a single
+    // softmax over the union is exact (it equals the LSE merge of the three partial attentions)
+    const int64_t n_kv  = inp->dca_sel->ne[0];
+    const int64_t n_tps = inp->dca_sel->ne[1];
+    ggml_tensor * kq = nullptr;
+    for (int v_i = 0; v_i < 3; ++v_i) {
+        ggml_tensor * q = q_rope[v_i];
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+        ggml_tensor * kq_v = ggml_mul_mat(ctx0, k, q); // [n_kv, n_tps, n_head, n_stream]
+        ggml_mul_mat_set_prec(kq_v, GGML_PREC_F32);
+
+        ggml_tensor * sel = ggml_view_4d(ctx0, inp->dca_sel, n_kv, n_tps, 1, n_stream,
+                inp->dca_sel->nb[1], inp->dca_sel->nb[2], inp->dca_sel->nb[2], v_i*inp->dca_sel->nb[3]);
+        kq_v = ggml_mul(ctx0, kq_v, sel);
+
+        kq = kq ? ggml_add(ctx0, kq, kq_v) : kq_v;
+    }
+    cb(kq, "dca_kq", il);
+
+    kq = ggml_soft_max_ext(ctx0, kq, inp->get_kq_mask(), kq_scale, 0.0f);
+    cb(kq, "dca_kq_soft_max", il);
+
+    if (!v_trans) {
+        v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+    }
+
+    ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+    ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    cb(cur, "dca_out", il);
+
+    ggml_build_forward_expand(gf, cur);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }

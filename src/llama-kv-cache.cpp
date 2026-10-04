@@ -861,6 +861,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         if (!get_can_shift()) {
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
+        if (lctx->get_cparams().dca_chunk_size > 0) {
+            // the cache holds K roped at pos mod chunk_len: a delta rotation is wrong across chunk boundaries
+            GGML_ABORT("K-shift is not supported with Dual Chunk Attention");
+        }
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
 
@@ -1790,6 +1794,50 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+void llama_kv_cache::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[3] == 3);
+    GGML_ASSERT(chunk_len > 0);
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_stream = dst->ne[2];
+
+    GGML_ASSERT((int64_t) ubatch->n_tokens == n_tps*n_stream);
+
+    float * data = (float *) dst->data;
+    std::fill(data, data + ggml_nelements(dst), 0.0f);
+
+    const int64_t slice = n_kv*n_tps*n_stream;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s*n_tps + ii;
+
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+            const llama_pos p1 = ubatch->pos[i];
+            const int64_t   c1 = p1 / (llama_pos) chunk_len;
+
+            float * row = data + n_kv*i;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get(j);
+                if (p0 > p1) {
+                    continue; // causal: the KQ mask drops it
+                }
+                const int64_t c0 = p0 / (llama_pos) chunk_len;
+                const int64_t kind = c0 == c1 ? 0 : (c0 + 1 == c1 ? 1 : 2);
+                row[kind*slice + j] = 1.0f;
+            }
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2842,6 +2890,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const {
+    kv->set_input_dca_sel(dst, ubatch, chunk_len);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

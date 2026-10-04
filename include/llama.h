@@ -390,6 +390,14 @@ extern "C" {
         float    yarn_beta_fast;   // YaRN low correction dim
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
+
+        // Dual Chunk Attention (DCA; ChunkLlama / Qwen2.5-1M) [EXPERIMENTAL]
+        // training-free context extension: keys are roped at (pos mod (chunk_size - local_size)),
+        // queries at three remapped positions (intra / successive / inter chunk), so no relative
+        // distance exceeds chunk_size. 0 = off. Only for the archs that wire it (qwen2, qwen35, qwen35moe).
+        uint32_t dca_chunk_size;   // chunk size (Qwen2.5-1M: 262144)
+        uint32_t dca_local_size;   // local window (Qwen2.5-1M: 8192); chunk_len = chunk_size - local_size
+        uint32_t dca_orig_ctx;     // attention temperature s = max(1, 0.1*ln(n/orig)+1); 0 = no temperature
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
         // MoE-Spec budget (arXiv:2602.16052) — top-B aggregate-routing-score

@@ -24,6 +24,11 @@ struct llama_cparams {
     float rope_freq_scale;
 
     uint32_t n_ctx_orig_yarn;
+
+    // Dual Chunk Attention (0 = off); see llama_context_params
+    uint32_t dca_chunk_size;
+    uint32_t dca_local_size;
+    uint32_t dca_orig_ctx;
     // These hyperparameters are not exposed in GGUF, because all
     // existing YaRN models use the same values for them.
     float yarn_ext_factor;

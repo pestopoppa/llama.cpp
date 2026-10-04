@@ -135,6 +135,29 @@ llama_context::llama_context(
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
+    cparams.dca_chunk_size = params.dca_chunk_size;
+    cparams.dca_local_size = params.dca_local_size;
+    cparams.dca_orig_ctx   = params.dca_orig_ctx;
+    if (cparams.dca_chunk_size > 0) {
+        if (cparams.dca_local_size >= cparams.dca_chunk_size) {
+            throw std::runtime_error("dca_local_size must be smaller than dca_chunk_size");
+        }
+        switch (model.arch) {
+            case LLM_ARCH_QWEN2:
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+                break;
+            default:
+                throw std::runtime_error(std::string("dual chunk attention is not wired for arch ") + llm_arch_name(model.arch));
+        }
+        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            throw std::runtime_error("dual chunk attention is not supported for an MTP context (the nextn layer ropes plainly)");
+        }
+        LLAMA_LOG_INFO("%s: dual chunk attention: chunk_size = %u, local_size = %u (chunk_len = %u), orig_ctx = %u\n",
+                __func__, cparams.dca_chunk_size, cparams.dca_local_size,
+                cparams.dca_chunk_size - cparams.dca_local_size, cparams.dca_orig_ctx);
+    }
+
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
@@ -3802,6 +3825,9 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
+        /*.dca_chunk_size              =*/ 0,
+        /*.dca_local_size              =*/ 0,
+        /*.dca_orig_ctx                =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.moe_spec_budget             =*/ 0,
         /*.moe_spec_min_batch          =*/ 4,

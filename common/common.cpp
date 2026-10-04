@@ -1679,6 +1679,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.yarn_beta_fast    = params.yarn_beta_fast;
     cparams.yarn_beta_slow    = params.yarn_beta_slow;
     cparams.yarn_orig_ctx     = params.yarn_orig_ctx;
+    cparams.dca_chunk_size    = params.dca_chunk_size;
+    cparams.dca_local_size    = params.dca_local_size;
+    cparams.dca_orig_ctx      = params.dca_orig_ctx;
     cparams.moe_spec_budget   = params.moe_spec_budget;
     cparams.moe_spec_min_batch = params.moe_spec_min_batch;
     cparams.pooling_type      = params.pooling_type;

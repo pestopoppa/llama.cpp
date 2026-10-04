@@ -345,6 +345,15 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // Dual Chunk Attention (only when cparams.dca_chunk_size > 0)
+    ggml_tensor * dca_sel    = nullptr; // F32 [n_kv, n_batch/n_stream, n_stream, 3]: intra / succ / inter key selection
+    ggml_tensor * dca_pos    = nullptr; // I32 [n_batch*n_pos_per_embd*3]: k (= q intra), q succ, q inter positions
+    ggml_tensor * dca_qscale = nullptr; // F32 [1, 1, n_batch]: logit temperature (only when dca_orig_ctx > 0)
+    uint32_t      dca_n_pos_per_embd = 1;
+
+    // fills the DCA inputs; also called by the hybrid memory inputs, which set the attention inputs themselves
+    void set_input_dca(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -1149,6 +1158,24 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
+                  float   kq_scale,
+                    int   il) const;
+
+    // Dual Chunk Attention over the KV cache (cparams.dca_chunk_size > 0). Takes the UNROPED
+    // q/k: it ropes k at pos mod chunk_len (the value stored in the cache) and q three times
+    // (intra / successive / inter chunk positions), then attends with one softmax over the
+    // per-key selection of the three logits. rope_sections == nullptr -> ggml_rope_ext,
+    // else ggml_rope_multi. Non-FA path (generic ops; any backend).
+    ggml_tensor * build_attn_dca(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens], not roped
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens], not roped
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+                    int   n_rot_l,
+                    int * rope_sections,
                   float   kq_scale,
                     int   il) const;
 
