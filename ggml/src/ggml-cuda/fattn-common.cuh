@@ -1050,12 +1050,31 @@ static bool ggml_cuda_fattn_mask_skip_enabled(const ggml_tensor * Q, const ggml_
 // Neither changes the result of a query row: a row is computed from its own Q, mask row and the same KV partition
 // (parallel_blocks is chosen from the unsegmented tiling), and the KV blocks it skips contribute exactly nothing.
 
-// GGML_CUDA_FA_SEQ_ROWS=0 disables the per-sequence layouts (A/B and debugging).
+// Switches (read once, A/B and debugging):
+//   GGML_CUDA_FA_SEQ_ROWS=0   both layouts off (== KVU-19a);
+//   GGML_CUDA_FA_SEQ_VEC=0    the vec routing off;
+//   GGML_CUDA_FA_SEQ_TILES=0  the WMMA sequence tiles off.
+
+static bool ggml_cuda_fattn_env_flag(const char * name) {
+    const char * env = getenv(name);
+    return env == nullptr || atoi(env) != 0;
+}
+
+// GGML_CUDA_FA_SEQ_ROWS=0 disables both per-sequence layouts.
 static bool ggml_cuda_fattn_seq_layout_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_FA_SEQ_ROWS");
-        return env == nullptr || atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_cuda_fattn_env_flag("GGML_CUDA_FA_SEQ_ROWS");
+    return enabled;
+}
+
+// The vec routing for batches in which every query row is a different sequence.
+static bool ggml_cuda_fattn_seq_vec_enabled() {
+    static const bool enabled = ggml_cuda_fattn_seq_layout_enabled() && ggml_cuda_fattn_env_flag("GGML_CUDA_FA_SEQ_VEC");
+    return enabled;
+}
+
+// The WMMA query tiles that follow the sequences.
+static bool ggml_cuda_fattn_seq_tiles_enabled() {
+    static const bool enabled = ggml_cuda_fattn_seq_layout_enabled() && ggml_cuda_fattn_env_flag("GGML_CUDA_FA_SEQ_TILES");
     return enabled;
 }
 
@@ -1065,7 +1084,7 @@ static bool ggml_cuda_fattn_rows_are_seqs(const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
-    return ggml_cuda_fattn_seq_layout_enabled() && Q->ne[3] == 1 && Q->ne[1] > 1 &&
+    return ggml_cuda_fattn_seq_vec_enabled() && Q->ne[3] == 1 && Q->ne[1] > 1 &&
         ggml_flash_attn_ext_get_n_seq(dst) >= Q->ne[1] && ggml_cuda_fattn_mask_skip_possible(Q, K, mask);
 }
 
@@ -1500,7 +1519,7 @@ void launch_fattn(
         const int n_kv_blocks = K->ne[1]/FATTN_KQ_STRIDE;
         const int n_seq       = ggml_flash_attn_ext_get_n_seq(KQV);
 
-        if (seq_tiles_supported && !stream_k && ncols2 == 1 && ncols1 > 1 && ggml_cuda_fattn_seq_layout_enabled() &&
+        if (seq_tiles_supported && !stream_k && ncols2 == 1 && ncols1 > 1 && ggml_cuda_fattn_seq_tiles_enabled() &&
                 Q->ne[3] == 1 && n_seq > 1 && Q->ne[1] > 1 && Q->ne[1] <= FATTN_SEQ_TILES_MAX_ROWS) {
             // Query tiles that do not span two sequences: per-row scan, plan on the device, OR of the rows of each tile.
             // Each sequence adds at most one partial tile, so ntiles_x_plain + n_seq - 1 slots always suffice when the
