@@ -607,6 +607,12 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     ggml_barrier(params->threadpool);
 
     // 3) per-expert GEMM via iqk
+    // The flat slab gives every active expert the same number of row units whatever its token
+    // count, so it balances only while per-expert token counts are small and near-uniform: the
+    // speculative-verify widths it was measured at (DS41 DSpark b2, N=3). At prefill widths the
+    // counts spread and the split goes lopsided (DS41-C112: Qwen3.8-Flash-Next pp256 -23..-25%,
+    // pp5 not harmed). Keyed on the batch shape, not on an env knob. Both paths are bit-identical.
+    constexpr int64_t k_slab_max_cne1 = 8;
     const int64_t slab_gran = iqk_mul_mat_moe_row_granularity(tA);
     bool slab_ok = iqk_mmid_slab_enabled() && slab_gran > 0 && ne01 > 0 && ne01 % slab_gran == 0;
     int64_t n_active = 0;
@@ -614,6 +620,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         const int64_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
         ++n_active;
+        if (cne1 > k_slab_max_cne1) slab_ok = false;
         if (iqk_dequant_type(tA, cne1) != tA) slab_ok = false;
     }
     const int64_t units_per_expert = slab_ok ? ne01 / slab_gran : 0;
