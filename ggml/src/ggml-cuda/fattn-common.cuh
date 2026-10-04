@@ -1585,6 +1585,12 @@ void launch_fattn(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
+    // FA-INT64-OFFSET: the kernels take these strides as int32; a truncated stride is a silently wrong
+    // address, so refuse instead. nb32 is only read when the mask has more than one plane in dim 2.
+    GGML_ASSERT(Q->nb[1] <= INT32_MAX && Q->nb[2] <= INT32_MAX && Q->nb[3] <= INT32_MAX);
+    GGML_ASSERT(nb11 <= INT32_MAX && nb12 <= INT32_MAX && nb21 <= INT32_MAX && nb22 <= INT32_MAX);
+    GGML_ASSERT(!mask || (mask->nb[1] <= INT32_MAX && (mask->ne[2] == 1 || mask->nb[2] <= INT32_MAX)));
+
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
