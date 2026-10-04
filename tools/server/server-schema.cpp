@@ -84,7 +84,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     // [KPF-15] explicit junction checkpoints
     add((new field_json("checkpoint_at"))
-        ->set_desc("Array of prompt token counts at which to create a pinned context checkpoint (state after that many prompt tokens). -1 = end of prompt. Only used on memories that need checkpoints (recurrent/hybrid or SWA). At most 8 entries")
+        ->set_desc("Array of positions at which to create a pinned context checkpoint. An integer is a prompt token count (state after that many tokens), -1 = end of prompt. An object {\"message\": k, \"at\": \"start\"|\"end\"} is the start or end of the k-th message span of the rendered prompt (role delimiters; negative k counts from the end; \"end\" = start of the next span, or the prompt end). Only used on memories that need checkpoints (recurrent/hybrid or SWA). At most 8 entries")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             const json & v = data.at("checkpoint_at");
             if (!v.is_array()) {
@@ -94,9 +94,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 throw std::runtime_error("at most 8 positions are allowed");
             }
             std::vector<int32_t> out;
+            std::vector<std::pair<int32_t, bool>> out_msg;
             for (const auto & e : v) {
+                if (e.is_object()) {
+                    if (!e.contains("message") || !e.at("message").is_number_integer()) {
+                        throw std::runtime_error("an object entry needs an integer \"message\"");
+                    }
+                    const std::string at = e.contains("at") ? e.at("at").get<std::string>() : "end";
+                    if (at != "start" && at != "end") {
+                        throw std::runtime_error("\"at\" must be \"start\" or \"end\"");
+                    }
+                    out_msg.emplace_back((int32_t) e.at("message").get<int64_t>(), at == "end");
+                    continue;
+                }
                 if (!e.is_number_integer()) {
-                    throw std::runtime_error("must be an array of integers (token counts, -1 = end of prompt)");
+                    throw std::runtime_error("must be an array of integers (token counts, -1 = end of prompt) or {\"message\": k} objects");
                 }
                 const int64_t x = e.get<int64_t>();
                 if (x < -1 || x == 0 || x > INT32_MAX) {
@@ -106,7 +118,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
             std::sort(out.begin(), out.end());
             out.erase(std::unique(out.begin(), out.end()), out.end());
-            ctx.params.checkpoint_at = std::move(out);
+            ctx.params.checkpoint_at     = std::move(out);
+            ctx.params.checkpoint_at_msg = std::move(out_msg);
         }));
 
     // TODO: implement t_max_prompt_ms

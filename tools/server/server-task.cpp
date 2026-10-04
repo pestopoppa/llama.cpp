@@ -267,6 +267,8 @@ json result_timings::to_json() const {
         base["n_fork_tokens"] = n_fork_tokens;
         base["fork_src_slot"] = fork_src_slot;
         base["fork_src_kind"] = fork_src_kind;
+        base["id_slot"]       = id_slot;
+        base["id_task"]       = id_task;
     }
 
     return base;
@@ -628,6 +630,12 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
     };
+
+    // [P2] the non-streamed Responses body had no timings; added only when the fork telemetry is on, so the
+    // default response stays byte-identical
+    if (timings.fork_enabled && timings.prompt_n >= 0) {
+        res.push_back({"timings", timings.to_json()});
+    }
 
     return res;
 }
