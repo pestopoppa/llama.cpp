@@ -97,19 +97,31 @@ static __global__ void flash_attn_ext_f16(
 
     ggml_cuda_pdl_sync();
 
-    // The Q/QKV columns of this block: ncols consecutive columns, or, with tile_rows (query tiles that follow the
-    // sequences of a unified KV cache, see flash_attn_plan_seq_tiles), the columns of the planned tile. A column is
-    // computed the same way in either case. Tile slots past the last planned tile are empty.
-    int ic0         = ncols*blockIdx.x;    // Index of the first Q/QKV column to work on.
-    int ncols_valid = int(ne01.z) - ic0;   // Columns >= ncols_valid are padding.
+    // The Q/QKV rows of this block. Plain tiling: rows ic0 + j, ic0 = ncols*blockIdx.x, in column j. With tile_rows
+    // (query tiles that follow the sequences of a unified KV cache, see flash_attn_plan_seq_tiles) the tile is the rows
+    // [tile.x, tile.x + tile.y), at most ncols of them, and row r is computed in column r % ncols, the column it has in
+    // the plain tiling: column j holds row ic0 + j for j >= col_wrap and row ic0 + ncols + j for j < col_wrap, with
+    // ic0 = tile.x - col_wrap and col_wrap = tile.x % ncols. A row keeps its column: the column decides the warp, the
+    // register slot and the unrolled copy of the code that computes the row, and the copies are not guaranteed to
+    // round identically (the FP32->FP16 conversion of Q*scale was fused in some copies and not in others, see the Q
+    // conversion below), so a row computed in another column could differ in the last bits. Columns whose row is
+    // outside [ic0 + col_wrap, ic0 + row_end) are padding. Tile slots past the last planned tile are empty.
+    int ic0      = ncols*blockIdx.x;   // Index of the first Q/QKV row of the ncols-aligned row window.
+    int col_wrap = 0;                  // Columns j < col_wrap hold the rows ic0 + ncols + j.
+    int row_end  = int(ne01.z) - ic0;  // Rows >= ic0 + row_end (relative row index) are padding.
     if (tile_rows_ptr) {
         const int2 tile = tile_rows_ptr[blockIdx.x];
-        ic0         = tile.x;
-        ncols_valid = tile.y;
-        if (ncols_valid <= 0) {
+        if (tile.y <= 0) {
             return;
         }
+        col_wrap = tile.x % ncols;
+        ic0      = tile.x - col_wrap;
+        row_end  = col_wrap + tile.y;
     }
+    // Row of column j relative to ic0 (in [col_wrap, col_wrap + ncols)); the column is padding if it is >= row_end:
+    const auto col_row = [col_wrap](const int j) -> int {
+        return j < col_wrap ? j + ncols : j;
+    };
 
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
@@ -185,7 +197,11 @@ static __global__ void flash_attn_ext_f16(
         }
     }
 
-    // Convert Q to half and apply scale, temporarily store in KQ:
+    // Convert Q to half and apply scale, temporarily store in KQ.
+    // The product is rounded to FP32 and then to FP16 in every column. Without the empty asm the HIP compiler fuses
+    // multiply and conversion into one rounding (v_fma_mixlo_f16 on gfx90a) in some unrolled copies of this loop and
+    // not in others (fp contract(off) does not prevent it), so the FP16 value of Q*scale depended on the tile column
+    // of the row. It cannot differ when scale is a power of 2 (e.g. 1/16 for head size 256).
 #pragma unroll
     for (int j0 = 0; j0 < ncols; j0 += nwarps) {
         const int j = j0 + threadIdx.y;
@@ -195,7 +211,11 @@ static __global__ void flash_attn_ext_f16(
             if (i0 + warp_size > D && i >= D) {
                 break;
             }
-            KQ[j*D_padded + i] = j < ncols_valid ? Q_f[j*stride_Q + i] * scale : 0.0f;
+            float q = col_row(j) < row_end ? Q_f[col_row(j)*stride_Q + i] * scale : 0.0f;
+#if defined(GGML_USE_HIP)
+            asm volatile("" : "+v"(q)); // materialize the FP32 product: no fused multiply-convert
+#endif // defined(GGML_USE_HIP)
+            KQ[j*D_padded + i] = q;
         }
     }
 
@@ -275,8 +295,8 @@ static __global__ void flash_attn_ext_f16(
                 for (int k0 = 0; k0 < FATTN_KQ_STRIDE; k0 += warp_size) {
                     const int k = k0 + threadIdx.x;
 
-                    KQ_f_tmp[k0/warp_size] += mask && j < ncols_valid ?
-                        __half2float(slopeh*maskh[j*(nb31/sizeof(half)) + k_VKQ_0 + k]) : 0.0f;
+                    KQ_f_tmp[k0/warp_size] += mask && col_row(j) < row_end ?
+                        __half2float(slopeh*maskh[col_row(j)*(nb31/sizeof(half)) + k_VKQ_0 + k]) : 0.0f;
                     KQ_max_new = max(KQ_max_new, KQ_f_tmp[k0/warp_size] + FATTN_KQ_MAX_OFFSET);
                 }
                 KQ_max_new = warp_reduce_max<warp_size>(KQ_max_new);
@@ -328,7 +348,7 @@ static __global__ void flash_attn_ext_f16(
                 for (int k0 = 0; k0 < FATTN_KQ_STRIDE/2; k0 += warp_size) {
                     const int k = k0 + threadIdx.x;
 
-                    KQ2_tmp[k0/warp_size] += mask && j < ncols_valid ? slope2*mask2[(j*ne11 + k_VKQ_0)/2 + k] : make_half2(0.0f, 0.0f);
+                    KQ2_tmp[k0/warp_size] += mask && col_row(j) < row_end ? slope2*mask2[(col_row(j)*ne11 + k_VKQ_0)/2 + k] : make_half2(0.0f, 0.0f);
                     KQ_max_new = ggml_cuda_hmax2(KQ_max_new, KQ2_tmp[k0/warp_size]);
                 }
                 KQ_max_new = __half2half2(warp_reduce_max<warp_size>(ggml_cuda_hmax(__low2half(KQ_max_new), __high2half(KQ_max_new))));
@@ -489,8 +509,8 @@ static __global__ void flash_attn_ext_f16(
 #pragma unroll
     for (int j0 = 0; j0 < ncols; j0 += nwarps) {
         const int j_VKQ = j0 + threadIdx.y;
-        if (j_VKQ >= ncols_valid) {
-            return;
+        if (col_row(j_VKQ) >= row_end) {
+            continue; // With col_wrap > 0 the padding columns are not a suffix.
         }
 
         float KQ_rowsum_j;
@@ -500,7 +520,7 @@ static __global__ void flash_attn_ext_f16(
             KQ_rowsum_j = __low2float(KQ_rowsum_h2[j0/nwarps]) + __high2float(KQ_rowsum_h2[j0/nwarps]);
         }
 
-        const int j_dst_unrolled = ((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y;
+        const int j_dst_unrolled = ((sequence*int(ne01.z) + ic0 + col_row(j_VKQ))*ne02 + head)*gridDim.y + blockIdx.y;
 
 #pragma unroll
         for (int i0 = 0; i0 < D; i0 += warp_size) {
