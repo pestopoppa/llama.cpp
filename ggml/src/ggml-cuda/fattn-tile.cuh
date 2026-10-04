@@ -853,9 +853,10 @@ static __global__ void flash_attn_tile(
     const int sequence = blockIdx.z / (ne02/ncols2);
     const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+    // FA-INT64-OFFSET: 64-bit products of the int32 strides (nb12 of an f16-converted K is n_kv*D*2 bytes)
+    const float * Q_f  = (const float *) (Q + nb03*sequence + int64_t(nb02)*head0);
+    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + int64_t(nb12)*(head0 / gqa_ratio));
+    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + int64_t(nb22)*(head0 / gqa_ratio)); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
