@@ -30,6 +30,7 @@ struct ggml_compute_params {
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-cparams.h"
 #include "llama-memory-hybrid.h"
 #include "models/models.h"
 
@@ -268,31 +269,38 @@ static void fused_moe(
     }
 
     // the expert gemvs: up/gate [2560, 640, 512] IQ3_S with the Q8_K activation
-    const struct ggml_type_traits_cpu * qt_up = ggml_get_type_traits_cpu(L.ffn_up_exps->type);
+    // separate up/gate experts (the production GGUFs), or one merged gate_up
+    // tensor [n_embd, 2*n_ff, n_expert] whose rows [0, n_ff) are the gate and
+    // [n_ff, 2*n_ff) the up (llm_graph_context::build_moe_ffn's split)
+    const bool merged_gu = L.ffn_up_exps == nullptr && L.ffn_gate_up_exps != nullptr;
+    const ggml_tensor * t_up = merged_gu ? L.ffn_gate_up_exps : L.ffn_up_exps;
+    const ggml_tensor * t_gt = merged_gu ? L.ffn_gate_up_exps : L.ffn_gate_exps;
+    const struct ggml_type_traits_cpu * qt_up = ggml_get_type_traits_cpu(t_up->type);
     const struct ggml_type_traits_cpu * qt_upv = ggml_get_type_traits_cpu(qt_up->vec_dot_type);
     const size_t xq_up_size = ggml_row_size(qt_up->vec_dot_type, hp.n_embd);
     std::vector<uint8_t> xq_up(xq_up_size);
     qt_upv->from_float(x, xq_up.data(), hp.n_embd);
 
-    const int64_t n_ff = L.ffn_up_exps->ne[1]; // 640
+    const int64_t n_ff = merged_gu ? t_up->ne[1] / 2 : t_up->ne[1]; // 640
+    const size_t up_row0 = merged_gu ? (size_t) n_ff * t_up->nb[1] : 0;
     std::vector<float> glu(n_used * n_ff), up_tmp(n_used * n_ff), gate_tmp(n_used * n_ff);
-    const size_t nb_up_exp = L.ffn_up_exps->nb[2]; // expert stride
+    const size_t nb_up_exp = t_up->nb[2]; // expert stride
 
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         fprintf(stderr, "  moe up: type=%s nb1=%zu nb2=%zu n_embd=%lld sel[0]=%d\n",
-                ggml_type_name(L.ffn_up_exps->type), (size_t) L.ffn_up_exps->nb[1],
-                (size_t) L.ffn_up_exps->nb[2], (long long) hp.n_embd, sel[0]);
+                ggml_type_name(t_up->type), (size_t) t_up->nb[1],
+                (size_t) t_up->nb[2], (long long) hp.n_embd, sel[0]);
     }
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
-        const char * up_e = (const char *) L.ffn_up_exps->data + (size_t) e * nb_up_exp;
-        const char * gt_e = (const char *) L.ffn_gate_exps->data + (size_t) e * nb_up_exp;
+        const char * up_e = (const char *) t_up->data + (size_t) e * nb_up_exp + up_row0;
+        const char * gt_e = (const char *) t_gt->data + (size_t) e * nb_up_exp;
         FUSED_PROF_DOT_BEGIN();
         for (int64_t r = 0; r < n_ff; r++) {
             qt_up->vec_dot((int) hp.n_embd, &up_tmp[j * n_ff + r], 0,
-                           up_e + (size_t) r * L.ffn_up_exps->nb[1], 0, xq_up.data(), 0, 1);
+                           up_e + (size_t) r * t_up->nb[1], 0, xq_up.data(), 0, 1);
             qt_up->vec_dot((int) hp.n_embd, &gate_tmp[j * n_ff + r], 0,
-                           gt_e + (size_t) r * L.ffn_gate_exps->nb[1], 0, xq_up.data(), 0, 1);
+                           gt_e + (size_t) r * t_gt->nb[1], 0, xq_up.data(), 0, 1);
             const float g = gate_tmp[j * n_ff + r];
             glu[j * n_ff + r] = up_tmp[j * n_ff + r] * (g / (1.0f + expf(-g))); // silu(gate)*up
         }
@@ -335,13 +343,13 @@ static void fused_moe(
     }
     static const int8_t kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
     const bool dn_repacked = L.ffn_down_exps->extra != nullptr;
-    const bool up_repacked = L.ffn_up_exps->extra != nullptr;
-    const bool gt_repacked = L.ffn_gate_exps->extra != nullptr;
+    const bool up_repacked = t_up->extra != nullptr;
+    const bool gt_repacked = t_gt->extra != nullptr;
     const int64_t rp_I = dn_repacked ? (ggml_cpu_has_avx2() ? 8 : 4) : 0;
     if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         fprintf(stderr, "  moe repack: up=%s extra=%d gt=%s extra=%d dn=%s extra=%d rp_I=%lld\n",
-                ggml_type_name(L.ffn_up_exps->type), (int) up_repacked,
-                ggml_type_name(L.ffn_gate_exps->type), (int) gt_repacked,
+                ggml_type_name(t_up->type), (int) up_repacked,
+                ggml_type_name(t_gt->type), (int) gt_repacked,
                 ggml_type_name(L.ffn_down_exps->type), (int) dn_repacked, (long long) rp_I);
     }
     const int64_t rp_nblocks = n_ff / 32;
@@ -353,8 +361,8 @@ static void fused_moe(
                 (size_t) L.ffn_down_exps->nb[1], (size_t) L.ffn_down_exps->nb[2], glu_q_size,
                 L.ffn_down_exps->buffer ? ggml_backend_buffer_name(L.ffn_down_exps->buffer) : "none",
                 (int) dn_repacked, (long long) rp_I);
-        fprintf(stderr, "  moe up: type=%s buf=%s\n", ggml_type_name(L.ffn_up_exps->type),
-                L.ffn_up_exps->buffer ? ggml_backend_buffer_name(L.ffn_up_exps->buffer) : "none");
+        fprintf(stderr, "  moe up: type=%s buf=%s\n", ggml_type_name(t_up->type),
+                t_up->buffer ? ggml_backend_buffer_name(t_up->buffer) : "none");
     }
     for (int64_t j = 0; j < n_used; j++) {
         const int32_t e = sel[j];
@@ -1687,8 +1695,9 @@ bool llama_model_qwen4exp::fused_decode(
         const llama_ubatch & ubatch,
         const struct llama_memory_context_i * mctx_in,
         class llm_graph_result * res,
-        int n_threads,
+        const llama_cparams & cparams,
         const struct ggml_tensor * const * prev_layer_inp) const {
+    const int n_threads = cparams.n_threads;
     FUSED_PROF_INIT();
     FUSED_PROF_RESET();
     const auto prof_t0 = std::chrono::steady_clock::now();
@@ -1706,15 +1715,18 @@ bool llama_model_qwen4exp::fused_decode(
     const int64_t pos = ubatch.pos[0];
     const int64_t seq = ubatch.seq_id[0][0];
 
+    // the rope/YaRN parameters: exactly the members llm_graph_context's ctor
+    // takes from the cparams (llama-graph.cpp), so the fused decode ropes the
+    // query, the key and the indexer with the same geometry as the graph that
+    // prefilled the cache (YaRN, --rope-freq-base/--rope-scale overrides)
     FusedRopeParams rp;
-    rp.n_ctx_orig = 0; // filled by the caller's cparams via the hook
-    // the rope values are set by the hook's caller (the cparams); defaults here
-    rp.freq_base = 10000000.0f;
-    rp.freq_scale = 1.0f;
-    rp.ext_factor = 0.0f;
-    rp.attn_factor = 1.0f;
-    rp.beta_fast = 32.0f;
-    rp.beta_slow = 1.0f;
+    rp.n_ctx_orig  = (int) cparams.n_ctx_orig_yarn;
+    rp.freq_base   = cparams.rope_freq_base;
+    rp.freq_scale  = cparams.rope_freq_scale;
+    rp.ext_factor  = cparams.yarn_ext_factor;
+    rp.attn_factor = cparams.yarn_attn_factor;
+    rp.beta_fast   = cparams.yarn_beta_fast;
+    rp.beta_slow   = cparams.yarn_beta_slow;
 
     // the token embedding
     std::vector<float> res_hc(hc_dim);

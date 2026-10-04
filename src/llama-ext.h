@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Number of ubatches this context served through the model's fused decode
+// path (no graph). Lets tests prove the fused path actually ran.
+LLAMA_API int64_t llama_n_fused_decode(const struct llama_context * ctx);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
