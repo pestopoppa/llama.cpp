@@ -8450,11 +8450,18 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    // mask row length (>= kv; 0 = kv). A wide mask gives a large mask row stride (nb31) without
+    // a large K/V: with nb queries, nb31*ic0 can pass 2^31 at a ~2 GiB mask [FA-INT64-OFFSET]
+    const int64_t mask_ne0;
     ggml_tensor * cache_k = nullptr;
     ggml_tensor * cache_v = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        std::string res = VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        if (mask_ne0 != 0) {
+            res += ",mask_ne0=" + std::to_string(mask_ne0);
+        }
+        return res;
     }
 
     double max_nmse_err() override {
@@ -8470,9 +8477,12 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        int64_t mask_ne0 = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), mask_ne0(mask_ne0) {
+        GGML_ASSERT(mask_ne0 == 0 || mask_ne0 >= kv);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8520,7 +8530,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_ne0 ? mask_ne0 : kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -11207,6 +11217,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+
+    // [FA-INT64-OFFSET] 27B attention shape (D 256, 4 KV heads, GQA 6) at a small KV (512 cells) whose mask
+    // rows are 557056 wide (nb31 = 1088 KiB, as for n_kv = 544K). With 2048 queries the last row blocks start
+    // at ic0 ~ 2016, so nb31*ic0 ~ 2.25e9 > 2^31: a kernel forming that offset in int32 reads the mask from a
+    // wrapped offset (ggml-org/llama.cpp#27090). The mask is ~2.1 GiB; K/V/Q are small. The nb 64 cases keep
+    // the wide stride below 2^31 (stride handling alone).
+    for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
+        for (int64_t nb : {64, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, nb, true, false, 0, 0, prec,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 557056));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
