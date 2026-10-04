@@ -9125,7 +9125,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         // online softmax / attention over [ic_start, ic_end), FP16 or FP32 VKQ accumulator; result in VKQ32
         // ref: https://arxiv.org/pdf/2112.05682.pdf
-        auto accumulate = [&](const bool use_f16) {
+        auto accumulate = [&](const bool use_f16) __attribute__((noinline)) {
             S = 0.0f;
             M = -INFINITY;
 
@@ -9269,8 +9269,60 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 #if defined(__AVX512F__)
             accumulate_reg();
 #endif
+        } else if (vkq_f16_first) {
+            // FP16 accumulator: the legacy loop, kept inline and straight-line (an outlined lambda costs up to
+            // ~15% FA time on FA-bound shapes); bit-identical to the legacy kernel
+            memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
+
+            for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
+                }
+
+                float s; // KQ value
+
+                const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+
+                s = s*scale; // scale KQ value
+
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+
+                s += mv; // apply mask
+
+                const float Mold = M;
+
+                float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
+                float vs = 1.0f; // post-softmax KQ value, expf(s - M)
+
+                const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+
+                if (s > M) {
+                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                    M = s;
+                    ms = expf(Mold - M);
+
+                    // V = V*expf(Mold - M)
+                    ggml_vec_scale_f16(DV, VKQ16, ms);
+                } else {
+                    // no new maximum, ms == 1.0f, vs != 1.0f
+                    vs = expf(s - M);
+                }
+
+                // V += v*expf(s - M)
+                ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+
+                S = S*ms + vs; // scale and increment sum with partial sum
+            }
+
+            for (int64_t d = 0; d < DV; ++d) {
+                VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+            }
         } else {
-            accumulate(vkq_f16_first);
+            accumulate(false); // FP32 accumulator (GGML_FA_VKQ_F32=1, or V not F16)
         }
 
         if (vkq_check && !vkq_reg) {
