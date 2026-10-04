@@ -3,6 +3,40 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 
+#include <cstdlib>
+
+// CDNA (MFMA) tuning of the D=256 MMA FlashAttention kernel (experimental, v11 FA A/B 2026-10-04).
+//
+// Upstream picks ncols2 = 8 for any GQA ratio > 4 and, above 32/ncols2 query rows, a 64-column tile
+// (<256, 256, 64/ncols2, ncols2>). On CDNA the 64-column D=256 config runs 512 threads per block, i.e. two waves
+// per SIMD, which caps every wave at 256 of the unified VGPR+AGPR file. ROCm 6.2 then spills on gfx90a:
+// <256,256,8,8> 190 VGPRs (696 B scratch/lane), <256,256,32,2> 314 VGPRs (1040 B). The 32-column configs run
+// 256 threads (one wave per SIMD, 512 registers): <256,256,16,2> uses 499 with 0 spills.
+//
+// With the tuning on (default; GGML_CUDA_FA_CDNA_D256_TUNE=0 restores the upstream selection exactly):
+//   - ncols2 is the largest of 8/4/2 that divides the GQA ratio (GQA 6 -> 2: no wasted head slots,
+//     where upstream's ncols2 = 8 computes 8 head columns for 6 real heads);
+//   - a block never exceeds 32 columns (ncols1 <= 32/ncols2).
+// GGML_CUDA_FA_CDNA_D256_MMA_MIN_ROWS=n (n >= 3) additionally sends D=256 to MMA from n query rows on instead of
+// upstream's "rows * gqa_ratio_eff > 64" crossover (TILE below it). Unset/0 = upstream crossover. This knob is
+// independent of GGML_CUDA_FA_CDNA_D256_TUNE.
+static bool ggml_cuda_fattn_cdna_d256_tune() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FA_CDNA_D256_TUNE");
+        return !(e && atoi(e) == 0);
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_fattn_cdna_d256_mma_min_rows() {
+    static const int min_rows = [] {
+        const char * e = getenv("GGML_CUDA_FA_CDNA_D256_MMA_MIN_ROWS");
+        const int v = e ? atoi(e) : 0;
+        return v <= 0 ? 0 : (v < 3 ? 3 : v); // never take decode (<= 2 rows) away from the vec kernel
+    }();
+    return min_rows;
+}
+
 template <int DV, int ncols1, int ncols2>
 static void launch_fattn_vec(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -74,7 +108,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
-            (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+            (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256) ||
+            (DKQ == 256 && amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune())) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -134,6 +169,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             return;
         } else {
             GGML_ABORT("fatal error");
+        }
+    }
+
+    // CDNA D=256: pick ncols2 by divisibility (see ggml_cuda_fattn_cdna_d256_tune). Ratios with no power-of-2
+    // divisor fall through to the upstream selection.
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (use_gqa_opt && amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune()) {
+            if (gqa_ratio % 8 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+                return;
+            }
+            if (gqa_ratio % 4 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+                return;
+            }
+            if (gqa_ratio % 2 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                return;
+            }
         }
     }
 
@@ -568,7 +622,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
-    if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    // CDNA D=256 crossover override (GGML_CUDA_FA_CDNA_D256_MMA_MIN_ROWS): MMA from min_rows on; below it skip the
+    // upstream MFMA crossover and fall through to the tile/vec selection at the end of this function.
+    const bool cdna_d256_override = amd_mfma_available(cc) && Q->ne[0] == 256 && gqa_opt_applies &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 && ggml_cuda_fattn_cdna_d256_mma_min_rows() > 0;
+    if (cdna_d256_override && Q->ne[1] >= ggml_cuda_fattn_cdna_d256_mma_min_rows()) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 && !cdna_d256_override) {
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
