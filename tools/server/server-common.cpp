@@ -1091,6 +1091,41 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
 
+    // [P2] checkpoint_at {"message": k}: render messages[0, k) or [0, k] without a generation prompt and keep it
+    // only if it is a byte prefix of the full rendered prompt. The task builder tokenizes it and verifies the
+    // token prefix, so a junction is exact or dropped (works for templates without role delimiters).
+    if (body.contains("checkpoint_at") && body.at("checkpoint_at").is_array()) {
+        json prefixes = json::array();
+        const int32_t n_msgs = (int32_t) inputs.messages.size();
+        for (const auto & e : body.at("checkpoint_at")) {
+            if (!e.is_object() || !e.contains("message") || !e.at("message").is_number_integer()) {
+                continue;
+            }
+            const int32_t k_req  = e.at("message").get<int32_t>();
+            const int32_t k      = k_req < 0 ? n_msgs + k_req : k_req;
+            const bool    at_end = !e.contains("at") || (e.at("at").is_string() && e.at("at").get<std::string>() == "end");
+            const int32_t m      = at_end ? k + 1 : k;
+            if (k < 0 || k >= n_msgs || m <= 0 || m > n_msgs) {
+                continue;
+            }
+            try {
+                common_chat_templates_inputs pin = inputs;
+                pin.messages.resize(m);
+                pin.add_generation_prompt  = false;
+                pin.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+                const std::string pre = common_chat_templates_apply(opt.tmpls.get(), pin).prompt;
+                if (!pre.empty() && chat_params.prompt.compare(0, pre.size(), pre) == 0) {
+                    prefixes.push_back(pre);
+                } else {
+                    SRV_WRN("checkpoint_at: message %d: the rendered prefix is not a prefix of the prompt, ignored\n", k_req);
+                }
+            } catch (const std::exception & ex) {
+                SRV_WRN("checkpoint_at: message %d: template cannot render the prefix (%s), ignored\n", k_req, ex.what());
+            }
+        }
+        llama_params["checkpoint_at_prefix_text"] = prefixes;
+    }
+
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
     if (!chat_params.grammar.empty()) {
