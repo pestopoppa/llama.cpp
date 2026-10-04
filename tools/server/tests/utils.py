@@ -114,6 +114,8 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     no_cache_idle_slots: bool = False
+    slot_fork_min_tokens: int | None = None  # [KPF-11]
+    ctx_checkpoints: int | None = None
     log_path: str | None = None
     prefill_budget_decoding: int | None = None
     prefill_budget_target_ms: int | None = None
@@ -277,6 +279,10 @@ class ServerProcess:
             server_args.extend(["--prefill-budget-decoding", self.prefill_budget_decoding])
         if self.prefill_budget_target_ms is not None:
             server_args.extend(["--prefill-budget-target-ms", self.prefill_budget_target_ms])
+        if self.slot_fork_min_tokens is not None:
+            server_args.extend(["--slot-fork-min-tokens", self.slot_fork_min_tokens])
+        if self.ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.ctx_checkpoints])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
