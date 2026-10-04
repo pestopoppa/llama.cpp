@@ -263,6 +263,12 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (fork_enabled) {
+        base["n_fork_tokens"] = n_fork_tokens;
+        base["fork_src_slot"] = fork_src_slot;
+        base["fork_src_kind"] = fork_src_kind;
+    }
+
     return base;
 }
 
@@ -1754,6 +1760,36 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     });
 
     return &states.back();
+}
+
+int server_prompt_cache::best_lcp(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    // mirrors the selection in load()
+    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
+    float sim_best    = float(lcp_base) / tokens_new.size();
+
+    int res = -1;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+
+        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+            f_keep_best = f_keep_cur;
+            sim_best    = sim_cur;
+
+            res = lcp_cur;
+        }
+    }
+
+    return res;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
