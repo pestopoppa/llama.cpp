@@ -633,6 +633,7 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t slot_fork_min_tokens = 0;    // [KPF-11] min shared-prefix tokens for a cross-slot prefix fork (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -959,6 +960,10 @@ void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos 
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
 void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
+// [KPF-12] attention-only zero-copy share (LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY); returns false, changing nothing,
+// if the context's memory cannot do it
+bool common_context_seq_cp_attn(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+
 //
 // Batch utils
 //
@@ -1117,6 +1122,10 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    // [KPF-15] requested through the `checkpoint_at` request field: never evicted by the capacity or
+    // min-step erase loops (only invalidation, pos_max > pos_next, removes it)
+    bool pinned = false;
 
     size_t size() const;
 

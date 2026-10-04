@@ -447,6 +447,81 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+// [KPF-12] zero-copy share of the attention cells in [p0, p1): adds the dst bit to every src cell in range.
+// Only possible when src and dst live in the same stream (unified KV); otherwise returns false, changing nothing.
+bool llama_kv_cache::seq_cp_attn(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS] - the owning cache does the copy, like seq_cp
+    if (other) {
+        return true;
+    }
+
+    if (seq_id_src < 0 || (size_t) seq_id_src >= seq_to_stream.size() ||
+        seq_id_dst < 0 || (size_t) seq_id_dst >= seq_to_stream.size()) {
+        return false;
+    }
+
+    if (seq_to_stream[seq_id_src] != seq_to_stream[seq_id_dst]) {
+        return false;
+    }
+
+    seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+    return true;
+}
+
+// [KPF-16] one pass over every stream's cells
+bool llama_kv_cache::cell_stats(int64_t & n_size, int64_t & n_used, int64_t & n_shared,
+                                int32_t n_seq, int64_t * seq_private, int64_t * seq_shared) const {
+    if (other) {
+        // the cells are owned (and counted) by the other cache
+        return true;
+    }
+
+    n_seq = std::max<int32_t>(0, std::min<int32_t>(n_seq, (int32_t) seq_to_stream.size()));
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+
+        n_size += cells.size();
+        n_used += cells.get_used();
+
+        if (cells.get_used() == 0) {
+            continue;
+        }
+
+        const uint32_t i0 = cells.used_min();
+        const uint32_t i1 = cells.used_max_p1();
+
+        for (uint32_t i = i0; i < i1; ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+
+            const int cnt = cells.seq_count(i);
+            if (cnt > 1) {
+                n_shared++;
+            }
+
+            for (int32_t sq = 0; sq < n_seq; ++sq) {
+                if (seq_to_stream[sq] != s || !cells.seq_has(i, sq)) {
+                    continue;
+                }
+                if (cnt > 1) {
+                    if (seq_shared) {
+                        seq_shared[sq]++;
+                    }
+                } else {
+                    if (seq_private) {
+                        seq_private[sq]++;
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

@@ -773,6 +773,47 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // [KPF-12] flags for llama_memory_seq_cp_ext
+#define LLAMA_MEMORY_SEQ_CP_FLAGS_NONE      0
+    // Copy only the position-addressed attention cells, zero-copy (the dst sequence bit is added to the src
+    // cells). The state that LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY carries (recurrent rows, SWA windows) is NOT
+    // touched: dst never aliases src's recurrent state, and the caller must restore that state into dst from a
+    // checkpoint (llama_state_seq_set_data_ext(..., dst, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)).
+#define LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY 1
+
+    typedef uint32_t llama_memory_seq_cp_flags;
+
+    // Copy tokens of seq_id_src in [p0, p1) to seq_id_dst, honouring flags.
+    // Returns false, and changes nothing, if the memory cannot do it (e.g. ATTN_ONLY on a memory without an
+    // attention part, or src and dst in different KV streams, where a zero-copy share is impossible).
+    // An empty range (p0 == p1 >= 0) is a capability probe: it changes nothing.
+    // p0 < 0 : [0,  p1]
+    // p1 < 0 : [p0, inf)
+    LLAMA_API bool llama_memory_seq_cp_ext(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1,
+    llama_memory_seq_cp_flags flags);
+
+    // [KPF-16] attention-cell accounting over the shareable (position-addressed) KV cells
+    struct llama_memory_cell_stats {
+        int64_t n_size;   // attention cells in the pool, all streams
+        int64_t n_used;   // cells referenced by at least one sequence (= unique cells)
+        int64_t n_shared; // cells referenced by two or more sequences
+    };
+
+    // Fills *stats. If n_seq > 0, also fills seq_private[s] (cells only seq s references) and seq_shared[s]
+    // (cells seq s references together with another sequence) for s in [0, n_seq); either array may be NULL.
+    // One O(n_cells) pass. Returns false if the memory has no attention cells to account for.
+    LLAMA_API bool llama_memory_get_cell_stats(
+            llama_memory_t mem,
+            struct llama_memory_cell_stats * stats,
+                   int32_t n_seq,
+                   int64_t * seq_private,
+                   int64_t * seq_shared);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

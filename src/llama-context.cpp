@@ -4206,6 +4206,65 @@ void llama_memory_seq_cp(
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_seq_cp_ext(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1,
+llama_memory_seq_cp_flags flags) {
+    if (!mem) {
+        return false;
+    }
+
+    if (flags & LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY) {
+        return mem->seq_cp_attn(seq_id_src, seq_id_dst, p0, p1);
+    }
+
+    mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+    return true;
+}
+
+bool llama_memory_get_cell_stats(
+        llama_memory_t mem,
+        struct llama_memory_cell_stats * stats,
+               int32_t n_seq,
+               int64_t * seq_private,
+               int64_t * seq_shared) {
+    if (stats) {
+        *stats = { 0, 0, 0 };
+    }
+    for (int32_t s = 0; s < n_seq; ++s) {
+        if (seq_private) {
+            seq_private[s] = 0;
+        }
+        if (seq_shared) {
+            seq_shared[s] = 0;
+        }
+    }
+
+    if (!mem) {
+        return false;
+    }
+
+    int64_t n_size   = 0;
+    int64_t n_used   = 0;
+    int64_t n_shared = 0;
+
+    if (!mem->cell_stats(n_size, n_used, n_shared, n_seq, seq_private, seq_shared)) {
+        return false;
+    }
+
+    if (stats) {
+        stats->n_size   = n_size;
+        stats->n_used   = n_used;
+        stats->n_shared = n_shared;
+    }
+
+    return true;
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {
