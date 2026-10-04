@@ -551,13 +551,25 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         return true;
     }
 
-    for (int64_t row = ith; row < ne12*ne11; row += nth) {
+    // 256-element boundaries preserve Q8_K blocks and Q8_2_X4 packing.
+    const int64_t grain = 256;
+    const int64_t ngrain_row = (ne10 + grain - 1) / grain;
+    const int64_t q_units = ne12 * ne11 * ngrain_row;
+    const int64_t q_u0 = q_units * ith / nth;
+    const int64_t q_u1 = q_units * (ith + 1) / nth;
+    for (int64_t u = q_u0; u < q_u1; ) {
+        const int64_t row = u / ngrain_row;
+        const int64_t gs = u - row * ngrain_row;
+        const int64_t ge = std::min(q_u1 - row * ngrain_row, ngrain_row);
+        const int64_t e0 = gs * grain;
+        const int64_t e1 = std::min(ge * grain, ne10);
         const int64_t i12 = row / ne11;
         const int64_t i11 = row % ne11;
         iqk_quantize_activation(
                 activation_type,
-                (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
-                qact + i12*nbw2 + i11*nbw1, ne10);
+                (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]) + e0,
+                qact + i12*nbw2 + i11*nbw1 + iqk_activation_row_size(activation_type, e0), e1 - e0);
+        u = row * ngrain_row + ge;
     }
     // 2) Zero inactive SER rows and build the valid per-expert row mapping.
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
