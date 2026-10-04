@@ -26,6 +26,7 @@ static __global__ void flash_attn_ext_vec(
         const char * sinks_ptr,
         const int  * KV_max_ptr,
         const uint8_t * KV_live_ptr,
+        const int2    * tile_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -50,6 +51,7 @@ static __global__ void flash_attn_ext_vec(
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     const uint8_t * GGML_CUDA_RESTRICT KV_live = KV_live_ptr;
+    GGML_UNUSED(tile_rows_ptr); // query tiles that follow sequences: WMMA only
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
@@ -578,7 +580,7 @@ static __global__ void flash_attn_ext_vec(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_live_ptr, tile_rows_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -679,6 +681,7 @@ static bool launch_flash_attn_ext_vec_fused_combine(ggml_backend_cuda_context & 
         sinks ? (const char *) sinks->data : nullptr,
         nullptr,
         KV_live.ptr,
+        nullptr,
         (float *) dst->data,
         (float2 *) scratch.ptr,
         scale, max_bias, m0, m1, n_head_log2, 0.0f,

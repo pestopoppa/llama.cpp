@@ -8582,10 +8582,11 @@ struct test_flash_attn_ext_unified : public test_case {
     const float logit_softcap;
     const ggml_type type_K;
     const ggml_type type_V;
-    const int64_t hint; // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
+    const int64_t hint;        // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
+    const int64_t first_group; // > 0: query rows of sequence 0, the other rows are split evenly; 0: all groups even
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint);
+        return VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, first_group);
     }
 
     double max_nmse_err() override {
@@ -8599,9 +8600,22 @@ struct test_flash_attn_ext_unified : public test_case {
 
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
-                                ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0)
+                                ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0, int64_t first_group = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
-          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint) {}
+          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), first_group(first_group) {}
+
+    // the query rows of sequence s are [group_start(s), group_start(s) + group_size(s))
+    int64_t group_start(int64_t s) const {
+        if (first_group > 0 && n_seq > 1) {
+            const int64_t g0   = std::min(first_group, nb);
+            const int64_t rest = (nb - g0 + n_seq - 2) / (n_seq - 1);
+            return s == 0 ? 0 : std::min(nb, g0 + (s - 1)*rest);
+        }
+        return std::min(nb, s*((nb + n_seq - 1) / n_seq));
+    }
+    int64_t group_size(int64_t s) const {
+        return (s == n_seq - 1 ? nb : group_start(s + 1)) - group_start(s);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
@@ -8664,12 +8678,14 @@ struct test_flash_attn_ext_unified : public test_case {
             std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
             std::vector<float> data(kv*nb);
-            const int64_t group = (nb + n_seq - 1) / n_seq;
             for (int64_t i = 0; i < nb; ++i) {
-                const int     s     = std::min<int64_t>(i / group, n_seq - 1);
-                const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
+                int s = 0;
+                while (s < n_seq - 1 && i >= group_start(s) + group_size(s)) {
+                    ++s;
+                }
+                const int64_t n_grp = group_size(s);
                 // the tokens of the batch are the last n_grp cells of their sequence
-                const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - group_start(s)));
                 for (int64_t c = 0; c < kv; ++c) {
                     const bool visible = owner[c] == s && pos[c] <= pos_q;
                     data[i*kv + c] = visible ? dis(gen) : -INFINITY;
@@ -11383,6 +11399,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     test_cases.emplace_back(new test_flash_attn_ext_unified(64, 64, 2, 4, 8192, 16, 16, 64, 512, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 16));
+    // several query rows per sequence (drafted verify, mixed batches; query tiles that follow the sequences)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
+        for (int64_t hs : {128, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 16384, 32, 4, 4096, 0, 0.0f, 0.0f, type_KV, type_KV, 4));
+            test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 25, 4, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV, 4, 1));
+            test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 11, 4, 300, 1792, 0.0f, 0.0f, type_KV, type_KV, 4, 8));
+            test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 12288, 75, 3, 2048, 2560, 0.0f, 0.0f, type_KV, type_KV, 3, 2));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 64, 16, 64, 512, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 16));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 512, 3, 2048, 2560, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 3, 3));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 600, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(80, 80, 4, 4, 8192, 24, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(576, 512, 1, 16, 8192, 4, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     // a hint that overstates the number of sequences must not change the result (8 rows of 2 sequences, hint 8)
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 8, 2, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 8));
 
