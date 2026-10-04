@@ -16,7 +16,7 @@
 // With the tuning on (default; GGML_CUDA_FA_CDNA_D256_TUNE=0 restores the upstream selection exactly):
 //   - ncols2 is the largest of 8/4/2 that divides the GQA ratio (GQA 6 -> 2: no wasted head slots,
 //     where upstream's ncols2 = 8 computes 8 head columns for 6 real heads);
-//   - a block never exceeds 32 columns (ncols1 <= 32/ncols2).
+//   - a block never exceeds GGML_CUDA_FA_CDNA_D256_MAX_COLS columns (16 by default, or 32; ncols1 <= cap/ncols2).
 // GGML_CUDA_FA_CDNA_D256_MMA_MIN_ROWS=n (n >= 3) additionally sends D=256 to MMA from n query rows on instead of
 // upstream's "rows * gqa_ratio_eff > 64" crossover (TILE below it). Unset/0 = upstream crossover. This knob is
 // independent of GGML_CUDA_FA_CDNA_D256_TUNE.
@@ -26,6 +26,18 @@ static bool ggml_cuda_fattn_cdna_d256_tune() {
         return !(e && atoi(e) == 0);
     }();
     return enabled;
+}
+
+// GGML_CUDA_FA_CDNA_D256_MAX_COLS = 16 (default) or 32: the column cap applied while the tuning is on.
+// With #28576's fp32 VKQ accumulators (ROCm 6.2, gfx90a) only the 16-column configs stay spill-free:
+// <256,256,8,2> 512 regs / 0 spills, while <256,256,16,2> spills 209 VGPRs (840 B) and <256,256,8,8> 215 (780 B).
+// Without #28576 (fp16 VKQ) <256,256,16,2> fits (499 regs, 0 spills), hence the knob.
+static int ggml_cuda_fattn_cdna_d256_max_cols() {
+    static const int max_cols = [] {
+        const char * e = getenv("GGML_CUDA_FA_CDNA_D256_MAX_COLS");
+        return e && atoi(e) >= 32 ? 32 : 16;
+    }();
+    return max_cols;
 }
 
 static int ggml_cuda_fattn_cdna_d256_mma_min_rows() {
@@ -96,6 +108,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    // CDNA D=256 with a 16-column cap: every block uses the 16-column config (GQA 6 -> <256,256,8,2>).
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 <= 16) {
+        if (amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune() && ggml_cuda_fattn_cdna_d256_max_cols() <= 16) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
