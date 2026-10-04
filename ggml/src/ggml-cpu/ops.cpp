@@ -9008,6 +9008,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // workspace-ec (2026-10-04): F16 V used to accumulate VKQ in FP16 (VKQ16 + ggml_vec_mad_f16). The
+    // un-normalized accumulator is sum_i exp(s_i - M) * v_i, which for diffuse attention is ~ the per-channel
+    // sum of V over the visible cells: 2048 cells x a same-sign channel of 32 already exceeds FP16_MAX (65504)
+    // -> inf -> NaN, and well below overflow FP16 rounding (ulp 32 at 32k) degrades the result. FP32
+    // accumulation (as the tiled path and every other V type already do) is the default now;
+    // GGML_FA_VKQ_F16=1 restores the legacy FP16 accumulator for bit-exact A/B and replay only.
+    static const bool fa_vkq_f16_legacy = [](){
+        const char * e = getenv("GGML_FA_VKQ_F16");
+        return e ? (atoi(e) != 0) : false;
+    }();
+    const bool vkq_f16 = v->type == GGML_TYPE_F16 && fa_vkq_f16_legacy;
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -9027,7 +9039,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        if (vkq_f16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -9076,7 +9088,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (vkq_f16) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -9105,7 +9117,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (v->type == GGML_TYPE_F16) {
+                    ggml_vec_mad_f32_f16(DV, VKQ32, (const ggml_fp16_t *) v_data, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -9117,7 +9131,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (vkq_f16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
