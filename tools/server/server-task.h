@@ -68,6 +68,9 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    bool slot_fork = true; // [KPF-11] allow a cross-slot prefix fork for this request (needs --slot-fork-min-tokens > 0)
+    std::vector<int32_t> checkpoint_at; // [KPF-15] pinned checkpoint positions (token counts, sorted, -1 = end of prompt)
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
@@ -287,6 +290,12 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+
+    // [KPF-16] cross-slot prefix fork - only included when the fork feature is enabled (fork_enabled)
+    bool        fork_enabled  = false;
+    int32_t     n_fork_tokens = 0;      // prompt tokens taken from the fork (0 = no fork); part of cache_n
+    int32_t     fork_src_slot = -1;
+    std::string fork_src_kind = "none"; // none | checkpoint | end | kv
 
     json to_json() const;
 };
@@ -544,6 +553,15 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // [KPF-16] only filled when the cross-slot prefix fork is enabled
+    bool     kv_stats                 = false;
+    int64_t  kv_cells_size            = 0;
+    int64_t  kv_cells_used            = 0; // unique cells
+    int64_t  kv_cells_shared          = 0;
+    int64_t  kv_cells_logical         = 0; // sum over slots of the cells each references
+    uint64_t n_slot_forks_total       = 0;
+    uint64_t n_slot_fork_tokens_total = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -674,6 +692,9 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+
+    // [KPF-11] the LCP of the entry load() would pick for this slot prompt, without loading it (-1 = none)
+    int best_lcp(const server_prompt & prompt, const server_tokens & tokens_new) const;
 
     void update();
 };
