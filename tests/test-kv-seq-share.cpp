@@ -10,7 +10,11 @@
 //   - fork == fresh: the forked sequence's suffix logits match a fresh decode of the same tokens
 //   - fork == copy: the same state restored by the classic full-state copy path
 //   - source invariance: the source's continuation is unchanged by the fork taken from it
-//   - purge safety: removing the source drops only its seq bit; the fork's continuation is unchanged
+//   - purge safety: removing the source drops only its seq bit; the fork's serialized state (its cells'
+//     positions and K/V bytes) is byte-identical before and after the purge, and its continuation keeps
+//     the same top-1 (logits are not compared bit-exactly there: the new token lands in a freed cell that
+//     precedes the suffix cells in memory, so the attention sum runs in a different order than the
+//     contiguous reference - a property of any fragmented unified pool, fork or not)
 //   - seq_keep over shared cells
 // Runs on any model; exact cell counts are asserted only where one token = one cell (no SWA).
 
@@ -235,7 +239,14 @@ static int run(const common_params & params, llama_model * model, uint32_t n_rs_
     // 8. purge the source (the server's prompt_clear / [TAG_IDLE_SLOT_CLEAR]): only its bit goes
     llama_memory_seq_rm(mem, 2, -1, -1);
     stats d0 = get_stats(ctx);
+    common_prompt_checkpoint st_before;
+    st_before.update_tgt(ctx, 1, LLAMA_STATE_SEQ_FLAGS_NONE);
     llama_memory_seq_rm(mem, 0, -1, -1);
+    common_prompt_checkpoint st_after;
+    st_after.update_tgt(ctx, 1, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const bool st_same = st_before.data_tgt == st_after.data_tgt;
+    fprintf(stderr, "  %-34s %zu bytes, identical = %s\n", "fork state across src purge", st_after.data_tgt.size(), st_same ? "yes" : "no");
+    CHECK(st_same, "the purge of the source changed the fork's serialized state");
     stats d = get_stats(ctx);
     print_stats("source purged", d);
     check_invariant("source purged", d);
@@ -252,7 +263,7 @@ static int run(const common_params & params, llama_model * model, uint32_t n_rs_
     const auto l_after = last_logits(ctx, n_vocab);
     CHECK(decode_range(ref, dst_tok, p + S, p + S + 1, 0), "ref continuation");
     const auto l_after_ref = last_logits(ref, n_vocab);
-    compare("fork continuation after src purge", l_after, l_after_ref, 1e-3f);
+    compare("fork continuation after src purge", l_after, l_after_ref, INFINITY); // top-1 only, see header
 
     // 9. seq_keep over shared cells: fork seq 3 from seq 1, keep only seq 1
     CHECK(llama_memory_seq_cp_ext(mem, 1, 3, 0, p, LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY), "second share");
