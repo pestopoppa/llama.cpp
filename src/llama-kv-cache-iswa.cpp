@@ -124,6 +124,20 @@ void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+// [KPF-12] share only the full-attention (base) cells; the SWA window is the PARTIAL_ONLY state and is
+// restored into dst from a checkpoint by the caller
+bool llama_kv_cache_iswa::seq_cp_attn(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    return kv_base->seq_cp_attn(seq_id_src, seq_id_dst, p0, p1);
+}
+
+// [KPF-16] both pools are KV cells; report them summed
+bool llama_kv_cache_iswa::cell_stats(int64_t & n_size, int64_t & n_used, int64_t & n_shared,
+                                     int32_t n_seq, int64_t * seq_private, int64_t * seq_shared) const {
+    bool res = kv_base->cell_stats(n_size, n_used, n_shared, n_seq, seq_private, seq_shared);
+    res = kv_swa->cell_stats(n_size, n_used, n_shared, n_seq, seq_private, seq_shared) && res;
+    return res;
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);
