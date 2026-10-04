@@ -2233,6 +2233,75 @@ static void mul_mat_vec_q_switch_type(
 }
 
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+// The q8_1 buffers of graph-cached MMVQ nodes are baked into the captured graph (the quantize node writes them, every
+// reusing MMVQ node reads them), so they must stay allocated for as long as any graph instance of the context can be
+// launched. They used to be held as ggml_cuda_pool_alloc's from the shared ctx.pool() until the next capture. With the
+// legacy pool (no VMM: best-fit, whole-buffer, 256 slots, never shrinks) a batch-1 capture's ~250 small holds took
+// every free pool buffer, including the large cuBLAS dequant buffers, so each later prefill cudaMalloc'd a fresh set
+// and VRAM grew per decode/prefill cycle (KVU-16h). The legacy pool can also cudaFree a released buffer (slot overflow,
+// OOM-retry clear_pool), which would leave a captured graph pointing at freed memory.
+//
+// The cache therefore carves its buffers out of a private per-context device arena: exact-size (256-byte aligned)
+// slices of a few large chunks, rewound (not freed) at each new capture and released only when the context is
+// destroyed. The arena never touches ctx.pool(), its footprint is bounded by the largest single capture's q8_1 demand
+// (~2-3 MiB for a 27B dense model), and every address a graph instance was captured with stays allocated memory.
+// Kernels, launch order and q8_1 contents are unchanged; only the buffer addresses differ.
+struct mmvq_q8_1_graph_arena {
+    static constexpr size_t ALIGN     = 256;
+    static constexpr size_t MIN_CHUNK = 4u << 20; // 4 MiB
+
+    struct chunk {
+        char * ptr  = nullptr;
+        size_t size = 0;
+    };
+
+    int                device = -1;
+    std::vector<chunk> chunks;
+    size_t             ichunk = 0; // chunk the bump pointer is in
+    size_t             offset = 0; // bump pointer within chunks[ichunk]
+
+    // Start handing out slices from the beginning again. Called when a new capture starts: the previous capture's
+    // graph instances keep these addresses, but every graph re-quantizes into its slice before reading it and all
+    // cached work runs on stream 0, so stream order serializes any two graphs sharing a slice.
+    void rewind() {
+        ichunk = 0;
+        offset = 0;
+    }
+
+    void * alloc(const size_t size_req) {
+        const size_t size = GGML_PAD(size_req, ALIGN);
+        while (ichunk < chunks.size()) {
+            const chunk & c = chunks[ichunk];
+            if (offset + size <= c.size) {
+                void * ptr = c.ptr + offset;
+                offset += size;
+                return ptr;
+            }
+            ++ichunk;
+            offset = 0;
+        }
+        chunk c;
+        c.size = std::max(size, MIN_CHUNK);
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc((void **) &c.ptr, c.size));
+        chunks.push_back(c);
+        ichunk = chunks.size() - 1;
+        offset = size;
+        return c.ptr;
+    }
+
+    void release() {
+        if (!chunks.empty()) {
+            ggml_cuda_set_device(device);
+            for (const chunk & c : chunks) {
+                CUDA_CHECK(cudaFree(c.ptr));
+            }
+        }
+        chunks.clear();
+        rewind();
+    }
+};
+
 struct mmvq_q8_1_graph_cache_entry {
     const ggml_tensor * src1 = nullptr;
     ggml_type type = GGML_TYPE_COUNT;
@@ -2240,21 +2309,20 @@ struct mmvq_q8_1_graph_cache_entry {
     size_t nb[GGML_MAX_DIMS] = {};
     int64_t ne10_padded = 0;
     size_t q8_1_size = 0;
-    std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1;
+    void * q8_1 = nullptr; // slice of the owning cache's arena
 };
 
 struct mmvq_q8_1_graph_cache {
     ggml_backend_cuda_context * ctx = nullptr;
-    ggml_cuda_pool * pool = nullptr;
     unsigned long long capture_id = 0;
     std::vector<mmvq_q8_1_graph_cache_entry> entries;
+    mmvq_q8_1_graph_arena arena; // outlives clear(): freed only by ggml_cuda_mmvq_q8_1_graph_cache_clear
 
+    // Forget the entries of the previous capture and rewind the arena. Frees no device memory.
     void clear() {
-        while (!entries.empty()) {
-            entries.pop_back();
-        }
+        entries.clear();
+        arena.rewind();
         ctx = nullptr;
-        pool = nullptr;
         capture_id = 0;
     }
 };
@@ -2266,11 +2334,13 @@ struct mmvq_q8_1_graph_cache_registry {
 
 static mmvq_q8_1_graph_cache_registry q8_1_graph_cache_registry;
 
+// Called from ~ggml_backend_cuda_context: drops the context's cache and frees its arena.
 void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx) {
     std::lock_guard<std::mutex> lock(q8_1_graph_cache_registry.mutex);
     const auto it = q8_1_graph_cache_registry.caches.find(ctx);
     if (it != q8_1_graph_cache_registry.caches.end()) {
         it->second->clear();
+        it->second->arena.release();
         q8_1_graph_cache_registry.caches.erase(it);
     }
 }
@@ -2392,22 +2462,16 @@ void ggml_cuda_mul_mat_vec_q(
             cache_ptr = std::make_unique<mmvq_q8_1_graph_cache>();
         }
         mmvq_q8_1_graph_cache & cache = *cache_ptr;
-        ggml_cuda_pool * const pool = &ctx.pool();
-        if (cache.ctx != &ctx || cache.pool != pool) {
+        if (cache.ctx != &ctx || cache.capture_id != capture_id) {
             cache.clear();
             cache.ctx = &ctx;
-            cache.pool = pool;
             cache.capture_id = capture_id;
-        } else if (cache.capture_id != capture_id) {
-            cache.clear();
-            cache.ctx = &ctx;
-            cache.pool = pool;
-            cache.capture_id = capture_id;
+            cache.arena.device = ctx.device;
         }
 
         for (const mmvq_q8_1_graph_cache_entry & entry : cache.entries) {
             if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, src1_q8_1_size)) {
-                src1_q8_1 = entry.q8_1->get();
+                src1_q8_1 = entry.q8_1;
                 reuse_src1_q8_1 = true;
                 break;
             }
@@ -2424,8 +2488,8 @@ void ggml_cuda_mul_mat_vec_q(
             }
             entry.ne10_padded = ne10_padded;
             entry.q8_1_size = src1_q8_1_size;
-            entry.q8_1 = std::make_unique<ggml_cuda_pool_alloc<char>>(*pool, src1_q8_1_size);
-            src1_q8_1 = entry.q8_1->get();
+            entry.q8_1 = cache.arena.alloc(src1_q8_1_size);
+            src1_q8_1 = entry.q8_1;
         }
     }
 #endif
