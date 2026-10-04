@@ -319,6 +319,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
+    // the unroped q/k for Dual Chunk Attention (it ropes them itself)
+    ggml_tensor * Qraw = Qcur;
+    ggml_tensor * Kraw = Kcur;
+
     // Apply IMRoPE
     Qcur = ggml_rope_multi(
             ctx0, Qcur, inp_pos, nullptr,
@@ -339,9 +343,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (cparams.dca_chunk_size > 0) {
+        cur = build_attn_dca(inp,
+                    nullptr, nullptr, nullptr,
+                    Qraw, Kraw, Vcur, n_rot, sections, kq_scale, il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

@@ -471,6 +471,9 @@ struct common_params {
     float   yarn_beta_fast        = -1.0f; // YaRN low correction dim
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
+    int32_t dca_chunk_size        =     0; // Dual Chunk Attention chunk size (0 = off)
+    int32_t dca_local_size        =     0; // Dual Chunk Attention local window
+    int32_t dca_orig_ctx          =     0; // Dual Chunk Attention temperature base (0 = none)
     int32_t moe_spec_budget       =     0; // MoE-Spec (arXiv:2602.16052): top-B per-batch expert shortlist (0 = off)
     int32_t moe_spec_min_batch    =     4; // min n_tokens to trigger MoE-Spec budgeting
 
