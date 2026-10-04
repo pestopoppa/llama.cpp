@@ -98,10 +98,16 @@ static __global__ void flash_attn_ext_f16(
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const float * Q_f    = (const float *) (Q    + nb03* sequence         + nb02* head              + nb01*ic0);
-    const half  * K_h    = (const half  *) (K    + nb13* sequence         + nb12*(head / gqa_ratio));
-    const half  * V_h    = (const half  *) (V    + nb13* sequence         + nb12*(head / gqa_ratio)); // K and V have same shape
-    const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33)                           + nb31*ic0);
+    // FA-INT64-OFFSET: the strides are int32 kernel arguments, so the products are formed in 64 bit.
+    // nb31*ic0 (mask row bytes = 2*n_kv, times the first Q column of the block) passes 2^31 once
+    // n_kv > ~526K at -ub 2048 (n_kv > ~1.05M at -ub 1024) and the block then reads the mask from a
+    // wrapped, negative offset (ggml-org/llama.cpp#27090: silent exit at ~520K prefill). nb12 is the
+    // head stride of the f16-converted K/V (n_kv*D*2 bytes): nb12*(head/gqa_ratio) wraps at
+    // n_kv*D*2*(n_head_kv - 1) >= 2^31. Below those sizes the 64-bit values equal the 32-bit ones.
+    const float * Q_f    = (const float *) (Q    + nb03* sequence         + int64_t(nb02)*head            + int64_t(nb01)*ic0);
+    const half  * K_h    = (const half  *) (K    + nb13* sequence         + int64_t(nb12)*(head / gqa_ratio));
+    const half  * V_h    = (const half  *) (V    + nb13* sequence         + int64_t(nb12)*(head / gqa_ratio)); // K and V have same shape
+    const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33)                                  + int64_t(nb31)*ic0);
     const half2 * mask2  = (const half2 *)  maskh;
     const float * sinksf = (const float *) sinks;
 
@@ -301,7 +307,9 @@ static __global__ void flash_attn_ext_f16(
                 for (int k0 = 0; k0 < FATTN_KQ_STRIDE/2; k0 += warp_size) {
                     const int k = k0 + threadIdx.x;
 
-                    KQ2_tmp[k0/warp_size] += mask && ic0 + j < int(ne01.z) ? slope2*mask2[(j*ne11 + k_VKQ_0)/2 + k] : make_half2(0.0f, 0.0f);
+                    // FA-INT64-OFFSET: the mask row stride is nb31 (as in the f32 path above), not ne11;
+                    // identical whenever the mask is n_kv wide, which is every llama.cpp KQ mask
+                    KQ2_tmp[k0/warp_size] += mask && ic0 + j < int(ne01.z) ? slope2*mask2[j*(nb31/int(sizeof(half2))) + k_VKQ_0/2 + k] : make_half2(0.0f, 0.0f);
                     KQ_max_new = ggml_cuda_hmax2(KQ_max_new, KQ2_tmp[k0/warp_size]);
                 }
                 KQ_max_new = __half2half2(warp_reduce_max<warp_size>(ggml_cuda_hmax(__low2half(KQ_max_new), __high2half(KQ_max_new))));
