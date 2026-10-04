@@ -11413,6 +11413,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 600, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4, 2));
     test_cases.emplace_back(new test_flash_attn_ext_unified(80, 80, 4, 4, 8192, 24, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     test_cases.emplace_back(new test_flash_attn_ext_unified(576, 512, 1, 16, 8192, 4, 4, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
+    // drafted verify of 4 sequences with 9 rows each (1 + 8 drafted tokens): sequence tiles that start inside a tile
+    // window and wrap around it, also with ALiBi, softcap, and 3 sequences of [5, 20, 20] rows in 32-wide tiles;
+    // and cells interleaved in 64-cell runs, where the sequences share their blocks and the plain tiling is kept
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {128, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 36, 4, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV, 4));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 36, 4, 1024, 1024, 8.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 36, 4, 1024, 1024, 0.0f, 10.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 6, 12288, 45, 3, 2048, 2560, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 3, 5));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 6, 8192, 36, 4, 64, 512, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     // a hint that overstates the number of sequences must not change the result (8 rows of 2 sequences, hint 8)
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 8, 2, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 8));
 

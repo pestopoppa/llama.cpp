@@ -1045,15 +1045,21 @@ static bool ggml_cuda_fattn_mask_skip_enabled(const ggml_tensor * Q, const ggml_
 // (ggml_flash_attn_ext_get_n_seq). Two layouts use it:
 //   - every query row is a different sequence (batched decode): the vec kernel with one query row per block, so that
 //     each row iterates only over the KV blocks of its own sequence (ggml_cuda_fattn_rows_are_seqs);
-//   - several rows per sequence (drafted verify, mixed prefill/decode): query tiles that never span two sequences,
-//     built on the device from the per-row liveness (flash_attn_plan_seq_tiles, WMMA kernel).
-// Neither changes the result of a query row: a row is computed from its own Q, mask row and the same KV partition
-// (parallel_blocks is chosen from the unsegmented tiling), and the KV blocks it skips contribute exactly nothing.
-
+//   - several rows per sequence (drafted verify, mixed prefill/decode): WMMA query tiles that never span two
+//     sequences, planned on the device from the per-row liveness (flash_attn_plan_seq_tiles), and used only where they
+//     iterate over clearly fewer live KV blocks than the plain tiling.
+// The WMMA sequence tiles do not change the result of a query row: the row is computed in the same tile column (hence
+// by the same code), from its own Q and mask row, over the same KV partition (parallel_blocks is chosen from the plain
+// tiling), and the KV blocks it skips contribute exactly nothing. The vec routing is a different kernel for those
+// batches (checked against the CPU reference, not bit-identical to the WMMA result).
+//
 // Switches (read once, A/B and debugging):
-//   GGML_CUDA_FA_SEQ_ROWS=0   both layouts off (== KVU-19a);
-//   GGML_CUDA_FA_SEQ_VEC=0    the vec routing off;
-//   GGML_CUDA_FA_SEQ_TILES=0  the WMMA sequence tiles off.
+//   GGML_CUDA_FA_SEQ_ROWS=0              both layouts off (== KVU-19a);
+//   GGML_CUDA_FA_SEQ_VEC=0               the vec routing off;
+//   GGML_CUDA_FA_SEQ_TILES=0             the WMMA sequence tiles off;
+//   GGML_CUDA_FA_SEQ_TILES_MIN_GAIN=<p>  per-sequence tiles must save at least p% of the live KV blocks (default 20);
+//                                        -1 plans every batch with the hint and uses the planned tiles whenever they
+//                                        fit (testing: exercises the sequence tiles on every multi-sequence batch).
 
 static bool ggml_cuda_fattn_env_flag(const char * name) {
     const char * env = getenv(name);
@@ -1078,6 +1084,18 @@ static bool ggml_cuda_fattn_seq_tiles_enabled() {
     return enabled;
 }
 
+// Minimum share of the live KV blocks of the plain tiling, in percent, that per-sequence tiles must save to be used.
+// Per-sequence tiles are not free at equal work (more, smaller blocks: an aligned 4x8 verify ran 14-25% slower on the
+// MI210 with the same number of live blocks), so they are used only where they clearly save work.
+static int ggml_cuda_fattn_seq_tiles_min_gain() {
+    static const int min_gain = [] {
+        const char * env = getenv("GGML_CUDA_FA_SEQ_TILES_MIN_GAIN");
+        const int v = env ? atoi(env) : 20;
+        return v < 0 ? -1 : (v > 100 ? 100 : v);
+    }();
+    return min_gain;
+}
+
 // Whether the query rows of this call are all different sequences of one unified KV stream, and the KV is long enough
 // for the masked KV skip to matter.
 static bool ggml_cuda_fattn_rows_are_seqs(const ggml_tensor * dst) {
@@ -1092,17 +1110,47 @@ static bool ggml_cuda_fattn_rows_are_seqs(const ggml_tensor * dst) {
 // prompt processing, where at most a few tiles span a sequence boundary.
 #define FATTN_SEQ_TILES_MAX_ROWS 512
 
+// Whether per-sequence query tiles of width ncols1 can iterate over fewer live KV blocks than the plain tiling, from
+// the shapes alone (the row -> sequence map is device data). Sequences hold disjoint cells except where their cells
+// interleave, so splitting a plain tile at sequence boundaries never saves work by itself: a saving needs a sequence
+// whose rows the plain tiling cuts into more tiles than it needs. That cannot happen when every row is its own
+// sequence, nor for n_seq equal groups of g contiguous rows when g divides ncols1 or ncols1 divides g (e.g. an aligned
+// 4x8 drafted verify in 16-wide tiles). Those batches keep the plain tiling with no planning at all; the others are
+// planned, and the planner falls back to the plain tiling when the saving is too small.
+static bool ggml_cuda_fattn_seq_tiles_may_help(const int64_t n_rows, const int64_t n_seq, const int ncols1) {
+    if (n_seq < 2 || n_rows < 2 || n_rows > FATTN_SEQ_TILES_MAX_ROWS) {
+        return false;
+    }
+    if (ggml_cuda_fattn_seq_tiles_min_gain() < 0) {
+        return true; // forced (testing)
+    }
+    if (n_rows <= n_seq) {
+        return false;
+    }
+    if (n_rows % n_seq == 0) {
+        const int64_t g = n_rows / n_seq;
+        if (ncols1 % g == 0 || g % ncols1 == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Planning, one block of 1024 threads:
 //   1. per query row r: the number of live KV blocks, and the number of KV blocks live for both r and r-1;
 //   2. row r starts a new segment if r and r-1 share less than half of the live blocks of the smaller of the two
 //      (rows of one sequence share all but at most a block, rows of different sequences share only the blocks in
 //      which their cells interleave); rows without live blocks never start a segment;
 //   3. each segment is cut into tiles of at most ncols1 rows. tile_rows[t] = (first row, number of rows); slots past
-//      the last tile have 0 rows. If the tiles do not fit into n_slots, the plain tiling (t*ncols1, ncols1) is used.
+//      the last tile have 0 rows;
+//   4. cost check: the planned tiles are used only if they iterate over at most (100 - min_gain)% of the (tile, live
+//      KV block) pairs of the plain tiling (min_gain < 0: always, testing). Otherwise, and if the tiles do not fit
+//      into n_slots, tile_rows holds the plain tiling (t*ncols1, ncols1), which the kernels compute exactly as
+//      without tile_rows.
 __launch_bounds__(1024, 1)
 static __global__ void flash_attn_plan_seq_tiles(
         const uint8_t * __restrict__ KV_live_rows, int2 * __restrict__ tile_rows,
-        const int n_rows, const int n_kv_blocks, const int ncols1, const int n_slots) {
+        const int n_rows, const int n_kv_blocks, const int ncols1, const int n_slots, const int min_gain) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = 1024/warp_size;
 
@@ -1110,9 +1158,14 @@ static __global__ void flash_attn_plan_seq_tiles(
     __shared__ int  both[FATTN_SEQ_TILES_MAX_ROWS];
     __shared__ int2 tiles[FATTN_SEQ_TILES_MAX_ROWS];
     __shared__ int  n_tiles;
+    __shared__ int  cost[2]; // live (tile, KV block) pairs: [0] planned tiles, [1] plain tiling
 
     const int warp = threadIdx.x / warp_size;
     const int lane = threadIdx.x % warp_size;
+
+    if (threadIdx.x < 2) {
+        cost[threadIdx.x] = 0;
+    }
 
     for (int r = warp; r < n_rows; r += nwarps) {
         const uint8_t * cur  = KV_live_rows + int64_t(r)*n_kv_blocks;
@@ -1159,9 +1212,35 @@ static __global__ void flash_attn_plan_seq_tiles(
     }
     __syncthreads();
 
+    // Cost of both tilings: one warp per tile, lanes over the KV blocks, OR over the rows of the tile.
+    bool use_plan = n_tiles >= 0 && min_gain < 0;
+    if (n_tiles >= 0 && min_gain >= 0) {
+        const int ntiles_plain = (n_rows + ncols1 - 1) / ncols1;
+        for (int t = warp; t < n_tiles + ntiles_plain; t += nwarps) {
+            const int2 tr = t < n_tiles ? tiles[t] : make_int2((t - n_tiles)*ncols1, min(ncols1, n_rows - (t - n_tiles)*ncols1));
+            int c = 0;
+            for (int kb = lane; kb < n_kv_blocks; kb += warp_size) {
+                int live = 0;
+                for (int r = tr.x; r < tr.x + tr.y && !live; ++r) {
+                    live = KV_live_rows[int64_t(r)*n_kv_blocks + kb];
+                }
+                c += live != 0;
+            }
+#pragma unroll
+            for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+                c += __shfl_xor_sync(0xFFFFFFFF, c, offset, warp_size);
+            }
+            if (lane == 0) {
+                atomicAdd(&cost[t < n_tiles ? 0 : 1], c);
+            }
+        }
+        __syncthreads();
+        use_plan = int64_t(cost[0])*100 <= int64_t(cost[1])*(100 - min_gain) && cost[0] < cost[1];
+    }
+
     for (int t = threadIdx.x; t < n_slots; t += blockDim.x) {
         int2 tr = make_int2(0, 0);
-        if (n_tiles >= 0) {
+        if (use_plan) {
             if (t < n_tiles) {
                 tr = tiles[t];
             }
@@ -1520,10 +1599,11 @@ void launch_fattn(
         const int n_seq       = ggml_flash_attn_ext_get_n_seq(KQV);
 
         if (seq_tiles_supported && !stream_k && ncols2 == 1 && ncols1 > 1 && ggml_cuda_fattn_seq_tiles_enabled() &&
-                Q->ne[3] == 1 && n_seq > 1 && Q->ne[1] > 1 && Q->ne[1] <= FATTN_SEQ_TILES_MAX_ROWS) {
+                Q->ne[3] == 1 && ggml_cuda_fattn_seq_tiles_may_help(Q->ne[1], n_seq, ncols1)) {
             // Query tiles that do not span two sequences: per-row scan, plan on the device, OR of the rows of each tile.
             // Each sequence adds at most one partial tile, so ntiles_x_plain + n_seq - 1 slots always suffice when the
-            // rows of each sequence are contiguous (the planner falls back to the plain tiling otherwise).
+            // rows of each sequence are contiguous (the planner falls back to the plain tiling otherwise, and when the
+            // per-sequence tiles do not save enough live KV blocks). The grid depends on the shapes only.
             ntiles_x_grid = (int) std::min<int64_t>(ntiles_x_plain + n_seq - 1, Q->ne[1]);
 
             KV_live_rows.alloc(size_t(Q->ne[1])*n_kv_blocks);
@@ -1531,7 +1611,8 @@ void launch_fattn(
 
             tile_rows.alloc(ntiles_x_grid);
             flash_attn_plan_seq_tiles<<<1, 1024, 0, main_stream>>>(
-                KV_live_rows.ptr, tile_rows.ptr, int(Q->ne[1]), n_kv_blocks, ncols1, ntiles_x_grid);
+                KV_live_rows.ptr, tile_rows.ptr, int(Q->ne[1]), n_kv_blocks, ncols1, ntiles_x_grid,
+                ggml_cuda_fattn_seq_tiles_min_gain());
             CUDA_CHECK(cudaGetLastError());
 
             KV_live.alloc(size_t(ntiles_x_grid)*n_kv_blocks);
