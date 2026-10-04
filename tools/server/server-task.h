@@ -70,6 +70,8 @@ struct task_params {
 
     bool slot_fork = true; // [KPF-11] allow a cross-slot prefix fork for this request (needs --slot-fork-min-tokens > 0)
     std::vector<int32_t> checkpoint_at; // [KPF-15] pinned checkpoint positions (token counts, sorted, -1 = end of prompt)
+    std::vector<std::pair<int32_t, bool>> checkpoint_at_msg; // [P2] (message index, at_end) - resolved to token
+                                                             // positions against message_spans when the task is built
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
@@ -296,6 +298,8 @@ struct result_timings {
     int32_t     n_fork_tokens = 0;      // prompt tokens taken from the fork (0 = no fork); part of cache_n
     int32_t     fork_src_slot = -1;
     std::string fork_src_kind = "none"; // none | checkpoint | end | kv
+    int32_t     id_slot       = -1;     // [P2] the slot that served the request
+    int32_t     id_task       = -1;     // [P2] the task id /slots shows as id_task for that slot
 
     json to_json() const;
 };
