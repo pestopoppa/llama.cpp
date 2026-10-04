@@ -119,8 +119,15 @@ static __global__ void flash_attn_ext_f16(
         row_end  = col_wrap + tile.y;
     }
     // Row of column j relative to ic0 (in [col_wrap, col_wrap + ncols)); the column is padding if it is >= row_end:
+    // j = j0 + threadIdx.y is uniform within a warp: on HIP keep the result in a scalar register, otherwise the row
+    // offsets of the ncols/nwarps columns of a warp stay live in vector registers through the KV loop and cost
+    // occupancy (D=128: 168 -> 172 VGPRs, 3 -> 2 blocks per CU, and a different parallel_blocks).
     const auto col_row = [col_wrap](const int j) -> int {
+#if defined(GGML_USE_HIP)
+        return __builtin_amdgcn_readfirstlane(j < col_wrap ? j + ncols : j);
+#else
         return j < col_wrap ? j + ncols : j;
+#endif // defined(GGML_USE_HIP)
     };
 
     const int sequence = blockIdx.z / ne02;
