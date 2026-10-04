@@ -1360,7 +1360,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         prev_inp[n_layers + 1] = res->get_logits();
         res->reset();
-        if (model.fused_decode(ubatch, mctx, res, cparams.n_threads, prev_inp.data())) {
+        if (model.fused_decode(ubatch, mctx, res, cparams, prev_inp.data())) {
+            n_fused_decode++;
             ret = GGML_STATUS_SUCCESS;
             return res;
         }
@@ -4139,6 +4140,10 @@ struct ggml_cgraph * llama_graph_reserve(
         mctx = memory->init_full();
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+}
+
+int64_t llama_n_fused_decode(const struct llama_context * ctx) {
+    return ctx->get_n_fused_decode();
 }
 
 // llama adapter API

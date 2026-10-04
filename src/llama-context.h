@@ -253,6 +253,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    int64_t get_n_fused_decode() const { return n_fused_decode; }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -391,4 +393,5 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    mutable int64_t n_fused_decode = 0; // number of ubatches served by model.fused_decode (no graph)
 };
