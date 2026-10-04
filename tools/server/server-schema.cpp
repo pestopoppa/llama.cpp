@@ -2,6 +2,8 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <algorithm>
+
 namespace server_schema {
 
 //
@@ -75,6 +77,37 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("n_cache_reuse", params.n_cache_reuse))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
+
+    // [KPF-11] per-request opt-out of the cross-slot prefix fork (only meaningful with --slot-fork-min-tokens > 0)
+    add((new field_bool("slot_fork", params.slot_fork))
+        ->set_desc("Allow this request to start from a zero-copy fork of another slot's shared prefix (see --slot-fork-min-tokens). Default: true"));
+
+    // [KPF-15] explicit junction checkpoints
+    add((new field_json("checkpoint_at"))
+        ->set_desc("Array of prompt token counts at which to create a pinned context checkpoint (state after that many prompt tokens). -1 = end of prompt. Only used on memories that need checkpoints (recurrent/hybrid or SWA). At most 8 entries")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const json & v = data.at("checkpoint_at");
+            if (!v.is_array()) {
+                throw std::runtime_error("must be an array of integers (token counts, -1 = end of prompt)");
+            }
+            if (v.size() > 8) {
+                throw std::runtime_error("at most 8 positions are allowed");
+            }
+            std::vector<int32_t> out;
+            for (const auto & e : v) {
+                if (!e.is_number_integer()) {
+                    throw std::runtime_error("must be an array of integers (token counts, -1 = end of prompt)");
+                }
+                const int64_t x = e.get<int64_t>();
+                if (x < -1 || x == 0 || x > INT32_MAX) {
+                    throw std::runtime_error("each position must be -1 or a positive token count");
+                }
+                out.push_back((int32_t) x);
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            ctx.params.checkpoint_at = std::move(out);
+        }));
 
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
