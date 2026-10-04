@@ -1599,6 +1599,11 @@ void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_s
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool common_context_seq_cp_attn(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    return llama_memory_seq_cp_ext(mem, seq_id_src, seq_id_dst, p0, p1, LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY);
+}
+
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
@@ -2149,6 +2154,8 @@ bool common_prompt_checkpoint::empty() const {
 
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
+
+    pinned = false;
 
     pos_min = 0;
     pos_max = 0;

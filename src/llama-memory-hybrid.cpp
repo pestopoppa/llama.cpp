@@ -154,6 +154,18 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+// [KPF-12] attention half only. The recurrent half is never aliased: llama_memory_recurrent::seq_cp would make
+// dst share src's CURRENT tail cell (it ignores p0/p1), so the caller restores dst's recurrent state from a
+// checkpoint instead (state_read into dst allocates dst's own cell, see llama_memory_recurrent::state_read_meta)
+bool llama_memory_hybrid::seq_cp_attn(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    return mem_attn->seq_cp_attn(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid::cell_stats(int64_t & n_size, int64_t & n_used, int64_t & n_shared,
+                                     int32_t n_seq, int64_t * seq_private, int64_t * seq_shared) const {
+    return mem_attn->cell_stats(n_size, n_used, n_shared, n_seq, seq_private, seq_shared);
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);
