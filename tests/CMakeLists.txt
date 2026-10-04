@@ -256,6 +256,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # [KPF-17] cross-slot prefix fork on a generated GDN hybrid (attention share + recurrent restore)
+    llama_test(
+        test-kv-seq-share
+        NAME test-kv-seq-share-qwen35
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-kv-seq-share-qwen35 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -357,6 +368,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# [KPF-17] cross-slot prefix fork: shared attention cells (the generated hybrid case is registered below)
+llama_build_and_test(test-kv-seq-share.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-kv-seq-share PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
