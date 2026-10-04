@@ -109,6 +109,19 @@ struct llama_memory_i {
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+    // [KPF-12] attention-only zero-copy share; see llama_memory_seq_cp_ext / LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY.
+    // Default: unsupported (returns false, changes nothing).
+    virtual bool seq_cp_attn(llama_seq_id /*seq_id_src*/, llama_seq_id /*seq_id_dst*/, llama_pos /*p0*/, llama_pos /*p1*/) {
+        return false;
+    }
+
+    // [KPF-16] attention-cell accounting; see llama_memory_get_cell_stats. ACCUMULATES into the outputs
+    // (the caller zeroes them). Default: unsupported (returns false).
+    virtual bool cell_stats(int64_t & /*n_size*/, int64_t & /*n_used*/, int64_t & /*n_shared*/,
+                            int32_t /*n_seq*/, int64_t * /*seq_private*/, int64_t * /*seq_shared*/) const {
+        return false;
+    }
+
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
