@@ -517,6 +517,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         !(GGML_CUDA_CC_IS_AMD(cc) && (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16));
 
+    // A batch whose query rows are all different sequences of a unified KV cache (batched decode with --kv-unified):
+    // the vector kernel with one query row per block iterates only over the KV blocks of each row's own sequence.
+    // The kernels for large batches would iterate over the union of the cells of all sequences in each query tile.
+    if (can_use_vector_kernel && ggml_cuda_fattn_rows_are_seqs(dst)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {

@@ -701,7 +701,9 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
-        if (cc == GGML_CUDA_CC_CDNA2 && Q->ne[1] == 1 && Q->ne[3] == 1 &&
+        // One query row per block: decode, or a batch in which every row is a different sequence (see
+        // ggml_cuda_fattn_rows_are_seqs, the block grid has one block row per query row either way):
+        if (cc == GGML_CUDA_CC_CDNA2 && (Q->ne[1] == 1 || ggml_cuda_fattn_rows_are_seqs(dst)) && Q->ne[3] == 1 &&
             K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
             launch_flash_attn_ext_vec_fused_combine(ctx, dst)) {
             return;
@@ -726,7 +728,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    // One query row per block for decode, and for batches in which every query row is a different sequence of a
+    // unified KV cache: each row then iterates only over the KV blocks of its own sequence.
+    if (Q->ne[1] == 1 || ggml_cuda_fattn_rows_are_seqs(dst)) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;

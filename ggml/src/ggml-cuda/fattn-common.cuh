@@ -1008,20 +1008,59 @@ static bool ggml_cuda_fattn_convert_live(
     return true;
 }
 
-// Whether to scan the mask for dead KV blocks. GGML_CUDA_FA_MASK_SKIP=0 disables the skip (A/B and debugging),
-// GGML_CUDA_FA_MASK_SKIP_MIN_KV sets the smallest KV length for which the extra scan launch is worth its overhead.
+// Smallest KV length for which the masked KV block skip (and the per-sequence layouts built on it) are used:
+// below it the extra scan launch is not worth its overhead. GGML_CUDA_FA_MASK_SKIP_MIN_KV overrides the default.
+static int64_t ggml_cuda_fattn_mask_skip_min_kv() {
+    static const int64_t min_kv = [] {
+        const char * env = getenv("GGML_CUDA_FA_MASK_SKIP_MIN_KV");
+        return env ? (int64_t) atoll(env) : (int64_t) 4096;
+    }();
+    return min_kv;
+}
+
+// Whether the mask of this FlashAttention call can be scanned for dead KV blocks (shape and alignment only).
+static bool ggml_cuda_fattn_mask_skip_possible(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * mask) {
+    return mask && mask->type == GGML_TYPE_F16 &&
+        K->ne[1] >= ggml_cuda_fattn_mask_skip_min_kv() && K->ne[1] % FATTN_KQ_STRIDE == 0 && mask->ne[0] >= K->ne[1] &&
+        mask->ne[2] == 1 && mask->ne[1] >= Q->ne[1] && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0 &&
+        uintptr_t(mask->data) % 16 == 0;
+}
+
+// Whether to scan the mask for dead KV blocks. GGML_CUDA_FA_MASK_SKIP=0 disables the skip (A/B and debugging).
 static bool ggml_cuda_fattn_mask_skip_enabled(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * mask) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FA_MASK_SKIP");
         return env == nullptr || atoi(env) != 0;
     }();
-    static const int64_t min_kv = [] {
-        const char * env = getenv("GGML_CUDA_FA_MASK_SKIP_MIN_KV");
-        return env ? (int64_t) atoll(env) : (int64_t) 4096;
+    return enabled && ggml_cuda_fattn_mask_skip_possible(Q, K, mask);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Per-sequence KV iteration for batches in which every query row is a different sequence of a unified KV cache.
+//
+// The KV_live flags above are per query TILE. When the query rows of one tile belong to different sequences (batched
+// decode of several sequences in one ubatch), the live set of the tile is the union of their cells and nothing is
+// skipped. The graph tells the backend how many distinct sequences share the query rows
+// (ggml_flash_attn_ext_get_n_seq). When every query row is a different sequence, the vec kernel with one query row per
+// block makes each row iterate only over the KV blocks of its own sequence (ggml_cuda_fattn_rows_are_seqs).
+
+// GGML_CUDA_FA_SEQ_ROWS=0 disables the per-sequence layout (A/B and debugging).
+static bool ggml_cuda_fattn_seq_layout_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_SEQ_ROWS");
+        return env == nullptr || atoi(env) != 0;
     }();
-    return enabled && mask && mask->type == GGML_TYPE_F16 &&
-        K->ne[1] >= min_kv && K->ne[1] % FATTN_KQ_STRIDE == 0 && mask->ne[0] >= K->ne[1] && mask->ne[2] == 1 &&
-        mask->ne[1] >= Q->ne[1] && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0 && uintptr_t(mask->data) % 16 == 0;
+    return enabled;
+}
+
+// Whether the query rows of this call are all different sequences of one unified KV stream, and the KV is long enough
+// for the masked KV skip to matter.
+static bool ggml_cuda_fattn_rows_are_seqs(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    return ggml_cuda_fattn_seq_layout_enabled() && Q->ne[3] == 1 && Q->ne[1] > 1 &&
+        ggml_flash_attn_ext_get_n_seq(dst) >= Q->ne[1] && ggml_cuda_fattn_mask_skip_possible(Q, K, mask);
 }
 
 // Launches the scan; returns the number of KV_live rows (n_seq*ntiles_x).

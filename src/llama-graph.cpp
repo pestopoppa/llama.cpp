@@ -2577,6 +2577,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
+        // A unified KV cache puts the tokens of all sequences of the ubatch into one stream. Tell the backend how many
+        // sequences share the query rows, so that it can iterate the KV cells of each sequence separately. The hint is
+        // a function of the ubatch shape only (n_seqs_unq is part of the graph reuse check).
+        if (n_stream == 1 && ubatch.n_seqs_unq > 1) {
+            ggml_flash_attn_ext_set_n_seq(cur, (int32_t) ubatch.n_seqs_unq);
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.

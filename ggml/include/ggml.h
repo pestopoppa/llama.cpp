@@ -2458,6 +2458,18 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Hint: the number of distinct sequences among the query rows of each ne3 slice (0 = unknown, the default).
+    // With a KV cache shared by several sequences (llama.cpp --kv-unified) the query rows of one ubatch can belong to
+    // different sequences, each seeing only its own cells. Backends may use the hint to give each sequence its own
+    // KV iteration (e.g. one query row per block when every row is a different sequence). It never changes what is
+    // computed: the mask alone defines which cells a query row attends to.
+    GGML_API void ggml_flash_attn_ext_set_n_seq(
+            struct ggml_tensor * a,
+            int32_t              n_seq);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_n_seq(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
