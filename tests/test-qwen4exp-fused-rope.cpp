@@ -50,7 +50,16 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     std::hash<std::string> hasher;
     seed ^= hasher(tensor->name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    // repro knobs for the fused-vs-graph divergence at non-production weight scales (see the INF-64 note);
+    // unset = the fixture's N(0, 1e-2) for every tensor
+    static const char * e_nm = getenv("QFR_NORM_MEAN");
+    static const char * e_ns = getenv("QFR_NORM_STD");
+    static const char * e_ws = getenv("QFR_W_STD");
+    const bool is_norm = strstr(tensor->name, "norm") != nullptr;
+    const float mean = is_norm && e_nm ? (float) atof(e_nm) : 0.0f;
+    const float sd   = is_norm ? (e_ns ? (float) atof(e_ns) : (e_ws ? (float) atof(e_ws) : 1.0e-2f))
+                               : (e_ws ? (float) atof(e_ws) : 1.0e-2f);
+    std::normal_distribution<float> dis(mean, sd);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
