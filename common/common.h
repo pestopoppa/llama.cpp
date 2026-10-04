@@ -633,6 +633,8 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t prefill_budget_decoding  = 0; // max prompt tokens per server iteration while any slot is generating (0 = off: fill up to n_batch)
+    int32_t prefill_budget_target_ms = 0; // adaptive prefill budget: size it so an iteration with decoding slots takes about this long (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";

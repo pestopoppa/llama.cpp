@@ -1535,6 +1535,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-budget-decoding"}, "N",
+        string_format("max prompt tokens added per server iteration while any slot is generating, so decoding slots are not "
+            "stalled behind a full n_batch prefill chunk (Sarathi-style chunked prefill). With no slot generating, prompts "
+            "still use the full n_batch (default: %d, 0 = off)", params.prefill_budget_decoding),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prefill-budget-decoding must be non-negative");
+            }
+            params.prefill_budget_decoding = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_BUDGET_DECODING").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-budget-target-ms"}, "MS",
+        string_format("adaptive prefill budget: while any slot is generating, size the prompt tokens per iteration from the "
+            "measured cost per prompt token so that an iteration takes about MS milliseconds; the cost grows with KV depth, "
+            "so the budget shrinks as the cache fills. Combines with --prefill-budget-decoding as an upper bound "
+            "(default: %d, 0 = off)", params.prefill_budget_target_ms),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prefill-budget-target-ms must be non-negative");
+            }
+            params.prefill_budget_target_ms = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_BUDGET_TARGET_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

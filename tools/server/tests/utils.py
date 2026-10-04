@@ -113,6 +113,8 @@ class ServerProcess:
     cache_ram: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
+    prefill_budget_decoding: int | None = None
+    prefill_budget_target_ms: int | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
     gcp_compat: bool = False
@@ -265,6 +267,10 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.prefill_budget_decoding is not None:
+            server_args.extend(["--prefill-budget-decoding", self.prefill_budget_decoding])
+        if self.prefill_budget_target_ms is not None:
+            server_args.extend(["--prefill-budget-target-ms", self.prefill_budget_target_ms])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

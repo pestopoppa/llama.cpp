@@ -2863,6 +2863,84 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+
+    // decode-aware prefill budget (--prefill-budget-decoding / --prefill-budget-target-ms)
+    // while any slot is generating, every server iteration carries the decode/verify rows plus a chunk of
+    // a neighbour's prompt; the chunk's cost grows with the occupied KV cells, so a full n_batch chunk can
+    // stall every decoding slot for seconds per step. the budget caps the prompt tokens per iteration in
+    // that case only; with no slot generating, prompts still fill n_batch.
+    static constexpr int32_t PREFILL_BUDGET_MIN = 64;
+
+    struct prefill_budget_iter {
+        int32_t n_decode_rows = 0; // batch rows from generating slots (sampled + drafted tokens)
+        int32_t n_generating  = 0; // slots in SLOT_STATE_GENERATING
+        int32_t n_prompt      = 0; // prompt tokens added this iteration
+        int32_t n_prefilling  = 0; // slots that added prompt tokens this iteration
+        int32_t budget        = 0; // prompt-token budget applied this iteration (0 = none, n_batch)
+    } pb_iter;
+
+    double   pb_ms_per_tok = 0.0; // smoothed iteration ms per prompt token (adaptive budget)
+    uint64_t pb_n_iter     = 0;   // iterations that carried prompt tokens
+
+    // the prompt-token budget for this iteration, or 0 when it does not apply
+    int32_t prefill_budget_get(int32_t n_batch) const {
+        if (pb_iter.n_generating == 0) {
+            return 0;
+        }
+
+        int32_t budget = n_batch;
+
+        if (params_base.prefill_budget_decoding > 0) {
+            budget = std::min(budget, params_base.prefill_budget_decoding);
+        }
+
+        if (params_base.prefill_budget_target_ms > 0 && pb_ms_per_tok > 0.0) {
+            const double n = (double) params_base.prefill_budget_target_ms / pb_ms_per_tok;
+            const int32_t adaptive = (int32_t) std::min<double>(n, (double) n_batch);
+            budget = std::min(budget, std::max(PREFILL_BUDGET_MIN, adaptive));
+        }
+
+        return budget < n_batch ? budget : 0;
+    }
+
+    // per-iteration metrics, and the cost estimate for the adaptive budget
+    void prefill_budget_on_iter(int64_t t_iter_us) {
+        const auto & it = pb_iter;
+
+        if (it.n_prompt <= 0) {
+            return;
+        }
+
+        pb_n_iter++;
+
+        const double t_ms = t_iter_us / 1e3;
+
+        // ms per prompt token, measured over the whole iteration: it includes the decode rows, so it
+        // overestimates the marginal cost; the resulting multiplicative update n' = n * target / t
+        // converges on iterations of about the target time as long as the target exceeds the decode-only
+        // step time
+        if (it.n_prompt >= PREFILL_BUDGET_MIN) {
+            const double c = t_ms / it.n_prompt;
+            pb_ms_per_tok = pb_ms_per_tok > 0.0 ? 0.5 * pb_ms_per_tok + 0.5 * c : c;
+        }
+
+        // KV depth: positions held, summed over every slot (idle slots included). pos_max + 1, not
+        // pos_max - pos_min + 1: hybrid (recurrent) and SWA memories report a pos_min near pos_max, while the
+        // full-attention cells of the sequence still span [0, pos_max]
+        int64_t n_kv_pos = 0;
+        for (const auto & slot : slots) {
+            const auto p1 = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (p1 >= 0) {
+                n_kv_pos += p1 + 1;
+            }
+        }
+
+        SRV_INF("prefill-budget: iter %" PRIu64 ": decode_rows = %d (slots %d), prompt = %d (slots %d), budget = %d, "
+                "t_iter = %.1f ms, kv_pos = %" PRId64 ", ms/tok = %.3f\n",
+                pb_n_iter, it.n_decode_rows, it.n_generating, it.n_prompt, it.n_prefilling, it.budget,
+                t_ms, n_kv_pos, pb_ms_per_tok);
+    }
+
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -2955,6 +3033,7 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        const int64_t t_iter_start = ggml_time_us();
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -2992,6 +3071,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        prefill_budget_on_iter(ggml_time_us() - t_iter_start);
     }
 
     bool use_serial_speculative_verify(const server_slot & slot) const {
@@ -3108,6 +3189,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        pb_iter = {};
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3239,6 +3321,16 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // decode-aware prefill budget: while any slot is generating, cap the prompt tokens this iteration
+        pb_iter.n_decode_rows = batch.size();
+        for (const auto & slot : slots) {
+            pb_iter.n_generating += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+        }
+        pb_iter.budget = prefill_budget_get(n_batch);
+
+        // batch.size() limit for adding prompt tokens (prompts that cannot be split still use n_batch)
+        const int32_t n_prompt_limit = pb_iter.budget > 0 ? std::min(n_batch, pb_iter.n_decode_rows + pb_iter.budget) : n_batch;
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3247,8 +3339,8 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
-                    return; // batch is full, skip remaining slots
+                if (!add_ok || batch.size() >= n_prompt_limit) {
+                    return; // batch is full (or the prefill budget is spent), skip remaining slots
                 }
 
                 if (!slot.is_processing()) {
@@ -3651,7 +3743,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_prompt_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3714,7 +3806,20 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    if (n_tokens_cur > 0) {
+                        pb_iter.n_prefilling++;
+                        pb_iter.n_prompt += n_tokens_cur;
+                    }
+
+                    bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+
+                    // with a prefill budget, the last n_ubatch tokens of the prompt arrive in several smaller
+                    // chunks, and each would make a near-end checkpoint; keep only the two that a full chunk
+                    // makes (4 + n_ubatch and 4 tokens before the end, see checkpoint_offsets above)
+                    if (near_prompt_end && pb_iter.budget > 0) {
+                        const int n_left = slot.task->n_tokens() - n_tokens_start;
+                        near_prompt_end = n_left == std::min(n_batch, 4 + n_ubatch) || n_left == std::min(n_batch, 4);
+                    }
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
