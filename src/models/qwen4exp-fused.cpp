@@ -1669,7 +1669,7 @@ static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float *
             (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
             (unsigned char) row[8], (unsigned char) row[9], (unsigned char) row[10], (unsigned char) row[11],
             (unsigned char) row[12], (unsigned char) row[13], (unsigned char) row[14], (unsigned char) row[15]);
-    fprintf(stderr, "fused_embd row40: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+    if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "fused_embd row40: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
             (unsigned char) row[0], (unsigned char) row[1], (unsigned char) row[2], (unsigned char) row[3],
             (unsigned char) row[4], (unsigned char) row[5], (unsigned char) row[6], (unsigned char) row[7],
             (unsigned char) row[8], (unsigned char) row[9], (unsigned char) row[10], (unsigned char) row[11],
@@ -1738,10 +1738,12 @@ bool llama_model_qwen4exp::fused_decode(
         for (int64_t c = 0; c < hc; c++) {
             memcpy(res_hc.data() + c * n_embd, emb.data(), n_embd * sizeof(float));
         }
-        FILE * f = fopen("/tmp/qwen4exp-builds/f_res_hc.bin", "wb");
-        if (f) { fwrite(res_hc.data(), 4, res_hc.size(), f); fclose(f); }
-        FILE * f2 = fopen("/tmp/qwen4exp-builds/f_embd_tok.bin", "wb");
-        if (f2) { fwrite(emb.data(), 4, emb.size(), f2); fclose(f2); }
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
+            FILE * f = fopen("/tmp/qwen4exp-builds/f_res_hc.bin", "wb");
+            if (f) { fwrite(res_hc.data(), 4, res_hc.size(), f); fclose(f); }
+            FILE * f2 = fopen("/tmp/qwen4exp-builds/f_embd_tok.bin", "wb");
+            if (f2) { fwrite(emb.data(), 4, emb.size(), f2); fclose(f2); }
+        }
         if (getenv("GGML_FUSED_DUMP_FLAYERS") != NULL && getenv("GGML_FUSED_ONCE") != NULL) {
             FILE * f = fopen("/tmp/qwen4exp-builds/f_embd.bin", "wb");
             if (f) { fwrite(emb.data(), 4, n_embd, f); fclose(f); }
