@@ -9323,6 +9323,28 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // workspace-ec (2026-10-04): VKQ accumulator precision for F16 V.
+    // The legacy path accumulates the un-normalised VKQ = sum_i exp(s_i - M) v_i in FP16 (VKQ16 +
+    // ggml_vec_mad_f16). For diffuse attention that is ~ the per-channel sum of V over the visible cells, so
+    // 2048 cells x a same-sign channel of 32 exceeds FP16_MAX (65504) -> inf -> NaN in the output.
+    //   default           : legacy FP16 accumulation (bit-identical output whenever nothing overflows) plus an
+    //                       end-of-row non-finite check of the accumulator; only a row (or split-KV chunk) that
+    //                       overflowed is recomputed with FP32 accumulation. Overflow is sticky (inf*ms stays
+    //                       inf, or NaN when ms == 0), so the end-of-row check sees every overflow in the row.
+    //   GGML_FA_VKQ_F32=1 : FP32 accumulation for every row (fused cvtph+FMA; more accurate, costs 3-14% decode
+    //                       on FA-bound shapes).
+    //   GGML_FA_VKQ_F16=1 : legacy FP16 accumulation without the check (bit-exact replay of the old binary,
+    //                       NaN included). Takes precedence over GGML_FA_VKQ_F32.
+    enum { FA_VKQ_HYBRID = 0, FA_VKQ_F16 = 1, FA_VKQ_F32 = 2 };
+    static const int fa_vkq_mode = [](){
+        auto on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
+        if (on("GGML_FA_VKQ_F16")) return (int) FA_VKQ_F16;
+        if (on("GGML_FA_VKQ_F32")) return (int) FA_VKQ_F32;
+        return (int) FA_VKQ_HYBRID;
+    }();
+    const bool vkq_f16_first = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F32;
+    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode == FA_VKQ_HYBRID;
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -9342,12 +9364,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
-            memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
-        } else {
-            memset(VKQ32, 0, DV*sizeof(float));
-        }
-
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
@@ -9361,43 +9377,137 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
 
-        // online softmax / attention
-        // loop over n_kv and n_head_kv
+        // online softmax / attention over [ic_start, ic_end), FP16 or FP32 VKQ accumulator; result in VKQ32
         // ref: https://arxiv.org/pdf/2112.05682.pdf
+        auto accumulate = [&](const bool use_f16) __attribute__((noinline)) {
+            S = 0.0f;
+            M = -INFINITY;
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            // skip whole aligned runs of -INF mask values (e.g. cells of other sequences in a unified KV cache)
-            if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic_end && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
-                ic += GGML_FA_MASK_RUN - 1;
-                continue;
+            if (use_f16) {
+                memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
+            } else {
+                memset(VKQ32, 0, DV*sizeof(float));
             }
 
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-            if (mv == -INFINITY) {
-                continue;
+            for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                // skip whole aligned runs of -INF mask values (e.g. cells of other sequences in a unified KV cache)
+                if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic_end && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
+                    ic += GGML_FA_MASK_RUN - 1;
+                    continue;
+                }
+
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
+                }
+
+                float s; // KQ value
+
+                const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+
+                s = s*scale; // scale KQ value
+
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+
+                s += mv; // apply mask
+
+                const float Mold = M;
+
+                float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
+                float vs = 1.0f; // post-softmax KQ value, expf(s - M)
+
+                const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+
+                if (use_f16) {
+                    if (s > M) {
+                        // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                        M = s;
+                        ms = expf(Mold - M);
+
+                        // V = V*expf(Mold - M)
+                        ggml_vec_scale_f16(DV, VKQ16, ms);
+                    } else {
+                        // no new maximum, ms == 1.0f, vs != 1.0f
+                        vs = expf(s - M);
+                    }
+
+                    // V += v*expf(s - M)
+                    ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                } else {
+                    if (s > M) {
+                        // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                        M = s;
+                        ms = expf(Mold - M);
+
+                        // V = V*expf(Mold - M)
+                        ggml_vec_scale_f32(DV, VKQ32, ms);
+                    } else {
+                        // no new maximum, ms == 1.0f, vs != 1.0f
+                        vs = expf(s - M);
+                    }
+
+                    // V += v*expf(s - M)
+                    if (v->type == GGML_TYPE_F16) {
+                        ggml_vec_mad_f32_f16(DV, VKQ32, (const ggml_fp16_t *) v_data, vs);
+                    } else if (v_to_float) {
+                        v_to_float(v_data, V32, DV);
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    } else {
+                        // V is F32
+                        ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    }
+                }
+
+                S = S*ms + vs; // scale and increment sum with partial sum
             }
 
-            float s; // KQ value
-
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
-
-            s = s*scale; // scale KQ value
-
-            if (logit_softcap != 0.0f) {
-                s = logit_softcap*tanhf(s);
+            if (use_f16) {
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+                }
             }
+        };
 
-            s += mv; // apply mask
+        if (vkq_f16_first) {
+            // FP16 accumulator: the legacy loop, kept inline and straight-line (an outlined lambda costs up to
+            // ~15% FA time on FA-bound shapes); bit-identical to the legacy kernel
+            memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
 
-            const float Mold = M;
+            for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                // skip whole aligned runs of -INF mask values (e.g. cells of other sequences in a unified KV cache)
+                if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic_end && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
+                    ic += GGML_FA_MASK_RUN - 1;
+                    continue;
+                }
 
-            float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
-            float vs = 1.0f; // post-softmax KQ value, expf(s - M)
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
+                }
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+                float s; // KQ value
 
-            if (v->type == GGML_TYPE_F16) {
+                const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+
+                s = s*scale; // scale KQ value
+
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+
+                s += mv; // apply mask
+
+                const float Mold = M;
+
+                float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
+                float vs = 1.0f; // post-softmax KQ value, expf(s - M)
+
+                const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -9412,35 +9522,27 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
                 // V += v*expf(s - M)
                 ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
-            } else {
-                if (s > M) {
-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
-                    M = s;
-                    ms = expf(Mold - M);
 
-                    // V = V*expf(Mold - M)
-                    ggml_vec_scale_f32(DV, VKQ32, ms);
-                } else {
-                    // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
-                }
-
-                // V += v*expf(s - M)
-                if (v_to_float) {
-                    v_to_float(v_data, V32, DV);
-                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
-                } else {
-                    // V is F32
-                    ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
-                }
+                S = S*ms + vs; // scale and increment sum with partial sum
             }
 
-            S = S*ms + vs; // scale and increment sum with partial sum
-        }
-
-        if (v->type == GGML_TYPE_F16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+            }
+        } else {
+            accumulate(false); // FP32 accumulator (GGML_FA_VKQ_F32=1, or V not F16)
+        }
+
+        if (vkq_check) {
+            // exponent all-ones <=> inf or NaN; bit test so it survives -ffinite-math-only
+            uint32_t bad = 0;
+            for (int64_t d = 0; d < DV; ++d) {
+                uint32_t bits;
+                memcpy(&bits, &VKQ32[d], sizeof(bits));
+                bad |= (uint32_t) ((bits & 0x7f800000u) == 0x7f800000u);
+            }
+            if (bad) {
+                accumulate(false);
             }
         }
 

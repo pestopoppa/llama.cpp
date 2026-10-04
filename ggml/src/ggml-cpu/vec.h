@@ -652,6 +652,62 @@ inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int 
 #endif
 }
 
+// y (FP32) += x (FP16) * v, fused: no FP32 staging copy of x. Used by the CPU FA path to accumulate VKQ in
+// FP32 for F16 V (workspace-ec). Each element is one FMA of the exactly-converted x, i.e. the same arithmetic as
+// ggml_cpu_fp16_to_fp32 + ggml_vec_mad_f32 on the SIMD paths.
+inline static void ggml_vec_mad_f32_f16(const int n, float * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+    int i = 0;
+#if defined(__AVX512F__)
+    const __m512 vv = _mm512_set1_ps(v);
+    for (; i + 63 < n; i += 64) {
+        __m512 y0 = _mm512_loadu_ps(y + i +  0);
+        __m512 y1 = _mm512_loadu_ps(y + i + 16);
+        __m512 y2 = _mm512_loadu_ps(y + i + 32);
+        __m512 y3 = _mm512_loadu_ps(y + i + 48);
+        y0 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i +  0))), vv, y0);
+        y1 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i + 16))), vv, y1);
+        y2 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i + 32))), vv, y2);
+        y3 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i + 48))), vv, y3);
+        _mm512_storeu_ps(y + i +  0, y0);
+        _mm512_storeu_ps(y + i + 16, y1);
+        _mm512_storeu_ps(y + i + 32, y2);
+        _mm512_storeu_ps(y + i + 48, y3);
+    }
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i))), vv, _mm512_loadu_ps(y + i)));
+    }
+#elif defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+    const __m256 vv = _mm256_set1_ps(v);
+    for (; i + 31 < n; i += 32) {
+        __m256 y0 = _mm256_loadu_ps(y + i +  0);
+        __m256 y1 = _mm256_loadu_ps(y + i +  8);
+        __m256 y2 = _mm256_loadu_ps(y + i + 16);
+        __m256 y3 = _mm256_loadu_ps(y + i + 24);
+        y0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i +  0))), vv, y0);
+        y1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i +  8))), vv, y1);
+        y2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i + 16))), vv, y2);
+        y3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i + 24))), vv, y3);
+        _mm256_storeu_ps(y + i +  0, y0);
+        _mm256_storeu_ps(y + i +  8, y1);
+        _mm256_storeu_ps(y + i + 16, y2);
+        _mm256_storeu_ps(y + i + 24, y3);
+    }
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i))), vv, _mm256_loadu_ps(y + i)));
+    }
+#else
+    // portable: convert in L1-resident chunks, then the regular FP32 mad
+    float tmp[64];
+    for (; i + 63 < n; i += 64) {
+        ggml_cpu_fp16_to_fp32(x + i, tmp, 64);
+        ggml_vec_mad_f32(64, y + i, tmp, v);
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] += GGML_CPU_FP16_TO_FP32(x[i])*v;
+    }
+}
+
 inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, const float s, const float b) {
 #if defined(GGML_USE_ACCELERATE)
     vDSP_vsmsa(x, 1, &s, &b, y, 1, n);
