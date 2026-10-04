@@ -9074,22 +9074,29 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     //   GGML_FA_VKQ_REG=1 : (x86 AVX512, DV <= 256, DV % 16 == 0) FP32 accumulator held in zmm registers over
     //                       blocks of 64 cells (scores first, one rescale per block); falls back to the default
     //                       where unavailable. Precedence: F16 > F32 > REG > default.
-    enum { FA_VKQ_HYBRID = 0, FA_VKQ_F16 = 1, FA_VKQ_F32 = 2, FA_VKQ_REG = 3 };
+    //   GGML_FA_VKQ_REG=auto: shape-gated option A: REG when DV >= 256 (any rows) or when the op has a single
+    //                       query row (neq1 == 1, any DV); the default hybrid otherwise. Bench (Qwen3.5-0.8B
+    //                       D=256 / Qwen3-1.7B D=128, f16 KV, 16k): REG wins tg at both D and pp5 at D=256, loses
+    //                       pp5 at D=128 -- the gate keeps the wins and drops the loss.
+    enum { FA_VKQ_HYBRID = 0, FA_VKQ_F16 = 1, FA_VKQ_F32 = 2, FA_VKQ_REG = 3, FA_VKQ_REG_AUTO = 4 };
     static const int fa_vkq_mode = [](){
         auto on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
         if (on("GGML_FA_VKQ_F16")) return (int) FA_VKQ_F16;
         if (on("GGML_FA_VKQ_F32")) return (int) FA_VKQ_F32;
+        const char * r = getenv("GGML_FA_VKQ_REG");
+        if (r != nullptr && strcmp(r, "auto") == 0) return (int) FA_VKQ_REG_AUTO;
         if (on("GGML_FA_VKQ_REG")) return (int) FA_VKQ_REG;
         return (int) FA_VKQ_HYBRID;
     }();
 #if defined(__AVX512F__)
-    const fa_vacc_f16_block_t vacc_reg = (v->type == GGML_TYPE_F16 && fa_vkq_mode == FA_VKQ_REG) ? fa_vacc_f16_select(DV) : nullptr;
+    const bool want_reg = fa_vkq_mode == FA_VKQ_REG || (fa_vkq_mode == FA_VKQ_REG_AUTO && (DV >= 256 || neq1 == 1));
+    const fa_vacc_f16_block_t vacc_reg = (v->type == GGML_TYPE_F16 && want_reg) ? fa_vacc_f16_select(DV) : nullptr;
 #else
     const void * vacc_reg = nullptr;
 #endif
     const bool vkq_reg       = vacc_reg != nullptr;
     const bool vkq_f16_first = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F32;
-    const bool vkq_check     = v->type == GGML_TYPE_F16 && (fa_vkq_mode == FA_VKQ_HYBRID || fa_vkq_mode == FA_VKQ_REG);
+    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F16 && fa_vkq_mode != FA_VKQ_F32;
 
     int ith = params->ith;
 
