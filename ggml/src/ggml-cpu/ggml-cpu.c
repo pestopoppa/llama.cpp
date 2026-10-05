@@ -2755,6 +2755,8 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
         case GGML_OP_UNARY:
         case GGML_OP_GLU:
             return true;
+        case GGML_OP_CONCAT:
+            return node->src[1] && ggml_nrows(node->src[1]) <= 3;
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
