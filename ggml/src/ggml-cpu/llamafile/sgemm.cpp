@@ -1525,11 +1525,8 @@ class tinyBLAS_Q0_AVX {
         int64_t ytiles = (m - m0) / 4;
         int64_t xtiles = (n - n0) / RN;
         int64_t tiles = xtiles * ytiles;
-        int64_t duty = (tiles + nth - 1) / nth;
-        int64_t start = duty * ith;
-        int64_t end = start + duty;
-        if (end > tiles)
-            end = tiles;
+        int64_t start = tiles * ith / nth;
+        int64_t end = tiles * (ith + 1) / nth;
         for (int64_t job = start; job < end; ++job) {
             int64_t ii = m0 + job / xtiles * 4;
             int64_t jj = n0 + job % xtiles * RN;
