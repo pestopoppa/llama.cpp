@@ -586,6 +586,37 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     }
     ggml_barrier(params->threadpool);
 
+    bool slab_ok = iqk_mmid_slab_enabled() && ids->ne[1] >= 2 && ids->ne[1] <= 8;
+    const int64_t slab_gran = slab_ok ? iqk_mul_mat_moe_row_granularity(tA) : 1;
+    slab_ok = slab_ok && slab_gran > 0 && ne01 > 0 && ne01 % slab_gran == 0;
+    int64_t n_active = 0;
+    unsigned checked_counts = 0;
+    for (int cur_a = 0; slab_ok && cur_a < n_as; ++cur_a) {
+        const int64_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) continue;
+        if (cne1 > 8 || iqk_dequant_type(tA, (int) cne1) != tA) {
+            slab_ok = false;
+            break;
+        }
+        ++n_active;
+        const unsigned count_bit = 1u << cne1;
+        if (checked_counts & count_bit) continue;
+        checked_counts |= count_bit;
+        const char * A = (const char *) src0->data + (size_t) cur_a * src0->nb[2];
+        const iqk_mmid * rmap = matrix_rows + (size_t) cur_a * n_ids * ids->ne[1];
+        // Check each kernel selection on every thread before assigning any rows.
+        if (!iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
+                tA, A, src0->nb[1], activation_type, qact, act_row,
+                (float *) dst->data, dst->nb[1], dst->nb[2], rmap, 0, 0)) {
+            slab_ok = false;
+        }
+    }
+    const int64_t units_per_expert = slab_ok ? ne01 / slab_gran : 0;
+    const int64_t units_total = n_active * units_per_expert;
+    const int64_t u0 = units_total * ith / nth;
+    const int64_t u1 = units_total * (ith + 1) / nth;
+    int64_t expert_unit = 0;
+
     // 3) per-expert GEMM via iqk
     bool engaged = false;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -594,6 +625,20 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         engaged = true;
         const char * A = (const char *) src0->data + (size_t) cur_a * src0->nb[2];
         const iqk_mmid * rmap = matrix_rows + (size_t) cur_a * n_ids * ids->ne[1];
+        if (slab_ok) {
+            const int64_t first = u0 > expert_unit ? u0 : expert_unit;
+            const int64_t end = u1 < expert_unit + units_per_expert ? u1 : expert_unit + units_per_expert;
+            // Each row keeps its activation bytes, kernel and reduction order.
+            if (first < end && !iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
+                    tA, A, src0->nb[1],
+                    activation_type, qact, act_row,
+                    (float *) dst->data, dst->nb[1], dst->nb[2],
+                    rmap, (first - expert_unit) * slab_gran, (end - first) * slab_gran)) {
+                return false;
+            }
+            expert_unit += units_per_expert;
+            continue;
+        }
         if (!iqk_mul_mat_moe(ne01, cne1, ne10, (int) ne11,
                 tA, A, src0->nb[1],
                 activation_type, qact, act_row,
