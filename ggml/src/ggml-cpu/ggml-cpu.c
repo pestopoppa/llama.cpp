@@ -2723,13 +2723,11 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
         }
     }
 
-    // thread 0 must already be the only writer under the row-range split.  Different kernels
-    // hand a different tensor to get_thread_range() -- binary-ops/unary-ops/scale/dup/glu use
-    // src[0], fill uses dst -- so BOTH must have a single row for thread 0 to own all of it.
-    if (ggml_nrows(node) > ggml_cpu_tiny_solo_rows) {
+    // Bound both row counts; the solo executor preserves each row's arithmetic on thread 0.
+    if (ggml_nrows(node) > 5) {
         return false;
     }
-    if (node->src[0] && ggml_nrows(node->src[0]) > ggml_cpu_tiny_solo_rows) {
+    if (node->src[0] && ggml_nrows(node->src[0]) > 5) {
         return false;
     }
     if (ggml_nelements(node) > ggml_cpu_tiny_solo_max) {
