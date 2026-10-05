@@ -1375,6 +1375,14 @@ class tinyBLAS_Q0_AVX {
   private:
     void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
         int64_t mc, nc, mp, np;
+#if defined(__AVX2__) && defined(__F16C__)
+        if (n - n0 == 5 && m - m0 >= 4) {
+            gemm4xN<5>(m0, m, n0, n);
+            mp = m0 + (m - m0) / 4 * 4;
+            mnpack(mp, m, n0, n);
+            return;
+        }
+#endif
         switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4)) {
 #if VECTOR_REGISTERS == 32
         case 0x44:
