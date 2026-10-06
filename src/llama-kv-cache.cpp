@@ -1882,7 +1882,7 @@ void llama_kv_cache::jetlong_init(const llama_jetlong_cfg & cfg, uint32_t n_rot)
             it = jl_ctx_map.emplace(buft, std::move(c)).first;
         }
 
-        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), GGML_TYPE_F32, (int64_t) n_rot*hparams.n_head_kv(il), kv_size, n_stream);
+        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), cfg.f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, (int64_t) n_rot*hparams.n_head_kv(il), kv_size, n_stream);
         ggml_format_name(t, "cache_jl_kgrp_l%d", il);
         jl_kgrp[ikv] = t;
     }

@@ -25,6 +25,7 @@
 struct llama_jetlong_cfg {
     int32_t w0       = 0;     // local (near) window; 0 = Jet-Long off (stock)
     int32_t w_native = 0;     // native window w (default: n_ctx_orig / n_ctx_train)
+    bool    f16      = false; // side cache stored as f16
     bool    uncached = false; // recompute every grouped-K row every ubatch (reference / T3 control)
 
     bool enabled() const { return w0 > 0 && w_native > 0; }

@@ -1683,6 +1683,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.jetlong_window     = params.jetlong_window;
     cparams.jetlong_native     = params.jetlong_native;
     cparams.jetlong_uncached   = params.jetlong_uncached ? 1 : 0;
+    cparams.jetlong_f16        = params.jetlong_f16 ? 1 : 0;
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.flash_attn_type   = params.flash_attn_type;

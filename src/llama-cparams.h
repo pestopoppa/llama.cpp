@@ -65,6 +65,7 @@ struct llama_cparams {
     int32_t jetlong_window;
     int32_t jetlong_native;
     bool    jetlong_uncached;
+    bool    jetlong_f16;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

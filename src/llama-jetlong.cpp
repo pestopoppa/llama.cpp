@@ -270,10 +270,10 @@ ggml_tensor * llama_jetlong_build_attn(
 
     // [n_rot, Hkv, n_kv, ns] view of the side cache, mirroring get_k
     ggml_tensor * kg4 = ggml_view_4d(ctx, kgrp_dep, n_rot, Hkv, n_kv, ns,
-            n_rot*sizeof(float),
-            n_rot*Hkv*sizeof(float),
-            n_rot*Hkv*kv_size*sizeof(float),
-            n_rot*Hkv*kv_size*sizeof(float)*s0);
+            n_rot*ggml_type_size(kgrp->type),
+            n_rot*Hkv*ggml_type_size(kgrp->type),
+            n_rot*Hkv*kv_size*ggml_type_size(kgrp->type),
+            n_rot*Hkv*kv_size*ggml_type_size(kgrp->type)*s0);
 
     // 2. queries: stock (near), pass-through dims (distant), grouped rotary dims (distant)
     auto split_q = [&](ggml_tensor * x) {

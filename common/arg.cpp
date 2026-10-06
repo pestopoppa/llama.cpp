@@ -2237,6 +2237,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_JETLONG_NATIVE"));
     add_opt(common_arg(
+        {"--jetlong-f16"},
+        "[EXPERIMENTAL] Jet-Long: store the grouped-K side cache as f16 (half the VRAM; slightly different numerics)",
+        [](common_params & params) {
+            params.jetlong_f16 = true;
+        }
+    ).set_env("LLAMA_ARG_JETLONG_F16"));
+    add_opt(common_arg(
         {"--jetlong-uncached"},
         "[EXPERIMENTAL] Jet-Long: recompute every grouped-K row on every ubatch (control for the per-epoch cache)",
         [](common_params & params) {

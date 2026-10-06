@@ -2117,6 +2117,7 @@ static void llama_jetlong_attach(llama_memory_i * mem, const llama_hparams & hpa
     cfg.w0       = cparams.jetlong_window;
     cfg.w_native = cparams.jetlong_native;
     cfg.uncached = cparams.jetlong_uncached;
+    cfg.f16      = cparams.jetlong_f16;
 
     kv->jetlong_init(cfg, hparams.n_rot());
 }

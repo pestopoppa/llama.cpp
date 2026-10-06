@@ -475,6 +475,7 @@ struct common_params {
     int32_t moe_spec_min_batch    =     4; // min n_tokens to trigger MoE-Spec budgeting
     int32_t jetlong_window        =     0; // Jet-Long local window w0 (0 = off) [EXPERIMENTAL]
     int32_t jetlong_native        =     0; // Jet-Long native window w (0 = from model)
+    bool    jetlong_f16           = false; // Jet-Long: store the grouped-K side cache as f16 (halves VRAM)
     bool    jetlong_uncached      = false; // Jet-Long: recompute grouped K every ubatch (test control)
 
     // offload params

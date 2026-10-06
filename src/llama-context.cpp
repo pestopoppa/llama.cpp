@@ -274,6 +274,7 @@ llama_context::llama_context(
     cparams.jetlong_window   = std::max(0, params.jetlong_window);
     cparams.jetlong_native   = params.jetlong_native > 0 ? params.jetlong_native : (int32_t) cparams.n_ctx_orig_yarn;
     cparams.jetlong_uncached = params.jetlong_uncached != 0;
+    cparams.jetlong_f16      = params.jetlong_f16 != 0;
     if (cparams.jetlong_window > 0) {
         const bool rope_ok = hparams.rope_type == LLAMA_ROPE_TYPE_NEOX || hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
                              hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
@@ -3821,6 +3822,7 @@ llama_context_params llama_context_default_params() {
         /*.jetlong_window              =*/ 0,
         /*.jetlong_native              =*/ 0,
         /*.jetlong_uncached            =*/ 0,
+        /*.jetlong_f16                 =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

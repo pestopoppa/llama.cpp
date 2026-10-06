@@ -396,6 +396,7 @@ extern "C" {
         // Jet-Long prototype [EXPERIMENTAL]: grouped-position correction above the native window
         int32_t  jetlong_window;      // local window w0; 0 = off (stock, default)
         int32_t  jetlong_native;      // native window w; 0 = from model (n_ctx_orig / n_ctx_train)
+        int32_t  jetlong_f16;         // 1 = store the Jet-Long grouped-K side cache as f16
         int32_t  jetlong_uncached;    // 1 = recompute every grouped-K row every ubatch (test control)
 
         ggml_backend_sched_eval_callback cb_eval;
