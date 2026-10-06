@@ -2086,9 +2086,14 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        // With the attention Hadamard rotation (quantized K) the cache holds H(rope(k)) with H spanning the FULL head, so the
+        // shift must dequantize, un-rotate and re-rotate whole heads; a view of the n_rot dims only mixes unrelated rows
+        // and also makes the quantized ggml_cpy destination non-contiguous (aborts on CPU). rope still rotates only n_rot dims.
+        const bool full_head = inp->k_rot && n_embd_nope == 0 && ggml_is_quantized(layer.k->type);
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                full_head ? n_embd_head_k : n_rot, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
