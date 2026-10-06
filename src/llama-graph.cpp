@@ -481,12 +481,33 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (jl_active) {
+        llama_jetlong_fill_inputs(jl, mctx->jetlong_cfg(), jl_rope, jl_plan, ubatch->pos, jl_upd_idx, jl_upd_delta,
+                [&](int64_t i, int64_t j) { return mctx->jetlong_cell_pos(*ubatch, i, j); });
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
     this->mctx = mctx;
+
+    // Jet-Long: an active graph carries per-ubatch side-cache update lists -> never reused;
+    //           an in-window graph is reused only for another in-window ubatch
+    if (jl_active) {
+        return false;
+    }
+    if (mctx->jetlong_enabled()) {
+        const auto & ub = params.ubatch;
+        std::vector<int32_t> seq(ub.n_tokens);
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            seq[i] = ub.seq_id[i][0];
+        }
+        if (llama_jetlong_plan_ubatch(mctx->jetlong_cfg(), (int32_t) ub.n_tokens, ub.pos, seq.data()).active) {
+            return false;
+        }
+    }
 
     bool res = true;
 
@@ -2764,6 +2785,27 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    // Jet-Long prototype: decide per ubatch; in-window ubatches build nothing extra (stock graph)
+    if (mctx_cur->jetlong_enabled()) {
+        mctx_cur->jetlong_prepare(ubatch, inp->jl_plan, inp->jl_upd_idx, inp->jl_upd_delta);
+
+        if (inp->jl_plan.active) {
+            auto & r = inp->jl_rope;
+            r.n_rot = (int32_t) hparams.n_rot();
+            for (int i = 0; i < 4; ++i) {
+                r.sections[i] = hparams.rope_sections[i];
+            }
+            r.mode      = hparams.rope_type;
+            r.freq_base = cparams.rope_freq_base;
+
+            const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+            inp->jl.create(ctx0, r, ubatch.n_tokens, (int64_t) inp->jl_upd_idx.size(), mctx_cur->get_n_kv(), n_stream,
+                    hparams.n_embd_head_k());
+            inp->jl_active = true;
+        }
+    }
+
     return inp;
 }
 
@@ -2790,6 +2832,9 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    // Jet-Long needs the query in the RoPE domain (before the K Hadamard)
+    ggml_tensor * q_rope = q_cur;
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -2809,11 +2854,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
+    ggml_tensor * k_store = nullptr;
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_build_forward_expand(gf, k_store);
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
@@ -2824,6 +2871,17 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+
+    // Jet-Long prototype: only when a sequence of this ubatch is above the native window
+    if (inp->jl_active && kq_b == nullptr && sinks == nullptr) {
+        ggml_tensor * kgrp = mctx_cur->get_kgrp(il);
+        if (kgrp) {
+            const bool v_trans = v->nb[1] > v->nb[2];
+            cur = llama_jetlong_build_attn(ctx0, gf, inp->jl_rope, inp->jl, q, q_rope, inp->self_k_rot,
+                    k_store, k, v, v_trans, kgrp, mctx_cur->jetlong_s0(), kq_mask, kq_scale, cur);
+            cb(cur, "jl_kqv_out", il);
+        }
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

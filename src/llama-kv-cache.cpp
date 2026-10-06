@@ -367,6 +367,8 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    jl_state.invalidate();
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -818,6 +820,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    // K-shift / stream copies rewrite cached K outside of a ubatch store -> the grouped-K rows are stale
+    if (do_shift || !sc_info.empty()) {
+        jl_state.invalidate();
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -1835,6 +1842,124 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
+//
+// Jet-Long prototype
+//
+
+void llama_kv_cache::jetlong_init(const llama_jetlong_cfg & cfg, uint32_t n_rot) {
+    if (!cfg.enabled()) {
+        return;
+    }
+
+    if (other) {
+        LLAMA_LOG_WARN("%s: Jet-Long is not supported on a cache that shares cells with another context; disabled\n", __func__);
+        return;
+    }
+
+    const uint32_t kv_size = get_size();
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t((layers.size() + 1)*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create ggml context for the Jet-Long side cache");
+    }
+
+    jl_kgrp.assign(layers.size(), nullptr);
+
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const uint32_t il = layers[ikv].il;
+        ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, (int64_t) n_rot*hparams.n_head_kv(il), kv_size, n_stream);
+        ggml_format_name(t, "cache_jl_kgrp_l%d", il);
+        jl_kgrp[ikv] = t;
+    }
+
+    // CPU-first prototype: the side cache lives in host memory
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type());
+    if (!buf) {
+        throw std::runtime_error("failed to allocate the Jet-Long side cache");
+    }
+    ggml_backend_buffer_clear(buf, 0);
+
+    LLAMA_LOG_INFO("%s: Jet-Long ON: w0 = %d, w_native = %d, %s, n_rot = %u, side cache = %.2f MiB\n", __func__,
+            cfg.w0, cfg.w_native, cfg.uncached ? "uncached" : "cached per G-epoch", n_rot,
+            ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+    jl_ctxs_bufs.emplace_back(std::move(ctx), buf);
+
+    jl_cfg = cfg;
+    jl_state.resize((size_t) kv_size*n_stream);
+}
+
+ggml_tensor * llama_kv_cache::get_kgrp(int32_t il) const {
+    if (jl_kgrp.empty()) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    return jl_kgrp[it->second];
+}
+
+void llama_kv_cache::jetlong_prepare(const llama_ubatch & ubatch, const slot_info & sinfo, uint32_t n_kv,
+        llama_jetlong_ubatch_plan & plan, std::vector<int64_t> & upd_idx, std::vector<int32_t> & upd_delta) const {
+    upd_idx.clear();
+    upd_delta.clear();
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    std::vector<int32_t> pos(n_tokens);
+    std::vector<int32_t> seq(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        pos[i] = ubatch.pos[i];
+        seq[i] = ubatch.seq_id[i][0];
+    }
+
+    plan = llama_jetlong_plan_ubatch(jl_cfg, (int32_t) n_tokens, pos.data(), seq.data());
+    if (!plan.active) {
+        return;
+    }
+
+    const int64_t kv_size = get_size();
+
+    std::vector<int64_t> cand_idx;
+    std::vector<int32_t> cand_pos;
+    std::vector<int64_t> forced;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t strm = sinfo.strm[s];
+        const auto & cells = v_cells[strm];
+
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                continue;
+            }
+            cand_idx.push_back((int64_t) strm*kv_size + j);
+            cand_pos.push_back(cells.pos_get(j));
+        }
+
+        for (uint32_t i = 0; i < sinfo.size(); ++i) {
+            forced.push_back((int64_t) strm*kv_size + sinfo.idxs[s][i]);
+        }
+    }
+
+    jl_state.collect(plan.G, jl_cfg.uncached, cand_idx, cand_pos, forced, upd_idx, upd_delta);
+}
+
+int32_t llama_kv_cache::jetlong_cell_pos(const llama_ubatch & ubatch, int64_t i, int64_t j) const {
+    const llama_seq_id seq_id = ubatch.seq_id[i][0];
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    if (cells.is_empty(j)) {
+        return -1;
+    }
+    return cells.pos_get(j);
+}
+
 bool llama_kv_cache::has_cell_ext() const {
     // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
@@ -2172,6 +2297,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    jl_state.invalidate();
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -2858,4 +2984,13 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+int64_t llama_kv_cache_context::jetlong_s0() const {
+    return sinfos[i_cur].s0;
+}
+
+void llama_kv_cache_context::jetlong_prepare(const llama_ubatch & ubatch, llama_jetlong_ubatch_plan & plan,
+        std::vector<int64_t> & upd_idx, std::vector<int32_t> & upd_delta) const {
+    kv->jetlong_prepare(ubatch, sinfos[i_cur], n_kv, plan, upd_idx, upd_delta);
 }

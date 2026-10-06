@@ -2097,7 +2097,39 @@ static ggml_type gdn_recurrent_state_type() {
     return (e && atoi(e) != 0) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
 }
 
+static void llama_jetlong_attach(llama_memory_i * mem, const llama_hparams & hparams, const llama_cparams & cparams) {
+    if (cparams.jetlong_window <= 0 || mem == nullptr) {
+        return;
+    }
+
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            kv = hyb->get_mem_attn();
+        }
+    }
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: Jet-Long: unsupported memory type for this model; disabled\n", __func__);
+        return;
+    }
+
+    llama_jetlong_cfg cfg;
+    cfg.w0       = cparams.jetlong_window;
+    cfg.w_native = cparams.jetlong_native;
+    cfg.uncached = cparams.jetlong_uncached;
+
+    kv->jetlong_init(cfg, hparams.n_rot());
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    llama_memory_i * res = create_memory_impl(params, cparams);
+
+    llama_jetlong_attach(res, hparams, cparams);
+
+    return res;
+}
+
+llama_memory_i * llama_model::create_memory_impl(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
     switch (arch) {

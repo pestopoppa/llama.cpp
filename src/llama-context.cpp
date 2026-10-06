@@ -271,6 +271,19 @@ llama_context::llama_context(
     cparams.moe_spec_budget = params.moe_spec_budget;
     cparams.moe_spec_min_batch = params.moe_spec_min_batch > 0 ? params.moe_spec_min_batch : 4;
 
+    cparams.jetlong_window   = std::max(0, params.jetlong_window);
+    cparams.jetlong_native   = params.jetlong_native > 0 ? params.jetlong_native : (int32_t) cparams.n_ctx_orig_yarn;
+    cparams.jetlong_uncached = params.jetlong_uncached != 0;
+    if (cparams.jetlong_window > 0) {
+        const bool rope_ok = hparams.rope_type == LLAMA_ROPE_TYPE_NEOX || hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
+                             hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+        if (!rope_ok || cparams.rope_freq_scale != 1.0f || cparams.yarn_ext_factor != 0.0f) {
+            LLAMA_LOG_WARN("%s: Jet-Long needs NeoX-paired RoPE without YaRN/linear scaling (rope_type = %d, freq_scale = %.4f, ext = %.2f); disabled\n",
+                    __func__, (int) hparams.rope_type, cparams.rope_freq_scale, cparams.yarn_ext_factor);
+            cparams.jetlong_window = 0;
+        }
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -3805,6 +3818,9 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.moe_spec_budget             =*/ 0,
         /*.moe_spec_min_batch          =*/ 4,
+        /*.jetlong_window              =*/ 0,
+        /*.jetlong_native              =*/ 0,
+        /*.jetlong_uncached            =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

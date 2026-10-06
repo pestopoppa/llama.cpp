@@ -61,6 +61,11 @@ struct llama_cparams {
     int32_t moe_spec_budget;
     int32_t moe_spec_min_batch;  // default 4; minimum batch size to trigger budgeting
 
+    // Jet-Long prototype (0 = off)
+    int32_t jetlong_window;
+    int32_t jetlong_native;
+    bool    jetlong_uncached;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

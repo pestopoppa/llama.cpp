@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-jetlong.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -240,6 +241,27 @@ public:
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
+    //
+    // Jet-Long prototype (experimental; see llama-jetlong.h)
+    //
+
+    // allocate the grouped-K side cache (F32 [n_rot*n_head_kv, kv_size, n_stream] per layer, CPU buffer)
+    void jetlong_init(const llama_jetlong_cfg & cfg, uint32_t n_rot);
+
+    bool jetlong_enabled() const { return jl_cfg.enabled() && !jl_kgrp.empty(); }
+    const llama_jetlong_cfg & jetlong_cfg() const { return jl_cfg; }
+
+    ggml_tensor * get_kgrp(int32_t il) const;
+
+    // per-ubatch plan + the side-cache rows to (re)compute (commits the per-cell state)
+    void jetlong_prepare(const llama_ubatch & ubatch, const slot_info & sinfo, uint32_t n_kv,
+            llama_jetlong_ubatch_plan & plan, std::vector<int64_t> & upd_idx, std::vector<int32_t> & upd_delta) const;
+
+    // position of cell j in the stream of token i of the ubatch, -1 if empty
+    int32_t jetlong_cell_pos(const llama_ubatch & ubatch, int64_t i, int64_t j) const;
+
+    void jetlong_invalidate() const { jl_state.invalidate(); }
+
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
     // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
     //   tok: A B X X X C
@@ -251,6 +273,12 @@ public:
 private:
     const llama_model & model;
     const llama_hparams & hparams;
+
+    // Jet-Long prototype state
+    llama_jetlong_cfg jl_cfg;
+    std::vector<ggml_tensor *> jl_kgrp; // indexed like layers (ikv)
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> jl_ctxs_bufs;
+    mutable llama_jetlong_cell_state jl_state;
 
     struct kv_layer {
         // layer index in the model
@@ -433,6 +461,17 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // Jet-Long prototype
+    bool jetlong_enabled() const { return kv->jetlong_enabled(); }
+    const llama_jetlong_cfg & jetlong_cfg() const { return kv->jetlong_cfg(); }
+    ggml_tensor * get_kgrp(int32_t il) const { return kv->get_kgrp(il); }
+    int64_t jetlong_s0() const;
+    void jetlong_prepare(const llama_ubatch & ubatch, llama_jetlong_ubatch_plan & plan,
+            std::vector<int64_t> & upd_idx, std::vector<int32_t> & upd_delta) const;
+    int32_t jetlong_cell_pos(const llama_ubatch & ubatch, int64_t i, int64_t j) const {
+        return kv->jetlong_cell_pos(ubatch, i, j);
+    }
 
     // the used cells of a sequence (the fused decode fast path reads the cell
     // positions to compute the visible set and the current write cell)

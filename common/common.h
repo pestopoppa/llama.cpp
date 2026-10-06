@@ -473,6 +473,9 @@ struct common_params {
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     int32_t moe_spec_budget       =     0; // MoE-Spec (arXiv:2602.16052): top-B per-batch expert shortlist (0 = off)
     int32_t moe_spec_min_batch    =     4; // min n_tokens to trigger MoE-Spec budgeting
+    int32_t jetlong_window        =     0; // Jet-Long local window w0 (0 = off) [EXPERIMENTAL]
+    int32_t jetlong_native        =     0; // Jet-Long native window w (0 = from model)
+    bool    jetlong_uncached      = false; // Jet-Long: recompute grouped K every ubatch (test control)
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-jetlong.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -344,6 +345,14 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+
+    // Jet-Long prototype (only populated for an ubatch with a sequence above the native window)
+    bool                      jl_active = false;
+    llama_jetlong_rope        jl_rope;
+    llama_jetlong_ubatch_plan jl_plan;
+    llama_jetlong_graph_inp   jl;
+    std::vector<int64_t>      jl_upd_idx;
+    std::vector<int32_t>      jl_upd_delta;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed

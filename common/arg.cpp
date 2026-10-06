@@ -2221,6 +2221,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SPEC_MIN_BATCH"));
     add_opt(common_arg(
+        {"--jetlong-window"}, "N",
+        string_format("[EXPERIMENTAL] Jet-Long grouped-position correction above the native window, local window w0\n"
+                      "(keys within w0 of the query keep base RoPE); in-window sequences run the stock graph (default: %d = off)",
+                      params.jetlong_window),
+        [](common_params & params, int value) {
+            params.jetlong_window = value;
+        }
+    ).set_env("LLAMA_ARG_JETLONG_WINDOW"));
+    add_opt(common_arg(
+        {"--jetlong-native"}, "N",
+        string_format("[EXPERIMENTAL] Jet-Long native window w, G = ceil(L/w) (default: %d = from model)", params.jetlong_native),
+        [](common_params & params, int value) {
+            params.jetlong_native = value;
+        }
+    ).set_env("LLAMA_ARG_JETLONG_NATIVE"));
+    add_opt(common_arg(
+        {"--jetlong-uncached"},
+        "[EXPERIMENTAL] Jet-Long: recompute every grouped-K row on every ubatch (control for the per-epoch cache)",
+        [](common_params & params) {
+            params.jetlong_uncached = true;
+        }
+    ).set_env("LLAMA_ARG_JETLONG_UNCACHED"));
+    add_opt(common_arg(
         {"-gan", "--grp-attn-n"}, "N",
         string_format("group-attention factor (default: %d)", params.grp_attn_n),
         [](common_params & params, int value) {
