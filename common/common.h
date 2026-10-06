@@ -357,6 +357,10 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    // set only when --spec-ngram-mod-n-max is given explicitly: allows ngram-mod drafts to be
+    // wider than the draft model's n_max (per-impl draft width). Unset => legacy behaviour.
+    bool n_max_set = false;
 };
 
 struct common_params_speculative_ngram_map {

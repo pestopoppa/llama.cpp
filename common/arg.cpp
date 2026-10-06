@@ -4024,6 +4024,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram n-max must be between 0 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_max = value;
+            params.speculative.ngram_mod.n_max_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(

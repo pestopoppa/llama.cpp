@@ -2872,6 +2872,17 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     return n_max;
 }
 
+int32_t common_speculative_ngram_mod_width(const common_params_speculative * spec) {
+    // 0 => not widened (legacy: every impl capped by draft.n_max)
+    if (!spec->ngram_mod.n_max_set || spec->draft.n_max <= 0) {
+        return 0;
+    }
+    if (std::find(spec->types.begin(), spec->types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) == spec->types.end()) {
+        return 0;
+    }
+    return std::max(0, spec->ngram_mod.n_max);
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -3285,10 +3296,13 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                {
+                    // per-impl cap: ngram-mod may use its own (wider) cap
+                    const int32_t cap = (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD && dp.n_max_ngram_mod > 0)
+                        ? dp.n_max_ngram_mod : dp.n_max;
+                    if (cap > 0 && !result.empty() && (int) result.size() > cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", cap);
+                        result.resize(cap);
                     }
                 }
 

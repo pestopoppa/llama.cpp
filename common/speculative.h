@@ -27,6 +27,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
+int32_t common_speculative_ngram_mod_width(const common_params_speculative * spec);
 
 common_params common_base_params_to_speculative(const common_params & params);
 
@@ -44,6 +45,9 @@ struct common_speculative_draft_params {
     // overrides individual configurations (-1 disabled)
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
+
+    // per-impl width: cap applied only to ngram-mod drafts (-1: not widened, use n_max)
+    int32_t n_max_ngram_mod = -1;
 
     llama_pos   n_past;
     llama_token id_last;
