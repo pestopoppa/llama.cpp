@@ -1913,6 +1913,18 @@ void llama_kv_cache::jetlong_prepare(const llama_ubatch & ubatch, const slot_inf
 
     const uint32_t n_tokens = ubatch.n_tokens;
 
+    plan = llama_jetlong_ubatch_plan{};
+
+    // reserve/measure ubatches (llama_batch_allocr::ubatch_reserve) carry no sequence ids: never active
+    if (ubatch.pos == nullptr || ubatch.seq_id == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (ubatch.seq_id[i] == nullptr || ubatch.n_seq_id == nullptr || ubatch.n_seq_id[i] < 1) {
+            return;
+        }
+    }
+
     std::vector<int32_t> pos(n_tokens);
     std::vector<int32_t> seq(n_tokens);
     for (uint32_t i = 0; i < n_tokens; ++i) {

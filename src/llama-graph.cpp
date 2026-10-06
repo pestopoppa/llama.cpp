@@ -500,11 +500,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     }
     if (mctx->jetlong_enabled()) {
         const auto & ub = params.ubatch;
+        bool has_ids = ub.pos != nullptr && ub.seq_id != nullptr && ub.n_seq_id != nullptr;
         std::vector<int32_t> seq(ub.n_tokens);
-        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        for (uint32_t i = 0; has_ids && i < ub.n_tokens; ++i) {
+            if (ub.seq_id[i] == nullptr || ub.n_seq_id[i] < 1) {
+                has_ids = false; // reserve ubatch: never active
+                break;
+            }
             seq[i] = ub.seq_id[i][0];
         }
-        if (llama_jetlong_plan_ubatch(mctx->jetlong_cfg(), (int32_t) ub.n_tokens, ub.pos, seq.data()).active) {
+        if (has_ids && llama_jetlong_plan_ubatch(mctx->jetlong_cfg(), (int32_t) ub.n_tokens, ub.pos, seq.data()).active) {
             return false;
         }
     }
