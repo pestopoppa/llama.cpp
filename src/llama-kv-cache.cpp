@@ -1858,38 +1858,51 @@ void llama_kv_cache::jetlong_init(const llama_jetlong_cfg & cfg, uint32_t n_rot)
 
     const uint32_t kv_size = get_size();
 
-    ggml_init_params params = {
-        /*.mem_size   =*/ size_t((layers.size() + 1)*ggml_tensor_overhead()),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-
-    ggml_context_ptr ctx { ggml_init(params) };
-    if (!ctx) {
-        throw std::runtime_error("failed to create ggml context for the Jet-Long side cache");
-    }
+    // one ggml context per buffer type: each layer's side cache lives on the same device as that layer's K cache
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> jl_ctx_map;
 
     jl_kgrp.assign(layers.size(), nullptr);
 
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         const uint32_t il = layers[ikv].il;
-        ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, (int64_t) n_rot*hparams.n_head_kv(il), kv_size, n_stream);
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers[ikv].k->buffer);
+
+        auto it = jl_ctx_map.find(buft);
+        if (it == jl_ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t((layers.size() + 1)*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr c { ggml_init(params) };
+            if (!c) {
+                throw std::runtime_error("failed to create ggml context for the Jet-Long side cache");
+            }
+            it = jl_ctx_map.emplace(buft, std::move(c)).first;
+        }
+
+        ggml_tensor * t = ggml_new_tensor_3d(it->second.get(), GGML_TYPE_F32, (int64_t) n_rot*hparams.n_head_kv(il), kv_size, n_stream);
         ggml_format_name(t, "cache_jl_kgrp_l%d", il);
         jl_kgrp[ikv] = t;
     }
 
-    // CPU-first prototype: the side cache lives in host memory
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type());
-    if (!buf) {
-        throw std::runtime_error("failed to allocate the Jet-Long side cache");
+    size_t jl_bytes = 0;
+    for (auto & [buft, ctx] : jl_ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate the Jet-Long side cache");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: Jet-Long side cache %10s = %.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        jl_bytes += ggml_backend_buffer_get_size(buf);
+        jl_ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
-    ggml_backend_buffer_clear(buf, 0);
 
     LLAMA_LOG_INFO("%s: Jet-Long ON: w0 = %d, w_native = %d, %s, n_rot = %u, side cache = %.2f MiB\n", __func__,
             cfg.w0, cfg.w_native, cfg.uncached ? "uncached" : "cached per G-epoch", n_rot,
-            ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-
-    jl_ctxs_bufs.emplace_back(std::move(ctx), buf);
+            jl_bytes/1024.0/1024.0);
 
     jl_cfg = cfg;
     jl_state.resize((size_t) kv_size*n_stream);
