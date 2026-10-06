@@ -472,7 +472,8 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    // wide=true: cap for ngram-mod drafts (per-impl width), 0 if not widened
+    int get_n_draft_max(bool wide = false) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -486,6 +487,17 @@ struct server_slot {
 
         // The request may reduce the launch-time speculative budget, including
         // setting it to zero to disable speculation for this request.
+        if (wide) {
+            const int w = common_speculative_ngram_mod_width(&task->params.speculative);
+            if (w <= std::max(0, task->params.speculative.draft.n_max)) {
+                return 0;
+            }
+            n_draft_max = std::min(n_draft_max, w);
+            if (n_remaining > 0) {
+                n_draft_max = std::min(n_draft_max, n_remaining - 1);
+            }
+            return std::max(0, n_draft_max);
+        }
         n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
 
         if (n_remaining > 0) {
@@ -3097,6 +3109,7 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max_ngram = slot.get_n_draft_max(true);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3123,6 +3136,7 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
+                            /* .n_max_ngram_mod = */ n_draft_max_ngram > 0 ? n_draft_max_ngram : -1,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
