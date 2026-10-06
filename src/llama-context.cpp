@@ -191,7 +191,8 @@ llama_context::llama_context(
         cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
-    if (cparams.yarn_ext_factor != 0) {
+    // a user-supplied --yarn-attn-factor (>= 0) is taken verbatim: do not overwrite it with the derived value below
+    if (cparams.yarn_ext_factor != 0 && params.yarn_attn_factor < 0.0f) {
         static auto get_mscale = [](float scale, float mscale) {
             return scale <= 1.0f ? 1.0f : (0.1f * mscale * logf(scale) + 1.0f);
         };
