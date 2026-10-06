@@ -185,10 +185,19 @@ int main() {
     }
     snprintf(buf, sizeof buf, "rotdim norm ratio after 1 shift: noYaRN %.5f, YaRN %.5f; threshold 1.000+/-1e-3", h1_plain_ratio1, h1_yarn_ratio1);
     verdict("H1", h1_conf, buf);
+    {   // fix check: shift with attn_factor = 1/(1+0.1 ln(1/fs)) as in build_rope_shift after the fix (src/llama-kv-cache.cpp)
+        rp fx = YARN; fx.attn = 1.0f / (1.0f + 0.1f*logf(1.0f / YARN.fs));
+        std::vector<float> cache = fresh_float(K0, poss(100), YARN, nullptr);
+        for (int n = 1; n <= 4; n++) {
+            cache = kshift(cache, GGML_TYPE_F32, std::vector<int32_t>(NC, 37), fx, 0, 256);
+            auto fresh = fresh_float(K0, add(poss(100), 37*n), YARN, nullptr);
+            printf("  [fix formula] YaRN f32 n=%d ratio(rotdims)=%.5f maxabs=%.3e\n", n, nrm(cache, true)/nrm(fresh, true), maxabs(cache, fresh));
+        }
+    }
 
     // ---------------- H2 ----------------
     // 3 cells at positions {10,11,13}... (use NC cells), seq_div G=2 via llama_kv_cells; K roped at p_old, shifted by cells.get_shift, vs fresh at p_old/2.
-    printf("== H2 (pos_div shift sign); noYaRN, f32 K, G=2\n");
+    printf("== H2 (pos_div shift sign); noYaRN, f32 K, G=2 (uses the live llama_kv_cells::pos_div: CONFIRMED on ffc1bac82, REFUTED once the sign fix commit is present)\n");
     double h2_err = 0, h2_err_signflip = 0, h2_err_add = 0;
     {
         llama_kv_cells cells; cells.resize(NC);
