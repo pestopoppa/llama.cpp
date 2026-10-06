@@ -551,13 +551,26 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         return true;
     }
 
-    for (int64_t i12 = 0; i12 < ne12; ++i12) {
-        for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-            iqk_quantize_activation(
-                    activation_type,
-                    (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
-                    qact + i12*nbw2 + i11*nbw1, ne10);
-        }
+    // Keep Q8_2_X4 groups intact, including the final unpacked remainder.
+    const int64_t grain = activation_type == GGML_TYPE_Q8_K ? 256 : 128;
+    const int64_t ngrain_row = (ne10 + grain - 1) / grain;
+    const int64_t units = ne11 * ne12 * ngrain_row;
+    const int64_t quant_u0 = (int64_t) ith * units / nth;
+    const int64_t quant_u1 = (int64_t) (ith + 1) * units / nth;
+    for (int64_t u = quant_u0; u < quant_u1; ) {
+        const int64_t r = u / ngrain_row;
+        const int64_t gs = u - r * ngrain_row;
+        int64_t ge = quant_u1 - r * ngrain_row;
+        if (ge > ngrain_row) ge = ngrain_row;
+        const int64_t e0 = gs * grain;
+        const int64_t e1 = (ge * grain < ne10) ? ge * grain : ne10;
+        const int64_t i12 = r / ne11;
+        const int64_t i11 = r - i12 * ne11;
+        iqk_quantize_activation(
+                activation_type,
+                (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]) + e0,
+                qact + i12*nbw2 + i11*nbw1 + iqk_activation_row_size(activation_type, e0), e1 - e0);
+        u = r * ngrain_row + ge;
     }
     // 2) Zero inactive SER rows and build the valid per-expert row mapping.
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
