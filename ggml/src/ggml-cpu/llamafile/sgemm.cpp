@@ -502,11 +502,19 @@ class tinyBLAS {
             return true;
         }
         if (m % 8 == 0 ) {
+            if (n >= 2 && n <= 5 && m / 8 < params->nth) {
+                mnpack<4, 1, 1>(m, n, 1, 1);
+                return true;
+            }
             const int64_t SIZE_N = BLOCK_SIZE<6>(n);
             mnpack<4, 6, 2>(m, n, SIZE_N, 12);
             return true;
         }
         if (m % 4 == 0) {
+            if (n >= 2 && n <= 5 && m / 4 < params->nth) {
+                mnpack<1, 1, 1>(m, n, 1, 1);
+                return true;
+            }
             const int64_t SIZE_N = BLOCK_SIZE<6>(n);
             mnpack<4, 6, 1>(m, n, SIZE_N, 12);
             return true;
@@ -518,11 +526,19 @@ class tinyBLAS {
             return true;
         }
         if (m % 8 == 0 ) {
+            if (n >= 2 && n <= 5 && m / 8 < params->nth) {
+                mnpack<4, 1, 1>(m, n, 1, 1);
+                return true;
+            }
             const int64_t SIZE_N = BLOCK_SIZE<3>(n);
             mnpack<4, 3, 2>(m, n, SIZE_N, 24);
             return true;
         }
         if (m % 4 == 0) {
+            if (n >= 2 && n <= 5 && m / 4 < params->nth) {
+                mnpack<1, 1, 1>(m, n, 1, 1);
+                return true;
+            }
             const int64_t SIZE_N = BLOCK_SIZE<3>(n);
             mnpack<4, 3, 1>(m, n, SIZE_N, 24);
             return true;
