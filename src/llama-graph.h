@@ -331,6 +331,10 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // Jet-Long: shared by every input that wraps this one (e.g. llm_graph_input_mem_hybrid)
+    void set_input_jetlong(const llama_ubatch * ubatch, const llama_kv_cache_context * mctx_attn) const;
+    bool can_reuse_jetlong(const llm_graph_params & params, const llama_kv_cache_context * mctx_attn) const;
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 

@@ -45,6 +45,7 @@ struct geom {
     int   n_rot  = 64;
     int   sections[4] = {11, 11, 10, 0};
     float base   = 1e7f;
+    bool  neox   = false; // false: IMRoPE (qwen35/qwen35moe), true: plain NeoX (qwen3)
 };
 
 static uint64_t splitmix(uint64_t x) {
@@ -182,7 +183,7 @@ struct runner {
 
         rope.n_rot = g.n_rot;
         for (int i = 0; i < 4; ++i) rope.sections[i] = g.sections[i];
-        rope.mode      = GGML_ROPE_TYPE_IMROPE;
+        rope.mode      = g.neox ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_IMROPE;
         rope.freq_base = g.base;
     }
 
@@ -236,10 +237,17 @@ struct runner {
         ggml_tensor * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, T, 1, 1); ggml_set_input(mask);
 
         int sections[4] = { g.sections[0], g.sections[1], g.sections[2], g.sections[3] };
-        ggml_tensor * q_rope = ggml_rope_multi(ctx, q_raw, ipos, nullptr, g.n_rot, sections, GGML_ROPE_TYPE_IMROPE,
-                262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-        ggml_tensor * k_rope = ggml_rope_multi(ctx, k_raw, ipos, nullptr, g.n_rot, sections, GGML_ROPE_TYPE_IMROPE,
-                262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_tensor * q_rope, * k_rope;
+        if (g.neox) {
+            ggml_tensor * p1 = ggml_view_1d(ctx, ipos, T, 0);
+            q_rope = ggml_rope_ext(ctx, q_raw, p1, nullptr, g.n_rot, GGML_ROPE_TYPE_NEOX, 262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k_rope = ggml_rope_ext(ctx, k_raw, p1, nullptr, g.n_rot, GGML_ROPE_TYPE_NEOX, 262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            q_rope = ggml_rope_multi(ctx, q_raw, ipos, nullptr, g.n_rot, sections, GGML_ROPE_TYPE_IMROPE,
+                    262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k_rope = ggml_rope_multi(ctx, k_raw, ipos, nullptr, g.n_rot, sections, GGML_ROPE_TYPE_IMROPE,
+                    262144, g.base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
 
         auto hadamard = [&](ggml_tensor * x, ggml_tensor * rot) {
             const int64_t n = rot->ne[0];
@@ -749,6 +757,38 @@ int main(int argc, char ** argv) {
         const double tol = std::max(1e-3, 2.0*rs.inw_exact.rel());
         verdict((std::string("T3 cached vs reference [") + c->name + "]").c_str(), rs.ext_exact.rel() <= tol,
                 "rel max-abs %.3e over %d above-native rows (tol %.1e)", rs.ext_exact.rel(), rs.n_ext, tol);
+    }
+
+    // ------------------------------------------------------------------ T4: ubatch size sweep x rope type
+    printf("\n== T4 ubatch sizes across native (ub 1, 4, 16 < w0 = 32, 64 > w0), decode past native, IMRoPE and NeoX ==\n");
+    for (int neox = 0; neox < 2; ++neox) {
+        geom g4 = g; g4.neox = neox != 0;
+        for (const run_cfg * c : { &c_q8, &c_f16 }) {
+            for (int ub_n : { 1, 4, 16, 64 }) {
+                run_cfg cu = *c; cu.jl.uncached = true;
+                sched_builder sb;
+                sb.prefill(0, 224, 64);             // in-window bulk
+                sb.prefill(0, 556, ub_n);           // ub_n-token ubatches straddling w = 256 and 2w = 512 (G 1 -> 2 -> 3)
+                sb.prefill(0, 560, 4);              // a short tail ubatch beyond native (refined coordinator repro)
+                sb.decode({0}, 8);                  // decode past native
+                runner ra(g4, *c, 1024), rb(g4, cu, 1024);
+                double worst = 0;
+                ref_stats rs;
+                int n_active = 0;
+                for (const auto & ub : sb.steps) {
+                    step_out a2 = ra.step(ub), b2 = rb.step(ub);
+                    std::vector<int> rows(ub.size()); for (int i = 0; i < (int) ub.size(); ++i) rows[i] = i;
+                    worst = std::max(worst, max_abs_rows(a2.out, b2.out, g4.D*g4.H, rows));
+                    n_active += a2.active;
+                    check_vs_ref(ra, ub, a2, rs, false);
+                }
+                const double ref_err = c->rot ? rs.ext_q8q.rel() : rs.ext_exact.rel();
+                char nm[128]; snprintf(nm, sizeof nm, "T4 %s ub=%d +tail4 +decode8 to L=568 [%s]", neox ? "NeoX" : "IMRoPE", ub_n, c->name.c_str());
+                verdict(nm, worst == 0.0 && ref_err <= 1e-3 && n_active > 0,
+                        "cached==uncached %.3g | vs %s ref %.3e (%d rows) | %zu ubatches, %d active",
+                        worst, c->rot ? "Q-q8-aware" : "exact", ref_err, rs.n_ext, sb.steps.size(), n_active);
+            }
+        }
     }
 
     // ------------------------------------------------------------------ real geometry (optional)

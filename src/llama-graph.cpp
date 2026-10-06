@@ -482,23 +482,24 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    if (jl_active) {
-        llama_jetlong_fill_inputs(jl, mctx->jetlong_cfg(), jl_rope, jl_plan, ubatch->pos, jl_upd_idx, jl_upd_delta,
-                [&](int64_t i, int64_t j) { return mctx->jetlong_cell_pos(*ubatch, i, j); });
-    }
+    set_input_jetlong(ubatch, mctx);
 }
 
-bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+void llm_graph_input_attn_kv::set_input_jetlong(const llama_ubatch * ubatch, const llama_kv_cache_context * mctx_attn) const {
+    if (!jl_active) {
+        return;
+    }
+    llama_jetlong_fill_inputs(jl, mctx_attn->jetlong_cfg(), jl_rope, jl_plan, ubatch->pos, jl_upd_idx, jl_upd_delta,
+            [&](int64_t i, int64_t j) { return mctx_attn->jetlong_cell_pos(*ubatch, i, j); });
+}
 
-    this->mctx = mctx;
-
+bool llm_graph_input_attn_kv::can_reuse_jetlong(const llm_graph_params & params, const llama_kv_cache_context * mctx_attn) const {
     // Jet-Long: an active graph carries per-ubatch side-cache update lists -> never reused;
     //           an in-window graph is reused only for another in-window ubatch
     if (jl_active) {
         return false;
     }
-    if (mctx->jetlong_enabled()) {
+    if (mctx_attn->jetlong_enabled()) {
         const auto & ub = params.ubatch;
         bool has_ids = ub.pos != nullptr && ub.seq_id != nullptr && ub.n_seq_id != nullptr;
         std::vector<int32_t> seq(ub.n_tokens);
@@ -509,9 +510,20 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
             }
             seq[i] = ub.seq_id[i][0];
         }
-        if (has_ids && llama_jetlong_plan_ubatch(mctx->jetlong_cfg(), (int32_t) ub.n_tokens, ub.pos, seq.data()).active) {
+        if (has_ids && llama_jetlong_plan_ubatch(mctx_attn->jetlong_cfg(), (int32_t) ub.n_tokens, ub.pos, seq.data()).active) {
             return false;
         }
+    }
+    return true;
+}
+
+bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    if (!can_reuse_jetlong(params, mctx)) {
+        return false;
     }
 
     bool res = true;
@@ -1063,6 +1075,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    // Jet-Long inputs (sel, update rows, masks, deltas) live on the attention input; they must be filled here too
+    inp_attn->set_input_jetlong(ubatch, mctx->get_attn());
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1080,6 +1095,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
+
+    if (!inp_attn->can_reuse_jetlong(params, mctx->get_attn())) {
+        return false;
+    }
 
     bool res = true;
 
