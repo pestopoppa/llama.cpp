@@ -23,6 +23,14 @@ static bool gdn_timing_enabled() {
     return gdn_timing_requested() && graphs_disabled;
 }
 
+static bool gdn_chunked_prototype_requested() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED_PROTOTYPE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // [TAG_GDN_STATE_BF16] recurrent-state precision helpers.
 // The recurrent SSM state (curr_state / dst state region) may be stored as F32 (default,
 // byte-identical to upstream) or BF16 (runtime-gated by GGML_CUDA_GDN_STATE_BF16 at cache
@@ -253,6 +261,35 @@ static void launch_gated_delta_net(
     }
 }
 
+static bool try_launch_gated_delta_net_chunked_prototype(
+        bool kda, bool keep_rs, enum ggml_type dst_type, bool fused_cache,
+        int64_t S_v, int64_t n_tokens, int64_t n_seqs, int K) {
+    if (!gdn_chunked_prototype_requested()) {
+        return false;
+    }
+
+    const bool supported = !kda && !keep_rs && dst_type == GGML_TYPE_F32 && !fused_cache &&
+            S_v == 128 && n_seqs == 1 && K == 1 && n_tokens >= 64;
+
+    static bool warned_unsupported = false;
+    if (!supported) {
+        if (!warned_unsupported) {
+            GGML_LOG_INFO("%s: GGML_CUDA_GDN_CHUNKED_PROTOTYPE requested but unsupported shape; using serial GDN kernel\n",
+                    __func__);
+            warned_unsupported = true;
+        }
+        return false;
+    }
+
+    static bool warned_scaffold = false;
+    if (!warned_scaffold) {
+        GGML_LOG_WARN("%s: GGML_CUDA_GDN_CHUNKED_PROTOTYPE is a disabled scaffold only; using serial GDN kernel\n",
+                __func__);
+        warned_scaffold = true;
+    }
+    return false;
+}
+
 // 4-way (kda × keep_rs) dispatch, templated on the recurrent-state dtype.
 template <typename state_t>
 static void gdn_dispatch(bool kda, bool keep_rs,
@@ -366,9 +403,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
             state_slot_stride = cache->slot_stride;
         }
 
-        gdn_dispatch<float>(kda, keep_rs, q_d, k_d, v_d, g_d, b_d,
-            (const float *) src_state->data, dst_d, state_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+        if (!try_launch_gated_delta_net_chunked_prototype(kda, keep_rs, dst->type, cache != nullptr,
+                S_v, n_tokens, n_seqs, K)) {
+            gdn_dispatch<float>(kda, keep_rs, q_d, k_d, v_d, g_d, b_d,
+                (const float *) src_state->data, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+        }
     } else {
         GGML_ASSERT(cache == nullptr);
         nv_bfloat16 * dst_d       = (nv_bfloat16 *) dst->data;
