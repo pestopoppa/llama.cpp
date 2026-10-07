@@ -1,7 +1,6 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
-#include "deepseek4-fa-mask-capture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -796,24 +795,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
-    if (const char * dir = std::getenv("AUTOKERNEL_DUMP_FA_MASK")) {
-        if (dir[0]) {
-            if (!cparams.flash_attn || model.n_gpu_layers() != 0 || n_head != 64 ||
-                    model.hparams.n_head_kv(il) != 1 ||
-                    model.hparams.n_embd_head_k() != 512 || model.hparams.n_embd_head_v() != 512 ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_SOURCE_COMMIT") ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_MODEL") ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_RUN_ID") ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_RECIPE_SHA256") ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_PROMPT_SHA256") ||
-                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_MODEL_SHA256")) {
-                throw std::runtime_error("DS41 FA mask capture requires CPU FA and source/model provenance");
-            }
-            kq_mask = ggml_map_custom1(ctx0, kq_mask, dsv4_capture_fa_mask, 1,
-                                      (void *) (intptr_t) n_head);
-            cb(kq_mask, "autokernel_csa_lid_kq_mask", il);
-        }
-    }
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
     if (k_rot) {
