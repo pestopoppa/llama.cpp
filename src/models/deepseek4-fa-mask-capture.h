@@ -90,7 +90,9 @@ static void dsv4_capture_fa_mask(ggml_tensor * dst, const ggml_tensor * src,
         ",\"run_id\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_RUN_ID")) + ","
         "\"source_commit\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_SOURCE_COMMIT")) +
         ",\"model\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_MODEL")) +
-        ",\"model_sha256\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_MODEL_SHA256")) + "}\n";
+        ",\"model_sha256\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_MODEL_SHA256")) +
+        ",\"recipe_sha256\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_RECIPE_SHA256")) +
+        ",\"prompt_sha256\":" + dsv4_mask_json_string(std::getenv("AUTOKERNEL_FA_MASK_PROMPT_SHA256")) + "}\n";
     if (!dsv4_mask_publish(stem + ".mask.json", metadata.data(), metadata.size())) {
         LLAMA_LOG_ERROR("DS41 FA mask capture metadata failed: %s\n", stem.c_str());
     }
