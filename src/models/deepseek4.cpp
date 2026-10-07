@@ -803,6 +803,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_SOURCE_COMMIT") ||
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_MODEL") ||
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_RUN_ID") ||
+                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_RECIPE_SHA256") ||
+                    !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_PROMPT_SHA256") ||
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_MODEL_SHA256")) {
                 throw std::runtime_error("DS41 FA mask capture requires CPU FA and source/model provenance");
             }
