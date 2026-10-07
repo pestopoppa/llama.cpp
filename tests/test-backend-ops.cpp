@@ -5623,11 +5623,12 @@ struct test_ssm_scan_rollback : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
+                // Consume the same per-tensor tuple-seed stream as the float inputs.
+                // suite_seed_rng preserves random-device sampling when no suite seed is set.
+                std::mt19937 rng = suite_seed_rng();
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
