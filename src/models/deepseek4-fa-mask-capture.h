@@ -48,7 +48,9 @@ static bool dsv4_mask_publish(const std::string & path, const void * data, size_
 
 static void dsv4_capture_fa_mask(ggml_tensor * dst, const ggml_tensor * src,
                                int ith, int nth, void * userdata) {
-    GGML_ASSERT(ith == 0 && nth == 1);
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+    // CPU graph dispatch calls every pool thread; its node barrier publishes thread 0's copy.
+    if (ith != 0) { return; }
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
     GGML_ASSERT(src->type == GGML_TYPE_F16);
     const size_t bytes = ggml_nbytes(src);
