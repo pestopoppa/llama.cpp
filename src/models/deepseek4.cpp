@@ -799,6 +799,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     if (const char * dir = std::getenv("AUTOKERNEL_DUMP_FA_MASK")) {
         if (dir[0]) {
             if (!cparams.flash_attn || model.n_gpu_layers() != 0 || n_head != 64 ||
+                    model.hparams.n_head_kv(il) != 1 ||
                     model.hparams.n_embd_head_k() != 512 || model.hparams.n_embd_head_v() != 512 ||
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_SOURCE_COMMIT") ||
                     !dsv4_mask_env_present("AUTOKERNEL_FA_MASK_MODEL") ||
