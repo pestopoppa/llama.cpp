@@ -2018,6 +2018,13 @@ class tinyBLAS_Q0_AVX {
 #endif
             }
 
+            if (job + 1 < end) {
+                const int64_t next_ii = m0 + (job + 1) / xtiles * 4;
+                for (int64_t i = 0; i < 4; ++i)
+                    for (int64_t l = 0; l < 2 && l < k; ++l)
+                        __builtin_prefetch(A + lda * (next_ii + i) + l, 0, 1);
+            }
+
             for (int64_t j = 0; j < RN; ++j)
                 for (int64_t i = 0; i < 4; ++i)
                     C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
