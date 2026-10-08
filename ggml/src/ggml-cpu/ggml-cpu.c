@@ -1478,17 +1478,22 @@ UseGgmlGemm1:;
             }
         }
     #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
+        const int64_t bs = ggml_blck_size(vec_dot_type);
+        const int64_t blocks_per_row = ne10 / bs;
+        const int64_t nblocks = src1_nrows_total * blocks_per_row;
+        const int64_t block_end = ((ith + 1) * nblocks) / nth;
+
+        for (int64_t block = (ith * nblocks) / nth; block < block_end;) {
+            const int64_t row = block / blocks_per_row;
+            const int64_t i11 = row % ne11;
+            const int64_t i12 = (row / ne11) % ne12;
+            const int64_t i13 = row / (ne11 * ne12);
+            const int64_t ne10_block_start = block % blocks_per_row;
+            const int64_t count = MIN(block_end - block, blocks_per_row - ne10_block_start);
+            from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                       (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                       count * bs);
+            block += count;
         }
     #endif
         } // !mm_batch1
