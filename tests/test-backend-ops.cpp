@@ -2259,6 +2259,179 @@ static void print_test_result_locked(printer * output_printer, const test_result
     output_printer->print_test_result(result);
 }
 
+// ---------------------------------------------------------------------------
+// AKX-ALL-29.5: poisoned guard bands around dst (and the parent of a dst view).
+//
+// Opt-in only (AKX_GUARD_BANDS=1, or AKX_GUARD_SELFTEST=1); with neither set no code
+// below runs and allocation is byte-identical to before. test-backend-ops compares
+// dst only, so a kernel that writes outside its declared extent can pass. When
+// enabled, the root tensor of `out` is placed in its own buffer between a head and a
+// tail poison band; after the run the bands are read back. If `out` is a view into a
+// larger tensor (a KV slot), every byte of the parent outside the view must also be
+// unchanged. One receipt line per case goes to stderr:
+//   AK_GUARD_BANDS_V1 {json}   (schema epyc.autokernel.guard_bands.v1; the poison
+//   function, band layout and violation fields match loop/guard_bands.py).
+static bool akx_guard_enabled() {
+    static const bool enabled = [] {
+        const char * a = std::getenv("AKX_GUARD_BANDS");
+        const char * b = std::getenv("AKX_GUARD_SELFTEST");
+        return (a && std::strcmp(a, "1") == 0) || (b && std::strcmp(b, "1") == 0);
+    }();
+    return enabled;
+}
+static bool akx_guard_selftest() {
+    const char * b = std::getenv("AKX_GUARD_SELFTEST");
+    return b && std::strcmp(b, "1") == 0;
+}
+static uint8_t akx_poison(size_t i) { return (uint8_t) ((i * 167 + 91) & 0xFF); }
+
+// scratch-only: the data pointer of the guarded dst, so the injected op writes out of
+// extent into the backend under test only, never into the reference graph copy.
+static void * g_akx_inject_target = nullptr;
+static void akx_inject_fn(ggml_tensor * dst, const ggml_tensor * a, int ith, int /*nth*/, void * /*ud*/) {
+    if (ith != 0) {
+        return;
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(dst));
+    if (dst->data == g_akx_inject_target) {
+        ((uint8_t *) dst->data)[ggml_nbytes(dst)] = 0x00; // one byte past the declared extent
+    }
+}
+
+struct akx_guard {
+    static constexpr size_t BAND  = 4096;
+    static constexpr size_t ALIGN = 256;
+    bool                    active = false;
+    ggml_backend_buffer_ptr buf;
+    ggml_context_ptr        ctx;
+    ggml_tensor *           region = nullptr; // I8 view over the whole guarded buffer
+    ggml_tensor *           root   = nullptr;
+    ggml_tensor *           out    = nullptr;
+    size_t                  extent = 0;       // root bytes
+    size_t                  padded = 0;
+    std::vector<uint8_t>    snap;             // parent bytes before the run (view case)
+
+    void prepare(ggml_backend_t backend, ggml_tensor * out_tensor) {
+        if (!akx_guard_enabled()) {
+            return;
+        }
+        out  = out_tensor;
+        root = out;
+        while (root->view_src) {
+            root = root->view_src;
+        }
+        if (root->data || root->buffer) {
+            return;
+        }
+        extent = ggml_nbytes(root);
+        padded = (extent + ALIGN - 1) / ALIGN * ALIGN;
+        const size_t total = BAND + padded + BAND;
+        buf.reset(ggml_backend_alloc_buffer(backend, total));
+        if (!buf) {
+            return;
+        }
+        char * base = (char *) ggml_backend_buffer_get_base(buf.get());
+        if ((uintptr_t) base % ALIGN != 0) {
+            buf.reset();
+            return;
+        }
+        ggml_init_params params = { ggml_tensor_overhead() * 2, NULL, true };
+        ctx.reset(ggml_init(params));
+        int64_t ne = (int64_t) total;
+        region = ggml_new_tensor(ctx.get(), GGML_TYPE_I8, 1, &ne);
+        ggml_backend_tensor_alloc(buf.get(), region, base);
+        std::vector<uint8_t> head(BAND), tail(padded - extent + BAND);
+        for (size_t i = 0; i < head.size(); i++) { head[i] = akx_poison(i); }
+        for (size_t i = 0; i < tail.size(); i++) { tail[i] = akx_poison(i); }
+        ggml_backend_tensor_set(region, head.data(), 0, head.size());
+        ggml_backend_tensor_set(region, tail.data(), BAND + extent, tail.size());
+        ggml_backend_tensor_alloc(buf.get(), root, base + BAND);
+        if (akx_guard_selftest() && out->op == GGML_OP_MAP_CUSTOM1) {
+            g_akx_inject_target = root->data;
+        }
+        active = true;
+    }
+
+    void snapshot() {
+        if (active && out != root) {
+            snap.resize(extent);
+            ggml_backend_tensor_get(root, snap.data(), 0, extent);
+        }
+    }
+
+    // Returns "" when every band is intact, else the named reason. Always prints the receipt.
+    std::string check() {
+        if (!active) {
+            return "";
+        }
+        g_akx_inject_target = nullptr;
+        std::vector<uint8_t> all(BAND + padded + BAND);
+        ggml_backend_tensor_get(region, all.data(), 0, all.size());
+        const char * root_name = (out == root) ? "dst" : "kv";
+        struct viol { const char * view; const char * band; size_t first, n; int expected, observed; };
+        std::vector<viol> v;
+        auto scan = [&](const char * band, size_t lo, size_t hi) {
+            size_t first = 0, n = 0; int exp_b = 0, obs_b = 0;
+            for (size_t i = lo; i < hi; i++) {
+                if (all[i] != akx_poison(i - lo)) {
+                    if (n++ == 0) { first = i - lo; exp_b = akx_poison(i - lo); obs_b = all[i]; }
+                }
+            }
+            if (n) { v.push_back({ root_name, band, first, n, exp_b, obs_b }); }
+        };
+        scan("head", 0, BAND);
+        scan("tail", BAND + extent, BAND + padded + BAND);
+        size_t view_off = 0, view_ext = 0;
+        if (out != root) {
+            view_off = (size_t) ((const char *) out->data - (const char *) root->data);
+            view_ext = ggml_nbytes(out);
+            std::vector<uint8_t> after(extent);
+            ggml_backend_tensor_get(root, after.data(), 0, extent);
+            size_t first = 0, n = 0; int exp_b = 0, obs_b = 0;
+            for (size_t i = 0; i < extent; i++) {
+                if ((i < view_off || i >= view_off + view_ext) && after[i] != snap[i]) {
+                    if (n++ == 0) { first = i; exp_b = snap[i]; obs_b = after[i]; }
+                }
+            }
+            if (n) { v.push_back({ "dst", "outside_view", first, n, exp_b, obs_b }); }
+        }
+        std::string j = "{\"schema\":\"epyc.autokernel.guard_bands.v1\",\"band_bytes\":" + std::to_string(BAND) +
+                        ",\"views\":[{\"name\":\"" + root_name + "\",\"extent\":" + std::to_string(extent) +
+                        ",\"offset\":" + std::to_string(BAND) + "}";
+        if (out != root) {
+            j += ",{\"name\":\"dst\",\"extent\":" + std::to_string(view_ext) + ",\"offset\":" +
+                 std::to_string(BAND + view_off) + "}";
+        }
+        j += "],\"violations\":[";
+        for (size_t i = 0; i < v.size(); i++) {
+            j += std::string(i ? "," : "") + "{\"view\":\"" + v[i].view + "\",\"band\":\"" + v[i].band +
+                 "\",\"first_offset\":" + std::to_string(v[i].first) + ",\"n_bytes\":" + std::to_string(v[i].n) +
+                 ",\"expected\":" + std::to_string(v[i].expected) + ",\"observed\":" + std::to_string(v[i].observed) + "}";
+        }
+        j += "]}";
+        fprintf(stderr, "AK_GUARD_BANDS_V1 %s\n", j.c_str());
+        if (v.empty()) {
+            return "";
+        }
+        return "guard_band_violation: " + std::to_string(v[0].n) + " byte(s) in " + v[0].band + " band of view '" +
+               v[0].view + "' (first at +" + std::to_string(v[0].first) + ")";
+    }
+};
+
+// Scratch-only op whose reference implementation is a copy; with the injection armed
+// (AKX_GUARD_SELFTEST=1) the backend under test writes one byte past dst.
+struct test_akx_guard_inject : public test_case {
+    std::string vars() override { return "scratch"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t ne[1] = { 64 };
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_map_custom1(ctx, a, akx_inject_fn, 1, nullptr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -2578,6 +2751,8 @@ struct test_case {
         }
 
         // allocate
+        akx_guard guard;
+        guard.prepare(backend1, out); // no-op unless AKX_GUARD_BANDS=1 / AKX_GUARD_SELFTEST=1
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
 
         if (buf == NULL) {
@@ -2603,6 +2778,7 @@ struct test_case {
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
         }
+        guard.snapshot();
 
         std::vector<autokernel_value_source> value_sources;
         std::string value_source_error;
@@ -2851,8 +3027,16 @@ struct test_case {
         }
 
         // Create test result
+        const std::string guard_reason = guard.check();
+        if (!guard_reason.empty()) {
+            printf("%s ", guard_reason.c_str());
+            ud.ok = false;
+        }
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        if (!guard_reason.empty()) {
+            error_msg = guard_reason;
+        }
         std::string value_receipt;
         if (autokernel_value_transforms) {
             value_receipt =
@@ -9808,6 +9992,10 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    if (akx_guard_selftest()) {
+        test_cases.emplace_back(new test_akx_guard_inject()); // scratch-only; never in the default suite
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
