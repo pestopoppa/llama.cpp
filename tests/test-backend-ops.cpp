@@ -2307,7 +2307,8 @@ struct akx_guard {
     ggml_tensor *           region = nullptr; // I8 view over the whole guarded buffer
     ggml_tensor *           root   = nullptr;
     ggml_tensor *           out    = nullptr;
-    size_t                  extent = 0;       // root bytes
+    size_t                  extent = 0;       // root bytes (ggml_nbytes)
+    size_t                  alloc  = 0;       // root bytes the backend declares for it (buft alloc size >= extent)
     size_t                  padded = 0;
     std::vector<uint8_t>    snap;             // parent bytes before the run (view case)
 
@@ -2324,7 +2325,13 @@ struct akx_guard {
             return;
         }
         extent = ggml_nbytes(root);
-        padded = (extent + ALIGN - 1) / ALIGN * ALIGN;
+        // The backend may declare more bytes for a tensor than ggml_nbytes: quantized rows are padded
+        // (init_tensor zeroes that padding) and a CUDA/HIP FLASH_ATTN_EXT dst carries its own kernel
+        // workspace. Those bytes belong to the tensor's allocation, so the tail band starts after them;
+        // starting it at ggml_nbytes read the allocator's own padding as a kernel write (AKX-ALL-29.5 HIP
+        // run 20261020: 130 false positives) and overflowed the buffer for FA (ggml_backend_tensor_alloc assert).
+        alloc  = std::max(extent, ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), root));
+        padded = (alloc + ALIGN - 1) / ALIGN * ALIGN;
         const size_t total = BAND + padded + BAND;
         buf.reset(ggml_backend_alloc_buffer(backend, total + ALIGN)); // slack: base may be < ALIGN-aligned
         if (!buf) {
@@ -2337,11 +2344,11 @@ struct akx_guard {
         int64_t ne = (int64_t) total;
         region = ggml_new_tensor(ctx.get(), GGML_TYPE_I8, 1, &ne);
         ggml_backend_tensor_alloc(buf.get(), region, base);
-        std::vector<uint8_t> head(BAND), tail(padded - extent + BAND);
+        std::vector<uint8_t> head(BAND), tail(padded - alloc + BAND);
         for (size_t i = 0; i < head.size(); i++) { head[i] = akx_poison(i); }
         for (size_t i = 0; i < tail.size(); i++) { tail[i] = akx_poison(i); }
         ggml_backend_tensor_set(region, head.data(), 0, head.size());
-        ggml_backend_tensor_set(region, tail.data(), BAND + extent, tail.size());
+        ggml_backend_tensor_set(region, tail.data(), BAND + alloc, tail.size());
         ggml_backend_tensor_alloc(buf.get(), root, base + BAND);
         if (akx_guard_selftest() && out->op == GGML_OP_MAP_CUSTOM1) {
             g_akx_inject_target = root->data;
@@ -2370,7 +2377,7 @@ struct akx_guard {
             const char * di = std::getenv("AKX_GUARD_DEVICE_INJECT");
             if (di && std::strcmp(di, "1") == 0) {
                 uint8_t z = 0x00;
-                ggml_backend_tensor_set(region, &z, BAND + extent, 1);
+                ggml_backend_tensor_set(region, &z, BAND + alloc, 1);
             }
         }
         std::vector<uint8_t> all(BAND + padded + BAND);
@@ -2388,7 +2395,7 @@ struct akx_guard {
             if (n) { v.push_back({ root_name, band, first, n, exp_b, obs_b }); }
         };
         scan("head", 0, BAND);
-        scan("tail", BAND + extent, BAND + padded + BAND);
+        scan("tail", BAND + alloc, BAND + padded + BAND);
         size_t view_off = 0, view_ext = 0;
         if (out != root) {
             view_off = (size_t) ((const char *) out->data - (const char *) root->data);
@@ -2426,7 +2433,7 @@ struct akx_guard {
         std::string j = "{\"schema\":\"epyc.autokernel.guard_bands.v1\",\"op\":\"" + esc(op_name) +
                         "\",\"vars\":\"" + esc(case_vars) + "\",\"output_dtype\":\"" +
                         ggml_type_name(out->type) + "\",\"output_rms\":" + rms_json +
-                        ",\"band_bytes\":" + std::to_string(BAND) +
+                        ",\"band_bytes\":" + std::to_string(BAND) + ",\"alloc_bytes\":" + std::to_string(alloc) +
                         ",\"views\":[{\"name\":\"" + root_name + "\",\"extent\":" + std::to_string(extent) +
                         ",\"offset\":" + std::to_string(BAND) + "}";
         if (out != root) {
