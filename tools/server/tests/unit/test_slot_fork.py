@@ -283,6 +283,52 @@ def test_fork_chain_holds_each_junction_checkpoint_once():
             assert len(at_junction) == 1 and at_junction[0]["pinned"], (s["id"], s["checkpoints"])
 
 
+def test_pinned_junction_slot_file_roundtrip():
+    # the slot file layout is upstream's (llama payload | SCKP | SDFT) and has no `pinned` flag: a pinned fork
+    # junction saved to a slot file comes back as an ordinary (unpinned) checkpoint. The restore must still work
+    # and a later fork must match fresh (known limitation, see RECUT2.md).
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="kpf-slotfile-")
+    try:
+        server.slot_save_path = tmp
+        server.no_cache_idle_slots = True
+        server.start()
+        build_prompts()
+        complete(TRUNK, 0, n_predict=0, checkpoint_at=[-1])
+        child = complete(TRUNK + SUF[1], 1)  # slot 1 inherits a pinned junction through the fork
+        assert child["timings"]["n_fork_tokens"] == TRUNK_LEN, child["timings"]
+        s1 = slots()[1]
+        if not s1["checkpoints"]:
+            pytest.skip("pure-attention model: checkpoints are not used (kv fork mode)")
+        assert any(c["pinned"] and c["n_tokens"] == TRUNK_LEN for c in s1["checkpoints"]), s1["checkpoints"]
+        n_ckpt = len(s1["checkpoints"])
+
+        res = server.make_request("POST", "/slots/1?action=save", data={"filename": "junction.bin"})
+        assert res.status_code == 200, res.body
+        assert res.body["n_saved"] > 0
+        res = server.make_request("POST", "/slots/2?action=restore", data={"filename": "junction.bin"})
+        assert res.status_code == 200, res.body
+        assert res.body["n_restored"] > 0
+
+        s2 = slots()[2]
+        assert len(s2["checkpoints"]) == n_ckpt, (s2["checkpoints"], n_ckpt)
+        assert not any(c["pinned"] for c in s2["checkpoints"]), s2["checkpoints"]  # pinned=false after restore
+
+        # a later request on the restored slot, and a fork whose source is the restored slot, both match fresh
+        again = complete(TRUNK + SUF[2], 2)
+        fresh2 = complete(TRUNK + SUF[2], 3, slot_fork=False, cache_prompt=False)
+        assert again["tokens"] == fresh2["tokens"]
+        assert again["timings"]["cache_n"] >= TRUNK_LEN, again["timings"]  # the restored state was reused
+        later = complete(TRUNK + SUF[3], 0)
+        fresh3 = complete(TRUNK + SUF[3], 3, slot_fork=False, cache_prompt=False)
+        assert later["tokens"] == fresh3["tokens"]
+        check_pool_invariant(slots())
+    finally:
+        server.slot_save_path = None
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_checkpoint_at_rejects_bad_input():
     server.start()
     build_prompts()
