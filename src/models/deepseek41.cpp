@@ -491,11 +491,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_engram(
     dot = ggml_scale(ctx0, dot, 1.0f/sqrtf((float) n_embd)); // [1, hc, n_tokens]
     cb(dot, "engram_dot", il);
 
-    // signed sqrt. ggml_sgn(0) is 0 where torch.copysign(y, +0.0) is +y, so a dot of exactly
-    // +0.0f gives sigmoid(0) here and sigmoid(1e-3) in the reference -- a 2.5e-4 gate delta on
-    // a measure-zero input. Flagged in NOTES.md rather than papered over.
+    // signed sqrt with copysign semantics (DS41-B3.1): torch.copysign(y, +0.0) is +y, so the
+    // sign is +1 at dot == +0.0 (ggml_sgn(0) is 0, which gave sigmoid(0) instead of sigmoid(1e-3)).
+    // sign = 1 - 2*step(-dot): exactly +/-1 for every non-zero dot (bit-identical to ggml_sgn there),
+    // +1 at +0.0. -0.0 also maps to +1 (torch gives -1 there; ggml has no sign-bit read).
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, mag, ggml_sgn(ctx0, dot)));
+    ggml_tensor * sgn  = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_neg(ctx0, dot)), -2.0f, 1.0f);
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, mag, sgn));
 
     // engram.py:363-364: a dead/image position passes through untouched.
     gate = ggml_mul(ctx0, gate, inp->gate_mask);
