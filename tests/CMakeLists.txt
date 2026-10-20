@@ -376,6 +376,8 @@ set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-down
 
 # [KPF-17] cross-slot prefix fork: shared attention cells (the generated hybrid case is registered below)
 llama_build_and_test(test-kv-seq-share.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+# [KPF-17.4] needs an SWA model; built here, run from the cpu-queue job with -m <gemma>, not from ctest
+llama_build(test-kpf-swa-checkpoint.cpp)
 set_tests_properties(test-kv-seq-share PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (NOT GGML_BACKEND_DL)
