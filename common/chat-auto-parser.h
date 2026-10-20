@@ -7,6 +7,7 @@
 #include "nlohmann/json.hpp"
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -71,6 +72,14 @@ struct generation_params {
     bool                                  is_inference  = true;
     bool                                  add_inference = false;
     bool                                  mark_input    = true;  // whether to mark input strings in the jinja context
+
+    // every template render made with these params (or a copy) records its text and input spans here,
+    // so the final prompt can be matched back to the render that produced it
+    struct rendered_prompt {
+        std::string                            text;
+        std::vector<std::pair<size_t, size_t>> input_spans;
+    };
+    std::shared_ptr<std::vector<rendered_prompt>> render_log;
 
     bool has_continuation() const {
         return continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !continue_msg.empty();

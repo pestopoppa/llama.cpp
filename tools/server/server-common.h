@@ -282,6 +282,32 @@ std::vector<server_tokens> tokenize_input_prompts(
                                         bool add_special,
                                         bool parse_special);
 
+// Special-token injection guard for chat-templated prompts.
+// The chat template marks which bytes of the rendered prompt came from request data (message content and
+// roles, tool definitions, template kwargs); oaicompat_chat_params_parse() forwards them as
+// "chat_input_spans": [[begin, end], ...]. A control-token spelling that lies entirely inside one of these
+// spans is tokenized as literal text (parse_special = false); everything else is tokenized exactly as
+// before, so a prompt without such spellings yields the same tokens as plain parse_special = true.
+// The raw /completion prompt path does not use this.
+std::vector<std::pair<size_t, size_t>> chat_input_spans_from_json(const json & data);
+
+// byte ranges of control-token spellings (the tokens parse_special = false refuses to match) that lie
+// entirely inside one of input_spans, longest match first
+std::vector<std::pair<size_t, size_t>> find_control_spellings_in_spans(
+        const llama_vocab * vocab,
+        const std::string & prompt,
+        const std::vector<std::pair<size_t, size_t>> & input_spans);
+
+// tokenize a chat-templated prompt (add_special = true, parse_special = true) except that control-token
+// spellings inside input_spans become literal text; mctx may be null (text-only)
+server_tokens tokenize_chat_prompt(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        const std::string & prompt,
+        const std::vector<std::pair<size_t, size_t>> & input_spans,
+        const std::vector<raw_buffer> & files,
+        bool is_placeholder = false);
+
 //
 // OAI utils
 //

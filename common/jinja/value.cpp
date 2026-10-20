@@ -232,6 +232,30 @@ static std::string json_ensure_ascii_preserving_format(const std::string & json_
     return output;
 }
 
+// true if any string inside val (object keys included) came from user input
+static bool value_contains_input(const value & val) {
+    if (is_val<value_string>(val)) {
+        for (const auto & part : val->as_string().parts) {
+            if (part.is_input) {
+                return true;
+            }
+        }
+    } else if (is_val<value_array>(val)) {
+        for (const auto & item : val->as_array()) {
+            if (value_contains_input(item)) {
+                return true;
+            }
+        }
+    } else if (is_val<value_object>(val)) {
+        for (const auto & [k, v] : val->as_ordered_object()) {
+            if (value_contains_input(k) || value_contains_input(v)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static value tojson(const func_args & args) {
     args.ensure_count(1, 5);
     value val_ascii      = args.get_kwarg_or_pos("ensure_ascii", 1);
@@ -258,7 +282,12 @@ static value tojson(const func_args & args) {
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }
-    return mk_val<value_string>(json_str);
+    auto res = mk_val<value_string>(json_str);
+    // serialized data stays data: input anywhere in the value marks the whole JSON text as input
+    if (value_contains_input(args.get_pos(0))) {
+        res->val_str.mark_input();
+    }
+    return res;
 }
 
 template<bool is_reject>
