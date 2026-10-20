@@ -1,6 +1,7 @@
 import pytest
 from utils import *
 import base64
+import struct
 import requests
 
 server = ServerPreset.tinyllama2()
