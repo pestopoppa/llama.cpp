@@ -2326,15 +2326,12 @@ struct akx_guard {
         extent = ggml_nbytes(root);
         padded = (extent + ALIGN - 1) / ALIGN * ALIGN;
         const size_t total = BAND + padded + BAND;
-        buf.reset(ggml_backend_alloc_buffer(backend, total));
+        buf.reset(ggml_backend_alloc_buffer(backend, total + ALIGN)); // slack: base may be < ALIGN-aligned
         if (!buf) {
             return;
         }
         char * base = (char *) ggml_backend_buffer_get_base(buf.get());
-        if ((uintptr_t) base % ALIGN != 0) {
-            buf.reset();
-            return;
-        }
+        base = (char *) (((uintptr_t) base + ALIGN - 1) / ALIGN * ALIGN);
         ggml_init_params params = { ggml_tensor_overhead() * 2, NULL, true };
         ctx.reset(ggml_init(params));
         int64_t ne = (int64_t) total;
@@ -2360,7 +2357,7 @@ struct akx_guard {
     }
 
     // Returns "" when every band is intact, else the named reason. Always prints the receipt.
-    std::string check() {
+    std::string check(const std::string & op_name, const std::string & case_vars) {
         if (!active) {
             return "";
         }
@@ -2395,7 +2392,30 @@ struct akx_guard {
             }
             if (n) { v.push_back({ "dst", "outside_view", first, n, exp_b, obs_b }); }
         }
-        std::string j = "{\"schema\":\"epyc.autokernel.guard_bands.v1\",\"band_bytes\":" + std::to_string(BAND) +
+        // AKX-ALL-29.4: output dtype and RMS of the backend output tensor (opt-in only).
+        std::string rms_json = "null";
+        {
+            std::vector<float> f = tensor_to_float(out);
+            if (!f.empty()) {
+                double acc = 0.0;
+                for (float x : f) { acc += (double) x * (double) x; }
+                const double rms = std::sqrt(acc / (double) f.size());
+                if (std::isfinite(rms)) {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.9g", rms);
+                    rms_json = tmp;
+                }
+            }
+        }
+        auto esc = [](const std::string & in) {
+            std::string o;
+            for (char c : in) { if (c == '"' || c == '\\') { o += '\\'; } if ((unsigned char) c >= 0x20) { o += c; } }
+            return o;
+        };
+        std::string j = "{\"schema\":\"epyc.autokernel.guard_bands.v1\",\"op\":\"" + esc(op_name) +
+                        "\",\"vars\":\"" + esc(case_vars) + "\",\"output_dtype\":\"" +
+                        ggml_type_name(out->type) + "\",\"output_rms\":" + rms_json +
+                        ",\"band_bytes\":" + std::to_string(BAND) +
                         ",\"views\":[{\"name\":\"" + root_name + "\",\"extent\":" + std::to_string(extent) +
                         ",\"offset\":" + std::to_string(BAND) + "}";
         if (out != root) {
@@ -3013,7 +3033,7 @@ struct test_case {
         }
 
         // Create test result
-        const std::string guard_reason = guard.check();
+        const std::string guard_reason = guard.check(current_op_name, vars());
         if (!guard_reason.empty()) {
             printf("%s ", guard_reason.c_str());
             ud.ok = false;
