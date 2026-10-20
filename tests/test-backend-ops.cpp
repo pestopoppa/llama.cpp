@@ -2418,20 +2418,6 @@ struct akx_guard {
     }
 };
 
-// Scratch-only op whose reference implementation is a copy; with the injection armed
-// (AKX_GUARD_SELFTEST=1) the backend under test writes one byte past dst.
-struct test_akx_guard_inject : public test_case {
-    std::string vars() override { return "scratch"; }
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        int64_t ne[1] = { 64 };
-        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
-        ggml_set_name(a, "a");
-        ggml_tensor * out = ggml_map_custom1(ctx, a, akx_inject_fn, 1, nullptr);
-        ggml_set_name(out, "out");
-        return out;
-    }
-};
-
 struct test_case {
     virtual ~test_case() {}
 
@@ -4889,6 +4875,20 @@ struct test_add_id : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// Scratch-only op whose reference implementation is a copy; with the injection armed
+// (AKX_GUARD_SELFTEST=1) the backend under test writes one byte past dst.
+struct test_akx_guard_inject : public test_case {
+    std::string vars() override { return "scratch"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t ne[1] = { 64 };
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_map_custom1(ctx, a, akx_inject_fn, 1, nullptr);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
