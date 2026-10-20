@@ -4317,6 +4317,14 @@ static void ggml_cpu_prof_atexit(void) {
 }
 #endif
 
+#if defined(GGML_USE_IQK_MULMAT)
+static bool ggml_cpu_fused_upgate_enabled(void) {
+    static int v = -1; // benign race: idempotent init
+    if (v < 0) { const char * e = getenv("GGML_CPU_FUSED_UPGATE"); v = (e && atoi(e) == 1) ? 1 : 0; }
+    return v == 1;
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4328,6 +4336,22 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+#if defined(GGML_USE_IQK_MULMAT)
+    // CH-19: MUL_MAT_ID + MUL_MAT_ID + GLU(swiglu) -> one fused up+gate+SwiGLU node. Default OFF.
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_fused_upgate_enabled()) {
+        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 3)) {
+            struct ggml_tensor * n1  = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+            struct ggml_tensor * up   = (glu->src[1] == node) ? node : n1;
+            struct ggml_tensor * gate = (glu->src[0] == node) ? node : n1;
+            if (up != gate && ggml_iqk_try_moe_up_gate(params, up, gate, glu)) {
+                return 2;
+            }
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
