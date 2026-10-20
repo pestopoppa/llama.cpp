@@ -645,6 +645,7 @@ struct common_params {
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
+    bool chat_input_parse_special = false; // parse control-token spellings inside chat request data as control tokens
 
     // server CORS params
     std::string cors_origins = "*";

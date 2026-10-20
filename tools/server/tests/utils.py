@@ -123,6 +123,7 @@ class ServerProcess:
     gcp_compat: bool = False
     server_tools: str | None = None
     cors_origins: str | None = None
+    chat_input_parse_special: bool = False
 
     # session variables
     process: subprocess.Popen | None = None
@@ -286,6 +287,8 @@ class ServerProcess:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:
             server_args.extend(["--tools", self.server_tools])
+        if self.chat_input_parse_special:
+            server_args.append("--chat-input-parse-special")
         if self.backend_sampling:
             server_args.append("--backend_sampling")
         if self.gcp_compat:

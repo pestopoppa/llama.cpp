@@ -15,6 +15,7 @@
 
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -880,6 +881,19 @@ static void foreach_parameter(const json &                                      
     }
 }
 
+// drop the first `skip` bytes from span coordinates and clip them to [0, size)
+static void common_chat_shift_input_spans(std::vector<std::pair<size_t, size_t>> & spans, size_t skip, size_t size) {
+    std::vector<std::pair<size_t, size_t>> out;
+    for (const auto & [b, e] : spans) {
+        const size_t nb = std::min(b > skip ? b - skip : 0, size);
+        const size_t ne = std::min(e > skip ? e - skip : 0, size);
+        if (ne > nb) {
+            out.emplace_back(nb, ne);
+        }
+    }
+    spans = std::move(out);
+}
+
 static std::string common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
@@ -919,19 +933,35 @@ static std::string common_chat_template_direct_apply_impl(
 
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
+    // bos/eos come from the model, not from the user (as upstream ff026f8c0)
+    ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(tmpl.bos_token()));
+    ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(tmpl.eos_token()));
+
     // render
     jinja::runtime runtime(ctx);
     const jinja::value results = runtime.execute(tmpl.prog);
     auto parts = jinja::runtime::gather_string_parts(results);
 
-    std::string result = parts->as_string().str();
+    std::string result;
+    std::vector<std::pair<size_t, size_t>> input_spans;
+    for (const auto & part : parts->val_str.parts) {
+        if (part.is_input && !part.val.empty()) {
+            input_spans.emplace_back(result.size(), result.size() + part.val.size());
+        }
+        result += part.val;
+    }
 
     // TODO: improve this later
     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
         result = result.substr(tmpl.bos_token().size());
+        common_chat_shift_input_spans(input_spans, tmpl.bos_token().size(), result.size());
     }
     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
         result = result.substr(0, result.size() - tmpl.eos_token().size());
+        common_chat_shift_input_spans(input_spans, 0, result.size());
+    }
+    if (inputs.render_log) {
+        inputs.render_log->push_back({ result, std::move(input_spans) });
     }
     return result;
 }
@@ -2643,9 +2673,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     return std::nullopt;
 }
 
-static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
-                                                            const struct common_chat_templates_inputs & inputs) {
+static common_chat_params common_chat_templates_apply_jinja_impl(
+        const struct common_chat_templates *        tmpls,
+        const struct common_chat_templates_inputs & inputs,
+        const std::shared_ptr<std::vector<autoparser::generation_params::rendered_prompt>> & render_log) {
     autoparser::generation_params params;
+    params.render_log = render_log;
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
     const auto & tmpl =
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
@@ -2781,6 +2814,67 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     } catch (const std::exception & e) {
         throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());
     }
+}
+
+// Find the template render the final prompt was built from and carry its input spans over to the prompt.
+// The final prompt must be that render, optionally followed by a tail of the generation prompt (which
+// builders append for continuation); anything else (e.g. a builder that edits the rendered string) leaves
+// has_input_spans = false, and the caller falls back to parsing special tokens everywhere.
+static void common_chat_attach_input_spans(
+        common_chat_params &                                                 data,
+        const std::vector<autoparser::generation_params::rendered_prompt> & render_log,
+        const struct common_chat_templates_inputs &                          inputs) {
+    const std::string & prompt = data.prompt;
+    const autoparser::generation_params::rendered_prompt * best = nullptr;
+    for (const auto & r : render_log) {
+        if (r.text.size() > prompt.size() || prompt.compare(0, r.text.size(), r.text) != 0) {
+            continue;
+        }
+        const size_t tail = prompt.size() - r.text.size();
+        const auto & gen  = data.generation_prompt;
+        if (tail > 0 && (tail > gen.size() || prompt.compare(r.text.size(), tail, gen, gen.size() - tail, tail) != 0)) {
+            continue;
+        }
+        if (best == nullptr || r.text.size() > best->text.size()) {
+            best = &r;
+        }
+    }
+    if (best == nullptr) {
+        LOG_WRN("%s: rendered prompt does not match any template render; special tokens in request data will be parsed\n", __func__);
+        return;
+    }
+    data.has_input_spans = true;
+    data.input_spans     = best->input_spans;
+
+    // a continued (prefilled) final message is appended by the builders outside of the render: mark it too
+    const size_t base = best->text.size();
+    if (base < prompt.size() && inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.messages.empty()) {
+        const auto & msg = inputs.messages.back();
+        size_t end = prompt.size();
+        std::vector<std::pair<size_t, size_t>> tail_spans;
+        const std::string content = msg.render_content();
+        if (!content.empty() && end - base >= content.size() && string_ends_with(prompt, content)) {
+            tail_spans.emplace_back(end - content.size(), end);
+            end -= content.size();
+        }
+        const std::string & reasoning = msg.reasoning_content;
+        if (!reasoning.empty() && end - base >= reasoning.size()) {
+            const size_t pos = prompt.rfind(reasoning, end - reasoning.size());
+            if (pos != std::string::npos && pos >= base) {
+                tail_spans.emplace_back(pos, pos + reasoning.size());
+            }
+        }
+        std::sort(tail_spans.begin(), tail_spans.end());
+        data.input_spans.insert(data.input_spans.end(), tail_spans.begin(), tail_spans.end());
+    }
+}
+
+static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
+                                                            const struct common_chat_templates_inputs & inputs) {
+    auto render_log = std::make_shared<std::vector<autoparser::generation_params::rendered_prompt>>();
+    common_chat_params data = common_chat_templates_apply_jinja_impl(tmpls, inputs, render_log);
+    common_chat_attach_input_spans(data, *render_log, inputs);
+    return data;
 }
 
 // Legacy template route (adhoc C++ implementation of known templates), forward to llama_chat_apply_template.

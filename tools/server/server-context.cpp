@@ -4944,7 +4944,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        // chat-templated prompt: control-token spellings inside request data are tokenized as text
+        const bool is_chat = res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_RESP ||
+                             res_type == TASK_RESPONSE_TYPE_OAI_ASR  || res_type == TASK_RESPONSE_TYPE_ANTHROPIC;
+        const auto chat_input_spans = is_chat && !params.chat_input_parse_special && prompt.is_string() ?
+            chat_input_spans_from_json(data) : std::vector<std::pair<size_t, size_t>>();
+
+        if (!chat_input_spans.empty()) {
+            inputs.push_back(tokenize_chat_prompt(ctx_server.vocab, ctx_server.mctx, prompt.get<std::string>(), chat_input_spans, files));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
         } else {
@@ -6269,7 +6277,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
-    if (mctx != nullptr) {
+    const auto chat_input_spans = !params.chat_input_parse_special && prompt.is_string() ?
+        chat_input_spans_from_json(body_parsed) : std::vector<std::pair<size_t, size_t>>();
+    if (!chat_input_spans.empty()) {
+        n_tokens = tokenize_chat_prompt(vocab, mctx, prompt.get<std::string>(), chat_input_spans, files, true).size();
+    } else if (mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
