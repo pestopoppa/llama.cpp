@@ -2362,6 +2362,17 @@ struct akx_guard {
             return "";
         }
         g_akx_inject_target = nullptr;
+        {
+            // Device-buffer positive control (AKX_GUARD_DEVICE_INJECT=1, with AKX_GUARD_BANDS=1): the
+            // MAP_CUSTOM1 selftest op is CPU-only, so on ROCm0 it is "not supported" and cannot fire. This
+            // writes one byte into the tail band of the DEVICE buffer after the graph ran, to prove the
+            // readback + band scan detects a change on the GPU allocation. It does NOT exercise a kernel write.
+            const char * di = std::getenv("AKX_GUARD_DEVICE_INJECT");
+            if (di && std::strcmp(di, "1") == 0) {
+                uint8_t z = 0x00;
+                ggml_backend_tensor_set(region, &z, BAND + extent, 1);
+            }
+        }
         std::vector<uint8_t> all(BAND + padded + BAND);
         ggml_backend_tensor_get(region, all.data(), 0, all.size());
         const char * root_name = (out == root) ? "dst" : "kv";
