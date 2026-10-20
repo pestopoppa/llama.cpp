@@ -1,4 +1,5 @@
 #include "llama-sampler.h"
+#include "../common/rng-poskey.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -1026,7 +1027,13 @@ struct llama_sampler_dist : public llama_sampler_backend {
     std::mt19937 rng;
 
     ggml_tensor * inp_uniform;
+
+    uint64_t n_accepted = 0; // SPEC-RNG.1: absolute position counter (LLAMA_RNG_POSKEY=1)
 };
+
+static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token) {
+    ((llama_sampler_dist *) smpl->ctx)->n_accepted++;
+}
 
 static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
@@ -1070,7 +1077,9 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const double rnd = dist(ctx->rng);
+    const double rnd = llama_rng_poskey_enabled()
+        ? llama_rng_poskey_u01(ctx->seed_cur, ctx->n_accepted, LLAMA_RNG_ROLE_DIST)
+        : dist(ctx->rng);
 
           double sum_run = 0.0f;
     const double sum_tgt = sum_cum*rnd;
@@ -1109,6 +1118,7 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_dist *) smpl->ctx;
     ctx->seed_cur = get_rng_seed(ctx->seed);
     ctx->rng.seed(ctx->seed_cur);
+    ctx->n_accepted = 0;
 }
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
@@ -1120,6 +1130,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         auto * result_ctx = (llama_sampler_dist *) result->ctx;
 
         result_ctx->rng = ctx->rng;
+        result_ctx->n_accepted = ctx->n_accepted;
     }
 
     return result;
@@ -1216,7 +1227,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 
 static struct llama_sampler_i llama_sampler_dist_i = {
     /* .name              = */ llama_sampler_dist_name,
-    /* .accept            = */ nullptr,
+    /* .accept            = */ llama_sampler_dist_accept,
     /* .apply             = */ llama_sampler_dist_apply,
     /* .reset             = */ llama_sampler_dist_reset,
     /* .clone             = */ llama_sampler_dist_clone,
@@ -1237,6 +1248,7 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .seed_cur    = */ seed_cur,
             /* .rng         = */ std::mt19937(seed_cur),
             /* .inp_uniform = */ nullptr,
+            /* .n_accepted  = */ 0,
         }
     );
 }
