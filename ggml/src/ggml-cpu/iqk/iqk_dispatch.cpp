@@ -628,10 +628,12 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int64_t slab_gran = slab_ok ? iqk_mul_mat_moe_row_granularity(tA) : 1;
     slab_ok = slab_ok && slab_gran > 0 && ne01 > 0 && ne01 % slab_gran == 0;
     int64_t n_active = 0;
+    int64_t max_cne1 = 0;
     unsigned checked_counts = 0;
     for (int cur_a = 0; slab_ok && cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
+        if (cne1 > max_cne1) max_cne1 = cne1;
         if (cne1 > 8 || iqk_dequant_type(tA, (int) cne1) != tA) {
             slab_ok = false;
             break;
@@ -655,6 +657,20 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int64_t u1 = units_total * (ith + 1) / nth;
     int64_t expert_unit = 0;
 
+    // Consolidation C re-port of f75e2a699 (akm-moe-rowexact-weighted-slabs, +3.179% on GLM-5.3 MTP serving):
+    // when the row-exact MTP verify path runs a Q4_K/Q5_K MoE, split the slab units across threads in proportion to
+    // each expert's row count instead of equally per active expert. Same row slices, kernels and reduction order,
+    // only the thread->slice assignment changes. Every other case keeps the champion's equal-units partition.
+    const bool slab_weighted = slab_ok && mmid_rowexact && (tA == GGML_TYPE_Q4_K || tA == GGML_TYPE_Q5_K) &&
+        max_cne1 <= ggml_cpu_rowexact_n();
+    int64_t work_total = 0;
+    for (int cur_a = 0; slab_weighted && cur_a < n_as; ++cur_a) {
+        work_total += matrix_row_counts[cur_a] * units_per_expert;
+    }
+    const int64_t work0 = work_total * ith / nth;
+    const int64_t work1 = work_total * (ith + 1) / nth;
+    int64_t work_prefix = 0;
+
     // 3) per-expert GEMM via iqk
     bool engaged = false;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -663,6 +679,24 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
         engaged = true;
         const char * A = (const char *) src0->data + (size_t) cur_a * src0->nb[2];
         const iqk_mmid * rmap = matrix_rows + (size_t) cur_a * n_ids * ids->ne[1];
+        if (slab_weighted) {
+            const int64_t expert_work = cne1 * units_per_expert;
+            const int64_t local0 = work0 <= work_prefix ? 0 :
+                (work0 < work_prefix + expert_work ? work0 - work_prefix : expert_work);
+            const int64_t local1 = work1 <= work_prefix ? 0 :
+                (work1 < work_prefix + expert_work ? work1 - work_prefix : expert_work);
+            const int64_t unit0 = (local0 + cne1 - 1) / cne1;
+            const int64_t unit1 = (local1 + cne1 - 1) / cne1;
+            work_prefix += expert_work;
+            if (unit0 < unit1 && !iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
+                    tA, A, src0->nb[1],
+                    activation_type, qact, act_row,
+                    (float *) dst->data, dst->nb[1], dst->nb[2],
+                    rmap, unit0 * slab_gran, (unit1 - unit0) * slab_gran)) {
+                return false;
+            }
+            continue;
+        }
         if (slab_ok) {
             const int64_t first = u0 > expert_unit ? u0 : expert_unit;
             const int64_t end = u1 < expert_unit + units_per_expert ? u1 : expert_unit + units_per_expert;
