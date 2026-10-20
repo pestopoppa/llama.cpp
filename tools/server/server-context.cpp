@@ -1859,7 +1859,7 @@ private:
         if (llama_model_n_swa(llama_get_model(ctx_dft)) > 0) {
             return false;
         }
-        const auto * mem = llama_get_memory(ctx_dft);
+        llama_memory_t mem = llama_get_memory(ctx_dft);
         return llama_memory_seq_pos_min(mem, src_id) == 0 && llama_memory_seq_pos_max(mem, src_id) >= p - 1;
     }
 
