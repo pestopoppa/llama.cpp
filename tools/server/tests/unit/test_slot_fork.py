@@ -451,6 +451,12 @@ def server_mode() -> str:
 # ---------------------------------------------------------------------------------------------------------------
 
 LOGPROB_FLOOR = 0.05  # fresh-vs-fresh floor on the first generated token's logprob (CPU, differing batch shapes)
+# A greedy flip is accepted only where the fresh run's top-2 logprobs are this close. Any change of float evaluation order
+# (batch boundaries, batch composition, KV cell placement) moves CPU logprobs: measured 2026-10-20 on gemma-3-1b, the
+# slot's OWN checkpoint continuation (no fork at all), the fork and a fresh prefill of TRUNK+SUF[1] differ by up to 0.06
+# nats at token 1, and at token 3 the top-2 (19566 vs 3026) are 0.07-0.25 nats apart, so job 23's "fork vs fresh"
+# divergence at index 3 was that near-tie flipping, not the fork (the logit-level floor is in test-kpf-swa-checkpoint).
+TIE_MARGIN = 0.5
 
 
 def need_ckpt_mode():
@@ -459,6 +465,8 @@ def need_ckpt_mode():
 
 
 def fresh(prompt: list[int], id_slot: int, n_predict: int = 24, **extra) -> dict:
+    # top-2 per position: same_as_fresh needs the runner-up and its margin
+    extra["n_probs"] = max(2, int(extra.get("n_probs", 0)))
     return complete(prompt, id_slot, n_predict=n_predict, slot_fork=False, cache_prompt=False, **extra)
 
 
@@ -470,7 +478,22 @@ def first_logprob(body: dict):
 
 
 def same_as_fresh(a: dict, b: dict, what: str):
-    assert a["tokens"] == b["tokens"], (what, a["tokens"], b["tokens"])
+    """a equals the fresh run b token for token, except that ONE greedy flip to b's runner-up is accepted at a position
+    where b's top-2 are within TIE_MARGIN; past such a flip the two continuations legitimately differ, so the comparison
+    stops there. A wrong state diverges where b is confident, or to a token outside b's top-2."""
+    ta, tb = a["tokens"], b["tokens"]
+    probs = b.get("completion_probabilities") or []
+    for i, (x, y) in enumerate(zip(ta, tb)):
+        if x == y:
+            continue
+        tops = probs[i].get("top_logprobs", []) if i < len(probs) else []
+        margin = tops[0]["logprob"] - tops[1]["logprob"] if len(tops) >= 2 else None
+        assert margin is not None and margin < TIE_MARGIN and x == tops[1]["id"] and y == tops[0]["id"], \
+            (what, f"diverged at {i}", ta, tb, tops[:2])
+        print(f"{what}: greedy flip at a near-tie of the fresh run, index {i}, top-2 margin {margin:.3f} nats")
+        break
+    else:
+        assert len(ta) == len(tb), (what, ta, tb)
     la, lb = first_logprob(a), first_logprob(b)
     if la is not None and lb is not None:
         assert abs(la - lb) < LOGPROB_FLOOR, (what, la, lb)
@@ -510,6 +533,9 @@ def test_kpf171_pinned_ntokens_equal_requested():
         server.slot_save_path = tmp
         server.n_batch = server.n_batch or 40
         server.n_ubatch = server.n_batch
+        # with cache_idle_slots on (the default) every launch purges every idle slot into the RAM cache: slot 0 would be
+        # empty by the slot-file step below and that step would compare two empty lists (job 23 ran it so, vacuously)
+        server.no_cache_idle_slots = True
         server.start()
         build_prompts()
         need_ckpt_mode()
@@ -533,6 +559,7 @@ def test_kpf171_pinned_ntokens_equal_requested():
         assert_ckpt_offsets(slots(), "after fork")
 
         # slot-file round trip keeps n_tokens
+        assert sorted(c["n_tokens"] for c in ckpts(0) if c["pinned"]) == sorted(req), ckpts(0)
         res = server.make_request("POST", "/slots/0?action=save", data={"filename": "k.bin"})
         assert res.status_code == 200, res.body
         res = server.make_request("POST", "/slots/3?action=restore", data={"filename": "k.bin"})
@@ -564,6 +591,9 @@ def test_kpf171_offset_oracle_under_concurrency():
         server.slot_save_path = tmp
         server.n_batch = 40
         server.n_ubatch = 40
+        # every probe launch would purge the three idle sources (cache_idle_slots): job 23's second probe found no
+        # source at all (n_fork_tokens 0, kind none). The oracle needs the sources to stay.
+        server.no_cache_idle_slots = True
         server.start()
         build_prompts()
         need_ckpt_mode()
@@ -662,8 +692,16 @@ def test_kpf172_source_diverges_below_junction():
         c1 = complete(TRUNK + SUF[1], 1)
         assert c1["timings"]["n_fork_tokens"] == TRUNK_LEN, c1["timings"]
         assert any(c["pinned"] and c["n_tokens"] == TRUNK_LEN for c in ckpts(1))
-        # slot 0 rewinds below the junction
-        complete(TRUNK[:40] + SUF[2], 0, n_predict=2, slot_fork=False)
+        if idle_cache:
+            # cache_idle_slots on a unified KV: launching c1 already purged the idle source (prompt_clear, pinned
+            # checkpoints included), so slot 0 is below the junction now. An explicit rewind request here would purge
+            # the idle CHILD the same way (job 23 did that: c2 then forked 18 tokens from slot 0's new prompt), so the
+            # real case is the next trunk request reaching the child before any other launch.
+            s0 = slots()[0]
+            assert s0["kv_cells"]["private"] + s0["kv_cells"]["shared"] == 0, s0
+        else:
+            # slot 0 rewinds below the junction
+            complete(TRUNK[:40] + SUF[2], 0, n_predict=2, slot_fork=False)
         assert not [c for c in ckpts(0) if c["n_tokens"] >= TRUNK_LEN], ckpts(0)
         c2 = complete(TRUNK + SUF[3], 2)
         assert c2["timings"]["n_fork_tokens"] == TRUNK_LEN, (idle_cache, c2["timings"])
@@ -778,7 +816,8 @@ def test_kpf173_pinned_cap_per_slot():
     build_prompts()
     need_ckpt_mode()
     cap, lens = 3, []
-    sizes = []
+    n_ctx_ckpt = 8
+    max_one = 0.0
     for k in range(10):
         pr = seq_prompt(k)
         lens.append(len(pr))
@@ -786,8 +825,15 @@ def test_kpf173_pinned_cap_per_slot():
         p = pinned_of(0)
         assert len(p) <= cap, (k, p)
         assert p == lens[-cap:], (k, p, lens)  # newest kept, oldest dropped first
-        sizes.append(sum(c["size_mib"] for c in ckpts(0)))
-    assert max(sizes) <= 1.2 * sizes[cap + 1], sizes  # bounded over the series
+        # bounded over the series: the COUNT is bounded (--ctx-checkpoints, pinned capped) and each checkpoint is one
+        # state. A checkpoint's size is the state size, constant for a recurrent state but growing with the token count
+        # up to the window on an SWA cache, so "total size plateaus" (job 23's assertion) only holds on hybrids
+        cks = ckpts(0)
+        assert len(cks) <= max(n_ctx_ckpt, cap + 1), (k, cks)
+        max_one = max([max_one] + [c["size_mib"] for c in cks])
+        pinned_mib = sum(c["size_mib"] for c in cks if c["pinned"])
+        assert pinned_mib <= cap * max_one + 1e-6, (k, pinned_mib, max_one, cks)
+        assert sum(c["size_mib"] for c in cks) <= max(n_ctx_ckpt, cap + 1) * max_one + 1e-6, (k, cks)
     # ordinary release did not drop them (the slot is idle now)
     assert pinned_of(0) == lens[-cap:]
     # a child inherits the clones and they count toward ITS cap
