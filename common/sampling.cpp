@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "rng-poskey.h"
 
 #include "common.h"
 #include "fit.h"
@@ -125,9 +126,11 @@ struct common_sampler {
 
     uint32_t speculative_seed;
     std::mt19937 speculative_rng;
+    uint64_t n_accepted = 0; // SPEC-RNG.1: absolute position (tokens accepted so far)
 
     void reset() {
         prev.clear();
+        n_accepted = 0;
 
         llama_sampler_reset(chain);
         speculative_rng.seed(speculative_seed);
@@ -424,6 +427,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p   = */ {},
         /* .speculative_seed = */ speculative_seed,
         /* .speculative_rng  = */ std::mt19937(speculative_seed),
+        /* .n_accepted       = */ 0,
     };
 
     return result;
@@ -477,6 +481,7 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+    gsmpl->n_accepted++;
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
@@ -498,6 +503,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .speculative_seed = */ gsmpl->speculative_seed,
         /* .speculative_rng  = */ gsmpl->speculative_rng,
+        /* .n_accepted       = */ gsmpl->n_accepted,
     };
 }
 
@@ -965,7 +971,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             }
         }
 
-        if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
+        const uint64_t spec_pos = gsmpl->n_accepted; // absolute position of the token being decided
+        const bool poskey = llama_rng_poskey_enabled();
+        const float u_acc = poskey
+            ? (float) llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_ACC)
+            : 0.0f;
+        if (q_draft > 0.0f && (poskey ? u_acc : uniform(gsmpl->speculative_rng)) * q_draft <= p_draft) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
 
@@ -986,8 +997,20 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 
         llama_token id = fallback;
         if (residual_sum > 0.0f) {
-            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
-            id = p->data[sample(gsmpl->speculative_rng)].id;
+            if (poskey) {
+                // inverse-CDF on a position-keyed uniform
+                const double tgt = llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_RES) * (double) residual_sum;
+                double run = 0.0;
+                size_t pick = p->size - 1;
+                for (size_t j = 0; j < p->size; ++j) {
+                    run += residual[j];
+                    if (residual[j] > 0.0f && run > tgt) { pick = j; break; }
+                }
+                id = p->data[pick].id;
+            } else {
+                std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
+                id = p->data[sample(gsmpl->speculative_rng)].id;
+            }
         }
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
