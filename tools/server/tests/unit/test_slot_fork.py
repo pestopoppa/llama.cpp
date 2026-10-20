@@ -263,6 +263,26 @@ def test_checkpoint_at_is_pinned():
     assert body["timings"]["prompt_n"] == TRUNK_LEN
 
 
+def test_fork_chain_holds_each_junction_checkpoint_once():
+    # trunk with a pinned end checkpoint, then a chain of children (end fork, then checkpoint forks): no slot may hold
+    # two checkpoints of the same state (n_tokens, pos_max); on a 27B each one is ~150 MiB
+    server.no_cache_idle_slots = True
+    server.start()
+    build_prompts()
+    complete(TRUNK, 0, n_predict=0, checkpoint_at=[-1])
+    if not slots()[0]["checkpoints"]:
+        pytest.skip("pure-attention model: checkpoints are not used (kv fork mode)")
+    for k in (1, 2, 3):
+        body = complete(TRUNK + SUF[k], k)
+        assert body["timings"]["n_fork_tokens"] == TRUNK_LEN, body["timings"]
+    for s in slots():
+        keys = [(c["n_tokens"], c["pos_max"]) for c in s["checkpoints"]]
+        assert len(keys) == len(set(keys)), (s["id"], s["checkpoints"])
+        at_junction = [c for c in s["checkpoints"] if c["n_tokens"] == TRUNK_LEN]
+        if s["id"] > 0:
+            assert len(at_junction) == 1 and at_junction[0]["pinned"], (s["id"], s["checkpoints"])
+
+
 def test_checkpoint_at_rejects_bad_input():
     server.start()
     build_prompts()
