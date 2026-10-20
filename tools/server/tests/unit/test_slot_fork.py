@@ -630,30 +630,75 @@ def test_kpf171_offset_oracle_under_concurrency():
 
 
 def test_kpf171_abort_then_retry():
-    """KPF-17.1(3): abort a trunk-first request at several offsets mid-prefill, send a sibling at once: output == fresh and
-    the fork never reads the aborted slot's cells beyond its decoded n_past.
-    MUTATION: no_posmax_guard (bites in kv fork mode, i.e. a pure-attention model; on hybrids the checkpoint list only
-    holds decoded positions, so this case is the corresponding oracle there)."""
+    """KPF-17.1(3): abort a trunk-first request at several offsets mid-prefill, send a sibling right after the cancel lands:
+    output == fresh and the fork never reads the aborted slot's cells beyond its decoded n_past.
+
+    How a slot cancelled mid-prefill is treated (server-context.cpp): the cancel is a queue task, handled between
+    update_slots iterations (SERVER_TASK_TYPE_CANCEL -> release()); prompt tokens are appended only in the iteration
+    whose batch decodes them, and a failed decode prompt_clear()s every processing slot. So at any fork launch a source's
+    prompt tokens equal its decoded cells, and the kv-mode guard `src_pos_max < p - 1` in find_fork_source is
+    defence in depth that no reachable state exercises: LLAMA_KPF_MUTATE=no_posmax_guard ALONE is undetectable by
+    construction (job 22, 2026-10-20). In kv mode this case asserts that invariant directly (n_prompt_tokens == cells).
+    MUTATIONS (kv mode, pure-attention model): abort_keeps_tail is a fault injection (a cancelled mid-prefill slot keeps
+    the next n_batch prompt tokens it never decoded, i.e. the state upstream's "handle ret == 2 (abort)" TODO would create)
+    -> must still PASS, the guard skips that source; abort_keeps_tail,no_posmax_guard -> must FAIL (forks cells that
+    were never computed). On hybrids the checkpoint list only holds decoded positions, so this case is the output oracle.
+
+    Job 22 never aborted anything: the old request was non-streaming, so requests.post returned only after the server
+    finished (every slot-0 release showed the full 703 tokens). The client now hangs up with a read timeout, and then
+    sends NOTHING for 1.2 s: a non-streaming handler notices the hang-up only when its 1 s result wait times out
+    (server_response::recv_with_timeout restarts the full wait on every notify, i.e. on ANY task's result), so polling
+    /slots right away starves the disconnect check and the task runs to completion. The cancel therefore lands on a
+    1 s tick of the request's wait; the delays below put the hang-up before ticks 1, 1, 2, 2 and 3."""
     import requests
+    inject = "abort_keeps_tail" in os.environ.get("LLAMA_KPF_MUTATE", "").split(",")
     server.n_batch = 40
     server.n_ubatch = 40
     server.start()
     build_prompts()
-    big = (TRUNK * 5)[: 5 * TRUNK_LEN]
-    for k, delay in enumerate((0.1, 0.2, 0.35, 0.5, 0.8)):
-        url = f"http://{server.server_host}:{server.server_port}/completion"
-        r = requests.post(url, json={"prompt": big + SUF[0], "id_slot": 0, "n_predict": 4, "cache_prompt": True,
-                                     "checkpoint_at": [TRUNK_LEN, 2 * TRUNK_LEN, 3 * TRUNK_LEN]}, stream=True, timeout=600)
-        time.sleep(delay)
-        r.close()  # client disconnect -> the server cancels the task mid-prefill
-        sib = complete(big[: 2 * TRUNK_LEN] + SUF[1 + k], 1, n_predict=8)
-        same_as_fresh(sib, fresh(big[: 2 * TRUNK_LEN] + SUF[1 + k], 2, n_predict=8, n_probs=1), f"abort@{delay}")
+    kv = server_mode() == "kv"
+    # long enough that a cancel landing up to ~1 s (HTTP_POLLING_SECONDS) after the hang-up is still mid-prefill: TRUNK*12
+    # (1647 tokens) prefilled in 1.2 s on gemma-3-1b with 24 threads and no round was cancelled. TRUNK*24 keeps slot 0 +
+    # the sibling + the fresh run inside the 8192-cell pool.
+    big = TRUNK * 24
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    aborted, tail_seen = 0, 0
+    for k, delay in enumerate((0.1, 0.5, 1.2, 1.6, 2.2)):
+        try:
+            requests.post(url, json={"prompt": big + SUF[0], "id_slot": 0, "n_predict": 4, "cache_prompt": True,
+                                     "checkpoint_at": [TRUNK_LEN, 2 * TRUNK_LEN, 3 * TRUNK_LEN]}, timeout=(10, delay))
+        except requests.exceptions.ReadTimeout:
+            pass  # the client hung up: the server cancels the task at its next poll
+        time.sleep(1.2)  # no traffic: let the handler's 1 s wait time out and see the closed connection
+        for _ in range(200):
+            if not slots()[0]["is_processing"]:
+                break
+            time.sleep(0.05)
+        s0 = slots()[0]
+        assert not s0["is_processing"], s0
+        n_tok = s0.get("n_prompt_tokens", 0)
+        cells = s0["kv_cells"]["private"] + s0["kv_cells"]["shared"]
+        aborted += int(n_tok < len(big))
+        if kv:
+            if inject:
+                tail_seen += int(n_tok > cells)
+            else:
+                assert n_tok == cells, (delay, n_tok, cells)  # the invariant that makes the guard unreachable
+        sib_prompt = big + SUF[1 + k]
+        sib = complete(sib_prompt, 1, n_predict=8)
         n_f = sib["timings"]["n_fork_tokens"]
-        assert n_f <= 2 * TRUNK_LEN + 0, sib["timings"]
+        print(f"abort@{delay}: slot 0 n_prompt_tokens {n_tok} cells {cells}, sibling n_fork_tokens {n_f} "
+              f"({sib['timings'].get('fork_src_kind')})")
+        if kv:
+            assert n_f <= cells, (delay, n_f, cells, sib["timings"])  # never beyond the aborted slot's decoded cells
+            assert n_f == 0 or sib["timings"]["fork_src_slot"] == 0, sib["timings"]
+        same_as_fresh(sib, fresh(sib_prompt, 2, n_predict=8, n_probs=1), f"abort@{delay}")
         assert_ckpt_offsets(slots(), f"abort@{delay}")
-        time.sleep(0.5)
-        erase_slot(0)
-        erase_slot(1)
+        for i in (0, 1, 2):  # slot 2 (the fresh run) shares big with the next sibling: it must not be a fork source
+            erase_slot(i)
+    assert aborted >= 1, "no round was cancelled mid-prefill: the case would be vacuous"
+    if kv and inject:
+        assert tail_seen >= 1, "fault injection abort_keeps_tail never created a source ahead of its cells"
     check_pool_invariant(slots())
 
 

@@ -136,7 +136,7 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
-// [KPF-17/19] test-only mutation switch: LLAMA_KPF_MUTATE=name[,name...] removes ONE guard so a conformance case can be
+// [KPF-17/19] test-only mutation switch: LLAMA_KPF_MUTATE=name[,name...] removes ONE guard (or, for the names documented as fault injections, creates the state a guard defends against) so a conformance case can be
 // proven to fail without it. Unset in production (a single getenv at first use).
 static bool kpf_mutate(const char * name) {
     static const std::string env = []() { const char * e = getenv("LLAMA_KPF_MUTATE"); return std::string(e ? e : ""); }();
@@ -3275,6 +3275,17 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            if (kpf_mutate("abort_keeps_tail") && slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                                    !slot.task->tokens.has_mtmd) {
+                                // [KPF-17.1(3) fault injection] the cancelled mid-prefill slot keeps the next n_batch
+                                // prompt tokens it never decoded: the state the find_fork_source pos_max guard defends
+                                // against (unreachable today: tokens are appended only in the iteration that decodes them)
+                                const int32_t n0 = slot.prompt.n_tokens();
+                                const int32_t n1 = std::min<int32_t>(slot.task->n_tokens(), n0 + params_base.n_batch);
+                                for (int32_t i = n0; i < n1; ++i) {
+                                    slot.prompt.tokens.push_back(slot.task->tokens[i]);
+                                }
+                            }
                             slot.release();
                             break;
                         }
