@@ -1906,7 +1906,15 @@ private:
             }
         }
         if (ckpt == &snap) {
-            dst.prompt.checkpoints.push_back(std::move(snap));
+            // the source may already carry a pinned checkpoint of this exact state (e.g. its `checkpoint_at: [-1]`):
+            // that one was cloned above, so do not hold the same snapshot twice
+            const bool have = std::any_of(dst.prompt.checkpoints.begin(), dst.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & cur) {
+                        return cur.pinned && cur.n_tokens == snap.n_tokens && cur.pos_max == snap.pos_max;
+                    });
+            if (!have) {
+                dst.prompt.checkpoints.push_back(std::move(snap));
+            }
         }
         // keep the capacity bound: drop the oldest unpinned first
         while (dst.prompt.checkpoints.size() > (size_t) std::max(1, params_base.n_ctx_checkpoints)) {
@@ -2794,13 +2802,23 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool pinned = false) {
         const int id_task = slot.task->id;
 
-        if (pinned) {
-            // a checkpoint already taken at this exact point only needs the pin
+        {
             const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto & cur : slot.prompt.checkpoints) {
-                if (cur.n_tokens == n_tokens && cur.pos_max == pos_max) {
+                if (cur.n_tokens != n_tokens || cur.pos_max != pos_max) {
+                    continue;
+                }
+                if (pinned) {
+                    // a checkpoint already taken at this exact point only needs the pin
                     cur.pinned = true;
                     SLT_TRC(slot, "pinned existing context checkpoint (n_tokens = %" PRId64 ")\n", n_tokens);
+                    return;
+                }
+                if (cur.pinned) {
+                    // [KPF-15] a pinned checkpoint (checkpoint_at, or inherited through a fork) already holds this
+                    // exact state: an unpinned second copy only costs memory. Pinned checkpoints exist only when
+                    // the fork features are in use, so the champion path is unchanged.
+                    SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " already held (pinned)\n", n_tokens);
                     return;
                 }
             }
