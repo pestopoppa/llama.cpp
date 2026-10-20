@@ -636,6 +636,8 @@ struct common_params {
     int32_t prefill_budget_decoding  = 0; // max prompt tokens per server iteration while any slot is generating (0 = off: fill up to n_batch)
     int32_t prefill_budget_target_ms = 0; // adaptive prefill budget: size it so an iteration with decoding slots takes about this long (0 = off)
     int32_t slot_fork_min_tokens = 0;    // [KPF-11] min shared-prefix tokens for a cross-slot prefix fork (0 = off)
+    int32_t slot_pinned_max      = -1;   // [KPF-17.3] per-slot cap on TOTAL pinned checkpoints (-1 = derived, 0 = no cap)
+    bool    slot_fork_dft_full   = false; // [KPF-19.1] fork destination takes the FULL drafter KV (seq_cp) instead of relying on PARTIAL_ONLY semantics
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";

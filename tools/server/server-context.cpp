@@ -136,6 +136,17 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+// [KPF-17/19] test-only mutation switch: LLAMA_KPF_MUTATE=name[,name...] removes ONE guard so a conformance case can be
+// proven to fail without it. Unset in production (a single getenv at first use).
+static bool kpf_mutate(const char * name) {
+    static const std::string env = []() { const char * e = getenv("LLAMA_KPF_MUTATE"); return std::string(e ? e : ""); }();
+    if (env.empty()) {
+        return false;
+    }
+    const std::string key = std::string(",") + name + ",";
+    return (std::string(",") + env + ",").find(key) != std::string::npos;
+}
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -1790,7 +1801,10 @@ private:
                 continue;
             }
 
-            const int32_t lcp = src.prompt.tokens.get_common_prefix(task.tokens);
+            int32_t lcp = src.prompt.tokens.get_common_prefix(task.tokens);
+            if (kpf_mutate("fork_no_lcp")) {
+                lcp = std::min<int32_t>(src.prompt.n_tokens(), n_task); // [KPF-17.1 mutation] ignore the token key
+            }
             if (lcp < n_min) {
                 continue;
             }
@@ -1800,7 +1814,7 @@ private:
             if (slot_fork_mode == SLOT_FORK_KV) {
                 const int32_t p = std::min(lcp, n_task - 1);
                 // src must hold every position in [0, p)
-                if (llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id) != 0 || src_pos_max < p - 1) {
+                if (llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id) != 0 || (src_pos_max < p - 1 && !kpf_mutate("no_posmax_guard"))) {
                     continue;
                 }
                 consider(src, p, nullptr, "kv");
@@ -1822,7 +1836,7 @@ private:
                     continue;
                 }
                 // positions must equal token indices, and src must still hold the attention cells
-                if (ckpt.pos_max + 1 != p || src_pos_max < p - 1) {
+                if ((ckpt.pos_max + 1 != p || src_pos_max < p - 1) && !kpf_mutate("no_posmax_guard")) {
                     continue;
                 }
                 // SWA: the same acceptance test pre_decode applies when it restores a checkpoint, so dst does not
@@ -1835,6 +1849,48 @@ private:
         }
 
         return best;
+    }
+
+    // [KPF-19.1] the drafter cache is a plain, non-SWA, rollbackable KV that still holds [0, p) for src
+    bool slot_fork_dft_plain(int src_id, int32_t p) const {
+        if (!ctx_dft || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            return false;
+        }
+        if (llama_model_n_swa(llama_get_model(ctx_dft)) > 0) {
+            return false;
+        }
+        const auto * mem = llama_get_memory(ctx_dft);
+        return llama_memory_seq_pos_min(mem, src_id) == 0 && llama_memory_seq_pos_max(mem, src_id) >= p - 1;
+    }
+
+    // [KPF-17.3] per-slot cap on total pinned checkpoints; 0 = uncapped (today's per-request bound)
+    int32_t pinned_cap() const {
+        if (kpf_mutate("pin_cap_off")) {
+            return 0;
+        }
+        const int32_t v = params_base.slot_pinned_max;
+        if (v >= 0) {
+            return v;
+        }
+        // derived: ~150 MiB per 27B checkpoint, ~1.2 GiB of pinned junctions per slot, never above --ctx-checkpoints
+        return std::max<int32_t>(1, std::min<int32_t>(8, params_base.n_ctx_checkpoints));
+    }
+
+    // drop the OLDEST pinned checkpoint(s) while the slot holds more than the cap. Called after every addition of a
+    // pinned checkpoint (create_checkpoint, fork inheritance). Release rule: this and prompt_clear / prompt-cache
+    // eviction are the ONLY places a pinned checkpoint dies; ordinary slot release (release()) never touches them
+    void enforce_pinned_cap(server_slot & slot) {
+        const int32_t cap = pinned_cap();
+        if (cap <= 0) {
+            return;
+        }
+        auto & v = slot.prompt.checkpoints;
+        while (std::count_if(v.begin(), v.end(), [](const common_prompt_checkpoint & c) { return c.pinned; }) > cap) {
+            auto it = std::find_if(v.begin(), v.end(), [](const common_prompt_checkpoint & c) { return c.pinned; });
+            SLT_WRN(slot, "pinned-checkpoint cap %d: dropping the oldest pinned checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cap, it->n_tokens, (float) it->size() / 1024 / 1024);
+            v.erase(it);
+        }
     }
 
     // dst becomes exactly what it would be had it processed task.tokens[0, p) itself: attention cells
@@ -1871,7 +1927,9 @@ private:
             if (!common_context_seq_cp_attn(ctx_tgt, src.id, dst.id, 0, p)) {
                 GGML_ABORT("attention-only seq_cp failed after a successful capability probe");
             }
-            ckpt->load_tgt(ctx_tgt, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (!kpf_mutate("fork_skip_ckpt_load")) { // [KPF-17.2 mutation] dst never gets the recurrent/SWA state
+                ckpt->load_tgt(ctx_tgt, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
         }
 
         // draft
@@ -1879,11 +1937,16 @@ private:
             common_context_seq_rm(ctx_dft, dst.id, -1, -1);
             if (slot_fork_mode == SLOT_FORK_KV) {
                 common_context_seq_cp(ctx_dft, src.id, dst.id, 0, p);
+            } else if (params_base.slot_fork_dft_full && slot_fork_dft_plain(src.id, p)) {
+                // [KPF-19.1] explicit full drafter KV: independent of whether state_write honours PARTIAL_ONLY
+                common_context_seq_cp(ctx_dft, src.id, dst.id, 0, p);
             } else {
                 if (!common_context_seq_cp_attn(ctx_dft, src.id, dst.id, 0, p)) {
                     GGML_ABORT("attention-only seq_cp failed on the draft context after a successful capability probe");
                 }
-                ckpt->load_dft(ctx_dft, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (!kpf_mutate("dft_partial_noop")) { // [KPF-19.1 mutation] emulates #30514: PARTIAL_ONLY restores nothing
+                    ckpt->load_dft(ctx_dft, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
             }
         }
 
@@ -1924,6 +1987,12 @@ private:
                 break;
             }
             dst.prompt.checkpoints.erase(it);
+        }
+
+        enforce_pinned_cap(dst);
+
+        if (kpf_mutate("fork_clobber_src")) { // [KPF-17.2 mutation] the fork disturbs its source
+            common_context_seq_rm(ctx_tgt, src.id, p, -1);
         }
 
         dst.kv_altered    = false;
@@ -2812,6 +2881,7 @@ private:
                     // a checkpoint already taken at this exact point only needs the pin
                     cur.pinned = true;
                     SLT_TRC(slot, "pinned existing context checkpoint (n_tokens = %" PRId64 ")\n", n_tokens);
+                    enforce_pinned_cap(slot);
                     return;
                 }
                 if (cur.pinned) {
@@ -2864,7 +2934,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur + (kpf_mutate("ckpt_ntokens_skew") ? 1 : 0), pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -2875,6 +2945,10 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, pinned ? ", pinned" : "");
+
+        if (pinned) {
+            enforce_pinned_cap(slot);
+        }
     }
 
     // [KPF-15] pinned checkpoint at the end of the prompt, for `checkpoint_at` -1 or == n_tokens

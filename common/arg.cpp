@@ -1538,6 +1538,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_FORK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-pinned-checkpoints"}, "N",
+        string_format("[KPF-17.3] cap on the TOTAL pinned checkpoints (checkpoint_at / fork junctions) a slot holds across requests; "
+            "the OLDEST pinned one is dropped when exceeded. Pinned checkpoints are released only by prompt_clear or eviction to "
+            "the prompt cache, never by ordinary slot release. -1 = derived (min(8, --ctx-checkpoints)), 0 = no cap, i.e. the "
+            "per-request bound only (default: %d)", params.slot_pinned_max),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("slot-pinned-checkpoints must be >= -1");
+            }
+            params.slot_pinned_max = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_PINNED_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-fork-dft-full"},
+        "[KPF-19.1] a checkpoint-mode fork copies the FULL drafter KV from the source (plain non-SWA drafter only) instead of "
+        "restoring a PARTIAL_ONLY drafter checkpoint, so the fork does not depend on whether the drafter cache honours PARTIAL_ONLY",
+        [](common_params & params) {
+            params.slot_fork_dft_full = true;
+        }
+    ).set_env("LLAMA_ARG_SLOT_FORK_DFT_FULL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
