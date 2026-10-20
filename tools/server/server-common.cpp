@@ -9,7 +9,12 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <unordered_map>
 #include <sstream>
 #include <fstream>
 #include <limits>
@@ -784,6 +789,195 @@ std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtm
 }
 
 //
+// chat prompt tokenization with input spans (special-token injection guard)
+//
+
+std::vector<std::pair<size_t, size_t>> chat_input_spans_from_json(const json & data) {
+    std::vector<std::pair<size_t, size_t>> spans;
+    const auto it = data.find("chat_input_spans");
+    if (it == data.end() || !it->is_array()) {
+        return spans;
+    }
+    for (const auto & s : *it) {
+        if (s.is_array() && s.size() == 2 && s[0].is_number_unsigned() && s[1].is_number_unsigned()) {
+            const size_t b = s[0].get<size_t>();
+            const size_t e = s[1].get<size_t>();
+            if (e > b) {
+                spans.emplace_back(b, e);
+            }
+        }
+    }
+    std::sort(spans.begin(), spans.end());
+    return spans;
+}
+
+namespace {
+// texts of control and unknown tokens (those parse_special = false does not match), bucketed by first byte,
+// longest first; built once per vocab
+struct control_token_index {
+    int32_t n_tokens = 0;
+    std::array<std::vector<std::string>, 256> by_first_byte;
+};
+}
+
+static const control_token_index & get_control_token_index(const llama_vocab * vocab) {
+    static std::mutex mutex;
+    static std::unordered_map<const llama_vocab *, std::unique_ptr<control_token_index>> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & entry = cache[vocab];
+    const int32_t n_tokens = llama_vocab_n_tokens(vocab);
+    if (!entry || entry->n_tokens != n_tokens) {
+        entry = std::make_unique<control_token_index>();
+        entry->n_tokens = n_tokens;
+        for (llama_token id = 0; id < n_tokens; ++id) {
+            if (!(llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN))) {
+                continue;
+            }
+            const char * text = llama_vocab_get_text(vocab, id);
+            if (text == nullptr || text[0] == '\0') {
+                continue;
+            }
+            entry->by_first_byte[(uint8_t) text[0]].emplace_back(text);
+        }
+        for (auto & bucket : entry->by_first_byte) {
+            std::sort(bucket.begin(), bucket.end(), [](const std::string & a, const std::string & b) {
+                return a.size() > b.size();
+            });
+        }
+    }
+    return *entry;
+}
+
+std::vector<std::pair<size_t, size_t>> find_control_spellings_in_spans(
+        const llama_vocab * vocab,
+        const std::string & prompt,
+        const std::vector<std::pair<size_t, size_t>> & input_spans) {
+    std::vector<std::pair<size_t, size_t>> found;
+    if (input_spans.empty()) {
+        return found;
+    }
+    const auto & index = get_control_token_index(vocab);
+    size_t prev_end = 0;
+    for (const auto & [span_begin, span_end_raw] : input_spans) {
+        const size_t span_end = std::min(span_end_raw, prompt.size());
+        size_t pos = std::max(span_begin, prev_end);
+        while (pos < span_end) {
+            size_t len = 0;
+            for (const auto & text : index.by_first_byte[(uint8_t) prompt[pos]]) {
+                if (text.size() <= span_end - pos && prompt.compare(pos, text.size(), text) == 0) {
+                    len = text.size();
+                    break;
+                }
+            }
+            if (len > 0) {
+                found.emplace_back(pos, pos + len);
+                pos += len;
+            } else {
+                pos++;
+            }
+        }
+        prev_end = std::max(prev_end, span_end);
+    }
+    return found;
+}
+
+server_tokens tokenize_chat_prompt(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        const std::string & prompt,
+        const std::vector<std::pair<size_t, size_t>> & input_spans,
+        const std::vector<raw_buffer> & files,
+        bool is_placeholder) {
+    const auto spellings = find_control_spellings_in_spans(vocab, prompt, input_spans);
+    if (spellings.empty()) {
+        // nothing to neutralise: exactly the pre-existing tokenization
+        if (mctx != nullptr) {
+            return process_mtmd_prompt(mctx, prompt, files, is_placeholder);
+        }
+        return server_tokens(common_tokenize(vocab, prompt, true, true), false);
+    }
+
+    SRV_INF("tokenizing %zu control-token spelling(s) in request data as text\n", spellings.size());
+
+    // Split the prompt at the spellings. With parse_special = true the tokenizer already splits there (each
+    // spelling is a special-token fragment), so tokenizing the pieces between them on their own gives the
+    // same tokens as before; only the spellings themselves change, to literal text.
+    mtmd::bitmaps bitmaps;
+    std::vector<mtmd_helper::video_ptr> videos;
+    if (mctx != nullptr) {
+        for (auto & file : files) {
+            auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder);
+            if (!out.bitmap) {
+                throw std::runtime_error("Failed to load image or audio file");
+            }
+            bitmaps.entries.emplace_back(out.bitmap);
+            if (out.video_ctx) {
+                videos.emplace_back(out.video_ctx);
+            }
+        }
+    }
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+    size_t i_bm = 0;
+    const std::string marker = get_media_marker();
+
+    server_tokens result(llama_tokens(), mctx != nullptr);
+    if (llama_vocab_get_add_bos(vocab)) {
+        result.push_back(llama_vocab_bos(vocab));
+    }
+
+    auto add_piece = [&](size_t begin, size_t end, bool parse_special) {
+        if (end <= begin) {
+            return;
+        }
+        const std::string text = prompt.substr(begin, end - begin);
+        if (mctx == nullptr || !parse_special) {
+            for (const llama_token tok : common_tokenize(vocab, text, false, parse_special)) {
+                result.push_back(tok);
+            }
+            return;
+        }
+        size_t n_markers = 0;
+        for (size_t p = text.find(marker); p != std::string::npos; p = text.find(marker, p + marker.size())) {
+            n_markers++;
+        }
+        if (i_bm + n_markers > bitmaps_c_ptr.size()) {
+            throw std::runtime_error("number of media markers in prompt exceeds number of media files");
+        }
+        mtmd_input_text inp_txt = {
+            text.data(),
+            text.size(),
+            /* add_special */   false,
+            /* parse_special */ true,
+        };
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        if (mtmd_tokenize(mctx, chunks.ptr.get(), &inp_txt, bitmaps_c_ptr.data() + i_bm, n_markers) != 0) {
+            throw std::runtime_error("Failed to tokenize prompt");
+        }
+        i_bm += n_markers;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            result.push_back(chunks[i]);
+        }
+    };
+
+    size_t pos = 0;
+    for (const auto & [begin, end] : spellings) {
+        add_piece(pos, begin, true);
+        add_piece(begin, end, false);
+        pos = end;
+    }
+    add_piece(pos, prompt.size(), true);
+
+    if (mctx != nullptr && i_bm != bitmaps_c_ptr.size()) {
+        throw std::runtime_error("number of media markers in prompt does not match number of media files");
+    }
+    if (llama_vocab_get_add_eos(vocab)) {
+        result.push_back(llama_vocab_eos(vocab));
+    }
+    return result;
+}
+
+//
 // OAI utils
 //
 
@@ -1093,6 +1287,11 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    // always set (null when unknown), so a request body cannot supply its own spans
+    llama_params["chat_input_spans"] = nullptr;
+    if (chat_params.has_input_spans) {
+        llama_params["chat_input_spans"] = chat_params.input_spans;
+    }
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");

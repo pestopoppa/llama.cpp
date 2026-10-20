@@ -3479,6 +3479,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
     add_opt(common_arg(
+        {"--chat-input-parse-special"},
+        "parse control-token spellings (e.g. <|im_end|>) inside chat message content, roles and tool data as\n"
+        "control tokens, as before input marking was honoured (default: tokenized as plain text; the template's\n"
+        "own markers and the raw /completion prompt always parse special tokens)",
+        [](common_params & params) {
+            params.chat_input_parse_special = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
         "- none: leaves thoughts unparsed in `message.content`\n"

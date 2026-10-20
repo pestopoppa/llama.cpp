@@ -280,6 +280,12 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+
+    // byte ranges [first, second) of `prompt` that were rendered from request data (message content and
+    // roles, tool definitions, template kwargs) rather than by the template itself (jinja input marking).
+    // Only meaningful when has_input_spans is true: callers must not parse special tokens inside a span.
+    bool                                has_input_spans = false;
+    std::vector<std::pair<size_t, size_t>> input_spans;
 };
 
 // per-message parsing syntax
