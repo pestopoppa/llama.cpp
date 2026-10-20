@@ -8577,6 +8577,9 @@ struct test_flash_attn_ext : public test_case {
 // are split into n_seq contiguous groups, one per sequence, and see the causal prefix of their own sequence only.
 // This produces both KV blocks that are fully masked for a whole query tile (foreign or free cells) and blocks
 // that are partially masked (run boundaries, causal edge), which is what the masked-KV-block skip must handle.
+// With n_shared > 0 the first n_shared cells are a trunk shared by EVERY sequence (positions 0..n_shared-1 of
+// each), the cell layout a cross-slot prefix fork produces (KPF-12, zero-copy seq_cp): those blocks are live for
+// the query rows of all sequences at once, next to blocks that are live for one sequence only.
 // K and V are cell-major views of a larger cache tensor, as returned by llama_kv_cache::get_k/get_v.
 struct test_flash_attn_ext_unified : public test_case {
     const int64_t hsk;
@@ -8593,9 +8596,10 @@ struct test_flash_attn_ext_unified : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     const int64_t hint; // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
+    const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint);
+        return VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
     }
 
     double max_nmse_err() override {
@@ -8609,9 +8613,10 @@ struct test_flash_attn_ext_unified : public test_case {
 
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
-                                ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0)
+                                ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
+                                int64_t n_shared = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
-          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint) {}
+          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
@@ -8660,12 +8665,17 @@ struct test_flash_attn_ext_unified : public test_case {
                 continue;
             }
 
-            // owner sequence and position of each cell
+            // owner sequence and position of each cell (-2: the shared trunk, owned by every sequence)
+            const int64_t n_trunk = std::min(n_shared, kv - n_free);
             std::vector<int>     owner(kv, -1);
             std::vector<int64_t> pos(kv, -1);
-            std::vector<int64_t> n_cells(n_seq, 0);
-            for (int64_t c = 0; c < kv - n_free; ++c) {
-                const int s = (c / run) % n_seq;
+            std::vector<int64_t> n_cells(n_seq, n_trunk);
+            for (int64_t c = 0; c < n_trunk; ++c) {
+                owner[c] = -2;
+                pos[c]   = c;
+            }
+            for (int64_t c = n_trunk; c < kv - n_free; ++c) {
+                const int s = ((c - n_trunk) / run) % n_seq;
                 owner[c] = s;
                 pos[c]   = n_cells[s]++;
             }
@@ -8681,7 +8691,7 @@ struct test_flash_attn_ext_unified : public test_case {
                 // the tokens of the batch are the last n_grp cells of their sequence
                 const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
                 for (int64_t c = 0; c < kv; ++c) {
-                    const bool visible = owner[c] == s && pos[c] <= pos_q;
+                    const bool visible = (owner[c] == s || owner[c] == -2) && pos[c] <= pos_q;
                     data[i*kv + c] = visible ? dis(gen) : -INFINITY;
                 }
             }
@@ -11405,6 +11415,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 4));
     test_cases.emplace_back(new test_flash_attn_ext_unified(64, 64, 2, 4, 8192, 16, 16, 64, 512, 0.0f, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16, 16));
+    // [KPF-17] a trunk shared by every sequence (cross-slot prefix fork): blocks live for all query rows at once,
+    // next to per-sequence runs; block-aligned and unaligned trunks; plain decode, batched decode (hint), verify
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {128, 256}) {
+            for (int64_t n_shared : {2048, 1000}) {
+                test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 1, 4, 512, 1024, 0.0f, 0.0f, type_KV, type_KV, 0, n_shared));
+                test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 4, 4, 512, 1024, 0.0f, 0.0f, type_KV, type_KV, 4, n_shared));
+                test_cases.emplace_back(new test_flash_attn_ext_unified(hs, hs, 4, 6, 8192, 32, 4, 512, 1024, 0.0f, 0.0f, type_KV, type_KV, 4, n_shared));
+            }
+        }
+    }
+    // the production decode shape: one busy sequence forked from a long trunk, idle forked neighbours
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 16384, 4, 4, 2048, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 8192));
     // a hint that overstates the number of sequences must not change the result (8 rows of 2 sequences, hint 8)
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 8, 2, 1024, 1024, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 8));
 
