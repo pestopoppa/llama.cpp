@@ -613,6 +613,10 @@ struct server_slot {
         timings.predicted_per_token_ms = t_token_generation / n_decoded;
         timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
 
+        if (task && !task->params.kv_reorder_report.is_null()) {
+            timings.kv_reorder = task->params.kv_reorder_report;
+        }
+
         // Add speculative metrics
         if (n_draft_total > 0) {
             timings.draft_n          = n_draft_total;
@@ -1669,6 +1673,147 @@ private:
         return nullptr;
     }
 
+    // Opt-in reorder planner (chunk-KV reuse P1a). The request marked order-insensitive segments; if those segments can
+    // be rebuilt in the order of a cached prompt so that the request becomes a longer exact-prefix hit, rewrite
+    // the task's tokens. Tokens outside the segments never move. Never called unless the request sent `kv_reorder`.
+    // Exact for every memory type: the cached state is the true state for the (reordered) history, nothing is shifted.
+    void kv_reorder_apply(server_task & task) {
+        const int64_t t_start = ggml_time_us();
+
+        json rep = json{ {"requested", true}, {"applied", false} };
+        task.params.kv_reorder_report = rep;
+        auto & report = task.params.kv_reorder_report;
+
+        auto skip = [&](const char * why) {
+            report["reason"] = why;
+            SRV_INF("kv_reorder: not applied (%s)\n", why);
+        };
+
+        if (task.type != SERVER_TASK_TYPE_COMPLETION) { return skip("not a completion task"); }
+        if (!task.params.cache_prompt)                { return skip("cache_prompt is off"); }
+        if (task.is_parent() || task.params.n_cmpl > 1) { return skip("n_cmpl > 1"); }
+        if (task.tokens.has_media())                  { return skip("multimodal prompt"); }
+
+        const llama_tokens & prompt = task.tokens.get_tokens();
+
+        std::vector<bool> pinned;
+        if (!server_reorder::pinned_from_segments(prompt.size(), task.params.kv_reorder_segments, pinned)) {
+            return skip("invalid segments");
+        }
+
+        // junctions of an unmodified prompt: where each marked segment starts, and where the last one ends
+        auto segment_junctions = [&]() {
+            std::vector<int32_t> j;
+            for (const auto & sg : task.params.kv_reorder_segments) {
+                j.push_back(sg.offset);
+                j.push_back(sg.offset + sg.n_tokens);
+            }
+            std::sort(j.begin(), j.end());
+            j.erase(std::unique(j.begin(), j.end()), j.end());
+            j.erase(std::remove_if(j.begin(), j.end(), [&](int32_t v) { return v <= 0 || v >= (int32_t) prompt.size(); }), j.end());
+            return j;
+        };
+
+        // candidates, newest first: idle slots by last use, then the prompt cache (newest state last in the list)
+        const bool any_prefix = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa == 0;
+
+        std::vector<server_reorder::candidate> cands;
+        std::vector<json> cand_src;
+
+        auto add_cand = [&](const server_prompt & sp, json src) {
+            if (sp.tokens.empty() || sp.tokens.has_media()) {
+                return;
+            }
+            server_reorder::candidate c;
+            c.toks       = &sp.tokens.get_tokens();
+            c.any_prefix = any_prefix;
+            for (const auto & ck : sp.checkpoints) {
+                c.ckpts.push_back((int32_t) ck.n_tokens);
+            }
+            cands.push_back(std::move(c));
+            cand_src.push_back(std::move(src));
+        };
+
+        {
+            std::vector<const server_slot *> idle;
+            for (const auto & sl : slots) {
+                if (!sl.is_processing() && (task.id_slot == -1 || sl.id == task.id_slot)) {
+                    idle.push_back(&sl);
+                }
+            }
+            std::stable_sort(idle.begin(), idle.end(), [](const server_slot * a, const server_slot * b) {
+                return a->t_last_used > b->t_last_used;
+            });
+            for (const server_slot * sl : idle) {
+                add_cand(sl->prompt, json{ {"slot", sl->id} });
+            }
+        }
+        if (prompt_cache && task.id_slot == -1) {
+            int idx = 0;
+            for (auto it = prompt_cache->states.rbegin(); it != prompt_cache->states.rend(); ++it, ++idx) {
+                add_cand(it->prompt, json{ {"cache_state", idx} });
+            }
+        }
+
+        report["n_candidates"] = (int) cands.size();
+        report["n_segment_tokens"] = (int) std::count(pinned.begin(), pinned.end(), false);
+
+        server_reorder::config cfg;
+        if (task.params.kv_reorder_min_gain  > 0) { cfg.min_gain  = task.params.kv_reorder_min_gain; }
+        if (task.params.kv_reorder_budget_ms > 0) { cfg.budget_us = (int64_t) task.params.kv_reorder_budget_ms * 1000; }
+
+        server_reorder::result res;
+        const bool ok = !cands.empty() && server_reorder::plan(prompt, cands, pinned, cfg, res);
+        report["plan_ms"] = (ggml_time_us() - t_start) / 1000.0;
+
+        if (!ok) {
+            task.params.kv_reorder_junctions = segment_junctions();
+            return skip(cands.empty() ? "no cached prompt" : "no reordering beats the baseline prefix");
+        }
+
+        llama_tokens reordered(prompt.size());
+        int32_t n_moved = 0;
+        for (size_t k = 0; k < prompt.size(); k++) {
+            reordered[k] = prompt[res.perm[k]];
+            n_moved += res.perm[k] != (int32_t) k;
+        }
+
+        // message spans refer to the original token positions: drop those that start inside a movable segment
+        {
+            auto & spans = task.params.message_spans.spans;
+            spans.erase(std::remove_if(spans.begin(), spans.end(), [&](const common_chat_msg_span & sp) {
+                return sp.pos < pinned.size() && !pinned[sp.pos];
+            }), spans.end());
+        }
+
+        task.tokens = server_tokens(reordered, false);
+        task.params.kv_reorder_junctions = res.junctions;
+        {
+            // the end of the last marked segment is a junction too (start of the pinned tail)
+            int32_t end = 0;
+            for (const auto & sg : task.params.kv_reorder_segments) { end = std::max(end, sg.offset + sg.n_tokens); }
+            if (end > 0 && end < (int32_t) prompt.size()) {
+                task.params.kv_reorder_junctions.push_back(end);
+            }
+            std::sort(task.params.kv_reorder_junctions.begin(), task.params.kv_reorder_junctions.end());
+            task.params.kv_reorder_junctions.erase(std::unique(task.params.kv_reorder_junctions.begin(), task.params.kv_reorder_junctions.end()),
+                                                   task.params.kv_reorder_junctions.end());
+        }
+
+        report["applied"]          = true;
+        report["candidate"]        = cand_src[res.candidate];
+        report["baseline_prefix"]  = res.baseline_prefix;
+        report["reordered_prefix"] = res.reordered_prefix;
+        report["common_prefix"]    = res.common_prefix;
+        report["n_pieces"]         = res.n_pieces;
+        report["n_moved"]          = n_moved;
+        report["timed_out"]        = res.timed_out;
+
+        SRV_INF("kv_reorder: applied, candidate %s, reusable prefix %d -> %d (common %d), pieces %d, moved %d tokens, %.2f ms\n",
+                cand_src[res.candidate].dump().c_str(), res.baseline_prefix, res.reordered_prefix, res.common_prefix,
+                res.n_pieces, n_moved, report["plan_ms"].get<double>());
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -2711,6 +2856,11 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // opt-in reorder planner (chunk-KV reuse P1a): only for requests that mark segments
+                    if (!task.params.kv_reorder_segments.empty()) {
+                        kv_reorder_apply(task);
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -4056,6 +4206,13 @@ private:
                             }
                         }
 
+                        // reorder planner: break at a junction of the (reordered) prompt so a checkpoint is created there
+                        if (do_checkpoint && !slot.task->params.kv_reorder_junctions.empty() &&
+                            std::binary_search(slot.task->params.kv_reorder_junctions.begin(), slot.task->params.kv_reorder_junctions.end(),
+                                               (int32_t) slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4098,7 +4255,14 @@ private:
                         near_prompt_end = n_left == std::min(n_batch, 4 + n_ubatch) || n_left == std::min(n_batch, 4);
                     }
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    // reorder planner junction (always false unless the request sent `kv_reorder`)
+                    const bool is_junction = !slot.task->params.kv_reorder_junctions.empty() &&
+                        std::binary_search(slot.task->params.kv_reorder_junctions.begin(), slot.task->params.kv_reorder_junctions.end(),
+                                           (int32_t) n_tokens_start) &&
+                        std::none_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                                     [&](const auto & ck) { return ck.n_tokens == (int64_t) n_tokens_start; });
+
+                    const bool is_user_start = spans.is_user_start(n_tokens_start) || is_junction;
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
@@ -4137,7 +4301,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_junction ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

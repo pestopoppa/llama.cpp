@@ -263,6 +263,10 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (!kv_reorder.is_null()) {
+        base["kv_reorder"] = kv_reorder;
+    }
+
     return base;
 }
 
