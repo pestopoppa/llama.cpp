@@ -131,6 +131,16 @@ def check_pool_invariant(ss: list[dict]):
         assert s["kv_pool"] == pool  # one snapshot
 
 
+def assert_forked(body: dict, what: str, n_min: int = FORK_MIN, src: int | None = None) -> int:
+    """generic guard: a case whose purpose is to exercise the fork fails if the fork did not happen (2026-10-21: the
+    decoding-source and current-step cases passed for weeks without a single do_slot_fork in their logs)"""
+    t = body["timings"]
+    assert t.get("n_fork_tokens", 0) >= max(1, n_min), (what, "the fork did not happen", t)
+    if src is not None:
+        assert t.get("fork_src_slot") == src, (what, "forked from the wrong slot", t)
+    return t["n_fork_tokens"]
+
+
 def test_fork_off_adds_nothing():
     global server
     server = make_server(fork_min=0)
@@ -234,21 +244,23 @@ def test_fork_from_busy_source():
 
     th = threading.Thread(target=run_busy)
     th.start()
-    # wait until slot 0 is generating
+    # wait until slot 0 is generating. Not next_token.n_decoded: /slots reports it from the slot's PREVIOUS task until
+    # the new one generates. n_prompt_tokens past the prompt can only be advanced by the current task.
     deadline = time.time() + 300
-    while time.time() < deadline:
+    while True:
         s0 = slots()[0]
-        if s0["is_processing"] and s0["next_token"][0]["n_decoded"] > 0:
+        if s0["is_processing"] and s0.get("n_prompt_tokens", 0) > len(busy_prompt):
             break
+        if not th.is_alive() or time.time() > deadline:
+            pytest.fail(f"source never started generating (n_prompt_tokens {s0.get('n_prompt_tokens')})")
         time.sleep(0.05)
-    else:
-        pytest.fail("source never started generating")
 
     child = complete(TRUNK + SUF[5], 1)
+    busy = th.is_alive()
     th.join()
     t = child["timings"]
-    assert t["n_fork_tokens"] >= TRUNK_LEN, t
-    assert t["fork_src_slot"] == 0
+    assert_forked(child, "busy source", TRUNK_LEN, src=0)
+    assert busy, "source finished before the child returned: not a fork from a busy source"
 
     # child and source ran concurrently, the baselines alone: batch composition alone can move greedy
     # output on a unified KV pool (RTG-57), so only the head is asserted here. KPF-18 item 1/3 measure this
@@ -369,6 +381,7 @@ def test_p2_epoch_hash_ladder_and_ids():
 
     c = complete(TRUNK + SUF[1], 1)
     t = c["timings"]
+    assert_forked(c, "fork-into epoch", FORK_MIN, src=0)  # the epoch / ladder assertions below are about a fork
     assert t["id_slot"] == 1 and t["id_task"] >= 0
     ss = slots()
     assert ss[1]["id_task"] == t["id_task"]
@@ -662,7 +675,7 @@ def test_kpf171_abort_then_retry():
     # the sibling + the fresh run inside the 8192-cell pool.
     big = TRUNK * 24
     url = f"http://{server.server_host}:{server.server_port}/completion"
-    aborted, tail_seen = 0, 0
+    aborted, tail_seen, forked = 0, 0, 0
     for k, delay in enumerate((0.1, 0.5, 1.2, 1.6, 2.2)):
         try:
             requests.post(url, json={"prompt": big + SUF[0], "id_slot": 0, "n_predict": 4, "cache_prompt": True,
@@ -687,6 +700,7 @@ def test_kpf171_abort_then_retry():
         sib_prompt = big + SUF[1 + k]
         sib = complete(sib_prompt, 1, n_predict=8)
         n_f = sib["timings"]["n_fork_tokens"]
+        forked += int(n_f > 0)
         print(f"abort@{delay}: slot 0 n_prompt_tokens {n_tok} cells {cells}, sibling n_fork_tokens {n_f} "
               f"({sib['timings'].get('fork_src_kind')})")
         if kv:
@@ -699,6 +713,9 @@ def test_kpf171_abort_then_retry():
     assert aborted >= 1, "no round was cancelled mid-prefill: the case would be vacuous"
     if kv and inject:
         assert tail_seen >= 1, "fault injection abort_keeps_tail never created a source ahead of its cells"
+    else:
+        # the guard skips a source that is ahead of its cells (kind none) only under the injection
+        assert forked >= 1, "no sibling forked from the aborted slot: the case would be vacuous"
     check_pool_invariant(slots())
 
 
@@ -715,6 +732,7 @@ def test_kpf171_key_check_negative_control():
     assert f1["tokens"] != f2["tokens"]  # the control is sensitive: stale state would show
     complete(p1, 0, n_predict=24, checkpoint_at=[TRUNK_LEN, TRUNK_LEN + 3, -1])
     r2 = complete(p2, 1)
+    assert_forked(r2, "P2 after P1", FORK_MIN, src=0)  # the restore up to S must happen, or nothing is tested
     assert r2["timings"]["n_fork_tokens"] <= TRUNK_LEN, r2["timings"]
     same_as_fresh(r2, f2, "P2 after P1")
     erase_slot(1)
@@ -765,6 +783,7 @@ def test_kpf172_fork_same_iteration_as_source_erase():
     server.start()
     build_prompts()
     need_ckpt_mode()
+    n_forks = 0
     for r in range(8):
         erase_slot(0)
         erase_slot(1)
@@ -784,9 +803,15 @@ def test_kpf172_fork_same_iteration_as_source_erase():
         [x.start() for x in th]
         [x.join() for x in th]
         same_as_fresh(out["b"], fresh(TRUNK + SUF[(r + 1) % 8], 2, n_probs=1), f"round {r}")
-        if out["b"]["timings"]["n_fork_tokens"] > 0:
-            assert any(c["pinned"] for c in ckpts(1)) or True  # clone present when the fork won the race
+        n_f = out["b"]["timings"]["n_fork_tokens"]
+        if n_f > 0:
+            # dst holds its OWN pinned clone of the junction (was `... or True`, i.e. never checked)
+            n_forks += 1
+            assert out["b"]["timings"]["fork_src_slot"] == 0, out["b"]["timings"]
+            assert any(c["pinned"] and c["n_tokens"] == n_f for c in ckpts(1)), (r, n_f, ckpts(1))
         assert_ckpt_offsets(slots(), f"round {r}")
+    # the race is real only if dst forked in some round (job 20: 6 of 8 rounds forked from slot 0)
+    assert n_forks >= 1, "dst never forked from the source in 8 rounds: the case would be vacuous"
 
 
 def test_kpf172_fork_from_decoding_source_no_leak():
@@ -871,21 +896,37 @@ def test_kpf172_fork_from_checkpoint_of_current_step():
     server.start()
     build_prompts()
     need_ckpt_mode()
-    big = TRUNK * 4
+    big = TRUNK * 8
     js = [TRUNK_LEN, 2 * TRUNK_LEN, 3 * TRUNK_LEN]
-    for k, delay in enumerate((0.1, 0.5, 1.0, 1.6, 2.4)):
-        erase_slot(0)
-        erase_slot(1)
-        t = threading.Thread(target=lambda: complete(big + SUF[0], 0, n_predict=2, checkpoint_at=js))
+    # Job 20 (tiny hybrid) never exercised this: every sibling forked from an IDLE source (the trunk had finished, and
+    # the trunk request itself forked from the previous round's fresh run on slot 2 instead of prefilling). Now the
+    # trunk prefills from scratch (slot_fork off, slots 2/3 erased), the delays are fractions of a measured solo
+    # prefill, and at least one sibling must fork from slot 0 while it is still prefilling.
+    solo = complete(big + SUF[0], 3, n_predict=1, slot_fork=False, cache_prompt=False)
+    t_pp = solo["timings"]["prompt_ms"] / 1000.0
+    erase_slot(3)
+    mid_forks = 0
+    for k, frac in enumerate((0.1, 0.3, 0.5, 0.7, 0.9)):
+        delay = frac * t_pp
+        for i in (0, 1, 2):
+            erase_slot(i)
+        t = threading.Thread(target=lambda: complete(big + SUF[0], 0, n_predict=2, checkpoint_at=js, slot_fork=False))
         t.start()
         time.sleep(delay)
+        s0 = slots()[0]
+        mid = s0["is_processing"] and s0.get("n_prompt_tokens", 0) < len(big)
         sib_prompt = big[: 2 * TRUNK_LEN] + SUF[1 + k]
         sib = complete(sib_prompt, 1, n_predict=8)
         t.join()
         n_f = sib["timings"]["n_fork_tokens"]
+        print(f"delay {delay:.2f}s ({frac} of prefill): source mid-prefill {mid} (n_prompt_tokens "
+              f"{s0.get('n_prompt_tokens')}), sibling n_fork_tokens {n_f} from slot {sib['timings'].get('fork_src_slot')}")
         assert n_f == 0 or n_f in js or n_f >= 2 * TRUNK_LEN - 1, (delay, sib["timings"])
-        same_as_fresh(sib, fresh(sib_prompt, 2, n_predict=8, n_probs=1), f"delay {delay}")
-        assert_ckpt_offsets(slots(), f"delay {delay}")
+        if mid and n_f > 0 and sib["timings"]["fork_src_slot"] == 0:
+            mid_forks += 1
+        same_as_fresh(sib, fresh(sib_prompt, 2, n_predict=8, n_probs=1), f"delay {delay:.2f}")
+        assert_ckpt_offsets(slots(), f"delay {delay:.2f}")
+    assert mid_forks >= 1, "no sibling forked from the source while it was creating its junctions: vacuous"
 
 
 def pinned_of(i: int) -> list[int]:
@@ -977,6 +1018,7 @@ def test_kpf174_swa_pinned_junction_fork_equals_fresh():
         with open(rp, "a") as f:
             f.write(json.dumps({"case": "kpf174_swa_ckpt_ranges", "ckpts": rec, "n_trunk": len(long_t)}) + "\n")
     child = complete(long_t + SUF[1], 1)
+    assert_forked(child, "swa junction fork", len(long_t) // 2, src=0)
     same_as_fresh(child, fresh(long_t + SUF[1], 2, n_probs=1), "swa junction fork")
     assert_ckpt_offsets(slots(), "swa")
 
