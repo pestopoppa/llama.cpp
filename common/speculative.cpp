@@ -1319,6 +1319,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    // LiLiCorr (upstream #30506): a lattice head on a DFlash drafter. Draft blocks are always block_size
+    // tokens and carry, per token, the projected target feature of the anchor position (n_past - 1),
+    // kept in a per-seq ring of the last block_size + 1 projected rows.
+    bool    is_lilicorr    = false;
+    int32_t lilicorr_top_k = 0;
+    size_t  lilicorr_rows  = 0;
+    std::vector<float>       lilicorr_embd;
+    std::vector<llama_pos>   lilicorr_pos;
+    llama_batch              batch_lili = {}; // token+embd draft blocks (LiLiCorr only)
+    std::vector<llama_token> batch_lili_tokens;
+
     bool    is_dflash2     = false;
     // DeepSeek-V4.1-Flash DSpark (arch "deepseek41-dspark"). Same two-phase hand-off as DFlash --
     // llama_encode projects the concatenated target features, llama_decode writes the ring -- but
@@ -1407,6 +1418,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 selector_top_k = std::atoi(buf);
                 is_dflash2 = selector_top_k > 0;
             }
+            if (!is_dflash2 && !is_dspark &&
+                    llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0) {
+                lilicorr_top_k = std::atoi(buf);
+                is_lilicorr    = lilicorr_top_k > 0;
+            }
         }
         // INF-77 DS41-B13. DeepSeek's tokenizer has no MASK token, so a DSpark draft GGUF
         // declares its filler explicitly (dspark_noise_token_id = 128799, model.py:131). Fall
@@ -1452,6 +1468,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dspark41  = is_dspark && llama_model_dspark_is_v41(model_dft);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
+        if (is_lilicorr) {
+            if (block_size < 2 || (int64_t) lilicorr_top_k * (lilicorr_top_k + 1) > n_embd_dec) {
+                throw std::runtime_error("LiLiCorr drafter has an invalid block_size / candidate_topk");
+            }
+            if ((int64_t) block_size * n_seq > (int64_t) llama_n_batch(ctx_dft)) {
+                throw std::runtime_error("LiLiCorr draft blocks (block_size x n_seq) exceed the draft n_batch");
+            }
+            lilicorr_rows = (size_t) block_size + 1;
+            lilicorr_embd.assign((size_t) n_seq * lilicorr_rows * (size_t) n_embd_dec, 0.0f);
+            lilicorr_pos.assign((size_t) n_seq * lilicorr_rows, -1);
+
+            // llama_batch_init allocates only one of token/embd; the LiLiCorr block needs both
+            const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+            batch_lili = llama_batch_init(n_b, n_embd_dec, n_seq);
+            batch_lili_tokens.resize(n_b);
+            batch_lili.token = batch_lili_tokens.data();
+
+            LOG_INF("%s: - LiLiCorr lattice head: candidate_topk=%d, draft block=%d tokens\n",
+                    __func__, lilicorr_top_k, block_size);
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1480,8 +1517,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        // DFlash2 and LiLiCorr read their lattice from h_nextn and never consume raw logits.
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
 
         // Generic DFlash uses a non-causal noise block; Laguna is trained causal.
         bool causal = false;
@@ -1497,6 +1534,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     ~common_speculative_impl_draft_dflash() override {
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        if (is_lilicorr) {
+            batch_lili.token = nullptr; // owned by batch_lili_tokens
+            llama_batch_free(batch_lili);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1630,6 +1671,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
+                if (is_lilicorr) {
+                    // keep the projected rows of the last block_size + 1 positions: the next draft block
+                    // reads the anchor's row (upstream reads the same rows back from its fused decode)
+                    const size_t    seq_offset = (size_t) seq_id * lilicorr_rows;
+                    const llama_pos pos_last   = batch_in.pos[i_batch_beg[seq_id] + offset + n_chunk - 1];
+                    const llama_pos pos_min    = std::max<llama_pos>(0, pos_last - block_size);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos pos = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        if (pos < pos_min) {
+                            continue;
+                        }
+                        const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
+                        std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
+                                inp_g + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                        lilicorr_pos[slot] = pos;
+                    }
+                }
+
                 // inject the draft decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
@@ -1656,6 +1715,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (is_lilicorr) {
+            draft_lilicorr(dparams);
+            return;
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1830,6 +1894,97 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                 }
+            }
+
+            if (result.size() < (size_t) params.n_min) {
+                result.clear();
+            }
+        }
+    }
+
+    // LiLiCorr: one token+embd batch with a block_size block per drafting sequence,
+    // [id_last, MASK x (block_size-1)], every row carrying the anchor's projected feature; the drafter
+    // emits a [ids | scores] lattice per slot in h_nextn and the draft is its greedy path.
+    void draft_lilicorr(common_speculative_draft_params_vec & dparams) {
+        auto * ctx_dft = params.ctx_dft;
+
+        batch_lili.n_tokens = 0;
+
+        std::vector<int32_t> i_block_beg(n_seq, -1);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            const llama_pos n          = dp.n_past;
+            const llama_pos pos_anchor = n - 1;
+            const size_t    slot       = (size_t) seq_id * lilicorr_rows + (size_t) std::max<llama_pos>(0, pos_anchor) % lilicorr_rows;
+            if (pos_anchor < 0 || lilicorr_pos[slot] != pos_anchor) {
+                // the anchor's target feature was never processed: no state to condition on
+                LOG_DBG("%s: seq %d: no LiLiCorr anchor state at pos %d - skipping the draft\n",
+                        __func__, seq_id, (int) pos_anchor);
+                continue;
+            }
+            const float * state = lilicorr_embd.data() + slot * (size_t) n_embd_dec;
+
+            i_block_beg[seq_id] = batch_lili.n_tokens;
+            for (int32_t i = 0; i < block_size; ++i) {
+                const int32_t idx = batch_lili.n_tokens;
+                batch_lili.token   [idx]    = i == 0 ? dp.id_last : mask_token_id;
+                batch_lili.pos     [idx]    = n + i;
+                batch_lili.n_seq_id[idx]    = 1;
+                batch_lili.seq_id  [idx][0] = seq_id;
+                batch_lili.logits  [idx]    = false;
+                std::memcpy(batch_lili.embd + (size_t) idx * n_embd_dec, state, (size_t) n_embd_dec * sizeof(float));
+                batch_lili.n_tokens++;
+            }
+        }
+
+        if (batch_lili.n_tokens == 0) {
+            return;
+        }
+
+        const int ret = llama_decode(ctx_dft, batch_lili);
+        if (ret != 0) {
+            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            return;
+        }
+
+        const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+        GGML_ASSERT(lattice && "LiLiCorr head produced no lattice");
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] < 0) {
+                continue;
+            }
+            auto & dp     = dparams[seq_id];
+            auto & result = *dp.result;
+            if (dp.dists) {
+                dp.dists->clear();
+            }
+
+            const int32_t beg = i_block_beg[seq_id];
+
+            int32_t predecessor = 0;
+            for (int32_t i = 1; i < block_size; ++i) {
+                const float * row    = lattice + (size_t) (beg + i) * n_embd_dec;
+                const float * scores = row + lilicorr_top_k + (size_t) predecessor * lilicorr_top_k;
+
+                predecessor = (int32_t) std::distance(scores,
+                        std::max_element(scores, scores + lilicorr_top_k));
+                if (params.p_min > 0.0f) {
+                    // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                    float sum = 0.0f;
+                    for (int32_t k = 0; k < lilicorr_top_k; ++k) {
+                        sum += std::exp(scores[k] - scores[predecessor]);
+                    }
+                    if (1.0f / sum < params.p_min) {
+                        break;
+                    }
+                }
+                result.push_back((llama_token) row[predecessor]);
             }
 
             if (result.size() < (size_t) params.n_min) {

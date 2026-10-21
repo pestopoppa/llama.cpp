@@ -211,6 +211,13 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    // LiLiCorr lattice head on a DFlash drafter (upstream #30506); lilicorr_layers > 0 marks one
+    uint32_t lilicorr_hidden_size    = 0;
+    uint32_t lilicorr_candidate_topk = 0;
+    uint32_t lilicorr_num_heads      = 0;
+    uint32_t lilicorr_layers         = 0;
+    float    lilicorr_vector_eps     = 0.0f;
+    float    lilicorr_logit_scale    = 0.0f;
     // DSpark draft-block filler token. DeepSeek's tokenizer has no MASK token, so the noise id
     // (model.py:131 dspark_noise_token_id) has to come from GGUF metadata; -1 means "none" and
     // the runtime falls back to the vocabulary's MASK.
