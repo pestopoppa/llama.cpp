@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -279,7 +280,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool load_mtp = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool load_mtp = false,
+        const std::function<void(llama_context_params &)> & tweak_ctx = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -295,6 +297,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     if (!encode) {
         ctx_params.n_ubatch = 64;
+    }
+    if (tweak_ctx) {
+        tweak_ctx(ctx_params);
     }
 
     size_t tmp = seed;
@@ -742,6 +747,169 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// test-yarn-kshift: the K-shift graph must be a pure rotation.
+//
+// Decode stores K = m * R(p*theta) k with m the YaRN magnitude factor (attn_factor times the
+// 1 + 0.1 ln(1/freq_scale) that rope_yarn() folds in when ext_factor != 0). The shift graph must
+// apply R(d*theta) ONLY; re-applying m made every shift scale K by m (+d then -d gave m^2 K).
+// ---------------------------------------------------------------------------------------------
+
+static uint64_t fnv1a(const void * data, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+// K rows (F32) of the first n_take cells of seq 0 (all layers), extracted from the seq-state blob that holds
+// n_cells cells. blob layout (llama_kv_cache::state_write*): <header: n_stream, cell metadata>, v_trans u32,
+// n_layer u32, then per layer: k_type i32, k_size_row u64, n_cells * k_size_row bytes of K.
+static std::vector<float> read_k_rows(llama_context * lctx, uint32_t n_cells, uint32_t n_take, uint32_t n_layer, uint64_t k_size_row) {
+    std::vector<uint8_t> blob(llama_state_seq_get_size(lctx, 0));
+    const size_t n = llama_state_seq_get_data(lctx, blob.data(), blob.size(), 0);
+    GGML_ASSERT(n == blob.size());
+
+    // locate the first per-layer header by its (n_layer, F32, row size) signature
+    size_t off = 0;
+    bool found = false;
+    for (size_t o = 0; o + 20 <= blob.size() && !found; o += 4) {
+        uint32_t nl; int32_t kt; uint64_t sr;
+        memcpy(&nl, &blob[o + 4], 4);
+        memcpy(&kt, &blob[o + 8], 4);
+        memcpy(&sr, &blob[o + 12], 8);
+        if (nl == n_layer && kt == (int32_t) GGML_TYPE_F32 && sr == k_size_row) {
+            off = o + 20;
+            found = true;
+        }
+    }
+    GGML_ASSERT(found);
+
+    std::vector<float> ret;
+    const size_t stride = 12 + (size_t) n_cells * k_size_row; // per-layer header + K data
+    for (uint32_t il = 0; il < n_layer; il++) {
+        const size_t nf  = (size_t) n_take * k_size_row / sizeof(float);
+        const size_t cur = ret.size();
+        ret.resize(cur + nf);
+        memcpy(ret.data() + cur, &blob[off + il * stride], nf * sizeof(float));
+    }
+    return ret;
+}
+
+static std::vector<float> decode_logits_last(llama_context * lctx, llama_token tok, llama_pos pos) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, tok, pos, {0}, true);
+    if (llama_decode(lctx, batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode probe");
+    }
+    llama_batch_free(batch);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
+    return std::vector<float>(llama_get_logits_ith(lctx, 0), llama_get_logits_ith(lctx, 0) + n_vocab);
+}
+
+static void decode_tokens_at(llama_context * lctx, const std::vector<llama_token> & toks, llama_pos pos0) {
+    llama_batch batch = llama_batch_init(toks.size(), 0, 1);
+    for (size_t i = 0; i < toks.size(); i++) {
+        common_batch_add(batch, toks[i], pos0 + (llama_pos) i, {0}, false);
+    }
+    if (llama_decode(lctx, batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode prompt");
+    }
+    llama_batch_free(batch);
+}
+
+static int test_yarn_kshift(const size_t seed, const ggml_log_level log_level) {
+    // silence per-model logs
+    llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+        if (level >= *(const ggml_log_level *) ud) { fputs(text, stderr); }
+    }, const_cast<ggml_log_level *>(&log_level));
+
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu != nullptr);
+
+    const uint32_t N     = 40;  // prompt length
+    const llama_pos delta = 30; // shift distance (N + delta + probes < n_ctx = 128)
+    const double tol     = 1e-6;
+    int n_fail = 0;
+
+    struct cfg { const char * name; llm_arch arch; bool yarn; float attn_factor; };
+    const cfg cfgs[] = {
+        { "llama/yarn",   LLM_ARCH_LLAMA,  true,  1.0f },
+        { "qwen3/yarn",   LLM_ARCH_QWEN3,  true,  1.0f },
+        { "llama/yarn+af",LLM_ARCH_LLAMA,  true,  1.1f }, // user attn_factor on top of YaRN
+        { "llama/plain",  LLM_ARCH_LLAMA,  false, 1.0f },
+        { "qwen3/plain",  LLM_ARCH_QWEN3,  false, 1.0f },
+        { "llama/plain+af",LLM_ARCH_LLAMA, false, 1.1f }, // non-YaRN, attn_factor != 1: also a magnitude factor
+    };
+
+    for (const cfg & c : cfgs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(c.arch, false);
+        auto tweak = [&](llama_context_params & cp) {
+            cp.n_ctx    = 128;
+            cp.n_batch  = 128;
+            cp.n_ubatch = 128;
+            cp.type_k   = GGML_TYPE_F32;
+            cp.type_v   = GGML_TYPE_F32;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            if (c.yarn) {
+                cp.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+                cp.rope_freq_scale   = 0.25f; // factor 4
+                cp.yarn_orig_ctx     = 32;
+            }
+            cp.yarn_attn_factor = c.attn_factor;
+        };
+        auto [model, lctx] = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {cpu}, LLAMA_SPLIT_MODE_LAYER, false, false, tweak);
+        // cache context for the other runs: a fresh context on the same model
+        llama_context_params cp = llama_context_default_params();
+        cp.n_threads = cp.n_threads_batch = 4;
+        tweak(cp);
+        auto fresh_ctx = [&]() { llama_context_ptr p(llama_init_from_model(model.get(), cp)); GGML_ASSERT(p); return p; };
+
+        const uint32_t n_layer = llama_model_n_layer(model.get());
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const uint64_t row_b   = (uint64_t) llama_model_n_embd(model.get()) * sizeof(float); // n_head_kv == n_head
+        const std::vector<llama_token> toks = get_tokens(N, n_vocab, seed);
+        const llama_token probe_tok = (llama_token) (seed % n_vocab);
+
+        // (1) reference: decode at 0..N-1, then a probe (probe forces nothing, it only mirrors the other runs)
+        auto ctx_a = fresh_ctx();
+        decode_tokens_at(ctx_a.get(), toks, 0);
+        const std::vector<float> k_orig = read_k_rows(ctx_a.get(), N, N, n_layer, row_b);
+
+        // (2) round trip: +delta, flush (probe decode), -delta, flush (probe decode)
+        llama_memory_seq_add(llama_get_memory(ctx_a.get()), 0, 0, -1, delta);
+        const std::vector<float> lg_shift = decode_logits_last(ctx_a.get(), probe_tok, N + delta); // applies the shift
+        const std::vector<float> k_fwd    = read_k_rows(ctx_a.get(), N + 1, N, n_layer, row_b);
+        llama_memory_seq_add(llama_get_memory(ctx_a.get()), 0, 0, -1, -delta);
+        decode_logits_last(ctx_a.get(), probe_tok, N + 1);                                          // applies the unshift
+        const std::vector<float> k_rt = read_k_rows(ctx_a.get(), N + 2, N, n_layer, row_b);
+
+        // (3) fresh decode at delta..N-1+delta
+        auto ctx_b = fresh_ctx();
+        decode_tokens_at(ctx_b.get(), toks, delta);
+        const std::vector<float> k_fresh = read_k_rows(ctx_b.get(), N, N, n_layer, row_b);
+        const std::vector<float> lg_fresh = decode_logits_last(ctx_b.get(), probe_tok, N + delta);
+
+        const double nmse_rt    = nmse(k_orig, k_rt);
+        const double nmse_fresh = nmse(k_fresh, k_fwd);
+        const double nmse_lg    = nmse(lg_fresh, lg_shift);
+        const bool ok = nmse_rt <= tol && nmse_fresh <= tol && nmse_lg <= tol;
+        printf("test-yarn-kshift %-14s roundtrip K NMSE=%.3e  shifted-vs-fresh K NMSE=%.3e  probe-logits NMSE=%.3e  %s\n",
+                c.name, nmse_rt, nmse_fresh, nmse_lg, ok ? "OK" : "FAIL");
+        // digests for cross-build bit-identity checks (non-YaRN must not move)
+        printf("test-yarn-kshift DIGEST %-14s k_fwd=%016" PRIx64 " k_rt=%016" PRIx64 " logits=%016" PRIx64 "\n", c.name,
+                fnv1a(k_fwd.data(), k_fwd.size()*4), fnv1a(k_rt.data(), k_rt.size()*4), fnv1a(lg_shift.data(), lg_shift.size()*4));
+        if (!ok) {
+            n_fail++;
+        }
+    }
+    return n_fail == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -751,6 +919,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool yarn_kshift = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -778,6 +947,10 @@ int main(int argc, char ** argv) {
             log_level = GGML_LOG_LEVEL_INFO;
             continue;
         }
+        if (strcmp(argv[i], "--yarn-kshift") == 0) {
+            yarn_kshift = true;
+            continue;
+        }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
@@ -790,6 +963,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (yarn_kshift) {
+            return test_yarn_kshift(seed, log_level);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
