@@ -478,6 +478,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
+        // optional per-head attention sinks (e.g. the Nemotron 3.5 DSpark / LiLiCorr drafters)
+        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
+
         if (decoder_laguna) {
             const auto gate_name = tn(LLM_TENSOR_ATTN_GATE, "weight", i);
             const ggml_tensor * gate_meta = ml.get_tensor_meta(gate_name.str().c_str());
@@ -908,8 +911,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * wo = gated ? NULL : layer.wo;
 
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
 
         if (gated) {
             ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm);
