@@ -235,6 +235,62 @@ def test_n_probs_post_sampling_with_speculative_decoding():
             assert "prob" in prob and 0.0 < prob["prob"] <= 1.0
 
 
+def _completion_probs(prompt: str, n_predict: int, post_sampling: bool):
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "n_probs": 5,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": n_predict,
+        "post_sampling_probs": post_sampling,
+    })
+    assert res.status_code == 200
+    return res.body
+
+
+@pytest.mark.parametrize("post_sampling", [False, True])
+def test_n_probs_serial_verify_matches_plain(monkeypatch, post_sampling: bool):
+    # DS41-T4.1.2: LLAMA_SPEC_EXACT=serial (and the DSpark recurrent-target default at
+    # temp 0) verifies each draft token with its own single-token decode, overwriting
+    # ctx_tgt's logits every step, so the accept loop used to return no probabilities
+    # for any token accepted through it. The serial loop now captures prob/top-n_probs
+    # at each sampled row before the next decode. Every row on this path is a
+    # single-token decode, exactly like plain decoding, so the per-token ids AND
+    # probabilities must equal the no-draft run.
+    global server
+    prompt = "I believe the meaning of life is"
+    n_predict = 24
+    lp_key, top_key = ("prob", "top_probs") if post_sampling else ("logprob", "top_logprobs")
+
+    server.model_draft = None
+    server.spec_type = None
+    server.start()
+    plain = _completion_probs(prompt, n_predict, post_sampling)
+    server.stop()
+
+    create_server()
+    monkeypatch.setenv("LLAMA_SPEC_EXACT", "serial")
+    server.start()
+    serial = _completion_probs(prompt, n_predict, post_sampling)
+
+    # the serial path actually ran and accepted draft tokens (otherwise this would pass
+    # trivially through the non-speculative populate_token_probs path)
+    assert serial["timings"]["draft_n"] > 0
+    assert serial["timings"]["draft_n_accepted"] > 0
+
+    assert serial["content"] == plain["content"]
+    p_rows = plain["completion_probabilities"]
+    s_rows = serial["completion_probabilities"]
+    assert len(p_rows) == len(s_rows) == n_predict
+    for i, (p, s) in enumerate(zip(p_rows, s_rows)):
+        assert s["id"] == p["id"], f"row {i}"
+        assert len(s[top_key]) > 0, f"row {i}: no top-n on the serial path"
+        assert s[lp_key] == pytest.approx(p[lp_key], abs=1e-6), f"row {i}"
+        assert [t["id"] for t in s[top_key]] == [t["id"] for t in p[top_key]], f"row {i}"
+        for a, b in zip(s[top_key], p[top_key]):
+            assert a[lp_key] == pytest.approx(b[lp_key], abs=1e-6), f"row {i}"
+
+
 @pytest.mark.parametrize("n_slots,n_requests", [
     (1, 2),
     (2, 2),

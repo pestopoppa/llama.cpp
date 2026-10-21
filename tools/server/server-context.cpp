@@ -4838,7 +4838,14 @@ private:
     // tokens are decoded, so rejected tokens never enter recurrent state.
     // INF-70 E2a: LLAMA_SPEC_EXACT=serial routes every drafter through this path
     // at temp 0 (see use_serial_speculative_verify); nothing here is DSpark-specific.
-    llama_tokens sample_and_accept_dspark_serial(server_slot & slot, int32_t off) {
+    //
+    // DS41-T4.1.2: when out_probs is non-null, one capture per accepted token is appended (same order
+    // as the returned tokens) holding the TARGET model's prob/top-n_probs at the row that produced it.
+    // Each step re-decodes ctx_tgt and overwrites its logits, so the capture has to happen inside the
+    // loop -- right after sampling, before the next llama_decode -- exactly as the plain (non-
+    // speculative) path calls populate_token_probs() on the row it just sampled.
+    llama_tokens sample_and_accept_dspark_serial(server_slot & slot, int32_t off,
+                                                 std::vector<completion_token_output> * out_probs = nullptr) {
         GGML_ASSERT(use_serial_speculative_verify(slot));
         GGML_ASSERT(!slot.spec_draft.empty());
         GGML_ASSERT(slot.spec_i_batch.size() == 1);
@@ -4862,6 +4869,16 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
             accepted.push_back(id);
+
+            if (out_probs != nullptr) {
+                // logits row tok_idx is still the one id was sampled from: the next
+                // llama_decode below has not run yet.
+                completion_token_output cap;
+                cap.tok  = id;
+                cap.prob = 1.0f;
+                populate_token_probs(slot, cap, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                out_probs->push_back(std::move(cap));
+            }
 
             if (i == draft.size() || id != draft[i]) {
                 break;
@@ -5197,6 +5214,8 @@ private:
             // probabilities); the live sampler can't be replayed after the fact because it
             // has already accepted every token through the end of the round.
             std::vector<std::vector<llama_token_data>> verify_dists;
+            // DS41-T4.1.2: per-token captures from the serial verify loop (one per accepted token).
+            std::vector<completion_token_output> serial_probs;
 
             // verify and try to accept the draft
             {
@@ -5208,12 +5227,11 @@ private:
                 // checkpoint restore may need to replay verification.
                 common_sampler_ptr smpl_save;
                 if (serial_verify) {
-                    // TODO(TD-1d.2): the serial DSpark-exactness verify path re-decodes
-                    // ctx_tgt one token at a time, overwriting its own logits every step, so
-                    // it needs its own in-loop capture -- out of scope here (the reported
-                    // defect is the draft-mtp / batched-verify path below). n_probs stays
-                    // empty for tokens accepted through this path.
-                    accepted = sample_and_accept_dspark_serial(slot, off);
+                    // TD-1d.2 / DS41-T4.1.2: the serial verify path re-decodes ctx_tgt one token
+                    // at a time, overwriting its own logits every step, so it captures n_probs
+                    // inside its own loop (pre- or post-sampling, as the request asks).
+                    accepted = sample_and_accept_dspark_serial(slot, off, want_probs ? &serial_probs : nullptr);
+                    GGML_ASSERT(!want_probs || serial_probs.size() == accepted.size());
                 } else if (zos2_phase1 && zos2_pre.at(slot.id).valid) {
                     // GPU-ZOS-2 C3 phase 2: phase 1 cloned (unless lazy-save) and sampled exactly as the branch below
                     // would; want_probs is false and spec_exact is off under the overlap predicate
@@ -5381,7 +5399,12 @@ private:
                 // TD-1d.2: mirror populate_token_probs(), but from the TARGET-model
                 // distribution captured at the moment this token was verified/accepted,
                 // since by now slot.smpl has moved past every token in this round.
-                if (want_post_sampling_dist && i < verify_dists.size()) {
+                if (want_probs && i < serial_probs.size()) {
+                    // DS41-T4.1.2: serial verify captured this row in-loop (see
+                    // sample_and_accept_dspark_serial); already post- or pre-sampling as requested.
+                    result.prob  = serial_probs[i].prob;
+                    result.probs = std::move(serial_probs[i].probs);
+                } else if (want_post_sampling_dist && i < verify_dists.size()) {
                     const auto & cur_p = verify_dists[i];
 
                     for (const auto & cand : cur_p) {
