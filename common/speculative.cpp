@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <random>
 
@@ -136,6 +137,45 @@ static bool common_speculative_are_compatible(
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
+// DS41-CONF.1: env-gated DSpark confidence-head reliability log (default OFF).
+//   LLAMA_DSPARK_CONF_LOG=<path>       append one JSON line per verify round (see dspark_conf_log_round).
+//                                      Also forces the confidence head to be READ even when p_min == 0.
+//   LLAMA_DSPARK_CONF_PMIN_LOG=<float> truncation threshold used WHILE logging (default 0 = never
+//                                      truncate, so every position gets an unconditional label).
+//                                      The --spec-draft-p-min value is ignored while logging.
+// Unset => no file, no allocation, no behaviour change; the gate is a function-local static read once.
+struct dspark_conf_logger {
+    FILE *     fp   = nullptr;
+    float      pmin = 0.0f;
+    std::mutex mu;
+    std::atomic<uint64_t> round{0};
+
+    dspark_conf_logger() {
+        const char * path = std::getenv("LLAMA_DSPARK_CONF_LOG");
+        if (path && *path) {
+            fp = std::fopen(path, "a");
+            if (!fp) {
+                LOG_ERR("LLAMA_DSPARK_CONF_LOG: cannot open '%s' for append; logging disabled\n", path);
+            }
+        }
+        const char * pm = std::getenv("LLAMA_DSPARK_CONF_PMIN_LOG");
+        if (fp && pm && *pm) {
+            pmin = std::strtof(pm, nullptr);
+        }
+    }
+    ~dspark_conf_logger() { if (fp) std::fclose(fp); }
+};
+
+static dspark_conf_logger & dspark_conf_log() {
+    static dspark_conf_logger g;
+    return g;
+}
+
+static inline bool dspark_conf_log_on() {
+    static const bool on = dspark_conf_log().fp != nullptr;
+    return on;
+}
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -190,6 +230,10 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // DS41-CONF.1: called once per verify round with the draft width actually verified and the
+    // number of draft tokens the target accepted. Default: nothing to log.
+    virtual void log_round(llama_seq_id /*seq_id*/, size_t /*n_draft*/, size_t /*n_accepted*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1338,6 +1382,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // DS41-CONF.1 (only touched when LLAMA_DSPARK_CONF_LOG is set): per-seq confidences of the
+    // last draft, consumed by log_round() at verify time.
+    struct conf_pending { std::vector<float> conf; llama_pos n_past = 0; bool valid = false; };
+    std::vector<conf_pending> conf_pend;
+
+    void log_round(llama_seq_id seq_id, size_t n_draft, size_t n_accepted) override {
+        if (!is_dspark || !dspark_conf_log_on() || (size_t) seq_id >= conf_pend.size()) {
+            return;
+        }
+        conf_pending & cp = conf_pend[seq_id];
+        if (!cp.valid) {
+            return; // e.g. the re-verify of a checkpoint-restored partial draft: not a fresh round
+        }
+        cp.valid = false;
+
+        const size_t k = std::min(n_draft, cp.conf.size());
+        if (k == 0) {
+            return;
+        }
+        const size_t n_acc = std::min(n_accepted, k);
+        const size_t n_eval = std::min(n_acc + 1, k); // up to and including the first rejection
+
+        auto & lg = dspark_conf_log();
+        std::string line;
+        line.reserve(160 + k * 40);
+        char buf[64];
+        const uint64_t rnd = lg.round.fetch_add(1);
+        std::snprintf(buf, sizeof buf, "{\"round\":%" PRIu64 ",\"slot\":%d,\"n_past\":%d,\"block\":%zu,\"conf\":[",
+                rnd, (int) seq_id, (int) cp.n_past, k);
+        line += buf;
+        for (size_t i = 0; i < k; ++i) {
+            std::snprintf(buf, sizeof buf, i ? ",%.9g" : "%.9g", (double) cp.conf[i]);
+            line += buf;
+        }
+        line += "],\"cum\":[";
+        double cum = 1.0;
+        for (size_t i = 0; i < k; ++i) {
+            cum *= (double) cp.conf[i];
+            std::snprintf(buf, sizeof buf, i ? ",%.9g" : "%.9g", cum);
+            line += buf;
+        }
+        line += "],\"accepted\":[";
+        for (size_t i = 0; i < k; ++i) { line += i ? (i < n_acc ? ",1" : ",0") : (0 < n_acc ? "1" : "0"); }
+        line += "],\"evaluated\":[";
+        for (size_t i = 0; i < k; ++i) { line += i ? (i < n_eval ? ",1" : ",0") : "1"; }
+        std::snprintf(buf, sizeof buf, "],\"n_accepted\":%zu}\n", n_acc);
+        line += buf;
+
+        std::lock_guard<std::mutex> lock(lg.mu);
+        std::fwrite(line.data(), 1, line.size(), lg.fp);
+        std::fflush(lg.fp);
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1463,6 +1560,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_rng.resize(n_seq);
         selector_reset.assign(n_seq, true);
+
+        if (is_dspark && dspark_conf_log_on()) {
+            conf_pend.resize(n_seq);
+            LOG_INF("%s: LLAMA_DSPARK_CONF_LOG active: confidence head always read, truncation threshold %g (p_min=%g ignored)\n",
+                    __func__, (double) dspark_conf_log().pmin, (double) this->params.p_min);
+        }
 
         // GGUF stores HF hidden-state indices: an index below n_layer is the
         // input to that block, while n_layer is the final block output.
@@ -1769,12 +1872,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // DS41-CONF.1: while LLAMA_DSPARK_CONF_LOG is set the head is read regardless of p_min
+                // and the truncation threshold is LLAMA_DSPARK_CONF_PMIN_LOG (default 0 = none).
+                const bool  conf_log = !conf_pend.empty();
+                const float p_min_eff = conf_log ? dspark_conf_log().pmin : params.p_min;
+                const float * conf = (p_min_eff > 0.0f || conf_log) ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+
+                if (conf_log) {
+                    conf_pending & cp = conf_pend[seq_id];
+                    cp.conf.clear();
+                    cp.n_past = (llama_pos) dp.n_past;
+                    cp.valid  = false;
+                }
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf_log && conf) {
+                        conf_pend[seq_id].conf.push_back(conf[(size_t) idx * n_embd_dec]);
+                    }
+
+                    if (conf && conf[(size_t) idx * n_embd_dec] < p_min_eff) {
                         // model.py:1156 -- the confidence head TRUNCATES the proposal; it never
                         // rejects a token. Counted separately so that alpha/pos (accepted over
                         // proposed) is not polluted by positions that were never proposed.
@@ -1807,6 +1925,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // positions. Without this the ring keeps draft K at positions the target may
                 // never have accepted, and the next injection would collide with live cells.
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) dp.n_past, -1);
+
+                if (!conf_pend.empty()) {
+                    conf_pend[seq_id].valid = !result.empty();
+                }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -3376,6 +3498,15 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+void common_speculative_log_round(common_speculative * spec, llama_seq_id seq_id, size_t n_draft, size_t n_accepted) {
+    if (!dspark_conf_log_on() || spec == nullptr || seq_id < 0 || (size_t) seq_id >= spec->impl_last.size()) {
+        return;
+    }
+    if (common_speculative_impl * impl = spec->impl_last[seq_id]) {
+        impl->log_round(seq_id, n_draft, n_accepted);
     }
 }
 

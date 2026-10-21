@@ -81,6 +81,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// DS41-CONF.1: log one verify round (n_draft verified, n_accepted of them accepted) when the
+// env-gated LLAMA_DSPARK_CONF_LOG is set; a no-op otherwise.
+void common_speculative_log_round(common_speculative * spec, llama_seq_id seq_id, size_t n_draft, size_t n_accepted);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

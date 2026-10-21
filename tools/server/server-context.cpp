@@ -4539,6 +4539,7 @@ private:
                     // defect is the draft-mtp / batched-verify path below). n_probs stays
                     // empty for tokens accepted through this path.
                     accepted = sample_and_accept_dspark_serial(slot, off);
+                    common_speculative_log_round(spec.get(), slot.id, n_draft, accepted.size() - 1);
                 } else {
                     smpl_save.reset(common_sampler_clone(slot.smpl.get()));
 
@@ -4561,6 +4562,8 @@ private:
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 false, out_dists);
                     slot.spec_i_batch.clear();
+
+                    common_speculative_log_round(spec.get(), slot.id, n_draft, accepted.size() - 1);
 
                     if (spec_exact == SPEC_EXACT_DROP || spec_exact == SPEC_EXACT_REDECODE) {
                         exact_handled = spec_exact_bonus(slot, accepted, smpl_save);
