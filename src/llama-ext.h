@@ -20,6 +20,55 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // path (no graph). Lets tests prove the fused path actually ran.
 LLAMA_API int64_t llama_n_fused_decode(const struct llama_context * ctx);
 
+//
+// chunk-KV reuse (experimental, phase P1: attention-only memory)
+//
+// A chunk is the K/V of a contiguous position range of one sequence, exported once and injected later at a
+// different position offset (K is re-rotated by the offset through the ordinary K-shift graph). Nothing here runs
+// unless a caller invokes it. Hybrid / recurrent / SWA memory is refused (return 0 / false and a log line).
+//
+
+// true when the context's memory can export/inject chunks; otherwise `why` (if given) is filled
+LLAMA_API bool llama_chunk_kv_supported(const struct llama_context * ctx, char * why, size_t why_size);
+
+// write the K/V of seq_id positions [p0, p1) (p1 < 0: to the sequence end; all positions must be present).
+// dst == NULL: returns the size the blob needs. Returns the blob size, or 0 on refusal.
+LLAMA_API size_t llama_chunk_kv_export(
+        struct llama_context * ctx,
+                     uint8_t * dst,
+                      size_t   size,
+                llama_seq_id   seq_id,
+                   llama_pos   p0,
+                   llama_pos   p1);
+
+// place a blob into seq_id with every position moved by pos_delta; existing cells of the sequence are kept.
+// Returns the bytes consumed, or 0 on refusal (cache unchanged).
+LLAMA_API size_t llama_chunk_kv_inject(
+        struct llama_context * ctx,
+               const uint8_t * src,
+                      size_t   size,
+                llama_seq_id   seq_id,
+                   llama_pos   pos_delta);
+
+// diagnostic read-back (tests): K and V of seq_id positions [p0, p1) as f32, layer-major [layer][pos][n_embd_gqa].
+// Returns the number of K floats written (V count is returned through *n_v_out when given); NULL outputs only count.
+// A pending K re-rotation is applied first.
+LLAMA_API size_t llama_chunk_kv_read_f32(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+                   llama_pos   p0,
+                   llama_pos   p1,
+                       float * k_out,
+                       float * v_out,
+                      size_t * n_v_out);
+
+// apply any pending K re-rotation now (a decode does it anyway); returns true if work was done
+LLAMA_API bool llama_chunk_kv_apply_shift(struct llama_context * ctx);
+
+// startup self-check of the K re-rotation: rotate +d then -d with the model's actual rope parameters; nmse_out = worst NMSE
+// over the model's distinct rope configurations. Returns false when it could not run.
+LLAMA_API bool llama_chunk_kv_rope_selfcheck(struct llama_context * ctx, llama_pos delta, double * nmse_out);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

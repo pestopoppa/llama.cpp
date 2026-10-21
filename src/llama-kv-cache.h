@@ -185,6 +185,32 @@ public:
     const slot_info_vec_t *   sinfos_in);
 
     //
+    // chunk-KV reuse (experimental; nothing here runs unless a caller invokes it)
+    //
+
+    // true when this cache can take part in chunk export/inject: a plain (non-SWA, non-mirrored) attention cache whose
+    // K can be re-rotated. On false, *why (if given) says which condition failed.
+    bool chunk_supported(std::string * why = nullptr) const;
+
+    // write the cells of seq_id with pos in [p0, p1) (p1 < 0: up to the sequence end). The positions must be exactly
+    // p0..p1-1, each once. Returns false and writes NOTHING when unsupported or the range has holes.
+    bool chunk_export(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
+    // read a blob written by chunk_export into seq_id, placing its positions at pos + delta. Existing cells of the
+    // sequence are kept; a clash with positions already present is refused. K is re-rotated by delta by the ordinary
+    // K-shift graph at the next update (delta == 0: no rotation). Returns false and leaves the cache unchanged on refusal.
+    bool chunk_inject(llama_io_read_i & io, llama_seq_id seq_id, llama_pos delta);
+
+    // test/diagnostic read-back of the cells of seq_id at positions [p0, p1), converted to f32: layer-major,
+    // [layer][pos][n_embd_{k,v}_gqa]. Returns the number of K floats (0 on refusal or a missing position); with
+    // k_out/v_out null it only counts. Does NOT apply a pending K-shift: call the update first.
+    size_t chunk_read_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out = nullptr) const;
+
+    // startup self-check of the K re-rotation: rotate random K by +d then -d through the same graph the shift uses, for
+    // every distinct rope configuration of the model. nmse_out = worst NMSE over configurations (f64 accumulation).
+    bool chunk_rope_selfcheck(llama_context * lctx, llama_pos delta, double * nmse_out);
+
+    //
     // graph_build API
     //
 
@@ -337,7 +363,8 @@ private:
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,
-                       uint32_t   il) const;
+                       uint32_t   il,
+                           bool   inplace = true) const;
 
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
