@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-qdq.h"
 
 #include "gguf.h"
 #include "llama-kv-cache-dsv4.h"
@@ -1217,6 +1218,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     // --- grouped low-rank output projection (model.py:785-788, SPEC.md 3.5) --------------------
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
+    // DS41-W5.1a, default off (LLAMA_DSV41_QDQ=wo_a): model.py:787 act_quant(o, 32, "ue8m0",
+    // inplace=True) -- the reference round-trips o through FP8 e4m3 (pow2 scale per 32 along the
+    // group's 4096 dims) before the einsum with wo_a. Off = no node.
+    if (llama_dsv41_qdq_get().wo_a) {
+        out = llama_build_qdq(ctx0, out, LLAMA_QDQ_FP8_E4M3_UE8M0_B32);
+        cb(out, "attn_o_qdq", il);
+    }
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
     ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
     cb(oa, "attn_wo_a", il);
