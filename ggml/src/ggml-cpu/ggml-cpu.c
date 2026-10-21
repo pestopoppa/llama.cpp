@@ -4325,6 +4325,57 @@ static bool ggml_cpu_fused_upgate_enabled(void) {
 }
 #endif
 
+#if defined(GGML_USE_IQK_MULMAT)
+// CH-19.1: predicate for the fused MoE up+gate+SwiGLU node at nodes [node_n, node_n+2].
+// The up and gate MUL_MAT_IDs are SIBLINGS (both read the same src1 and expert ids; only the GLU
+// consumes them), not a chain, so ggml_can_fuse() -- which requires node i to consume node i-1 --
+// was always false here and the fused path never ran.  ggml_can_fuse_subgraph() checks the op
+// sequence, the COMPUTE flags, and that every use of the two MUL_MAT_IDs lies inside the subgraph
+// (no OUTPUT flag, no external view); the rest pins the exact form the fused kernel implements:
+//   - the two MUL_MAT_IDs are adjacent (either order), each used exactly once, and only by the GLU;
+//   - GLU = SWIGLU split form, not swapped: glu = silu(src[0]) * src[1], src[0] = gate, src[1] = up;
+//   - up and gate share src1 (the activations) and src[2] (the expert ids), and have identical shapes.
+// Graph metadata only, so every thread reaches the same answer.  On false nothing has been written.
+static bool ggml_cpu_can_fuse_moe_up_gate(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        struct ggml_tensor ** up_out,
+        struct ggml_tensor ** gate_out) {
+    static const enum ggml_op ops[3] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int outputs[1] = { node_n + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 3, ops, outputs, 1)) {
+        return false;
+    }
+    struct ggml_tensor * a   = cgraph->nodes[node_n];
+    struct ggml_tensor * b   = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    struct ggml_tensor * gate = glu->src[0];
+    struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, node_n) != 1 || ggml_node_get_use_count(cgraph, node_n + 1) != 1) {
+        return false;
+    }
+    if (a->view_src || b->view_src) {
+        return false;
+    }
+    if (up->src[1] != gate->src[1] || up->src[2] != gate->src[2]) {
+        return false;
+    }
+    if (!ggml_are_same_shape(up, gate) || !ggml_are_same_shape(glu, up)) {
+        return false;
+    }
+    *up_out   = up;
+    *gate_out = gate;
+    return true;
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4340,15 +4391,11 @@ static int ggml_cpu_try_fuse_ops(
 #if defined(GGML_USE_IQK_MULMAT)
     // CH-19: MUL_MAT_ID + MUL_MAT_ID + GLU(swiglu) -> one fused up+gate+SwiGLU node. Default OFF.
     if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_fused_upgate_enabled()) {
-        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
-        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 3)) {
-            struct ggml_tensor * n1  = cgraph->nodes[node_n + 1];
-            struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
-            struct ggml_tensor * up   = (glu->src[1] == node) ? node : n1;
-            struct ggml_tensor * gate = (glu->src[0] == node) ? node : n1;
-            if (up != gate && ggml_iqk_try_moe_up_gate(params, up, gate, glu)) {
-                return 2;
-            }
+        struct ggml_tensor * up   = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (ggml_cpu_can_fuse_moe_up_gate(cgraph, node_n, &up, &gate) &&
+                ggml_iqk_try_moe_up_gate(params, up, gate, cgraph->nodes[node_n + 2])) {
+            return 2;
         }
     }
 #endif

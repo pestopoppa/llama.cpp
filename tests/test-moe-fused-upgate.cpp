@@ -1,6 +1,8 @@
 // CH-19: fused MoE up+gate+SwiGLU (GGML_CPU_FUSED_UPGATE=1, needs GGML_IQK=1).
 //   test-moe-fused-upgate write <ref.bin>   -- run the graph, write outputs (run with FUSED_UPGATE=0)
 //   test-moe-fused-upgate cmp   <ref.bin>   -- run the graph, NMSE vs ref file (run with FUSED_UPGATE=1)
+//   test-moe-fused-upgate cmp   <ref.bin> <cell 0..3> -- run ONE cell only (one process per cell, so the
+//                                                       once-per-process ACTIVE marker proves THAT cell fused)
 // The graph is MUL_MAT_ID(up) -> MUL_MAT_ID(gate) -> GLU(swiglu split) on a single token, i.e. the
 // node pattern llm_graph_context::build_moe_ffn emits. The queue job greps stderr for the
 // "[iqk] ACTIVE: fused MoE up+gate" line to prove the fused path actually ran.
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -45,6 +48,14 @@ static std::vector<float> run_case(ggml_type type, int n_threads) {
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    // CH-19.1: record the node order the fusion predicate sees (expected: gate, up, glu -- the DFS
+    // visits glu->src[0] = gate first). Goes to stderr next to the ACTIVE marker.
+    fprintf(stderr, "graph(type=%d nt=%d):", (int) type, n_threads);
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * n = ggml_graph_node(gf, i);
+        fprintf(stderr, " %s%s", ggml_op_desc(n), n == up ? "(up)" : n == gate ? "(gate)" : "");
+    }
+    fprintf(stderr, "\n");
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
     std::vector<float> r((float *) out->data, (float *) out->data + ggml_nelements(out));
@@ -58,17 +69,23 @@ int main(int argc, char ** argv) {
         printf("RESULT test-moe-fused-upgate smoke pass=1 fail=0\n");
         return 0;
     }
-    if (argc != 3) { fprintf(stderr, "usage: %s [write|cmp <file>]\n", argv[0]); return 2; }
+    if (argc != 3 && argc != 4) { fprintf(stderr, "usage: %s [write <file> | cmp <file> [cell]]\n", argv[0]); return 2; }
     const std::string mode = argv[1];
     const ggml_type types[] = { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 };
+    const int       nts[]   = { 1, 8 };
+    const char * names[4] = { "Q4_K nt=1", "Q4_K nt=8", "Q8_0 nt=1", "Q8_0 nt=8" };
     int pass = 0, fail = 0;
 
+    const int only = argc == 4 ? atoi(argv[3]) : -1;
+    if (argc == 4 && (mode != "cmp" || only < 0 || only > 3)) { fprintf(stderr, "cell selector: cmp only, 0..3\n"); return 2; }
+
     std::vector<float> all;
-    for (ggml_type t : types) {
-        for (int nt : { 1, 8 }) {
-            auto r = run_case(t, nt);
-            all.insert(all.end(), r.begin(), r.end());
-        }
+    size_t per = 0;
+    for (int c = 0; c < 4; ++c) {
+        if (only >= 0 && c != only) { continue; }
+        auto r = run_case(types[c / 2], nts[c % 2]);
+        per = r.size();
+        all.insert(all.end(), r.begin(), r.end());
     }
     if (mode == "write") {
         FILE * f = fopen(argv[2], "wb");
@@ -81,15 +98,16 @@ int main(int argc, char ** argv) {
     }
     FILE * f = fopen(argv[2], "rb");
     if (!f) { perror("open"); return 2; }
-    std::vector<float> ref(all.size());
+    std::vector<float> ref(4 * per);
     if (fread(ref.data(), sizeof(float), ref.size(), f) != ref.size()) { fprintf(stderr, "short ref file\n"); return 2; }
     fclose(f);
-    const size_t per = all.size() / 4;
-    const char * names[4] = { "Q4_K nt=1", "Q4_K nt=8", "Q8_0 nt=1", "Q8_0 nt=8" };
     for (int c = 0; c < 4; ++c) {
+        if (only >= 0 && c != only) { continue; }
+        const size_t off = only >= 0 ? 0 : c * per; // offset into `all`
         double num = 0, den = 0, maxd = 0;
-        for (size_t i = c * per; i < (c + 1) * per; ++i) {
-            const double d = (double) all[i] - ref[i];
+        for (size_t k = 0; k < per; ++k) {
+            const size_t i = c * per + k;           // offset into `ref`
+            const double d = (double) all[off + k] - ref[i];
             num += d * d; den += (double) ref[i] * ref[i];
             maxd = std::fmax(maxd, std::fabs(d));
         }

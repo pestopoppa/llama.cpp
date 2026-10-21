@@ -756,6 +756,13 @@ extern "C" bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * para
                 nullptr, nullptr,
                 (float *) glu->data, glu->nb[1], glu->nb[2],
                 b1_row + i, 0.0f, ith, nth)) {
+            // CH-19.1: this thread already wrote its private slice of wdata (and maybe glu rows).
+            // The unfused MUL_MAT_ID the caller runs next reuses wdata from offset 0, so a thread
+            // that fell through early would race the quantization above in a slower thread.  The
+            // failure (MulMat::prepare on type/ne00/Ny) is identical in every thread -- the expert
+            // grouping is built from the same ids -- so all threads meet here; glu is rewritten in
+            // full by the unfused GLU.
+            ggml_barrier(params->threadpool);
             return false;
         }
         i = j;
