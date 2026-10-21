@@ -2,22 +2,45 @@
 # G1 shift exactness on a REAL role (Qwen3-VL-30B-A3B text path, attention-only, IMROPE): the same test-chunk-kv
 # binary as the CI gate, pointed at the real GGUF with f32 K/V caches. Needs an inference window (30B model loads
 # and decodes ~100 tokens a few times); refuses unless WINDOW_CONFIRMED=1.
-#   WINDOW_CONFIRMED=1 BUILD=<build dir> OUT=<dir> scripts/chunk-kv/run_g1_real_role.sh
+#   WINDOW_CONFIRMED=1 [KPF62_TEST_CHUNK_KV=<bin> | BUILD=<build dir>] OUT=<dir> scripts/chunk-kv/run_g1_real_role.sh [--dry-run]
+#   (default: binary from the BUILD_OK marker written by the kpf-62-8-build filler; --dry-run needs no window/claim)
 # Run under:  region-lock run --role bench --cpu-list <quarter> -- ...   (CPU) ; take NO region claim for a GPU run.
 set -euo pipefail
 
-[ "${WINDOW_CONFIRMED:-0}" = "1" ] || { echo "refusing: needs an inference window (set WINDOW_CONFIRMED=1)"; exit 3; }
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BUILD="${BUILD:-$ROOT/build-cpu}"
 MODEL="${MODEL:-/mnt/raid0/llm/models/lmstudio-community/Qwen3-VL-30B-A3B-Instruct-GGUF/Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf}"
 OUT="${OUT:-$ROOT/results/chunk-kv-g1-$(date -u +%Y%m%dT%H%M%SZ)}"
 THREADS="${THREADS:-48}"
 EXTRA="${EXTRA:-}"
+MARK="${KPF62_BUILD_OK:-/mnt/raid0/llm/tmp/qb2-kpf62-8/BUILD_OK}"
 
-[ -f "$MODEL" ] || { echo "FAIL: model $MODEL missing"; exit 2; }
+# Binary resolution order: $BUILD (dir) > $KPF62_TEST_CHUNK_KV (binary path) > BUILD_OK marker > $ROOT/build-cpu
+SRC=default
+if [ -n "${BUILD:-}" ]; then SRC=env-BUILD
+elif [ -n "${KPF62_TEST_CHUNK_KV:-}" ]; then BUILD="$(cd "$(dirname "$KPF62_TEST_CHUNK_KV")/.." && pwd)"; SRC=env-KPF62_TEST_CHUNK_KV
+elif [ -f "$MARK" ]; then BUILD="$(sed -n 's/^build_dir=//p' "$MARK")"; SRC="marker:$MARK"
+else BUILD="$ROOT/build-cpu"; fi
 BIN="$BUILD/bin/test-chunk-kv"
-[ -x "$BIN" ] || { echo "FAIL: $BIN not built"; exit 2; }
+[ -x "$BIN" ] || { echo "FAIL: test-chunk-kv not found at $BIN (source: $SRC). Build it first (filler kpf-62-8-build writes $MARK) or set KPF62_TEST_CHUNK_KV=<binary>"; exit 2; }
+if [ "$SRC" = "marker:$MARK" ]; then
+    want="$(sed -n 's/^sha256=//p' "$MARK")"; have="$(sha256sum "$BIN" | cut -d' ' -f1)"
+    [ "$want" = "$have" ] || { echo "FAIL: $BIN sha256 differs from BUILD_OK marker (rebuilt/stale?)"; exit 2; }
+fi
+
+if [ "$DRY" = 1 ]; then
+    echo "dry-run: no inference performed"
+    echo "binary   : $BIN (source: $SRC)"
+    echo "model    : $MODEL ($([ -f "$MODEL" ] && echo present || echo MISSING))"
+    echo "threads  : $THREADS   out: $OUT"
+    echo "head     : $(git -C "$ROOT" rev-parse HEAD)"
+    echo "claim    : region-lock run --role bench --cpu-list <quarter, e.g. 0-23,96-111 = q0> -- nice -n 19 $0   (WINDOW_CONFIRMED=1)"
+    exit 0
+fi
+
+[ "${WINDOW_CONFIRMED:-0}" = "1" ] || { echo "refusing: needs an inference window (set WINDOW_CONFIRMED=1)"; exit 3; }
+[ -f "$MODEL" ] || { echo "FAIL: model $MODEL missing"; exit 2; }
 
 # stale-artifact guard: the library must be newer than the last commit touching the chunk code, and contain the API
 LIB="$(ls "$BUILD"/bin/libllama.so* | head -1)"
