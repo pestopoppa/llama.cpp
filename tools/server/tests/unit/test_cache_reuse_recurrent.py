@@ -29,9 +29,12 @@ def test_hybrid_disables_cache_reuse(tmp_path):
     srv.n_cache_reuse = 16
     srv.start()
     try:
-        res = srv.make_request("POST", "/completion", data={"prompt": "Hello world, this is a test.", "n_predict": 4})
+        # a request that asks for chunk reuse must still be served (and must not shift the recurrent state)
+        res = srv.make_request("POST", "/completion", data={"prompt": "Hello world, this is a test.", "n_predict": 4,
+                                                           "n_cache_reuse": 16})
         assert res.status_code == 200
-        assert res.body["generation_settings"]["n_cache_reuse"] == 0
+        # this server's generation_settings does not echo n_cache_reuse; the load-time guard is asserted on the log
+        assert res.body["generation_settings"].get("n_cache_reuse", 0) == 0
     finally:
         srv.stop()
     log = open(srv.log_path).read()
