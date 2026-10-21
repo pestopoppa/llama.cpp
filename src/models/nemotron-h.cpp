@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <algorithm>
+
 void llama_model_nemotron_h::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
     ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
@@ -15,7 +17,14 @@ void llama_model_nemotron_h::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp,        false);
+    // Puzzle / Bolt models set a different expert FFN size per layer (scalar or per-layer array);
+    // the scalar keeps the maximum so uniform GGUFs behave exactly as before
+    std::fill(hparams.n_ff_exp_arr.begin(), hparams.n_ff_exp_arr.end(), 0);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+    hparams.n_ff_exp = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        hparams.n_ff_exp = std::max(hparams.n_ff_exp, hparams.n_ff_exp_arr[il]);
+    }
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp,      false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
@@ -25,12 +34,25 @@ void llama_model_nemotron_h::load_arch_hparams(llama_model_loader & ml) {
     switch (hparams.n_layer()) {
         case 52: type = LLM_TYPE_31B_A3_5B; break; // Nemotron-H_MOE 31B
         case 56: type = LLM_TYPE_9B; break;
-        case 88: type = LLM_TYPE_120B_A12B; break;
+        case 88:
+            {
+                // Nemotron 3 Super (uniform MoE) and the heterogeneous Puzzle / 3.5 Bolt
+                // (75B.A9B class) share 88 layers; per-layer expert FFN sizes discriminate
+                bool heterogeneous = false;
+                uint32_t ff0 = 0;
+                for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+                    const uint32_t ff = hparams.n_ff_exp_arr[i];
+                    if (ff == 0) { continue; }
+                    if (ff0 == 0) { ff0 = ff; }
+                    heterogeneous |= ff != ff0;
+                }
+                type = heterogeneous ? LLM_TYPE_75B_A9B : LLM_TYPE_120B_A12B;
+            } break;
         default: type = LLM_TYPE_UNKNOWN;
     }
 }
 
-void llama_model_nemotron_h::load_arch_tensors(llama_model_loader &) {
+void llama_model_nemotron_h::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     // mamba2 Mixer SSM params
@@ -89,18 +111,26 @@ void llama_model_nemotron_h::load_arch_tensors(llama_model_loader &) {
             layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
         }  else {
             if (n_expert != 0) {
-                const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+                // Bolt routes over a different number of experts per layer: take it from the router
+                // tensor (upstream #30520); uniform GGUFs give n_expert here
+                const auto * router_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str().c_str());
+                const int64_t n_expert_layer = router_meta ? router_meta->ne[1] : n_expert;
+                if (n_expert_layer < (int64_t) hparams.n_expert_used_il(i) || n_expert_layer > n_expert) {
+                    throw std::runtime_error("Invalid per-layer Nemotron expert count");
+                }
+                // per-layer n_ff_exp; fall back to n_ff/n_expert_used if absent (existing GGUFs)
+                const int64_t n_ff_exp = hparams.n_ff_exp_il(i) ? (int64_t) hparams.n_ff_exp_il(i) : n_ff / n_expert_used;
                 const int64_t n_ff_shexp = hparams.n_ff_shexp;
 
-                layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert}, 0);
-                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert         }, 0);
+                layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert_layer}, 0);
+                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert_layer         }, 0);
 
                 // MoE branch
                 layer.ffn_latent_down = create_tensor(tn(LLM_TENSOR_FFN_LATENT_DOWN, "weight", i), {n_embd, moe_n_embd}, TENSOR_NOT_REQUIRED);
                 layer.ffn_latent_up   = create_tensor(tn(LLM_TENSOR_FFN_LATENT_UP,   "weight", i), {moe_n_embd, n_embd}, TENSOR_NOT_REQUIRED);
 
-                layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   moe_n_embd, n_expert}, 0);
-                layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {moe_n_embd, n_ff_exp, n_expert}, 0);
+                layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   moe_n_embd, n_expert_layer}, 0);
+                layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {moe_n_embd, n_ff_exp, n_expert_layer}, 0);
 
                 // Shared expert branch
                 layer.ffn_down_shexp  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
@@ -217,6 +247,10 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur, 
         ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
         cb(router_logits, "ffn_moe_logits", il);
 
+        // per-layer expert count / top-k (Bolt); identical to n_expert / n_expert_used on uniform GGUFs
+        const int64_t n_expert_l      = model.layers[il].ffn_up_exps->ne[2];
+        const int64_t n_expert_used_l = cparams.warmup ? n_expert_l : (int64_t) hparams.n_expert_used_il(il);
+
         ggml_tensor * moe_out =
             build_moe_ffn(inp_latent,
                     model.layers[il].ffn_gate_inp,
@@ -224,7 +258,7 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur, 
                     nullptr, // no gate
                     model.layers[il].ffn_down_exps,
                     model.layers[il].ffn_exp_probs_b,
-                    n_expert, n_expert_used,
+                    n_expert_l, n_expert_used_l,
                     LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,

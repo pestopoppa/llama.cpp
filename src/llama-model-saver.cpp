@@ -219,7 +219,19 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_BLOCK_COUNT,                       hparams.n_layer_all);
     add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
     add_kv(LLM_KV_FEED_FORWARD_LENGTH,               hparams.n_ff_arr, true);
-    add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+    // heterogeneous MoE (Nemotron 3 Puzzle / 3.5 Bolt) keeps its per-layer arrays; every other
+    // model has an all-zero or uniform array and writes the scalar exactly as before
+    {
+        bool hetero = false;
+        for (uint32_t il = 1; il < hparams.n_layer(); ++il) {
+            hetero |= hparams.n_ff_exp_arr[il] != hparams.n_ff_exp_arr[0];
+        }
+        if (hetero) {
+            add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, true);
+        } else {
+            add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+        }
+    }
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     add_kv(LLM_KV_EXPERT_CHUNK_FEED_FORWARD_LENGTH,  hparams.n_ff_chexp);
     add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                  hparams.swiglu_clamp_exp);
@@ -227,7 +239,17 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
     add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
-    add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used);
+    {
+        bool hetero = false;
+        for (uint32_t il = 1; il < hparams.n_layer(); ++il) {
+            hetero |= hparams.n_expert_used_arr[il] != hparams.n_expert_used_arr[0];
+        }
+        if (hetero) {
+            add_kv(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, true);
+        } else {
+            add_kv(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used);
+        }
+    }
     add_kv(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);
     add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT,           hparams.n_group_used);

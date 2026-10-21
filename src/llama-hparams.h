@@ -56,7 +56,7 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
     uint32_t n_expert = 0;
-    uint32_t n_expert_used = 0;
+    uint32_t n_expert_used = 0; // maximum over layers when the GGUF carries a per-layer array
     uint32_t n_rel_attn_bkts = 0;
 
     // TODO: this needs to be reworked
@@ -90,6 +90,12 @@ struct llama_hparams {
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
     uint32_t n_ff_exp           = 0;
+
+    // per-layer top-k expert routing count and expert FFN size (upstream #25444 / #30520).
+    // A scalar GGUF key broadcasts over every layer, so the per-layer accessors return the
+    // scalar for every uniform model; heterogeneous MoE (Nemotron 3 Puzzle / 3.5 Bolt) carry arrays.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_used_arr = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr      = {};
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
     uint32_t n_expert_shared    = 0;
@@ -363,6 +369,10 @@ struct llama_hparams {
     uint32_t n_head_kv(uint32_t il = 0) const;
 
     uint32_t n_ff(uint32_t il = 0) const;
+
+    // per-layer expert counts; fall back to the scalar when il is out of range or the layer has no entry
+    uint32_t n_expert_used_il(int32_t il) const;
+    uint32_t n_ff_exp_il(int32_t il) const;
 
     uint32_t n_gqa(uint32_t il = 0) const;
 
