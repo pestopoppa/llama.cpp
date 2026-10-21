@@ -298,6 +298,7 @@ struct result_timings {
     int32_t     n_fork_tokens = 0;      // prompt tokens taken from the fork (0 = no fork); part of cache_n
     int32_t     fork_src_slot = -1;
     std::string fork_src_kind = "none"; // none | checkpoint | end | kv
+    bool        fork_src_busy = false;  // the source was processing a task at the fork (a fork from a busy source)
     int32_t     id_slot       = -1;     // [P2] the slot that served the request
     int32_t     id_task       = -1;     // [P2] the task id /slots shows as id_task for that slot
 

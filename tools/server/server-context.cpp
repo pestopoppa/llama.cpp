@@ -386,6 +386,7 @@ struct server_slot {
     int32_t      fork_n_tokens = 0;     // prompt tokens taken from the fork (0 = no fork)
     int32_t      fork_src_slot = -1;
     const char * fork_src_kind = "none"; // none | checkpoint | end | kv
+    bool         fork_src_busy = false;  // the source was processing a task when the fork was taken
 
     // [KPF-11] the cached cells no longer equal a fresh prefill of prompt.tokens (context shift, KV compression
     // eviction): never a fork source. Cleared when the cells are rebuilt from position 0.
@@ -405,6 +406,7 @@ struct server_slot {
         fork_n_tokens = 0;
         fork_src_slot = -1;
         fork_src_kind = "none";
+        fork_src_busy = false;
     }
 
     void reset() {
@@ -648,6 +650,7 @@ struct server_slot {
             timings.n_fork_tokens = fork_n_tokens;
             timings.fork_src_slot = fork_src_slot;
             timings.fork_src_kind = fork_src_kind;
+            timings.fork_src_busy = fork_src_busy;
             timings.id_slot       = id;
             timings.id_task       = task ? task->id : -1;
         }
@@ -2000,6 +2003,7 @@ private:
         dst.fork_n_tokens = p;
         dst.fork_src_slot = src.id;
         dst.fork_src_kind = c.kind;
+        dst.fork_src_busy = !c.idle;
 
         n_slot_forks_total       += 1;
         n_slot_fork_tokens_total += p;
@@ -3364,6 +3368,7 @@ private:
                                 {"n_fork_tokens", slot.fork_n_tokens},
                                 {"src_slot",      slot.fork_src_slot},
                                 {"src_kind",      slot.fork_src_kind},
+                                {"src_busy",      slot.fork_src_busy},
                             };
                             // [P2] prefix hash ladder: FNV-1a 64 over the token ids (int32, little endian) of the
                             // first n tokens, at every checkpoint position and at the slot's full length. One pass.

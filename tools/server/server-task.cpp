@@ -267,6 +267,7 @@ json result_timings::to_json() const {
         base["n_fork_tokens"] = n_fork_tokens;
         base["fork_src_slot"] = fork_src_slot;
         base["fork_src_kind"] = fork_src_kind;
+        base["fork_src_busy"] = fork_src_busy;
         base["id_slot"]       = id_slot;
         base["id_task"]       = id_task;
     }
