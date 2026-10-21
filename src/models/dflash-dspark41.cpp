@@ -80,6 +80,15 @@ ggml_tensor * llama_model_dflash::graph_dsv41::build_dspark_kv(
     kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
     cb(kv, "dspark_kv", il);
 
+    // DS41-T3.2, default off (LLAMA_DSV41_QDQ=kv_win): model.py:1044 (main_kv, the ring write)
+    // and :1064 (the block's own kv) both act_quant(..., 32, "ue8m0", inplace=True) the
+    // post-RoPE KV. Both come through here; the Hadamard rotation is applied by the callers,
+    // after this. Off = no node.
+    if (llama_dsv41_qdq_get().kv_win) {
+        kv = llama_build_qdq(ctx0, kv, LLAMA_QDQ_FP8_E4M3_UE8M0_B32);
+        cb(kv, "dspark_kv_qdq", il);
+    }
+
     return kv;
 }
 

@@ -820,6 +820,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_v41_lid_top_k(
     cb(indexer_q_pe, "lid_q_pe", il);
 
     indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
+    // DS41-T3.2, default off (LLAMA_DSV41_QDQ=idx_q): model.py:553 fp4_act_quant(q, 32,
+    // inplace=True) -- FP4 e2m1, pow2 scale per 32 along each head's 128 dims, post-RoPE,
+    // ahead of the Hadamard rotation.
+    if (llama_dsv41_qdq_get().idx_q) {
+        indexer_q = llama_build_qdq(ctx0, indexer_q, LLAMA_QDQ_FP4_E2M1_UE8M0_B32);
+        cb(indexer_q, "lid_q_qdq", il);
+    }
     indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, inp_idx.k_rot);
     cb(indexer_q, "lid_q_rot", il);
 
@@ -986,6 +993,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_compressed_attention(
                     ext_factor, DSV41_ROPE_ATTN_FACTOR, beta_fast, beta_slow);
             ik = ggml_concat(ctx0, ik_nope, ik_pe, 0);
 
+            // DS41-T3.2, default off (LLAMA_DSV41_QDQ=idx_k): model.py:546 fp4_act_quant(k, 32,
+            // inplace=True) -- FP4 e2m1 with a pow2 scale per 32, post-RoPE, before caching. It
+            // goes before the Hadamard rotation, which the reference does not have.
+            if (llama_dsv41_qdq_get().idx_k) {
+                ik = llama_build_qdq(ctx0, ik, LLAMA_QDQ_FP4_E2M1_UE8M0_B32);
+                cb(ik, "lid_k_qdq", il);
+            }
+
             if (inp_idx.k_rot) {
                 ik = llama_mul_mat_hadamard(ctx0, ik, inp_idx.k_rot);
             }
@@ -1007,6 +1022,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_compressed_attention(
                 ext_factor, DSV41_ROPE_ATTN_FACTOR, beta_fast, beta_slow);
 
         ggml_tensor * comp = ggml_concat(ctx0, comp_nope, comp_pe, 0);
+        // DS41-T3.2, default off (LLAMA_DSV41_QDQ=kv_comp): model.py:761 fp4_act_quant(latent, 16,
+        // inplace=True, scale_dtype=float8_e4m3fn) -- FP4 e2m1 with an e4m3 scale per 16,
+        // post-RoPE, before caching; ahead of the Hadamard rotation as for idx_k.
+        if (llama_dsv41_qdq_get().kv_comp) {
+            comp = llama_build_qdq(ctx0, comp, LLAMA_QDQ_FP4_E2M1_E4M3_B16);
+            cb(comp, "comp_latent_qdq", il);
+        }
         if (inp_comp.k_rot) {
             comp = llama_mul_mat_hadamard(ctx0, comp, inp_comp.k_rot);
         }
@@ -1188,6 +1210,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     cb(kv_pe, "kv_pe", il);
     kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
     cb(kv, "kv", il);
+    // DS41-T3.2, default off (LLAMA_DSV41_QDQ=kv_win): model.py:708 act_quant(kv, 32, "ue8m0",
+    // inplace=True) -- the window K is FP8 over the whole post-RoPE vector, RoPE tail included,
+    // before it is cached AND before this step attends to it. Off = no node.
+    if (llama_dsv41_qdq_get().kv_win) {
+        kv = llama_build_qdq(ctx0, kv, LLAMA_QDQ_FP8_E4M3_UE8M0_B32);
+        cb(kv, "kv_qdq", il);
+    }
 
     // --- attention -----------------------------------------------------------------------------
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
