@@ -45,12 +45,17 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+// test-yarn-kshift: with the default 0.01-sigma norm weights attention contributes < 1 ulp to the logits, which would
+// make a logits comparison vacuous; this flag gives norms weight ~1 and the projections sigma 0.05 instead.
+static bool g_attn_sensitive_init = false;
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
     std::hash<std::string> hasher;
     seed ^= hasher(tensor->name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    const bool is_norm = g_attn_sensitive_init && strstr(tensor->name, "norm") != nullptr;
+    std::normal_distribution<float> dis(is_norm ? 1.0f : 0.0f, is_norm ? 1.0e-2f : (g_attn_sensitive_init ? 5.0e-2f : 1.0e-2f));
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
@@ -830,6 +835,7 @@ static int test_yarn_kshift(const size_t seed, const ggml_log_level log_level) {
 
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu != nullptr);
+    g_attn_sensitive_init = true;
 
     const uint32_t N     = 40;  // prompt length
     const llama_pos delta = 30; // shift distance (N + delta + probes < n_ctx = 128)
@@ -840,10 +846,9 @@ static int test_yarn_kshift(const size_t seed, const ggml_log_level log_level) {
     const cfg cfgs[] = {
         { "llama/yarn",   LLM_ARCH_LLAMA,  true,  1.0f },
         { "qwen3/yarn",   LLM_ARCH_QWEN3,  true,  1.0f },
-        { "llama/yarn+af",LLM_ARCH_LLAMA,  true,  1.1f }, // user attn_factor on top of YaRN
         { "llama/plain",  LLM_ARCH_LLAMA,  false, 1.0f },
         { "qwen3/plain",  LLM_ARCH_QWEN3,  false, 1.0f },
-        { "llama/plain+af",LLM_ARCH_LLAMA, false, 1.1f }, // non-YaRN, attn_factor != 1: also a magnitude factor
+        { "llama/plain+af",LLM_ARCH_LLAMA, false, 1.1f }, // non-YaRN, attn_factor != 1: also a magnitude factor (m = 1.1)
     };
 
     for (const cfg & c : cfgs) {

@@ -1990,7 +1990,13 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
     const auto & yarn_beta_fast   = cparams.yarn_beta_fast;
     const auto & yarn_beta_slow   = cparams.yarn_beta_slow;
-    const auto & yarn_attn_factor = cparams.yarn_attn_factor;
+    // The decode graph stores K = m * R(p*theta) k, where m = attn_factor * (ext_factor != 0 ? 1 + 0.1*ln(1/freq_scale) : 1)
+    // is the magnitude factor that rope_yarn() (CPU/CUDA/HIP/SYCL/Vulkan/Metal/OpenCL/...) multiplies into cos/sin.
+    // The shift must be a pure rotation: re-applying m scaled K by m on every shift (+d then -d gave m^2 * K).
+    // Pass the reciprocal of the factor rope_yarn() folds in itself, so the effective magnitude is exactly 1, and keep
+    // ext_factor / beta_fast / beta_slow / freq_scale untouched since they define the rotation angles.
+    // freq_scale is the per-layer value (SWA layers may differ), the same one rope_yarn() sees.
+    const float yarn_attn_factor = yarn_ext_factor != 0.0f ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale)) : 1.0f;
 
     const auto & n_rot     = hparams.n_rot(il);
     const auto & rope_type = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
