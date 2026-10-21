@@ -178,6 +178,11 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    // DS41-T7.1a: process() is where a DFlash/DSpark drafter runs its encoder and the KV inject
+    // decode over the accepted target rows, once per verify step. It was the one untimed call,
+    // so the drafter's cost per step was t_draft_us plus an unknown.
+    int64_t t_process_us   = 0; // total time spent in process() in microseconds.
+    size_t  n_call_process = 0;
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -3210,7 +3215,12 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        if (!result) {
+            continue; // as before: the first failure skips the remaining implementations
+        }
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
+        result = impl->process(batch);
+        impl->n_call_process++;
     }
 
     return result;
@@ -3494,6 +3504,24 @@ void common_speculative_print_stats(const common_speculative * spec) {
                         ", cond/pos = (" + cond.str() + ")"
                         ", #trunc/pos = (" + trunc.str() + ")"
                         ", #bonus = " + std::to_string(impl->n_bonus_tokens);
+        }
+
+        // DS41-T7.1a: the drafter's own cost per verify step, at INFO so a default-verbosity
+        // server log carries it (the statistics lines below are TRACE). Totals are cumulative
+        // over this speculative context's lifetime, like every other counter here, so per-call
+        // means are the comparable unit. draft = draft() (drafter decode of the block + its
+        // sampling); process = process() (DFlash/DSpark encoder + KV inject decode); both
+        // synchronize with the drafter context before returning, so graph time is inside.
+        if (impl->gen_perf && (impl->n_call_draft > 0 || impl->n_call_process > 0)) {
+            const double draft_ms   = impl->t_draft_us   / 1000.0;
+            const double process_ms = impl->t_process_us / 1000.0;
+            SPC_INF("draft timing %16s: draft = %.3f ms / %zu calls (%.3f ms/call), process = %.3f ms / %zu calls (%.3f ms/call), "
+                    "draft+process per draft call = %.3f ms, begin = %.3f ms, accept = %.3f ms\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    draft_ms, impl->n_call_draft, impl->n_call_draft > 0 ? draft_ms / impl->n_call_draft : 0.0,
+                    process_ms, impl->n_call_process, impl->n_call_process > 0 ? process_ms / impl->n_call_process : 0.0,
+                    impl->n_call_draft > 0 ? (draft_ms + process_ms) / impl->n_call_draft : 0.0,
+                    impl->t_begin_us / 1000.0, impl->t_accept_us / 1000.0);
         }
 
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
