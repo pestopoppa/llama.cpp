@@ -97,6 +97,7 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
+    n_cache_reuse: int | None = None
     kv_streaming_sink: int | None = None
     kv_streaming_window: int | None = None
     spec_type: str | None = None
@@ -237,6 +238,8 @@ class ServerProcess:
                 server_args.extend(["--lora", lora_file])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
+        if self.n_cache_reuse is not None:
+            server_args.extend(["--cache-reuse", self.n_cache_reuse])
         if self.kv_streaming_sink is not None:
             server_args.extend(["--kv-streaming-sink", self.kv_streaming_sink])
         if self.kv_streaming_window is not None:

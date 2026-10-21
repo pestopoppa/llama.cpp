@@ -704,8 +704,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
-    // shifting the pos is trivial for recurrent models
-    return true;
+    // "can shift" means KV-style position shifting (llama_memory_seq_add) is semantically valid, i.e. the
+    // cached state for a token range can be moved to another position (context shift, --cache-reuse chunk
+    // reuse). Recurrent state is a lossy summary of the whole prefix: seq_add() only rewrites cell.pos and
+    // leaves the state stale, so a shift would silently produce wrong outputs. Always false.
+    return false;
 }
 
 size_t llama_memory_recurrent::total_size() const {
