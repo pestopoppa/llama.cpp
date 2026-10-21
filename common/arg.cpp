@@ -1576,6 +1576,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--cpu-fused-moe-upgate"}, "[on|off]",
+        "CPU backend: fuse MoE MUL_MAT_ID(up) + MUL_MAT_ID(gate) + SWIGLU into one iqk node (needs GGML_IQK=1; default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.cpu_fused_moe_upgate = true;
+            } else if (is_falsey(value)) {
+                params.cpu_fused_moe_upgate = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --cpu-fused-moe-upgate: '%s'\n", value.c_str()));
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

@@ -671,7 +671,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
 }
 
 // ---------------------------------------------------------------------------
-// CH-19: fused MoE up+gate+SwiGLU (default OFF; GGML_CPU_FUSED_UPGATE=1 and GGML_IQK=1).
+// CH-19: fused MoE up+gate+SwiGLU (default OFF; --cpu-fused-moe-upgate on -> cplan.fused_moe_upgate, and GGML_IQK=1).
 // Replaces MUL_MAT_ID(up) + MUL_MAT_ID(gate) + GLU(SWIGLU split) with one iqk_moe_fused_up_gate
 // call per used expert. Single-token decode only (ids->ne[1] == 1, distinct-or-not experts handled
 // per-group). Anything unsupported returns false BEFORE any write; the decision depends only on

@@ -361,6 +361,7 @@ struct cmd_params {
     std::vector<bool>                use_direct_io;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
+    std::vector<bool>                cpu_fused_moe_upgate;
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
@@ -412,6 +413,7 @@ static const cmd_params cmd_params_defaults = {
     /* use_direct_io        */ { false },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
+    /* cpu_fused_moe_upgate */ { false },
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
@@ -569,6 +571,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
+    printf("  --cpu-fused-moe-upgate <on|off>             (default: off; CH-19 fused MoE up+gate+SwiGLU, needs GGML_IQK=1)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("\n");
     printf(
@@ -954,6 +957,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_op_offload.insert(params.no_op_offload.end(), p.begin(), p.end());
+            } else if (arg == "--cpu-fused-moe-upgate") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & v : string_split<std::string>(argv[i], split_delim)) {
+                    if (v == "on" || v == "1") {
+                        params.cpu_fused_moe_upgate.push_back(true);
+                    } else if (v == "off" || v == "0") {
+                        params.cpu_fused_moe_upgate.push_back(false);
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                }
             } else if (arg == "--no-host") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1256,6 +1274,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_op_offload.empty()) {
         params.no_op_offload = cmd_params_defaults.no_op_offload;
     }
+    if (params.cpu_fused_moe_upgate.empty()) {
+        params.cpu_fused_moe_upgate = cmd_params_defaults.cpu_fused_moe_upgate;
+    }
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
@@ -1307,6 +1328,7 @@ struct cmd_params_instance {
     bool               use_direct_io;
     bool               embeddings;
     bool               no_op_offload;
+    bool               cpu_fused_moe_upgate;
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
@@ -1386,6 +1408,7 @@ struct cmd_params_instance {
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
+        cparams.cpu_fused_moe_upgate = cpu_fused_moe_upgate;
         cparams.swa_full        = false;
 
         // MoE-Spec budget (arXiv:2602.16052) via env var (CLI flag wired in common/arg.cpp; llama-bench has its own arg parser)
@@ -1420,6 +1443,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
+    for (const auto & cfu : params.cpu_fused_moe_upgate)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
@@ -1461,6 +1485,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .cpu_fused_moe_upgate= */ cfu,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
@@ -1498,6 +1523,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .cpu_fused_moe_upgate= */ cfu,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
@@ -1535,6 +1561,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
+                /* .cpu_fused_moe_upgate= */ cfu,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
@@ -1577,6 +1604,7 @@ struct test {
     bool                     use_direct_io;
     bool                     embeddings;
     bool                     no_op_offload;
+    bool                     cpu_fused_moe_upgate;
     bool                     no_host;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
@@ -1630,6 +1658,7 @@ struct test {
         use_direct_io  = inst.use_direct_io;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
+        cpu_fused_moe_upgate = inst.cpu_fused_moe_upgate;
         no_host        = inst.no_host;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
@@ -1690,7 +1719,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
+            "no_op_offload",  "cpu_fused_moe_upgate",           "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",       "autokernel_hardened",
             "autokernel_output_invariant",       "autokernel_hybrid_ab_complete",
             "autokernel_input_working_set_bytes",
@@ -1717,6 +1746,7 @@ struct test {
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "cpu_fused_moe_upgate" ||
             field == "autokernel_hardened" || field == "autokernel_output_invariant" ||
             field == "autokernel_hybrid_ab_complete" ||
             field == "autokernel_thread_set_stable" || field == "autokernel_escape_checks_complete") {
@@ -1795,6 +1825,7 @@ struct test {
                                             std::to_string(use_direct_io),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
+                                            std::to_string(cpu_fused_moe_upgate),
                                             std::to_string(no_host),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
@@ -2002,6 +2033,9 @@ struct markdown_printer : public printer {
         if (field == "no_op_offload") {
             return 4;
         }
+        if (field == "cpu_fused_moe_upgate") {
+            return 4;
+        }
         if (field == "no_host") {
             return 4;
         }
@@ -2041,6 +2075,9 @@ struct markdown_printer : public printer {
         }
         if (field == "no_op_offload") {
             return "nopo";
+        }
+        if (field == "cpu_fused_moe_upgate") {
+            return "cfmu";
         }
         if (field == "no_host") {
             return "noh";
@@ -2134,6 +2171,9 @@ struct markdown_printer : public printer {
         }
         if (params.no_op_offload.size() > 1 || params.no_op_offload != cmd_params_defaults.no_op_offload) {
             fields.emplace_back("no_op_offload");
+        }
+        if (params.cpu_fused_moe_upgate.size() > 1 || params.cpu_fused_moe_upgate != cmd_params_defaults.cpu_fused_moe_upgate) {
+            fields.emplace_back("cpu_fused_moe_upgate");
         }
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");

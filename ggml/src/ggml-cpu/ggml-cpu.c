@@ -4318,9 +4318,12 @@ static void ggml_cpu_prof_atexit(void) {
 #endif
 
 #if defined(GGML_USE_IQK_MULMAT)
-static bool ggml_cpu_fused_upgate_enabled(void) {
+// CH-19 fold: the feature switch is cplan->fused_moe_upgate (argv --cpu-fused-moe-upgate ->
+// llama_context_params.cpu_fused_moe_upgate -> ggml_backend_cpu_set_fused_moe_upgate).  The env var
+// is a diagnostic KILL switch only: GGML_CPU_FUSED_UPGATE=0 forces the fusion off; it cannot enable it.
+static bool ggml_cpu_fused_upgate_killed(void) {
     static int v = -1; // benign race: idempotent init
-    if (v < 0) { const char * e = getenv("GGML_CPU_FUSED_UPGATE"); v = (e && atoi(e) == 1) ? 1 : 0; }
+    if (v < 0) { const char * e = getenv("GGML_CPU_FUSED_UPGATE"); v = (e && strcmp(e, "0") == 0) ? 1 : 0; }
     return v == 1;
 }
 #endif
@@ -4390,7 +4393,7 @@ static int ggml_cpu_try_fuse_ops(
 
 #if defined(GGML_USE_IQK_MULMAT)
     // CH-19: MUL_MAT_ID + MUL_MAT_ID + GLU(swiglu) -> one fused up+gate+SwiGLU node. Default OFF.
-    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_fused_upgate_enabled()) {
+    if (node->op == GGML_OP_MUL_MAT_ID && cplan->fused_moe_upgate && !ggml_cpu_fused_upgate_killed()) {
         struct ggml_tensor * up   = NULL;
         struct ggml_tensor * gate = NULL;
         if (ggml_cpu_can_fuse_moe_up_gate(cgraph, node_n, &up, &gate) &&

@@ -542,7 +542,7 @@ bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml
 // iqk port (Stage 2): MoE expert GEMM fast path for GGML_OP_MUL_MAT_ID.
 bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 // CH-19: fused MoE up+gate+SwiGLU for MUL_MAT_ID(up), MUL_MAT_ID(gate), GLU(swiglu) (single-token decode).
-// Default-off (GGML_CPU_FUSED_UPGATE=1 AND GGML_IQK=1). Returns false -> caller runs the unfused nodes.
+// Default-off (cplan.fused_moe_upgate via --cpu-fused-moe-upgate on, AND GGML_IQK=1). Returns false -> caller runs the unfused nodes.
 bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * params,
         struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu);
 #endif

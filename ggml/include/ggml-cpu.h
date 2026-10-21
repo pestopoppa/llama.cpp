@@ -22,6 +22,11 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // CH-19: fuse MUL_MAT_ID(up) + MUL_MAT_ID(gate) + GLU(swiglu) into one iqk node (default false).
+        // Set per backend via ggml_backend_cpu_set_fused_moe_upgate(); GGML_CPU_FUSED_UPGATE=0 is a
+        // diagnostic kill switch only (it can force the fusion off, never on).
+        bool fused_moe_upgate;
     };
 
     // numa strategies
@@ -136,6 +141,7 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+    GGML_BACKEND_API void ggml_backend_cpu_set_fused_moe_upgate(ggml_backend_t backend_cpu, bool enable);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 

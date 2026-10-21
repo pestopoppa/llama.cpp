@@ -1,6 +1,8 @@
-// CH-19: fused MoE up+gate+SwiGLU (GGML_CPU_FUSED_UPGATE=1, needs GGML_IQK=1).
-//   test-moe-fused-upgate write <ref.bin>   -- run the graph, write outputs (run with FUSED_UPGATE=0)
-//   test-moe-fused-upgate cmp   <ref.bin>   -- run the graph, NMSE vs ref file (run with FUSED_UPGATE=1)
+// CH-19: fused MoE up+gate+SwiGLU (cplan.fused_moe_upgate, needs GGML_IQK=1).
+// The switch is argv: `--fused on|off` (default off) sets cplan.fused_moe_upgate, exactly what
+// llama_context does via ggml_backend_cpu_set_fused_moe_upgate. GGML_CPU_FUSED_UPGATE=0 is only a kill switch.
+//   test-moe-fused-upgate [--fused off] write <ref.bin>   -- run the graph, write outputs (unfused reference)
+//   test-moe-fused-upgate --fused on    cmp   <ref.bin>   -- run the graph, NMSE vs ref file
 //   test-moe-fused-upgate cmp   <ref.bin> <cell 0..3> -- run ONE cell only (one process per cell, so the
 //                                                       once-per-process ACTIVE marker proves THAT cell fused)
 // The graph is MUL_MAT_ID(up) -> MUL_MAT_ID(gate) -> GLU(swiglu split) on a single token, i.e. the
@@ -19,6 +21,7 @@
 #include <vector>
 
 static const double NMSE_MAX = 1e-5; // predeclared: iqk's activation is not ggml_silu bit-for-bit
+static bool g_fused = false;          // --fused on|off
 
 static std::vector<float> run_case(ggml_type type, int n_threads) {
     const int64_t K = 512, N = 256, E = 8, U = 4;
@@ -56,7 +59,11 @@ static std::vector<float> run_case(ggml_type type, int n_threads) {
         fprintf(stderr, " %s%s", ggml_op_desc(n), n == up ? "(up)" : n == gate ? "(gate)" : "");
     }
     fprintf(stderr, "\n");
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+    ggml_cplan cplan = ggml_graph_plan(gf, n_threads, nullptr);
+    std::vector<uint8_t> work(cplan.work_size + 1);
+    cplan.work_data        = work.data();
+    cplan.fused_moe_upgate = g_fused;
+    if (ggml_graph_compute(gf, &cplan) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); exit(2); }
 
     std::vector<float> r((float *) out->data, (float *) out->data + ggml_nelements(out));
     ggml_free(ctx);
@@ -64,6 +71,14 @@ static std::vector<float> run_case(ggml_type type, int n_threads) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc >= 3 && std::string(argv[1]) == "--fused") {
+        const std::string v = argv[2];
+        if (v == "on" || v == "1") { g_fused = true; } else if (v == "off" || v == "0") { g_fused = false; }
+        else { fprintf(stderr, "--fused on|off\n"); return 2; }
+        argv[2] = argv[0];
+        argv += 2; argc -= 2;
+    }
+    fprintf(stderr, "fused_moe_upgate=%d\n", g_fused ? 1 : 0);
     if (argc == 1) { // ctest smoke: just exercise the graph
         for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) { (void) run_case(t, 2); }
         printf("RESULT test-moe-fused-upgate smoke pass=1 fail=0\n");
