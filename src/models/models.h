@@ -1418,6 +1418,9 @@ struct llama_model_dflash : public llama_model_base {
 
         ggml_tensor * build_inp_embd_enc() const;
         void build_post_sampling() const override;
+
+        // per-token state rows of a token+embd draft batch ([n_embd, n_tokens]), nullptr otherwise
+        ggml_tensor * inp_state = nullptr;
     };
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
