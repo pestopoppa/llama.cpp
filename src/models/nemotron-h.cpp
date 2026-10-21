@@ -167,6 +167,9 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // block input, extracted only when requested (DFlash target features, cparams.embeddings_layer_inp)
+        res->t_layer_inp[il] = inpL;
+
         struct ggml_tensor * inpSA = inpL;
 
         // norm
