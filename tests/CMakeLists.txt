@@ -371,6 +371,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
     llama_build_and_test(test-gather-rows-e4m3-e8m0.cpp)
+    # DS41-W5.1a / DS41-T3.2: block FP8/FP4 quantize-dequantize op (src/llama-qdq.*)
+    llama_build_and_test(test-dsv41-qdq.cpp)
 
     # parallel tensor repack: 1 vs N threads byte-identical for every parallelized repack
     llama_build_and_test(test-repack-parallel.cpp)
