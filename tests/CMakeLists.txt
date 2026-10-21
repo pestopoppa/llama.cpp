@@ -268,6 +268,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # chunk-KV reuse (P1): f32 K/V caches so the shift exactness gates are not confounded by re-quantisation
     llama_build(test-chunk-kv.cpp)
+    target_include_directories(test-chunk-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
     foreach(CKV_ARCH llama qwen3 qwen3vl qwen35)
         llama_test(
             test-chunk-kv
@@ -278,6 +279,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-chunk-kv-${CKV_ARCH} PROPERTIES
             FIXTURES_REQUIRED generate-models
         )
+        if (CKV_ARCH STREQUAL "llama")
+            # random rope_freqs in the generated model; see test-chunk-kv.cpp
+            set_tests_properties(test-chunk-kv-${CKV_ARCH} PROPERTIES ENVIRONMENT "CKV_SKIP_K_GATE=1")
+        endif()
     endforeach()
 endif()
 
