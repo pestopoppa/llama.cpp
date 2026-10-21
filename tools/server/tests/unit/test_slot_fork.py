@@ -1025,8 +1025,11 @@ def test_kpf174_swa_pinned_junction_fork_equals_fresh():
 
 def test_kpf191_fork_drafter_state_equals_unforked():
     """KPF-19.1: forking an MTP-drafter slot gives the destination the same drafter state as an unforked slot: same
-    tokens and same draft_n / draft_n_accepted. Run once without and once with KPF_DFT_FULL=1 (--slot-fork-dft-full).
-    MUTATION: dft_partial_noop (emulates #30514: PARTIAL_ONLY restores nothing) must fail WITHOUT the flag and pass WITH it."""
+    tokens and same draft_n / draft_n_accepted. Run with and without KPF_DFT_FULL=1 (--slot-fork-dft-full).
+    On a PLAIN drafter cache the attention-only share already hands dst the whole drafter KV, so the fork is independent of
+    what a PARTIAL_ONLY load does: MUTATION dft_partial_noop (emulates #30514) must PASS with the flag off AND on (job 40
+    found it undetected; that is the correct reading, not a blind spot). The guard that the drafter case is NOT vacuous is
+    MUTATION dft_no_transfer (dst gets no drafter state): it must FAIL with the flag off and on."""
     if not os.environ.get("KPF_SPEC_TYPE"):
         pytest.skip("needs KPF_SPEC_TYPE=draft-mtp on an MTP model")
     server.start()

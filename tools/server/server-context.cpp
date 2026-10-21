@@ -1938,7 +1938,13 @@ private:
         // draft
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, dst.id, -1, -1);
-            if (slot_fork_mode == SLOT_FORK_KV) {
+            // [KPF-19.1] On a plain (non-SWA) drafter cache the attention-only share below already gives dst the WHOLE
+            // drafter KV [0, p) by reference, so the PARTIAL_ONLY load that follows is redundant there and a PARTIAL_ONLY
+            // that restores nothing (upstream #30514) changes nothing. It is load-bearing only for an SWA drafter
+            // (DFlash2 GGUFs with dflash.attention.sliding_window > 0), whose window comes from the checkpoint.
+            if (kpf_mutate("dft_no_transfer")) {
+                // [KPF-19.1 mutation] dst gets NO drafter state at all: the drafter cases must fail
+            } else if (slot_fork_mode == SLOT_FORK_KV) {
                 common_context_seq_cp(ctx_dft, src.id, dst.id, 0, p);
             } else if (params_base.slot_fork_dft_full && slot_fork_dft_plain(src.id, p)) {
                 // [KPF-19.1] explicit full drafter KV: independent of whether state_write honours PARTIAL_ONLY

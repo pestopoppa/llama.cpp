@@ -333,6 +333,7 @@ class ServerProcess:
                     "Authorization": f"Bearer {self.api_key}" if self.api_key else None
                 })
                 if response.status_code == 200:
+                    self._assert_port_owner()  # [KPF] a 200 from a stale server on our port must not count as ready
                     self.ready = True
                     return  # server is ready
             except Exception as e:
@@ -344,6 +345,16 @@ class ServerProcess:
             print(f"Waiting for server to start...")
             time.sleep(0.5)
         raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+
+    def _assert_port_owner(self) -> None:
+        """[KPF] fail closed unless the process WE spawned (self.process.pid) listens on server_port."""
+        if os.environ.get("KPF_PORT_OWNER_CHECK", "1") != "1":
+            return
+        out = subprocess.run(["ss", "-Hltnp", f"sport = :{self.server_port}"], capture_output=True, text=True, timeout=10).stdout
+        pids = {int(m) for m in re.findall(r"pid=(\d+)", out)}
+        if self.process.pid not in pids:
+            raise RuntimeError(f"port {self.server_port} answered /health but is owned by pid(s) {sorted(pids)}, "
+                               f"not our server pid={self.process.pid}: stale or foreign server")
 
     def stop(self) -> None:
         if self.external_server:
