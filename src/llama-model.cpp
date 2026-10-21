@@ -837,6 +837,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_102B_A12B:     return "102B.A12B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
         case LLM_TYPE_120B_A12B:     return "120B.A12B";
+        case LLM_TYPE_75B_A9B:       return "75B.A9B";
         case LLM_TYPE_122B_A10B:     return "122B.A10B";
         case LLM_TYPE_196B_A11B:     return "196B.A11B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
@@ -1122,7 +1123,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
     }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
-    ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
+    // scalar or per-layer array (Nemotron 3 Puzzle / 3.5 Bolt route a different top-k per layer);
+    // the scalar keeps the maximum so every validation and uniform-model path is unchanged
+    std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+    ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
+    hparams.n_expert_used = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        hparams.n_expert_used = std::max(hparams.n_expert_used, hparams.n_expert_used_arr[il]);
+    }
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
@@ -1130,6 +1138,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (hparams.n_expert <= 1) {
             hparams.n_expert      = 0;
             hparams.n_expert_used = 0;
+            std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
         }
     }
 

@@ -114,8 +114,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
-    } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+    } else if (arch == LLM_ARCH_NEMOTRON_H) {
         n_layer = 3;
+    } else if (arch == LLM_ARCH_NEMOTRON_H_MOE) {
+        n_layer = 4; // two FFN layers so the MoE fixture can be per-layer heterogeneous (3.5 Bolt)
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
     }
@@ -229,12 +231,26 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
 
-    if (moe) {
+    if (moe && arch == LLM_ARCH_NEMOTRON_H_MOE) {
+        // Nemotron 3.5 Bolt layout: expert_used_count / expert_feed_forward_length are per-layer
+        // arrays with zeros on the non-MoE layers and a different top-k and width per MoE layer
+        std::vector<uint32_t> n_ff_exp_per_layer;
+        std::vector<uint32_t> n_used_per_layer;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_ff_exp_per_layer.push_back(il <= 1 ? 0 : (il == 2 ? n_ff : n_ff/2));
+            n_used_per_layer.push_back(il <= 1 ? 0 : (il == 2 ? 1 : 2));
+        }
+        ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff_exp_per_layer);
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          n_used_per_layer);
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
+    } else if (moe) {
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff);
-        ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
-        ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
+    }
+    if (moe) {
+        ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
+        ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
@@ -439,6 +455,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
+        case LLM_ARCH_NEMOTRON_H_MOE: // Bolt-shaped per-layer heterogeneous fixture
             return true;
         default:
             return false;
