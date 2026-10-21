@@ -751,6 +751,8 @@ static ggml_tensor * build_dflash2_conv(
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
+//   * token+embd  -> noise block as above; the embd rows are per-token state (LiLiCorr anchor), the
+//                    champion's equivalent of upstream's llama_batch_ext embd_state
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params), model(model) {
@@ -773,8 +775,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
-    // KV cache injection
-    if (ubatch.embd) {
+    // KV cache injection (embd-only batch; a token+embd batch is a draft block with state rows)
+    if (ubatch.embd && !ubatch.token) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
@@ -857,21 +859,31 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         tok_embd = model_other->tok_embd;
     }
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp_tokens);
+    res->t_inp_tokens = inp_tokens;
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
-    res->t_inp_tokens = inp->tokens;
+    if (ubatch.embd) {
+        // token+embd draft block: the embd rows are per-token state for a draft head
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd);
+        inp->tokens = inp_tokens;
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        // set_input() writes embd only for token-less batches; aliasing it to h keeps can_reuse() valid
+        inp->embd = inp->h;
+        inp_state = inp->h;
+        res->add_input(std::move(inp));
+    } else {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        inp->tokens = inp_tokens;
+        res->add_input(std::move(inp));
+    }
 
-    ggml_tensor * inp_tokens = inp->tokens;
-
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
     cb(inpL, "inp_noise_embd", -1);
-
-    res->add_input(std::move(inp));
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
