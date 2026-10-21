@@ -2061,7 +2061,8 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                 ggml_tensor * factors,
                       float   freq_base,
                       float   freq_scale,
-                   uint32_t   il) const {
+                   uint32_t   il,
+                       bool   inplace) const {
     const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
 
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
@@ -2102,7 +2103,11 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
         // we rotate only the first n_rot dimensions
-        tmp = ggml_rope_ext_inplace(ctx, cur,
+        tmp = inplace ?
+            ggml_rope_ext_inplace(ctx, cur,
+                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow) :
+            ggml_rope_ext(ctx, cur,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
     }
@@ -2183,6 +2188,444 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     res->add_input(std::move(inp));
 
     return gf;
+}
+
+//
+// chunk-KV reuse
+//
+
+bool llama_kv_cache::chunk_supported(std::string * why) const {
+    auto fail = [&](const char * msg) {
+        if (why) {
+            *why = msg;
+        }
+        return false;
+    };
+
+    if (other) {
+        return fail("cache mirrors another cache");
+    }
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        return fail("sliding-window attention");
+    }
+    if (!get_can_shift()) {
+        return fail("K-shift unsupported for this model");
+    }
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+        return fail("model has no RoPE (K carries no position)");
+    }
+    return true;
+}
+
+bool llama_kv_cache::chunk_export(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    std::string why;
+    if (!chunk_supported(&why)) {
+        LLAMA_LOG_WARN("%s: chunk export refused: %s\n", __func__, why.c_str());
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t strm  = seq_to_stream[seq_id];
+    const auto &   cells = v_cells[strm];
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = cells.seq_pos_max(seq_id) + 1;
+    }
+    if (p1 <= p0) {
+        return false;
+    }
+
+    cell_ranges_t cr { strm, {} };
+
+    uint32_t cell_count = 0;
+    uint32_t range_begin = cells.size();
+
+    // every position of [p0, p1) must be present exactly once
+    std::vector<bool> seen((size_t) (p1 - p0), false);
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        bool add = !cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1);
+
+        if (add) {
+            const size_t k = (size_t) (cells.pos_get(i) - p0);
+            if (seen[k]) {
+                LLAMA_LOG_WARN("%s: chunk export refused: position %d appears twice\n", __func__, (int) cells.pos_get(i));
+                return false;
+            }
+            seen[k] = true;
+
+            ++cell_count;
+            if (range_begin == cells.size()) {
+                range_begin = i;
+            }
+        } else if (range_begin != cells.size()) {
+            cr.data.emplace_back(range_begin, i);
+            range_begin = cells.size();
+        }
+    }
+    if (range_begin != cells.size()) {
+        cr.data.emplace_back(range_begin, cells.size());
+    }
+
+    if (cell_count != (uint32_t) (p1 - p0)) {
+        LLAMA_LOG_WARN("%s: chunk export refused: [%d, %d) holds %u cells, expected %d\n", __func__,
+                (int) p0, (int) p1, cell_count, (int) (p1 - p0));
+        return false;
+    }
+
+    io.write(&p0, sizeof(p0));
+    io.write(&p1, sizeof(p1));
+    io.write(&cell_count, sizeof(cell_count));
+
+    state_write_meta(io, cr, seq_id);
+    state_write_data(io, cr);
+
+    return true;
+}
+
+bool llama_kv_cache::chunk_inject(llama_io_read_i & io, llama_seq_id seq_id, llama_pos delta) {
+    std::string why;
+    if (!chunk_supported(&why)) {
+        LLAMA_LOG_WARN("%s: chunk inject refused: %s\n", __func__, why.c_str());
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    llama_pos p0, p1;
+    uint32_t  cell_count;
+    io.read(&p0, sizeof(p0));
+    io.read(&p1, sizeof(p1));
+    io.read(&cell_count, sizeof(cell_count));
+
+    if (p1 <= p0 || cell_count != (uint32_t) (p1 - p0)) {
+        LLAMA_LOG_ERROR("%s: malformed chunk header ([%d, %d), %u cells)\n", __func__, (int) p0, (int) p1, cell_count);
+        return false;
+    }
+
+    const llama_pos q0 = p0 + delta;
+    const llama_pos q1 = p1 + delta;
+
+    if (q0 < 0) {
+        LLAMA_LOG_ERROR("%s: chunk would start at negative position %d\n", __func__, (int) q0);
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    auto & cells = v_cells[strm];
+
+    if (cell_count > cells.size()) {
+        LLAMA_LOG_ERROR("%s: chunk of %u cells does not fit a cache of %u\n", __func__, cell_count, cells.size());
+        return false;
+    }
+
+    // refuse to overlap positions the sequence already holds (checked BEFORE consuming the stream)
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, q0, q1)) {
+            LLAMA_LOG_ERROR("%s: chunk range [%d, %d) overlaps position %d already in sequence %d\n", __func__,
+                    (int) q0, (int) q1, (int) cells.pos_get(i), (int) seq_id);
+            return false;
+        }
+    }
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
+    llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        llama_pos pos;
+        uint32_t  n_seq_id;
+
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+
+        if (n_seq_id != 1) {
+            LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+            return false;
+        }
+
+        if (has_cell_ext()) {
+            llama_kv_cell_ext ext;
+            io.read(&ext, sizeof(ext));
+
+            // like seq_add(), only the base text position moves; the 2D (x, y) positions are text-equal for text chunks
+            if (hparams.n_pos_per_embd() > 1) {
+                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+            }
+
+            ubatch.token[i] = ext.tok;
+        }
+
+        {
+            llama_seq_id src_seq;
+            io.read(&src_seq, sizeof(src_seq));
+        }
+
+        ubatch.pos[i]      = pos + delta;
+        ubatch.n_seq_id[i] = n_seq_id;
+        ubatch.seq_id[i]   = &seq_id;
+    }
+
+    auto sinfo = find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: failed to find %u available cells in kv cache\n", __func__, cell_count);
+        return false;
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    GGML_ASSERT(sinfo.idxs[0].size() == cell_count);
+
+    bool res = true;
+    try {
+        res = state_read_data(io, strm, cell_count, sinfo);
+    } catch (...) {
+        res = false;
+    }
+
+    if (!res) {
+        seq_rm(seq_id, q0, q1);
+        LLAMA_LOG_ERROR("%s: failed to read chunk data\n", __func__);
+        return false;
+    }
+
+    // the K just written is rotated for pos - delta: queue the re-rotation for the K-shift graph
+    if (delta != 0) {
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            cells.mark_shift(sinfo.idxs[0][i], delta);
+        }
+    }
+
+    return true;
+}
+
+size_t llama_kv_cache::chunk_read_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out) const {
+    if (!chunk_supported() || p1 <= p0) {
+        return 0;
+    }
+
+    const uint32_t strm  = seq_to_stream[seq_id];
+    const auto &   cells = v_cells[strm];
+
+    const size_t n_pos = (size_t) (p1 - p0);
+
+    std::vector<int64_t> idx(n_pos, -1);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1)) {
+            idx[(size_t) (cells.pos_get(i) - p0)] = i;
+        }
+    }
+    for (size_t k = 0; k < n_pos; ++k) {
+        if (idx[k] < 0) {
+            return 0;
+        }
+    }
+
+    auto to_f32 = [](ggml_type t, const void * src, float * dst, size_t n) {
+        if (t == GGML_TYPE_F32) {
+            memcpy(dst, src, n*sizeof(float));
+        } else if (t == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, dst, (int64_t) n);
+        } else if (t == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) src, dst, (int64_t) n);
+        } else {
+            const auto * tt = ggml_get_type_traits(t);
+            GGML_ASSERT(tt && tt->to_float);
+            tt->to_float(src, dst, (int64_t) n);
+        }
+    };
+
+    size_t n_k = 0;
+    size_t n_v = 0;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+        auto * k = layer.k_stream[strm];
+        auto * v = layer.v_stream[strm];
+
+        const size_t k_row = ggml_row_size(k->type, n_embd_k_gqa);
+
+        std::vector<uint8_t> buf(k_row);
+        for (size_t p = 0; p < n_pos; ++p) {
+            if (k_out) {
+                ggml_backend_tensor_get(k, buf.data(), (size_t) idx[p]*k_row, k_row);
+                to_f32(k->type, buf.data(), k_out + n_k, n_embd_k_gqa);
+            }
+            n_k += n_embd_k_gqa;
+        }
+
+        if (v && v_out) {
+            if (!v_trans) {
+                const size_t v_row = ggml_row_size(v->type, n_embd_v_gqa);
+                std::vector<uint8_t> vb(v_row);
+                for (size_t p = 0; p < n_pos; ++p) {
+                    ggml_backend_tensor_get(v, vb.data(), (size_t) idx[p]*v_row, v_row);
+                    to_f32(v->type, vb.data(), v_out + n_v + p*n_embd_v_gqa, n_embd_v_gqa);
+                }
+            } else {
+                const size_t el = ggml_type_size(v->type);
+                std::vector<uint8_t> eb(el);
+                for (size_t p = 0; p < n_pos; ++p) {
+                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                        ggml_backend_tensor_get(v, eb.data(), ((size_t) idx[p] + (size_t) j*cells.size())*el, el);
+                        to_f32(v->type, eb.data(), v_out + n_v + p*n_embd_v_gqa + j, 1);
+                    }
+                }
+            }
+        }
+        if (v) {
+            n_v += n_pos*n_embd_v_gqa;
+        }
+    }
+
+    if (n_v_out) {
+        *n_v_out = n_v;
+    }
+
+    return n_k;
+}
+
+bool llama_kv_cache::chunk_rope_selfcheck(llama_context * lctx, llama_pos delta, double * nmse_out) {
+    std::string why;
+    if (!chunk_supported(&why)) {
+        LLAMA_LOG_WARN("%s: rope self-check skipped: %s\n", __func__, why.c_str());
+        return false;
+    }
+    if (delta <= 0) {
+        return false;
+    }
+
+    constexpr int64_t n_tok = 32;
+
+    struct cfg_t {
+        uint32_t il;
+        uint32_t n_rot;
+        uint32_t n_head_kv;
+        float    base;
+        float    scale;
+        ggml_tensor * factors;
+    };
+
+    const auto & cparams = lctx->get_cparams();
+
+    std::vector<cfg_t> cfgs;
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        cfg_t c = {
+            il,
+            (uint32_t) hparams.n_rot(il),
+            (uint32_t) hparams.n_head_kv(il),
+            model.get_rope_freq_base (cparams, il),
+            model.get_rope_freq_scale(cparams, il),
+            model.get_rope_factors(cparams, il),
+        };
+
+        bool dup = false;
+        for (const auto & o : cfgs) {
+            dup = dup || (o.n_rot == c.n_rot && o.n_head_kv == c.n_head_kv && o.base == c.base && o.scale == c.scale && o.factors == c.factors);
+        }
+        if (!dup) {
+            cfgs.push_back(c);
+        }
+    }
+
+    auto * sched = lctx->get_sched();
+
+    ggml_backend_sched_reset(sched);
+
+    auto * res = lctx->get_gf_res_reserve();
+
+    res->reset();
+
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    ggml_tensor * pos_fwd = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+    ggml_tensor * pos_bwd = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+    ggml_set_input(pos_fwd);
+    ggml_set_input(pos_bwd);
+
+    std::vector<ggml_tensor *> xs, ys;
+    for (const auto & c : cfgs) {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.n_rot, c.n_head_kv, n_tok);
+        ggml_set_input(x);
+
+        ggml_tensor * fwd = build_rope_shift(cparams, ctx, x,   pos_fwd, nullptr, c.factors, c.base, c.scale, c.il, false);
+        ggml_tensor * bwd = build_rope_shift(cparams, ctx, fwd, pos_bwd, nullptr, c.factors, c.base, c.scale, c.il, false);
+
+        ggml_set_output(bwd);
+        ggml_build_forward_expand(gf, bwd);
+
+        xs.push_back(x);
+        ys.push_back(bwd);
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate compute graph for the rope self-check\n", __func__);
+        return false;
+    }
+
+    // deterministic, non-trivial K and a spread of angles around delta
+    std::vector<int32_t> pf(n_tok), pb(n_tok);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        pf[t] =  (int32_t) (delta + 7*t);
+        pb[t] = -(int32_t) (delta + 7*t);
+    }
+    ggml_backend_tensor_set(pos_fwd, pf.data(), 0, n_tok*sizeof(int32_t));
+    ggml_backend_tensor_set(pos_bwd, pb.data(), 0, n_tok*sizeof(int32_t));
+
+    std::vector<std::vector<float>> in(xs.size());
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (size_t c = 0; c < xs.size(); ++c) {
+        in[c].resize(ggml_nelements(xs[c]));
+        for (auto & v : in[c]) {
+            rng = rng*6364136223846793005ull + 1442695040888963407ull;
+            v = (float) ((int32_t) (rng >> 33) % 2001 - 1000) / 500.0f;
+        }
+        ggml_backend_tensor_set(xs[c], in[c].data(), 0, in[c].size()*sizeof(float));
+    }
+
+    if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute the rope self-check\n", __func__);
+        return false;
+    }
+    lctx->synchronize();
+
+    double worst = 0.0;
+    for (size_t c = 0; c < xs.size(); ++c) {
+        std::vector<float> out(in[c].size());
+        ggml_backend_tensor_get(ys[c], out.data(), 0, out.size()*sizeof(float));
+
+        double num = 0.0, den = 0.0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            const double d = (double) out[i] - (double) in[c][i];
+            num += d*d;
+            den += (double) in[c][i]*(double) in[c][i];
+        }
+        worst = std::max(worst, den > 0.0 ? num/den : num);
+    }
+
+    ggml_backend_sched_reset(sched);
+
+    if (nmse_out) {
+        *nmse_out = worst;
+    }
+
+    return true;
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

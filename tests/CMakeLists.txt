@@ -198,6 +198,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-kv-host-mirror.cpp) # HSF-5.P host KV mirror, host-side logic (CPU only)
     llama_build_and_test(test-server-reorder.cpp)
     target_include_directories(test-server-reorder PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-server-chunk-store.cpp)
+    target_include_directories(test-server-chunk-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-dsv41-engram-hash.cpp)
     llama_build_and_test(test-dsa-sparse-attn-oracle.cpp)
     llama_build_and_test(test-dsv41-engram-gate.cpp)
@@ -304,6 +306,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # chunk-KV reuse (P1): f32 K/V caches so the shift exactness gates are not confounded by re-quantisation
+    llama_build(test-chunk-kv.cpp)
+    foreach(CKV_ARCH llama qwen3 qwen3vl qwen35)
+        llama_test(
+            test-chunk-kv
+            NAME test-chunk-kv-${CKV_ARCH}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${CKV_ARCH}-dense.gguf" -ctk f32 -ctv f32
+        )
+        set_tests_properties(test-chunk-kv-${CKV_ARCH} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
