@@ -791,26 +791,73 @@ def test_kpf172_fork_same_iteration_as_source_erase():
 
 def test_kpf172_fork_from_decoding_source_no_leak():
     """KPF-17.2(3): checkpoint_at beyond the prompt (inside the generation / unverified draft window) creates nothing, and a
-    fork taken while the source decodes (KPF_SPEC_TYPE=draft-mtp: k pending drafts) leaves the source's continuation
-    byte-identical with and without the fork. MUTATION: fork_clobber_src (fork disturbs its source), fork_skip_ckpt_load."""
+    fork taken while the source decodes (KPF_SPEC_TYPE=draft-mtp: k pending drafts) leaves the source untouched.
+    MUTATION: fork_clobber_src (fork disturbs its source), fork_skip_ckpt_load.
+
+    Jobs 20 and 21 (2026-10-21) never forked here (no do_slot_fork line in either log), so fork_clobber_src went
+    undetected: the wait loop read next_token.n_decoded, which /slots reports from the PREVIOUS task until the new one
+    generates (48 = the base run), so it returned at once while slot 0 was still prefilling (n_prompt_tokens 64 < the
+    137-token junction), the source held no checkpoint the child could use, and the child prefilled from scratch. Now:
+    wait on n_prompt_tokens past the prompt, require the child to have forked from slot 0, check the source's state
+    directly (cells == tokens, same length as the unforked run) and compare its tokens against an A/A control (same
+    concurrency, child with slot_fork off) instead of a fixed tolerance."""
     server.start()
     build_prompts()
     need_ckpt_mode()
     prompt = TRUNK + SUF[0]
     at = [TRUNK_LEN, len(prompt) + 3, len(prompt) + 10]
-    base = complete(prompt, 0, n_predict=48, checkpoint_at=at)
+    n_src = 96  # long enough that the source is still decoding while the child forks and prefills
+
+    def src_state() -> tuple[int, int]:
+        s0 = slots()[0]
+        return s0.get("n_prompt_tokens", 0), s0["kv_cells"]["private"] + s0["kv_cells"]["shared"]
+
+    base = complete(prompt, 0, n_predict=n_src, checkpoint_at=at)
     assert all(c["n_tokens"] <= len(prompt) for c in ckpts(0)), ckpts(0)  # beyond-prompt positions never checkpointed
-    erase_slot(0)
-    out: dict = {}
-    t = threading.Thread(target=lambda: out.update(complete(prompt, 0, n_predict=48, checkpoint_at=at)))
-    t.start()
-    for _ in range(200):  # wait until slot 0 is generating
-        if slots()[0].get("is_processing") and slots()[0].get("next_token", [{}])[0].get("n_decoded", 0) > 2:
-            break
-        time.sleep(0.05)
-    child = complete(TRUNK + SUF[1], 1, n_predict=24)
-    t.join()
-    assert out["tokens"] == base["tokens"], "source continuation changed by the fork"
+    base_tok, base_cells = src_state()
+    assert base_tok == base_cells, (base_tok, base_cells)
+
+    def concurrent(child_fork: bool) -> tuple[dict, dict]:
+        for i in (0, 1, 2):
+            erase_slot(i)
+        out: dict = {}
+        t = threading.Thread(target=lambda: out.update(complete(prompt, 0, n_predict=n_src, checkpoint_at=at)))
+        t.start()
+        deadline = time.time() + 300
+        while True:  # slot 0 has decoded >= 3 generated tokens (n_prompt_tokens counts them); never a stale field
+            s0 = slots()[0]
+            if s0["is_processing"] and s0.get("n_prompt_tokens", 0) >= len(prompt) + 3:
+                break
+            assert t.is_alive() and time.time() < deadline, ("source never reached decoding", s0.get("n_prompt_tokens"))
+            time.sleep(0.02)
+        child = complete(TRUNK + SUF[1], 1, n_predict=24, slot_fork=child_fork)
+        busy = t.is_alive()
+        t.join()
+        if child_fork:
+            tm = child["timings"]
+            assert tm["n_fork_tokens"] >= FORK_MIN and tm["fork_src_slot"] == 0, tm  # the fork path really ran
+            assert busy, "source finished before the child returned: not a fork from a decoding source"
+        return out, child
+
+    def matched(a: list[int], b: list[int]) -> int:
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        return n
+
+    # A/A control: the same concurrency without the fork measures how far batch composition alone moves the source
+    ctrl, _ = concurrent(False)
+    out, child = concurrent(True)
+    tok, cells = src_state()
+    # the source's own state, directly: every position it holds is a computed cell, and it holds as many as unforked
+    assert tok == cells, ("source cells != its tokens after the fork", tok, cells)
+    assert tok == base_tok, ("source length changed by the fork", tok, base_tok)
+    m_ctrl, m_fork = matched(ctrl["tokens"], base["tokens"]), matched(out["tokens"], base["tokens"])
+    print(f"source vs unforked: A/A control matches {m_ctrl}/{len(base['tokens'])}, forked run {m_fork}")
+    if m_ctrl == len(base["tokens"]):
+        assert out["tokens"] == base["tokens"], "source continuation changed by the fork (A/A control is exact)"
+    else:
+        assert m_fork >= m_ctrl, ("source diverged earlier than the A/A control", m_fork, m_ctrl)
     same_as_fresh(child, fresh(TRUNK + SUF[1], 2, n_predict=24, n_probs=1), "fork from decoding source")
     assert_ckpt_offsets(slots(), "decoding-source fork")
 
