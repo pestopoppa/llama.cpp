@@ -9,6 +9,7 @@
 #include "vec.h"
 #ifdef GGML_IQK_FLASH_ATTENTION
 #include "iqk/iqk_mul_mat.h" // AKX-ALL-LB4: iqk_flash_attn_noalibi
+#include <atomic>
 #include <climits>
 #endif
 
@@ -10234,21 +10235,42 @@ static void ggml_flash_attn_ext_reduce_partials(
 
 #ifdef GGML_IQK_FLASH_ATTENTION
 // AKX-ALL-LB4 (intake-2425): iqk CPU flash attention, the ik_llama fa/ templates vendored under
-// iqk/fa/. Compiled only with -DGGML_IQK_FLASH_ATTENTION=ON (OFF by default). Experimental: the
-// CPU correctness gates of AKX-ALL-LB4 have not run yet.
+// iqk/fa/. Compiled only with -DGGML_IQK_FLASH_ATTENTION=ON (OFF by default). Experimental.
 
 static void ggml_iqk_fa_barrier(void * tp) {
     ggml_barrier((struct ggml_threadpool *) tp);
 }
 
-// Diagnostic kill switch only (ONE-champion rule: before any champion fold this becomes an
-// argv/metadata switch). Unset or non-zero = on when compiled in; GGML_IQK_FA=0 = ggml kernel.
+// AKX-ALL-LB4.5 runtime switch (ONE-champion rule: behaviour is chosen on the command line, never by
+// an inherited environment variable). Process-wide, default on when compiled in; set from argv by
+// common (--cpu-iqk-fa), llama-bench (--cpu-iqk-fa) and test-fa-rowexact (--iqk-fa) through the CPU
+// backend's get_proc_address. It must not change while a graph runs: every thread of one op reads it
+// and the iqk kernel has internal barriers.
+static std::atomic<bool>     g_iqk_fa_enabled{true};
+static std::atomic<uint64_t> g_iqk_fa_n_calls{0};
+
+void ggml_cpu_iqk_fa_set_enabled(bool enabled) {
+    g_iqk_fa_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool ggml_cpu_iqk_fa_get_enabled(void) {
+    return g_iqk_fa_enabled.load(std::memory_order_relaxed);
+}
+
+uint64_t ggml_cpu_iqk_fa_n_calls(void) {
+    return g_iqk_fa_n_calls.load(std::memory_order_relaxed);
+}
+
 static bool ggml_iqk_fa_enabled() {
-    static const bool e = []() {
-        const char * s = getenv("GGML_IQK_FA");
-        return s == nullptr || atoi(s) != 0;
+    // the old GGML_IQK_FA environment kill switch is gone: say so once instead of silently ignoring it
+    static const bool warned = []() {
+        if (getenv("GGML_IQK_FA") != nullptr) {
+            GGML_LOG_WARN("%s: GGML_IQK_FA is ignored; select the iqk CPU flash attention with --cpu-iqk-fa on|off\n", __func__);
+        }
+        return true;
     }();
-    return e;
+    GGML_UNUSED(warned);
+    return g_iqk_fa_enabled.load(std::memory_order_relaxed);
 }
 
 static bool ggml_iqk_fa_kv_types_ok(ggml_type tk, ggml_type tv) {
@@ -10332,7 +10354,7 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
     }
 
     // op_params[4] in this tree is the kv-unified n_seq hint, not ik_llama's n_swa: pass n_swa = 0
-    return iqk_flash_attn_noalibi(q->type, mask->type, max_bias,
+    const bool done = iqk_flash_attn_noalibi(q->type, mask->type, max_bias,
             (int) q->ne[3], (int) q->ne[2], (long) q->nb[3], (long) q->nb[2],
             (int) k->ne[3], (int) k->ne[2], (long) k->nb[3], (long) k->nb[2],
             (int) v->ne[3], (int) v->ne[2], (long) v->nb[3], (long) v->nb[2],
@@ -10343,6 +10365,10 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
             scale, softcap, (float *) dst->data,
             params->wdata, ggml_iqk_fa_barrier, params->threadpool,
             params->ith, params->nth, /*n_swa =*/ 0);
+    if (done && params->ith == 0) {
+        g_iqk_fa_n_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    return done;
 }
 #endif // GGML_IQK_FLASH_ATTENTION
 

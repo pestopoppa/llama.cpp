@@ -122,6 +122,14 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
+#ifdef GGML_IQK_FLASH_ATTENTION
+// AKX-ALL-LB4.5: the iqk flash-attention runtime switch (see ggml-cpu.h); exported only through
+// the CPU backend's get_proc_address
+void     ggml_cpu_iqk_fa_set_enabled(bool enabled);
+bool     ggml_cpu_iqk_fa_get_enabled(void);
+uint64_t ggml_cpu_iqk_fa_n_calls(void);
+#endif
 #ifdef __cplusplus
 }
 #endif

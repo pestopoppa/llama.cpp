@@ -141,6 +141,20 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
     GGML_BACKEND_API void ggml_backend_cpu_set_rowexact(ggml_backend_t backend_cpu, bool enabled);
 
+    // iqk CPU flash attention (AKX-ALL-LB4, compiled only with -DGGML_IQK_FLASH_ATTENTION=ON).
+    // Process-wide runtime switch, set from argv (common: --cpu-iqk-fa on|off; llama-bench:
+    // --cpu-iqk-fa 0|1; test-fa-rowexact: --iqk-fa 0|1). No environment variable selects it.
+    // Default when compiled in: on. Set it before any graph is computed, never while one runs.
+    // Resolve through ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "<name>");
+    // a NULL result means the build does not contain the iqk kernel:
+    //   "ggml_backend_cpu_set_iqk_fa"      -> ggml_backend_cpu_set_iqk_fa_t
+    //   "ggml_backend_cpu_get_iqk_fa"      -> ggml_backend_cpu_get_iqk_fa_t
+    //   "ggml_backend_cpu_iqk_fa_n_calls"  -> ggml_backend_cpu_iqk_fa_n_calls_t (FLASH_ATTN_EXT ops
+    //                                          the iqk kernel computed since process start)
+    typedef void     (*ggml_backend_cpu_set_iqk_fa_t)(bool enabled);
+    typedef bool     (*ggml_backend_cpu_get_iqk_fa_t)(void);
+    typedef uint64_t (*ggml_backend_cpu_iqk_fa_n_calls_t)(void);
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     // Run fn(ith, nth, user_data) on a team of n_threads CPU threads and return when all have
