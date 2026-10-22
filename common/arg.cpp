@@ -997,6 +997,23 @@ static void add_rpc_devices(const std::string & servers) {
     }
 }
 
+// AKX-ALL-LB4.5: select the iqk CPU flash-attention kernel from argv (replaces the GGML_IQK_FA env kill
+// switch). The switch is process-wide in the CPU backend; a build without -DGGML_IQK_FLASH_ATTENTION=ON
+// exports no setter, so "on" is refused there and "off" is a no-op (that build only has the ggml kernel).
+static void apply_cpu_iqk_fa(bool enable) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t cpu_reg = ggml_backend_reg_by_name("CPU");
+    typedef void (*set_iqk_fa_t)(bool enabled);
+    auto * set_fn = cpu_reg ? (set_iqk_fa_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_set_iqk_fa") : nullptr;
+    if (!set_fn) {
+        if (enable) {
+            throw std::invalid_argument("--cpu-iqk-fa on: this build has no iqk CPU flash attention (built without -DGGML_IQK_FLASH_ATTENTION=ON)");
+        }
+        return;
+    }
+    set_fn(enable);
+}
+
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
     common_params dummy_params;
     common_params_context ctx_arg = common_params_parser_init(dummy_params, ex, nullptr);
@@ -2296,6 +2313,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = !value;
         }
     ).set_env("LLAMA_ARG_REPACK"));
+    add_opt(common_arg(
+        {"--cpu-iqk-fa"}, "on|off",
+        "iqk CPU flash-attention kernel for FLASH_ATTN_EXT, in builds with -DGGML_IQK_FLASH_ATTENTION=ON\n"
+        "(default: on when compiled in; 'off' runs the ggml kernel; 'on' is an error in builds without it)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.cpu_iqk_fa = 1;
+            } else if (is_falsey(value)) {
+                params.cpu_iqk_fa = 0;
+            } else {
+                throw std::invalid_argument("invalid value for --cpu-iqk-fa: '" + value + "' (expected on|off)");
+            }
+            apply_cpu_iqk_fa(params.cpu_iqk_fa == 1);
+        }
+    ));
     add_opt(common_arg(
         {"--no-host"},
         "bypass host buffer allowing extra buffers to be used",
