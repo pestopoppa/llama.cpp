@@ -132,6 +132,10 @@ option(GGML_GPROF                  "ggml: enable gprof"                         
 # has never had a build switch, so it has never been compiled into any binary on this host.
 # OFF by default: a profiling build is a SEPARATE arm, never the measured one.
 option(GGML_CPU_PROF               "ggml: compile the per-node CPU profiler (INF-70)"     OFF)
+# AKX-ALL-LB4 (intake-2425): compile the iqk CPU flash-attention kernel (ik_llama fa/ templates)
+# and hook it into the CPU FLASH_ATTN_EXT op. OFF by default: an OFF build is byte-identical to
+# the champion. Experimental only until the CPU correctness gates in AKX-ALL-LB4 pass.
+option(GGML_IQK_FLASH_ATTENTION    "ggml: compile the iqk CPU flash-attention kernel (experimental)" OFF)
 
 # build
 option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)

@@ -560,6 +560,11 @@ void mul_mat_fX_fY_Tx8(int n, const void * vx, size_t bx, const DataInfo& info, 
 #endif
 
 
+// AKX-ALL-LB4 iqk port: this file is compiled ONLY for the FA kernels (GGML_IQK_FLASH_ATTENTION),
+// which use iqk_gemm_default_floats and the float helpers above. The float mul_mat registration
+// below stays disabled: iqk_set_kernels_float is the stub in iqk_stubs.cpp, so enabling FA does
+// not route any F16/BF16/F32 MUL_MAT through iqk (that would change GEMM numerics under GGML_IQK=1).
+#if 0
 template <typename FloatX, typename FloatY>
 void set_mul_mat_f(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
     for (auto& f : funcs) f = nullptr;
@@ -602,9 +607,11 @@ void set_mul_mat_bf16_r16(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
     funcs[7] = mul_mat_bf16_r16_bf16<8>;
 }
 #endif
+#endif // 0 (AKX-ALL-LB4: float mul_mat registration disabled)
 
 } // namespace
 
+#if 0 // AKX-ALL-LB4: see above; the stub in iqk_stubs.cpp is the only definition
 bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels) {
 
     if (typeA == GGML_TYPE_BF16) {
@@ -661,6 +668,7 @@ bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t,
     return false;
 
 }
+#endif // 0 (AKX-ALL-LB4)
 
 void iqk_gemm_default_floats(int D, int nq, const char * cx, size_t bx, DataInfo& info, int k_step) {
     using q_float = float;
@@ -1075,6 +1083,7 @@ void mul_mat_f16_f16_1(int n, const void * vx, size_t bx, const DataInfo& info, 
 
 }
 
+#if 0 // AKX-ALL-LB4: aarch64 float mul_mat registration disabled as on x86 (stub in iqk_stubs.cpp)
 bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels) {
 
     if (ne00%4 == 0) {
@@ -1103,6 +1112,7 @@ bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t,
     return false;
 
 }
+#endif // 0 (AKX-ALL-LB4)
 
 namespace {
 template <int nrc_q>

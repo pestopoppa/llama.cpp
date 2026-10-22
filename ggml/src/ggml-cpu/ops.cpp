@@ -7,6 +7,10 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#ifdef GGML_IQK_FLASH_ATTENTION
+#include "iqk/iqk_mul_mat.h" // AKX-ALL-LB4: iqk_flash_attn_noalibi
+#include <climits>
+#endif
 
 #include <algorithm>
 #include <cfloat>
@@ -10071,6 +10075,115 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+#ifdef GGML_IQK_FLASH_ATTENTION
+// AKX-ALL-LB4 (intake-2425): iqk CPU flash attention, the ik_llama fa/ templates vendored under
+// iqk/fa/. Compiled only with -DGGML_IQK_FLASH_ATTENTION=ON (OFF by default). Experimental: the
+// CPU correctness gates of AKX-ALL-LB4 have not run yet.
+
+static void ggml_iqk_fa_barrier(void * tp) {
+    ggml_barrier((struct ggml_threadpool *) tp);
+}
+
+// Diagnostic kill switch only (ONE-champion rule: before any champion fold this becomes an
+// argv/metadata switch). Unset or non-zero = on when compiled in; GGML_IQK_FA=0 = ggml kernel.
+static bool ggml_iqk_fa_enabled() {
+    static const bool e = []() {
+        const char * s = getenv("GGML_IQK_FA");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return e;
+}
+
+static bool ggml_iqk_fa_kv_types_ok(ggml_type tk, ggml_type tv) {
+    const auto ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
+    if (ok(tk) && ok(tv)) {
+        return true;
+    }
+#ifdef __AVX512BF16__
+    if (tk == GGML_TYPE_BF16 && tv == GGML_TYPE_BF16) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+static bool ggml_iqk_fa_head_sizes_ok(int64_t dk, int64_t dv) {
+    // the (Dk, Dv) pairs that have a vendored fa/iqk_fa_<Dk>_<Dv>.cpp instantiation
+    return (dk ==  64 && dv ==  64) || (dk ==  96 && dv ==  96) || (dk == 128 && dv == 128) ||
+           (dk == 192 && dv == 128) || (dk == 192 && dv == 192) || (dk == 256 && dv == 256) ||
+           (dk == 320 && dv == 256) || (dk == 512 && dv == 512) || (dk == 576 && dv == 512);
+}
+
+// Returns true when the iqk kernel computed dst, false to run the ggml kernel. Every condition
+// below is a function of the op's types, shapes and params only, so all threads take the same
+// branch: the iqk kernel has internal barriers and returns false only for inputs filtered here.
+static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml_tensor * dst) {
+    // use_ref = the test-backend-ops CPU reference: it must stay the ggml kernel
+    if (params->use_ref || !ggml_iqk_fa_enabled()) {
+        return false;
+    }
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // iqk needs a mask (it also trims KV by scanning it) shared by all heads and sequences
+    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    // the iqk split-KV paths drop the sinks (ik_llama: "we do not implement sinks"): ggml kernel
+    if (sinks != nullptr) {
+        return false;
+    }
+    if (!ggml_iqk_fa_kv_types_ok(k->type, v->type) || !ggml_iqk_fa_head_sizes_ok(k->ne[0], v->ne[0])) {
+        return false;
+    }
+    if (k->ne[1] % 32 != 0) {
+        return false;
+    }
+    // strides are passed as int and the kernel forms row offsets as int*int (e.g. iq1*stride_m,
+    // first_k*stride_k): decline anything whose largest such offset passes 2^31 [FA-INT64-OFFSET]
+    const int64_t int_max = INT_MAX;
+    if ((int64_t) mask->nb[1] * q->ne[1] > int_max ||
+        (int64_t) k->nb[1]    * k->ne[1] > int_max ||
+        (int64_t) v->nb[1]    * v->ne[1] > int_max ||
+        (int64_t) q->nb[1]    * q->ne[1] > int_max) {
+        return false;
+    }
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    float softcap  = 0.0f;
+    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f) {
+        return false;
+    }
+    if (softcap != 0.0f) {
+        scale /= softcap; // same convention as the ggml kernel and ik_llama
+    }
+
+    // op_params[4] in this tree is the kv-unified n_seq hint, not ik_llama's n_swa: pass n_swa = 0
+    return iqk_flash_attn_noalibi(q->type, mask->type, max_bias,
+            (int) q->ne[3], (int) q->ne[2], (long) q->nb[3], (long) q->nb[2],
+            (int) k->ne[3], (int) k->ne[2], (long) k->nb[3], (long) k->nb[2],
+            (int) v->ne[3], (int) v->ne[2], (long) v->nb[3], (long) v->nb[2],
+            (int) dst->ne[2], (int) dst->ne[1], (long) dst->nb[1],
+            k->type, v->type, (int) k->ne[0], (int) v->ne[0], (int) q->ne[1], (int) k->ne[1],
+            (int) q->nb[1], (int) k->nb[1], (int) v->nb[1], (int) mask->nb[1],
+            q->data, k->data, v->data, mask->data, nullptr,
+            scale, softcap, (float *) dst->data,
+            params->wdata, ggml_iqk_fa_barrier, params->threadpool,
+            params->ith, params->nth, /*n_swa =*/ 0);
+}
+#endif // GGML_IQK_FLASH_ATTENTION
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10115,6 +10228,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+#ifdef GGML_IQK_FLASH_ATTENTION
+    // AKX-ALL-LB4: iqk CPU flash attention (never under use_ref; falls back for anything it does not cover)
+    if (ggml_iqk_try_flash_attn_ext(params, dst)) {
+        return;
+    }
+#endif
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
