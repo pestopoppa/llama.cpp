@@ -10,6 +10,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <initializer_list>
 #include <cstdio>
 
 static ggml_tensor * build_gdn(ggml_context * ctx, ggml_type state_type, int64_t K, bool kda) {
