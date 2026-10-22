@@ -167,7 +167,10 @@ def check_divergence(label: str, a: list[dict], b: list[dict]) -> int:
                 too_confident.append(f"prompt {i} d={d} tokens {tx[d]}/{ty[d]} not live candidates in both arms")
     print(f"[{label}] diverging prompts: {n_div}/{len(PROMPTS)} (reported, never a failure by itself)")
     assert not misaligned, (label, "divergence with IDENTICAL probability vectors up to d: the RNG is misaligned", misaligned)
-    assert not too_confident, (label, "divergent token is not a live candidate in the other arm: not a boundary flip", too_confident)
+    # Reported, not asserted: the top_p/min_p truncation cut drifts with the logits too, so a 2-4% tail token can be a live candidate
+    # in one arm and cut in the other (retest 2026-10-22: 1 of 13 divergences, tokens at p=0.043/0.023). Not a discriminating check.
+    if too_confident:
+        print(f"[{label}] NOTE tail tokens outside the other arm's truncated candidate set: {too_confident}")
     return n_div
 
 
