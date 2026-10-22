@@ -74,10 +74,10 @@ static bool read_kv(llama_context * ctx, llama_seq_id seq, llama_pos p0, llama_p
     return llama_chunk_kv_read_f32(ctx, seq, p0, p1, k.data(), v.data(), &n_v) == n_k;
 }
 
-static llama_context * make_ctx(const common_params & params, llama_model * model) {
+static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t n_ctx_seq = 1024) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 8;
-    cparams.n_ctx     = 8192;
+    cparams.n_ctx     = 8*n_ctx_seq;
     cparams.n_batch   = 512;
     cparams.n_ubatch  = 512;
     return llama_init_from_model(model, cparams);
@@ -113,7 +113,17 @@ static void test_refusal(const common_params & params, llama_model * model, int 
 }
 
 static void test_attention(const common_params & params, llama_model * model, int n_vocab) {
-    llama_context * ctx = make_ctx(params, model);
+    // CKV_N_CHUNK (default 24, clamped to [24, 512]): a longer chunk gives rounding drift in the G1-ref reference more chances to show
+    // (it scales with tokens x dims x depth); the KPF-62.8 k-quant fixture runs it at 512.
+    const int n_chunk  = std::min(512, std::max(24, getenv("CKV_N_CHUNK") ? atoi(getenv("CKV_N_CHUNK")) : 24)); // <= n_batch
+    const int n_suffix = 6;
+
+    uint32_t n_ctx_seq = 1024;
+    while (n_ctx_seq < (uint32_t) (2*n_chunk + 400)) {
+        n_ctx_seq *= 2;
+    }
+
+    llama_context * ctx = make_ctx(params, model, n_ctx_seq);
     CHECK(ctx != nullptr);
     if (!ctx) return;
 
@@ -121,9 +131,6 @@ static void test_attention(const common_params & params, llama_model * model, in
     CHECK(llama_chunk_kv_supported(ctx, why, sizeof(why)));
 
     std::mt19937 rng(1234);
-
-    const int n_chunk  = 24;
-    const int n_suffix = 6;
 
     const tokens_t chunk  = rand_tokens(rng, n_chunk,  n_vocab);
     const tokens_t suffix = rand_tokens(rng, n_suffix, n_vocab);
@@ -152,56 +159,125 @@ static void test_attention(const common_params & params, llama_model * model, in
     std::vector<float> k_src, v_src;
     CHECK(read_kv(ctx, 0, 0, n_chunk, k_src, v_src));
 
-    // 3. G1 shift exactness for several deltas: inject at delta (seq 1) vs encode in place at delta (seq 2)
-    int seq_next = 1;
+    // 3. G1 for several deltas. The same chunk is placed at [delta, delta + n_chunk) three ways, each in its own sequence
+    //    (separate KV streams, identical cell layout):
+    //      s_inj  the exported blob injected at +delta                                      (the feature under test)
+    //      s_add  encoded in place at 0, then moved by llama_memory_seq_add(+delta)         (the in-tree K-shift, i.e. --cache-reuse)
+    //      s_ref  encoded in place at delta, same isolated context                          (the pre-registered G1 reference)
+    //
+    //    G1a (plumbing exactness, always gated): s_inj == s_add BIT-FOR-BIT in K, V and suffix logits. Both start from the same
+    //    encode at 0 and go through the same K-shift graph, so any difference is an inject defect, on any model and any weight type.
+    //
+    //    G1-ref (P0_THRESHOLDS section 2): s_inj vs s_ref. Exact RoPE attention is translation-invariant, but in f32 the q.k of a
+    //    chunk encoded at delta differs from the one encoded at 0 in the last ulp, and that propagates through the layers. On the
+    //    2-layer generated fixtures it stays at V NMSE <= 1e-19 (visible with CKV_N_CHUNK=512). On a deep k-quant MoE it is
+    //    amplified: every matmul re-quantizes its activations to q8 blocks (an ulp on a rounding boundary flips a whole q8 step)
+    //    and a flipped router top-k compounds it, so the reference itself drifts (KPF-62.8, 2026-10-22: Qwen3-VL-30B-A3B Q4_K_M,
+    //    48 layers, layer-0 K NMSE 7e-15, V NMSE 6e-3 with the injected V bit-identical to the source -- the drift is in the
+    //    reference encode, not in the inject). s_add vs s_ref shows the in-tree shift carries the identical drift.
+    //    G1-ref gates unless CKV_G1_REF_INFORMATIONAL=1, in which case it is printed with its verdict and not gated.
+    const bool ref_info = getenv("CKV_G1_REF_INFORMATIONAL") && *getenv("CKV_G1_REF_INFORMATIONAL") && strcmp(getenv("CKV_G1_REF_INFORMATIONAL"), "0") != 0;
+    const int  n_layer  = llama_model_n_layer(model);
+    bool g1_ref_pass = true;
+    bool g1a_pass    = true;
     for (llama_pos delta : { 1, 17, 300 }) {
-        const llama_seq_id s_inj = seq_next++;
-        const llama_seq_id s_ref = seq_next++;
+        const llama_seq_id s_inj = 1;
+        const llama_seq_id s_add = 2;
+        const llama_seq_id s_ref = 3;
 
         CHECK(llama_chunk_kv_inject(ctx, blob.data(), blob.size(), s_inj, delta) == blob.size());
+
+        CHECK(decode(ctx, chunk, 0, s_add, n_vocab));
+        llama_memory_seq_add(llama_get_memory(ctx), s_add, 0, -1, delta);
 
         // in place, same isolated context (no predecessor), same positions
         CHECK(decode(ctx, chunk, delta, s_ref, n_vocab));
 
-        std::vector<float> k_i, v_i, k_r, v_r;
+        std::vector<float> k_i, v_i, k_a, v_a, k_r, v_r;
         CHECK(read_kv(ctx, s_inj, delta, delta + n_chunk, k_i, v_i));
+        CHECK(read_kv(ctx, s_add, delta, delta + n_chunk, k_a, v_a));
         CHECK(read_kv(ctx, s_ref, delta, delta + n_chunk, k_r, v_r));
         CHECK(k_i.size() == k_r.size() && v_i.size() == v_r.size());
-
-        const double nk = nmse(k_i, k_r);
-        const double nv = nmse(v_i, v_r);
-
-        if (nk > 1e-6) { // diagnostic: where does the K error sit?
-            const int n_layer = llama_model_n_layer(model);
-            const size_t per = k_i.size() / n_layer;
-            for (int il = 0; il < n_layer; ++il) {
-                std::vector<float> a(k_i.begin() + il*per, k_i.begin() + (il+1)*per), b(k_r.begin() + il*per, k_r.begin() + (il+1)*per);
-                printf("  layer %d K NMSE=%.3e\n", il, nmse(a, b));
-            }
-        }
+        CHECK(k_i.size() == k_a.size() && v_i.size() == v_a.size());
 
         // V is position-free: it must be a bit-exact copy of the source
         CHECK(v_i == v_src);
 
-        // continuation: decode the suffix on both and compare logits
-        std::vector<float> l_i, l_r;
+        // continuation: decode the suffix on all three and compare logits
+        std::vector<float> l_i, l_a, l_r;
         CHECK(decode(ctx, suffix, delta + n_chunk, s_inj, n_vocab, &l_i));
+        CHECK(decode(ctx, suffix, delta + n_chunk, s_add, n_vocab, &l_a));
         CHECK(decode(ctx, suffix, delta + n_chunk, s_ref, n_vocab, &l_r));
-        const double nl = nmse(l_i, l_r);
 
-        printf("G1 delta=%4d  K NMSE=%.3e  V NMSE=%.3e  logits NMSE=%.3e\n", (int) delta, nk, nv, nl);
-        // llama-dense from test-llama-archs carries RANDOM rope_freqs (|f| ~ 0.02), which inflates angles 50-3000x and
-        // makes f32 trig rounding visible in K; the gate is informational there (CKV_SKIP_K_GATE=1). Logits still gate.
-        if (!(getenv("CKV_SKIP_K_GATE") && *getenv("CKV_SKIP_K_GATE"))) {
-            CHECK(nk <= 1e-6);
+        // G1a: bit-for-bit
+        const bool k_eq = k_i == k_a;
+        const bool v_eq = v_i == v_a;
+        const bool l_eq = l_i.size() == l_a.size() && memcmp(l_i.data(), l_a.data(), l_i.size()*sizeof(float)) == 0;
+        printf("G1a delta=%4d  inject vs seq_add: K %s  V %s  logits %s  (K NMSE=%.3e logits NMSE=%.3e)\n", (int) delta,
+                k_eq ? "bit-identical" : "DIFFER", v_eq ? "bit-identical" : "DIFFER", l_eq ? "bit-identical" : "DIFFER",
+                nmse(k_i, k_a), nmse(l_i, l_a));
+        CHECK(k_eq);
+        CHECK(v_eq);
+        CHECK(l_eq);
+        g1a_pass = g1a_pass && k_eq && v_eq && l_eq;
+
+        // G1-ref
+        const double nk = nmse(k_i, k_r);
+        const double nv = nmse(v_i, v_r);
+        const double nl = nmse(l_i, l_r);
+        const double nk_add = nmse(k_a, k_r);
+        const double nv_add = nmse(v_a, v_r);
+        const double nl_add = nmse(l_a, l_r);
+
+        if (nk > 1e-6 || nv > 1e-6) { // diagnostic: where does the error sit? (V is position-free: any V error is drift of the reference encode)
+            const size_t per_k = k_i.size() / n_layer;
+            const size_t per_v = v_i.size() / n_layer;
+            for (int il = 0; il < n_layer; ++il) {
+                std::vector<float> a(k_i.begin() + il*per_k, k_i.begin() + (il+1)*per_k), b(k_r.begin() + il*per_k, k_r.begin() + (il+1)*per_k);
+                std::vector<float> c(v_i.begin() + il*per_v, v_i.begin() + (il+1)*per_v), d(v_r.begin() + il*per_v, v_r.begin() + (il+1)*per_v);
+                printf("  layer %d K NMSE=%.3e  V NMSE=%.3e\n", il, nmse(a, b), nmse(c, d));
+            }
         }
-        CHECK(nv <= 1e-6);
-        CHECK(nl <= 1e-5);
+
+        printf("G1 delta=%4d  K NMSE=%.3e  V NMSE=%.3e  logits NMSE=%.3e   (in-tree seq_add vs ref: K %.3e V %.3e logits %.3e)\n",
+                (int) delta, nk, nv, nl, nk_add, nv_add, nl_add);
+
+        // llama-dense from test-llama-archs carries RANDOM rope_freqs (|f| ~ 0.02), which inflates angles 50-3000x and
+        // makes f32 trig rounding visible in K; the K gate is informational there (CKV_SKIP_K_GATE=1). Logits still gate.
+        const bool skip_k = getenv("CKV_SKIP_K_GATE") && *getenv("CKV_SKIP_K_GATE");
+        const bool pass   = (skip_k || nk <= 1e-6) && nv <= 1e-6 && nl <= 1e-5;
+        g1_ref_pass = g1_ref_pass && pass;
+        if (!ref_info) {
+            if (!skip_k) {
+                CHECK(nk <= 1e-6);
+            }
+            CHECK(nv <= 1e-6);
+            CHECK(nl <= 1e-5);
+        }
 
         llama_memory_seq_rm(llama_get_memory(ctx), s_inj, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx), s_add, -1, -1);
         llama_memory_seq_rm(llama_get_memory(ctx), s_ref, -1, -1);
-        seq_next = 1;
     }
+
+    // encoder floor without any shift: the same chunk at the same positions [0, n_chunk), re-encoded in two ubatches instead of one.
+    // Identical in exact arithmetic; whatever this prints is the reference's own rounding-propagation floor on this model.
+    {
+        const llama_seq_id s = 4;
+        const tokens_t h0(chunk.begin(), chunk.begin() + n_chunk/2);
+        const tokens_t h1(chunk.begin() + n_chunk/2, chunk.end());
+        CHECK(decode(ctx, h0, 0, s, n_vocab));
+        CHECK(decode(ctx, h1, n_chunk/2, s, n_vocab));
+        std::vector<float> k, v;
+        CHECK(read_kv(ctx, s, 0, n_chunk, k, v));
+        printf("floor: same positions, ubatch split %d+%d vs one ubatch: K NMSE=%.3e  V NMSE=%.3e\n",
+                n_chunk/2, n_chunk - n_chunk/2, nmse(k, k_src), nmse(v, v_src));
+        llama_memory_seq_rm(llama_get_memory(ctx), s, -1, -1);
+    }
+
+    printf("VERDICT G1a (inject == in-tree seq_add, bit-for-bit): %s\n", g1a_pass ? "PASS" : "FAIL");
+    printf("VERDICT G1-ref (pre-registered, ref = encode in place at delta; K/V <= 1e-6, logits <= 1e-5): %s%s\n",
+            g1_ref_pass ? "PASS" : "FAIL", ref_info ? " (informational: CKV_G1_REF_INFORMATIONAL=1)" : "");
 
     // 4. delta = 0 is an exact copy (no rotation is queued), also for a range that does not start at 0
     {
