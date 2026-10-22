@@ -108,13 +108,16 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
 }
 
 static inline const std::unordered_set<ggml_type> & supported_kv_types() {
+    // AKX-ALL-LB4: GGML_TYPE_Q8_KV and GGML_TYPE_Q6_0 are ik_llama-only KV-cache types, absent from
+    // mainline ggml.h (a mainline KV cache can never hold them), so they are dropped from the set.
+    // The ops.cpp hook only routes f16/q8_0 (and bf16/bf16) K/V here anyway.
 #ifdef GGML_IQK_FA_ALL_QUANTS
     static std::unordered_set<ggml_type> k_supported = {
-        GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_KV, GGML_TYPE_Q6_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL
+        GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL
     };
 #else
     static std::unordered_set<ggml_type> k_supported = {
-        GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_KV, GGML_TYPE_Q6_0,
+        GGML_TYPE_F16, GGML_TYPE_Q8_0,
     };
 #endif
     return k_supported;
