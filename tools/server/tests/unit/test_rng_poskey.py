@@ -22,6 +22,13 @@ from utils import *
 
 server: ServerProcess
 
+
+@pytest.fixture(scope="module", autouse=True)
+def do_something():
+    # overrides conftest's preset download: with a local model nothing is fetched and no preset server is started on a default port
+    if not os.environ.get("LLAMA_TEST_RNG_MODEL"):
+        ServerPreset.load_all()
+
 PROMPTS = [
     "The lighthouse keeper kept a careful log. Every evening he wrote down",
     "In a small harbour town, the baker woke before dawn and began to",
