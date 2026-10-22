@@ -3,6 +3,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "kld-ear.h"
 
 #include <algorithm>
 #include <array>
@@ -186,6 +187,11 @@ struct kl_divergence_result {
     float  max_p_diff       = 0.0f;
     size_t n_same_top       = 0.0;
     size_t count            = 0.0;
+    // EAR = sum_v min(p_base, q) (kld-ear.h): full vocabulary, and SLQ's top-10 renormalized variant
+    double sum_ear_full     = 0.0;
+    double sum_ear_full2    = 0.0;
+    double sum_ear_topk     = 0.0;
+    double sum_ear_topk2    = 0.0;
 };
 
 static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
@@ -235,6 +241,12 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     kld.sum_kld  += sum;
     kld.sum_kld2 += sum*sum;
     ++kld.count;
+
+    const kld_ear_values ear = kld_ear_compute(n_vocab, logits, max_logit, base_log_prob, scale, min_log_prob);
+    kld.sum_ear_full  += ear.full;
+    kld.sum_ear_full2 += ear.full*ear.full;
+    kld.sum_ear_topk  += ear.topk;
+    kld.sum_ear_topk2 += ear.topk*ear.topk;
     if (imax == imax_base) {
         ++kld.n_same_top;
     }
@@ -276,6 +288,10 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 kld.n_same_top       += local_kld.n_same_top;
                 kld.max_p_diff        = std::max(kld.max_p_diff, local_kld.max_p_diff);
                 kld.count            += local_kld.count;
+                kld.sum_ear_full     += local_kld.sum_ear_full;
+                kld.sum_ear_full2    += local_kld.sum_ear_full2;
+                kld.sum_ear_topk     += local_kld.sum_ear_topk;
+                kld.sum_ear_topk2    += local_kld.sum_ear_topk2;
                 break;
             }
             lock.unlock();
@@ -2003,6 +2019,19 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+
+    // EAR lines are appended after every pre-existing line so existing parsers see unchanged output.
+    LOG("\n");
+    LOG("====== EAR statistics ======\n");
+    auto ear_full = mean_and_uncertainty(kld.sum_ear_full, kld.sum_ear_full2, kld.count);
+    auto ear_topk = mean_and_uncertainty(kld.sum_ear_topk, kld.sum_ear_topk2, kld.count);
+    const double ear_pinsker_floor = 1.0 - sqrt(std::max(kl_div.first, 0.0)/2.0);
+    LOG("EAR full vocab   : %10.6lf ± %10.6lf %%\n", 100.0*ear_full.first, 100.0*ear_full.second);
+    LOG("EAR top%d renorm : %10.6lf ± %10.6lf %%\n", KLD_EAR_TOP_K, 100.0*ear_topk.first, 100.0*ear_topk.second);
+    LOG("EAR Pinsker floor: %10.6lf %%\n", 100.0*ear_pinsker_floor);
+    // tolerance = one uint16 log-prob step of the base file (16 nats / 65535), the base reconstruction error bound
+    const double ear_tol = KLD_EAR_BASE_QUANT_TOL;
+    LOG("EAR Pinsker check: %s\n", ear_full.first + ear_tol >= ear_pinsker_floor && ear_full.first <= 1.0 + ear_tol ? "pass" : "FAIL");
 }
 
 // satisfies -Wmissing-declarations
