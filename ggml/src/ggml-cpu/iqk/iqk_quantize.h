@@ -31,6 +31,13 @@ void quantize_row_q8_1_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
 void quantize_row_q8_2_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q8_K   (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
+#ifdef GGML_IQK_FLASH_ATTENTION
+// AKX-ALL-LB4: activation quantizers used by the vendored fa/ templates (defined in
+// iqk_quantize_fa.cpp; quantize_row_q8_1_x4 in iqk_quantize_min.cpp). ik_llama signatures.
+void quantize_row_q8_0_x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_q8_KV  (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

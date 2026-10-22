@@ -75,6 +75,31 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_CPU_PROF)
     endif()
 
+    # AKX-ALL-LB4: iqk CPU flash attention (vendored ik_llama fa/ templates + the float-GEMM and
+    # q8 activation quantizers they need). OFF by default; with it OFF none of these sources is
+    # compiled and GGML_IQK_FLASH_ATTENTION is undefined, so the CPU backend is the champion's.
+    # Runtime: the FLASH_ATTN_EXT hook in ops.cpp is skipped under use_ref (the test-backend-ops
+    # CPU reference) and can be disabled with GGML_IQK_FA=0 (diagnostic kill switch only).
+    if (GGML_IQK_FLASH_ATTENTION)
+        message(STATUS "ggml-cpu: iqk flash attention ENABLED (GGML_IQK_FLASH_ATTENTION, experimental)")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IQK_FLASH_ATTENTION)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/iqk/iqk_flash_attn.cpp
+            ggml-cpu/iqk/iqk_flash_impl.h
+            ggml-cpu/iqk/iqk_gemm_floats.cpp
+            ggml-cpu/iqk/iqk_quantize_fa.cpp
+            ggml-cpu/iqk/fa/iqk_fa_templates.h
+            ggml-cpu/iqk/fa/iqk_fa_64_64.cpp
+            ggml-cpu/iqk/fa/iqk_fa_96_96.cpp
+            ggml-cpu/iqk/fa/iqk_fa_128_128.cpp
+            ggml-cpu/iqk/fa/iqk_fa_192_128.cpp
+            ggml-cpu/iqk/fa/iqk_fa_192_192.cpp
+            ggml-cpu/iqk/fa/iqk_fa_256_256.cpp
+            ggml-cpu/iqk/fa/iqk_fa_320_256.cpp
+            ggml-cpu/iqk/fa/iqk_fa_512_512.cpp
+            ggml-cpu/iqk/fa/iqk_fa_576_512.cpp)
+    endif()
+
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)

@@ -423,6 +423,11 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-col2im-1d.cpp)
     llama_build_and_test(test-gather-rows-e4m3-e8m0.cpp)
 
+    # [AKX-ALL-LB4] CPU FLASH_ATTN_EXT N=1 vs N=5 row-exactness on the long-context CPU shape. A
+    # measurement of the build under test (not every kernel path is row-exact), so it is built but
+    # not registered with ctest; run it explicitly: test-fa-rowexact [n_kv ...]
+    llama_build(test-fa-rowexact.cpp)
+
     # parallel tensor repack: 1 vs N threads byte-identical for every parallelized repack
     llama_build_and_test(test-repack-parallel.cpp)
     target_include_directories(test-repack-parallel PRIVATE

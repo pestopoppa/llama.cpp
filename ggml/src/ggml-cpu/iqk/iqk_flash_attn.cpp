@@ -167,25 +167,12 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
 
+    // AKX-ALL-LB4 iqk port: ik_llama prints the supported list and GGML_ABORTs here. In this tree the
+    // caller (ops.cpp FLASH_ATTN_EXT hook) pre-filters K/V types, and an unsupported pair must fall
+    // back to the ggml CPU kernel, never abort. The check depends only on the types, so every thread
+    // returns false together and no barrier is needed.
     if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v)) {
-        if (ith == 0) {
-            fprintf(stderr, "\n==================== K cache %s coupled with V cache %s is not a supported combination on the CPU backend.\n",
-                    ggml_type_name(type_k), ggml_type_name(type_v));
-            auto & supported = supported_kv_types();
-            fprintf(stderr, "Supported types are:\n");
-            for (auto type : supported) {
-                fprintf(stderr, "    %s\n", ggml_type_name(type));
-            }
-            fprintf(stderr, "    Warning: ik_llama.cpp does not support Q5_0 or Q5_1 KV cache on the CPU.\n");
-#ifdef __AVX512BF16__
-            fprintf(stderr, "    %s, but only if K and V are both %s\n", ggml_type_name(GGML_TYPE_BF16), ggml_type_name(GGML_TYPE_BF16));
-#endif
-#ifndef GGML_IQK_FA_ALL_QUANTS
-            fprintf(stderr, "    To enable q4_0, q4_1, and iq4_nl KV cache types, recompile with -DGGML_IQK_FA_ALL_QUANTS=ON\n");
-#endif
-        }
-        barrier(barrier_data);
-        GGML_ABORT("Fatal error");
+        return false;
     }
 
     if (n_swa > 0 && mask) {
@@ -512,12 +499,19 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
                             [[maybe_unused]] const void  * k,        // k matrix. Assumed to be fp16, nq x nk elements
                             [[maybe_unused]] const void  * v,        // v matrix. Assumed to be fp16, nq x nk elements
                             [[maybe_unused]] const void  * mask,     // mask. If not null, assumed to be fp16. nq x nk elements
+                            [[maybe_unused]] const void  * sinks,    // AKX-ALL-LB4: was missing, so the stub did not match the header
                             [[maybe_unused]] float         scale,    // scale applied before softmax
                             [[maybe_unused]] float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
                             [[maybe_unused]] float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
                             [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa) {
     return false;
+}
+
+// AKX-ALL-LB4: the real definition is inside the IQK_IMPLEMENT branch; without it (no AVX2 / no
+// dotprod) the CPU graph plan still calls this, so provide the no-work-buffer answer.
+size_t iqk_fa_work_buffer_size([[maybe_unused]] const struct ggml_tensor * dst, [[maybe_unused]] int nth) {
+    return 0;
 }
 
 #endif

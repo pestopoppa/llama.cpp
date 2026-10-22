@@ -546,6 +546,13 @@ bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml
 bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #endif
 
+#if defined(GGML_IQK_FLASH_ATTENTION) && !defined(__cplusplus)
+// (C only: C++ TUs get the IQK_API declaration from iqk/iqk_mul_mat.h)
+// AKX-ALL-LB4: work buffer the iqk FA kernel needs (K repack to q8_0_r8 at N >= 8, split-KV
+// partials at N == 1); defined in iqk/iqk_flash_attn.cpp, declared extern "C" in iqk/iqk_mul_mat.h.
+size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nthread);
+#endif
+
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
