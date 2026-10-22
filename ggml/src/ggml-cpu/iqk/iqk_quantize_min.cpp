@@ -143,7 +143,7 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
             if (i < nb4) {
                 y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
             } else {
-                y[i].d = GGML_FP32_TO_FP16(d);
+                y[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = GGML_FP32_TO_FP16(d);
             }
         } else {
             auto t = GGML_FP32_TO_BF16(d);
@@ -196,7 +196,7 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
             if (i < nb4) {
                 y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d * isum);
             } else {
-                y[i].s = GGML_FP32_TO_FP16(d * isum);
+                y[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.s = GGML_FP32_TO_FP16(d * isum);
             }
         } else {
             if (i < nb4) {
