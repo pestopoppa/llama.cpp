@@ -371,6 +371,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    int                              cpu_iqk_fa; // AKX-ALL-LB4.5: -1 build default, 0 off, 1 on
     bool                             autokernel_harden;
     uint64_t                         autokernel_seed;
     std::string                      autokernel_ready_file;
@@ -422,6 +423,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* cpu_iqk_fa           */ -1,
     /* autokernel_harden    */ false,
     /* autokernel_seed      */ 0,
     /* autokernel_ready_file */ "",
@@ -520,6 +522,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --cpu-iqk-fa <0|1>                          iqk CPU flash attention in -DGGML_IQK_FLASH_ATTENTION=ON builds, process-wide\n");
+    printf("                                              (default: on when compiled in; 1 is an error in builds without it)\n");
     printf("  --autokernel-harden <seed>                 trusted T1 mode: unique content/addresses plus an ordinary/full-device-sync hybrid pair per repetition\n");
     printf("  --autokernel-ready-file <absolute-path>    opt-in governed ready/continue barrier (requires all ready options)\n");
     printf("  --autokernel-continue-file <absolute-path> opt-in governed ready/continue barrier acknowledgement\n");
@@ -622,6 +626,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.cpu_iqk_fa           = cmd_params_defaults.cpu_iqk_fa;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1132,6 +1137,20 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--cpu-iqk-fa") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string v = argv[i];
+                if (v == "1" || v == "on") {
+                    params.cpu_iqk_fa = 1;
+                } else if (v == "0" || v == "off") {
+                    params.cpu_iqk_fa = 0;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2523,6 +2542,21 @@ int llama_bench(int argc, char ** argv) {
     auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
+
+    // AKX-ALL-LB4.5: iqk CPU flash attention, selected on the command line (no environment switch)
+    {
+        auto * set_iqk_fa_fn = (ggml_backend_cpu_set_iqk_fa_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_set_iqk_fa");
+        auto * get_iqk_fa_fn = (ggml_backend_cpu_get_iqk_fa_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_get_iqk_fa");
+        if (params.cpu_iqk_fa == 1 && !set_iqk_fa_fn) {
+            fprintf(stderr, "%s: error: --cpu-iqk-fa 1: this build has no iqk CPU flash attention (-DGGML_IQK_FLASH_ATTENTION=OFF)\n", __func__);
+            return 1;
+        }
+        if (params.cpu_iqk_fa >= 0 && set_iqk_fa_fn) {
+            set_iqk_fa_fn(params.cpu_iqk_fa == 1);
+        }
+        fprintf(stderr, "%s: cpu iqk flash attention: %s\n", __func__,
+                !set_iqk_fa_fn ? "not compiled" : (get_iqk_fa_fn && get_iqk_fa_fn() ? "on" : "off"));
+    }
 
     // initialize llama.cpp
     if (!params.verbose) {

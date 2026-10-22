@@ -77,7 +77,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # q8 activation quantizers they need). OFF by default; with it OFF none of these sources is
     # compiled and GGML_IQK_FLASH_ATTENTION is undefined, so the CPU backend is the champion's.
     # Runtime: the FLASH_ATTN_EXT hook in ops.cpp is skipped under use_ref (the test-backend-ops
-    # CPU reference) and can be disabled with GGML_IQK_FA=0 (diagnostic kill switch only).
+    # CPU reference) and is selected from argv (--cpu-iqk-fa on|off; AKX-ALL-LB4.5), default on.
     if (GGML_IQK_FLASH_ATTENTION)
         message(STATUS "ggml-cpu: iqk flash attention ENABLED (GGML_IQK_FLASH_ATTENTION, experimental)")
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IQK_FLASH_ATTENTION)

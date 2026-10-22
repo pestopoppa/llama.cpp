@@ -5,6 +5,14 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#ifdef GGML_IQK_FLASH_ATTENTION
+// AKX-ALL-LB4.5: defined in ops.cpp (declared in ops.h, which is not included here: it is heavy)
+extern "C" {
+void     ggml_cpu_iqk_fa_set_enabled(bool enabled);
+bool     ggml_cpu_iqk_fa_get_enabled(void);
+uint64_t ggml_cpu_iqk_fa_n_calls(void);
+}
+#endif
 
 #include <cctype>
 #include <string>
@@ -642,6 +650,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     #ifdef GGML_USE_CPU_REPACK
         features.push_back({ "REPACK", "1" });
     #endif
+    #ifdef GGML_IQK_FLASH_ATTENTION
+        features.push_back({ "IQK_FA", "1" }); // compiled in; the runtime switch is --cpu-iqk-fa
+    #endif
 
         features.push_back({ nullptr, nullptr });
 
@@ -714,6 +725,21 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_parallel_run") == 0) {
         return (void *)ggml_cpu_parallel_run;
     }
+#ifdef GGML_IQK_FLASH_ATTENTION
+    // AKX-ALL-LB4.5: iqk flash-attention runtime switch (NULL = the build has no iqk FA kernel)
+    if (strcmp(name, "ggml_backend_cpu_set_iqk_fa") == 0) {
+        ggml_backend_cpu_set_iqk_fa_t fct = ggml_cpu_iqk_fa_set_enabled;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_cpu_get_iqk_fa") == 0) {
+        ggml_backend_cpu_get_iqk_fa_t fct = ggml_cpu_iqk_fa_get_enabled;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_cpu_iqk_fa_n_calls") == 0) {
+        ggml_backend_cpu_iqk_fa_n_calls_t fct = ggml_cpu_iqk_fa_n_calls;
+        return (void *)fct;
+    }
+#endif
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
