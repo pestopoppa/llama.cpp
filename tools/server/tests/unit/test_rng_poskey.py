@@ -9,7 +9,7 @@
 #       logits are bit-identical and the position-keyed draws must be too);
 #   (2) wherever two arms (np1 vs concurrent np4; depth 0 vs 3) DO diverge, the divergence is explained by logit drift and not by a
 #       misaligned RNG: at the first divergent token d the two arms' post-sampling top-k probability vectors differ at d or earlier, and
-#       the two chosen tokens are a low-margin disagreement (their post-sampling probabilities are within DRIFT_PROB_TOL).
+#       each arm's chosen token at d is a live post-sampling candidate in the other arm (a boundary flip, not a different draw).
 #
 # PREDECLARED RULE (written before the run): PASS = (1) 8/8 identical, and (2) zero divergences with identical probs up to d
 # The count of diverging prompts is REPORTED (printed) and never fails a test by itself.
@@ -127,12 +127,10 @@ def boot_run(n_slots, depth, argv_poskey, concurrent_n, env=None, full=False, **
                     os.environ[k] = v
 
 
-# 0.15 absolute tolerance on the post-sampling probability of the two diverging tokens (see check_divergence). Why this number: a
-# divergence with identical seeded draws needs the CDF boundary between the two tokens to have moved across the draw u, and the drift of
-# a CPU GEMM/MoE path change is O(1e-3) in logit space, i.e. a few 1e-3 in probability. 0.15 is ~two orders above that, so a drift flip
-# passes with a wide margin, while a confident disagreement (e.g. 0.9 vs 0.3: an unrelated draw, i.e. a misaligned RNG) fails. The
-# tolerance is only a backstop: the primary criterion is "probability vectors differ at or before d".
-DRIFT_PROB_TOL = 0.15
+# Low-margin criterion (see check_divergence). A drift flip happens when the CDF boundary between two candidates moves across the
+# seeded draw u, so the two chosen tokens need NOT have similar probabilities (sorted [0.6, 0.3, ...] with u just past 0.6 picks the
+# 0.3 token in one arm and the 0.6 token in the other). What a flip does require is that both tokens are live candidates in BOTH arms at
+# d; a token absent from the other arm's post-sampling candidate set cannot be reached by moving a boundary, only by a different draw.
 
 
 def prob_vec(entry: dict) -> list[tuple[int, float]]:
@@ -162,11 +160,14 @@ def check_divergence(label: str, a: list[dict], b: list[dict]) -> int:
         if drifted_at is None:
             # same context up to d, identical probability vectors at every position <= d, yet different tokens: the draw itself differs
             misaligned.append(f"prompt {i} d={d}")
-        elif abs(pa - pb) > DRIFT_PROB_TOL:
-            too_confident.append(f"prompt {i} d={d} probs {pa:.4f}/{pb:.4f}")
+        else:
+            cand_x = {t for t, p in prob_vec(px[d]) if p > 0}
+            cand_y = {t for t, p in prob_vec(py[d]) if p > 0}
+            if tx[d] not in cand_y or ty[d] not in cand_x:
+                too_confident.append(f"prompt {i} d={d} tokens {tx[d]}/{ty[d]} not live candidates in both arms")
     print(f"[{label}] diverging prompts: {n_div}/{len(PROMPTS)} (reported, never a failure by itself)")
     assert not misaligned, (label, "divergence with IDENTICAL probability vectors up to d: the RNG is misaligned", misaligned)
-    assert not too_confident, (label, f"divergence is a confident disagreement (|dp| > {DRIFT_PROB_TOL}), not low-margin drift", too_confident)
+    assert not too_confident, (label, "divergent token is not a live candidate in the other arm: not a boundary flip", too_confident)
     return n_div
 
 
@@ -180,7 +181,7 @@ def test_poskey_np4_serial_equals_np1():
 
 @pytest.mark.parametrize("pair", ["np1_vs_np4", "depth0_vs_depth3"])
 def test_poskey_divergence_is_low_margin(pair):
-    """former byte-identity pairs, now: any divergence must be explained by logit drift (see module docstring and DRIFT_PROB_TOL)"""
+    """former byte-identity pairs, now: any divergence must be explained by logit drift (see module docstring and check_divergence)"""
     probs = {"n_probs": 10, "post_sampling_probs": True}
     if pair == "np1_vs_np4":
         a = boot_run(1, 0, "on", 1, full=True, **probs)
