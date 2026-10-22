@@ -200,4 +200,13 @@ extern "C" void quantize_row_q8_2_x4(const float * x, void * vy, int64_t k) {
     quantize_row_q8_1_x4_T<block_q8_2, block_q8_2_x4>(x, (block_q8_2 *)vy, k);
 }
 
+#ifdef GGML_IQK_FLASH_ATTENTION
+#include "iqk_ext_blocks.h"
+// AKX-ALL-LB4: the fa/ templates quantize Q rows to q8_1_x4 for q4_1-class K caches; verbatim
+// ik_llama wrapper over the same template (only compiled with the iqk FA option).
+extern "C" void quantize_row_q8_1_x4(const float * x, void * vy, int64_t k) {
+    quantize_row_q8_1_x4_T<block_q8_1, block_q8_1_x4>(x, (block_q8_1 *)vy, k);
+}
+#endif
+
 #endif // IQK_IMPLEMENT

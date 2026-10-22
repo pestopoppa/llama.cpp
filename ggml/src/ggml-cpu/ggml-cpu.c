@@ -3561,7 +3561,12 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
-                        cur += MAX(prefill, decode);
+                        size_t fa_work = MAX(prefill, decode);
+#if defined(GGML_IQK_FLASH_ATTENTION)
+                        // AKX-ALL-LB4: the iqk kernel uses wdata from offset 0 (K repack, split-KV partials)
+                        fa_work = MAX(fa_work, iqk_fa_work_buffer_size(node, n_tasks));
+#endif
+                        cur += fa_work;
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

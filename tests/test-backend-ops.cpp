@@ -8578,6 +8578,40 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// [AKX-ALL-LB4] GGML_OP_FLASH_ATTN_EXT with same-sign, large-magnitude V over a long KV. For diffuse
+// attention the un-normalised accumulator sum_i exp(s_i - M) v_i is ~ (visible cells) x |v|, which passes
+// FP16_MAX (65504) long before the normalised output does, so a kernel that accumulates V*softmax in FP16
+// returns inf/NaN here while the reference (the ggml CPU kernel's hybrid accumulator recomputes an
+// overflowed row in FP32) stays finite. V ~ U[v_min, v_max] with v_min > 0; Q, K, mask as the base case.
+struct test_flash_attn_ext_large_v : public test_flash_attn_ext {
+    const float v_min;
+    const float v_max;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",large_v=[" + std::to_string(v_min) + "," + std::to_string(v_max) + "]";
+    }
+
+    test_flash_attn_ext_large_v(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                                ggml_type type_KV, float v_min, float v_max)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV),
+          v_min(v_min), v_max(v_max) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "v") == 0 || (cache_v != nullptr && t == cache_v->view_src)) {
+                // "v" is a view of a 2x cache tensor; init_tensor_uniform writes a view as a contiguous
+                // byte range from its offset, which does not cover every head's visible cells, so the
+                // whole parent cache gets the large range too
+                init_tensor_uniform(t, v_min, v_max);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with the mask and K/V layout of a unified KV cache shared by several sequences
 // (--kv-unified): the cells of each sequence are contiguous runs of `run` cells, interleaved with the runs of
 // the other sequences, and the last `n_free` cells belong to no sequence (released cells). The query tokens
@@ -11375,6 +11409,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+
+    // [AKX-ALL-LB4] opt-in set "fa_cpu_long_ctx" (kept out of the default corpus): the CPU long-context
+    // attention surface the iqk CPU flash-attention wiring must match the reference on. Q38FN-class shape:
+    // D 256, 2 KV heads, GQA 12, decode (nb 1) and verify (nb 5), f16 and q8_0 KV, kv 8k/64k/128k; plus the
+    // large-magnitude-V cases that expose an FP16 V-accumulator overflow. Correctness only:
+    //   TEST_BACKEND_OPS_EXTRA_CASES=fa_cpu_long_ctx test-backend-ops -b CPU -o FLASH_ATTN_EXT
+    if (test_backend_ops_extra_case_set("fa_cpu_long_ctx")) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int64_t kv : {8192, 65536, 131072}) {
+                for (int64_t nb : {1, 5}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                                                                    GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+            for (int64_t nb : {1, 5}) {
+                // ~0.24 x 65536 cells x 24 ~ 3.8e5 un-normalised: past FP16_MAX on a diffuse row
+                test_cases.emplace_back(new test_flash_attn_ext_large_v(256, 256, 2, {12, 1}, 65536, nb, type_KV, 16.0f, 32.0f));
+            }
+        }
+    }
 
     // [FA-INT64-OFFSET] 27B attention shape (D 256, 4 KV heads, GQA 6) at a small KV (512 cells) whose mask
     // rows are 557056 wide (nb31 = 1088 KiB, as for n_kv = 544K). With 2048 queries the last row blocks start

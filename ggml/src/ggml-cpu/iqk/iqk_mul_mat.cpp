@@ -1491,7 +1491,7 @@ void * iqk_repack_k(int int_type_k, int nek0, int nek1, int nek2, int nek3, long
     return result;
 }
 
-#if 0  // iqk port: flash-attn + fused-delta-net NOT vendored (v6 has its own FA); fa/ templates not copied
+#if defined(GGML_IQK_FLASH_ATTENTION)  // AKX-ALL-LB4: fa/ templates vendored (ik_llama d48241315); was "#if 0" in the Stage-1 port
 #include "iqk_flash_impl.h"
 #include "fa/iqk_fa_templates.h"
 
