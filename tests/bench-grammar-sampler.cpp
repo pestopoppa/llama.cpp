@@ -17,8 +17,13 @@
 // almost never valid: every step takes the full-vocab slow path; upper bound).
 // Output: one JSON object per config appended to --out (JSONL; configs already present are skipped, so a cut run resumes).
 //
+// SPEC-GRAM.2 window part (2026-10-22): profile "real" (needs --logits-model FULL_GGUF): the logits at every scripted position come from the
+// real model, teacher-forced through a chat-formatted prompt (one llama_decode per script, logits for every position, cached before timing).
+// The timed sampler step is unchanged; slow_path_frac is then the REAL grammar rejection rate and reject_resample_ms the extra cost of a
+// rejected step (slow-step mean minus fast-step mean). --temp sets the chain temperature (default 0.8 = the SPEC-GRAM.1 chain).
 // Usage: bench-grammar-sampler --model GGUF --label NAME --grammar-file F.gbnf --schema-file S.json --step-ms X [--reps 30] [--out F.jsonl]
 //        [--seed 1] [--max-seconds 900] [--kinds toolcall-eager,toolcall-lazy,schema-eager] [--profiles peaked,random] [--batches 1,5]
+//        [--logits-model FULL_GGUF --threads 24 --temp 0.8]   (adds profile "real")
 #include "llama.h"
 #include "json-schema-to-grammar.h"
 
@@ -31,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -57,6 +63,9 @@ struct bench_args {
     int    reps = 30;           // passes over the script set per config (2 warm-up passes are extra and dropped)
     int    seed = 1;
     double max_seconds = 900.0; // do not start a new config after this much wall time
+    std::string logits_model;   // SPEC-GRAM.2: full model whose real logits drive profile "real" (empty = synthetic profiles only)
+    int    threads = 8;
+    float  temp = 0.8f;
 };
 
 static std::string read_file(const std::string & path) {
@@ -97,14 +106,14 @@ static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::s
 // ---------------------------------------------------------------------------------------------------------------------------------
 // the sampler under test
 
-static llama_sampler * make_chain(uint32_t seed) {
+static llama_sampler * make_chain(uint32_t seed, float temp) {
     llama_sampler_chain_params cp = llama_sampler_chain_default_params();
     cp.no_perf = true;
     llama_sampler * chain = llama_sampler_chain_init(cp);
     llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95f, 1));
     llama_sampler_chain_add(chain, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
     return chain;
 }
@@ -123,10 +132,17 @@ struct step_ctx {
     std::vector<std::vector<float>> pool;   // precomputed synthetic logits, rotated (generating 150k normals per step would dominate the timing)
     std::vector<llama_token_data> cur;
     size_t pool_i = 0;
+    const float * real = nullptr;           // profile "real": the model's logits at the current scripted position (no boost)
 };
 
 static void fill_logits(step_ctx & c, llama_token target, bool peaked) {
     // = common_sampler::set_logits: one pass writing n_vocab llama_token_data
+    if (c.real) {
+        for (int32_t i = 0; i < c.n_vocab; ++i) {
+            c.cur[(size_t) i] = { i, c.real[i], 0.0f };
+        }
+        return;
+    }
     const std::vector<float> & lg = c.pool[c.pool_i % c.pool.size()];
     for (int32_t i = 0; i < c.n_vocab; ++i) {
         c.cur[(size_t) i] = { i, lg[(size_t) i], 0.0f };
@@ -208,24 +224,27 @@ struct config_stats {
     std::vector<double> apply_ms;     // full-vocab grammar apply at the state before each step (grammar runs only)
     std::vector<double> accept_ms;
     std::vector<double> clone_ms;     // B>1: snapshot + free per batch
+    std::vector<double> slow_ms, fast_ms;   // per-step time split by the grammar rejection outcome
     long n_steps = 0, n_slow = 0, n_script_invalid = 0, n_passes_aborted = 0;
 };
 
 // walk the scripted token streams through grammar+chain (grmr may be null = baseline)
 static config_stats run_config(step_ctx & c, const llama_vocab * vocab, const std::string & gbnf, const char * root, bool lazy, bool with_grammar,
-                               const std::vector<std::vector<llama_token>> & scripts, bool peaked, int batch, int reps, uint32_t seed) {
+                               const std::vector<std::vector<llama_token>> & scripts, bool peaked, int batch, int reps, uint32_t seed,
+                               float temp, const std::vector<std::vector<std::vector<float>>> * real) {
     config_stats st;
     llama_sampler * grmr  = with_grammar ? make_grammar(vocab, gbnf, root, lazy) : nullptr;
     if (with_grammar && !grmr) {
         fprintf(stderr, "grammar failed to parse\n");
         exit(3);
     }
-    llama_sampler * chain = make_chain(seed);
+    llama_sampler * chain = make_chain(seed, temp);
 
     const int warmup = 2;
     for (int pass = 0; pass < reps + warmup; ++pass) {
         const bool record = pass >= warmup;
-        for (const auto & script : scripts) {
+        for (size_t si = 0; si < scripts.size(); ++si) {
+            const auto & script = scripts[si];
             if (grmr) { llama_sampler_reset(grmr); }
             llama_sampler_reset(chain);
             size_t i = 0;
@@ -243,6 +262,7 @@ static config_stats run_config(step_ctx & c, const llama_vocab * vocab, const st
                 }
                 for (size_t k = 0; k < nb; ++k) {
                     const llama_token t = script[i + k];
+                    c.real = real ? (*real)[si][i + k].data() : nullptr;
                     if (!script_token_valid(grmr, t)) {
                         if (record) { st.n_script_invalid++; st.n_passes_aborted++; }
                         aborted = true;
@@ -259,7 +279,7 @@ static config_stats run_config(step_ctx & c, const llama_vocab * vocab, const st
                     batch_ms += r.step_ms;
                     if (record) {
                         st.n_steps++;
-                        if (r.slow) { st.n_slow++; }
+                        if (r.slow) { st.n_slow++; st.slow_ms.push_back(r.step_ms); } else { st.fast_ms.push_back(r.step_ms); }
                         st.accept_ms.push_back(r.accept_ms);
                         if (batch == 1) { st.unit_ms.push_back(r.step_ms); }
                     }
@@ -278,6 +298,7 @@ static config_stats run_config(step_ctx & c, const llama_vocab * vocab, const st
             }
         }
     }
+    c.real = nullptr;
     if (grmr) { llama_sampler_free(grmr); }
     llama_sampler_free(chain);
     return st;
@@ -307,6 +328,9 @@ int main(int argc, char ** argv) {
         else if (k == "--reps")         { a.reps = atoi(next().c_str()); }
         else if (k == "--seed")         { a.seed = atoi(next().c_str()); }
         else if (k == "--max-seconds")  { a.max_seconds = atof(next().c_str()); }
+        else if (k == "--logits-model") { a.logits_model = next(); }
+        else if (k == "--threads")      { a.threads = atoi(next().c_str()); }
+        else if (k == "--temp")         { a.temp = (float) atof(next().c_str()); }
         else { fprintf(stderr, "unknown arg %s\n", k.c_str()); return 2; }
     }
     if (a.model.empty() || a.grammar_file.empty()) {
@@ -331,9 +355,10 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_log_set(quiet_log, nullptr);
     llama_model_params mp = llama_model_default_params();
-    mp.vocab_only = true;       // metadata + vocabulary only: no weights are read or mapped
-    mp.use_mmap   = false;
-    llama_model * model = llama_model_load_from_file(a.model.c_str(), mp);
+    const bool want_real = !a.logits_model.empty();
+    mp.vocab_only = !want_real; // synthetic profiles: metadata + vocabulary only, no weights are read or mapped
+    mp.use_mmap   = want_real;  // real profile: the weights are mapped read-only (page cache), never copied
+    llama_model * model = llama_model_load_from_file((want_real ? a.logits_model : a.model).c_str(), mp);
     if (!model) {
         fprintf(stderr, "failed to load vocab from %s\n", a.model.c_str());
         return 3;
@@ -351,7 +376,7 @@ int main(int argc, char ** argv) {
             for (auto & x : v) { x = nd(rng); }
         }
     }
-    printf("vocab %s: n_vocab=%d (vocab-only load)\n", a.label.c_str(), c.n_vocab);
+    printf("vocab %s: n_vocab=%d (%s)\n", a.label.c_str(), c.n_vocab, want_real ? "full load: real logits" : "vocab-only load");
 
     const std::string gbnf_tool = read_file(a.grammar_file);
     std::string gbnf_schema;
@@ -375,6 +400,67 @@ int main(int argc, char ** argv) {
         "{\"name\": \"calculate\", \"arguments\": {}}",
     };
 
+    // ---- SPEC-GRAM.2: real logits per scripted position (teacher-forced, chat-formatted, Qwen chatml with thinking disabled)
+    const std::string sys_tool = "You are an agent. Answer with ONE line in exactly one of these forms: TOOL(\"name\", key=value, ...) to call a tool "
+                                 "(tools: http_get(url, timeout), calculate(expr)); FINAL(\"answer\") to give the final answer; or plain Python code. "
+                                 "You may put one '# comment' line first.";
+    const std::string sys_lazy = "You are a helpful agent. Briefly say what you will do, then call a tool in the form TOOL(\"name\", key=value, ...) "
+                                 "(tools: http_get(url, timeout), calculate(expr)).";
+    const std::string sys_schema = "You are an agent. Reply with a single JSON object {\"name\": <tool>, \"arguments\": {...}} and nothing else. "
+                                   "Tools: http_get(url, timeout), calculate(expr).";
+    const std::vector<std::string> tool_users   = { "Fetch https://example.org/a with a 30 second timeout.", "What is six times seven? Give the final answer.",
+                                                    "Compute 3*7+2 with the calculator.", "Write code that prints 1." };
+    const std::vector<std::string> lazy_users   = { "Can you fetch https://example.org/a for me (30 s timeout)?", "Can you work out 3*7+2?" };
+    const std::vector<std::string> schema_users = { "Fetch https://example.org/a with a 30 second timeout.", "Call the calculator with no arguments." };
+    auto chat_prefix = [](const std::string & sys, const std::string & user) {
+        return "<|im_start|>system\n" + sys + "<|im_end|>\n<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    };
+    std::map<std::string, std::vector<std::vector<std::vector<float>>>> real_logits;   // kind -> script -> position -> n_vocab logits
+    if (want_real) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 4096; cp.n_batch = 4096; cp.n_ubatch = 512; cp.n_seq_max = 1;
+        cp.n_threads = a.threads; cp.n_threads_batch = a.threads; cp.no_perf = true;
+        llama_context * lctx = llama_init_from_model(model, cp);
+        if (!lctx) { fprintf(stderr, "failed to create a context on %s\n", a.logits_model.c_str()); return 3; }
+        const auto t_real = clk::now();
+        for (const std::string & kind : split(a.kinds, ',')) {
+            const bool lazy = kind == "toolcall-lazy", schema = kind == "schema-eager";
+            const auto & texts = schema ? schema_scripts : (lazy ? lazy_scripts : tool_scripts);
+            const auto & users = schema ? schema_users : (lazy ? lazy_users : tool_users);
+            const std::string & sys = schema ? sys_schema : (lazy ? sys_lazy : sys_tool);
+            auto & per_script = real_logits[kind];
+            for (size_t si = 0; si < texts.size(); ++si) {
+                const std::string pre = chat_prefix(sys, users[si % users.size()]);
+                std::vector<llama_token> ptoks((size_t) pre.size() + 16);
+                int32_t np = llama_tokenize(vocab, pre.c_str(), (int32_t) pre.size(), ptoks.data(), (int32_t) ptoks.size(), false, true);
+                if (np < 0) { fprintf(stderr, "prefix tokenize failed\n"); return 3; }
+                ptoks.resize((size_t) np);
+                const std::vector<llama_token> stoks = tokenize(vocab, texts[si]);
+                std::vector<llama_token> all = ptoks;
+                all.insert(all.end(), stoks.begin(), stoks.end());
+                llama_memory_clear(llama_get_memory(lctx), true);
+                llama_batch b = llama_batch_init((int32_t) all.size(), 0, 1);
+                for (size_t i = 0; i < all.size(); ++i) {
+                    b.token[i] = all[i]; b.pos[i] = (llama_pos) i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0;
+                    b.logits[i] = i + 1 >= ptoks.size() ? 1 : 0;          // positions that predict a scripted token
+                }
+                b.n_tokens = (int32_t) all.size();
+                if (llama_decode(lctx, b) != 0) { fprintf(stderr, "llama_decode failed (%s script %zu)\n", kind.c_str(), si); return 3; }
+                std::vector<std::vector<float>> pos;
+                for (size_t k = 0; k < stoks.size(); ++k) {
+                    const float * lg = llama_get_logits_ith(lctx, (int32_t) (ptoks.size() + k - 1));
+                    if (!lg) { fprintf(stderr, "no logits at %zu\n", ptoks.size() + k - 1); return 3; }
+                    pos.emplace_back(lg, lg + c.n_vocab);
+                }
+                llama_batch_free(b);
+                per_script.push_back(std::move(pos));
+                printf("real logits %s script %zu: prefix %zu + script %zu tokens\n", kind.c_str(), si, ptoks.size(), stoks.size());
+            }
+        }
+        printf("real logits computed in %.1f s\n", ms_since(t_real) / 1000.0);
+        llama_free(lctx);
+    }
+
     const auto t_start = clk::now();
     for (const std::string & kind : split(a.kinds, ',')) {
         const bool lazy = kind == "toolcall-lazy";
@@ -388,14 +474,17 @@ int main(int argc, char ** argv) {
         }
         for (const std::string & prof : split(a.profiles, ',')) {
             const bool peaked = prof == "peaked";
+            const bool real = prof == "real";
+            if (real && !real_logits.count(kind)) { printf("skip %s|real: no --logits-model\n", kind.c_str()); continue; }
+            const auto * rl = real ? &real_logits.at(kind) : nullptr;
             for (const std::string & bs : split(a.batches, ',')) {
                 const int batch = atoi(bs.c_str());
                 const std::string key = a.label + "|" + kind + "|" + prof + "|B" + bs;
                 if (done.count(key)) { printf("skip (done) %s\n", key.c_str()); continue; }
                 if (ms_since(t_start) / 1000.0 > a.max_seconds) { printf("time budget reached: not starting %s\n", key.c_str()); continue; }
 
-                const config_stats g = run_config(c, vocab, gbnf, root, lazy, true,  scripts, peaked, batch, a.reps, (uint32_t) a.seed);
-                const config_stats b = run_config(c, vocab, gbnf, root, lazy, false, scripts, peaked, batch, a.reps, (uint32_t) a.seed);
+                const config_stats g = run_config(c, vocab, gbnf, root, lazy, true,  scripts, peaked, batch, a.reps, (uint32_t) a.seed, a.temp, rl);
+                const config_stats b = run_config(c, vocab, gbnf, root, lazy, false, scripts, peaked, batch, a.reps, (uint32_t) a.seed, a.temp, rl);
 
                 const double g_unit = mean(g.unit_ms), b_unit = mean(b.unit_ms);
                 const double per_tok_g = g_unit / (double) batch, per_tok_b = b_unit / (double) batch;
@@ -419,6 +508,10 @@ int main(int argc, char ** argv) {
                 j["baseline_unit_ms"] = { {"mean", b_unit}, {"p50", percentile(b.unit_ms, 0.5)}, {"p95", percentile(b.unit_ms, 0.95)} };
                 j["apply_full_vocab_ms"] = { {"mean", mean(g.apply_ms)}, {"p50", percentile(g.apply_ms, 0.5)}, {"p95", percentile(g.apply_ms, 0.95)} };
                 j["accept_ms_mean"] = mean(g.accept_ms);
+                j["temp"] = a.temp; j["logits_source"] = real ? a.logits_model : std::string("synthetic");
+                j["n_slow"] = g.n_slow;
+                j["reject_resample_ms"] = { {"slow_step_mean", mean(g.slow_ms)}, {"fast_step_mean", mean(g.fast_ms)},
+                                            {"delta", g.slow_ms.empty() ? 0.0 : mean(g.slow_ms) - mean(g.fast_ms)}, {"slow_step_p95", percentile(g.slow_ms, 0.95)} };
                 j["clone_free_ms_mean"] = mean(g.clone_ms);
                 j["grammar_delta_ms_per_token"] = delta_tok;
                 j["decode_step_ms_assumed"] = a.step_ms;
