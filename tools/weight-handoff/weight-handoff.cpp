@@ -45,6 +45,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------------------------- util
@@ -134,6 +135,7 @@ struct args_t {
     // generation (coherence) mode
     bool gen = false;
     std::string gen_arm, prompt_file, gen_out, gen_meta;
+    std::string gen_list, gen_dir;   // batch form: lines "ARM<TAB>ID<TAB>PROMPT_PATH" -> GEN_DIR/ARM/ID.{txt,json}
     int n_gen = 512;
 };
 
@@ -142,7 +144,7 @@ static void usage() {
         "usage: llama-weight-handoff --model-p P.gguf --model-d D.gguf --ref P|R [--model-r R.gguf]\n"
         "         (--passages FILE.bin --out OUT.jsonl [--arms A,B,C,D] [--first N --count N] [--selftest K]\n"
         "          [--selftest-tol X] [--tf-batch 1] [--stop-file F] [--deadline EPOCH] | --check-only | --gen --gen-arm A|B|C|D --prompt-file F\n"
-        "          --gen-out TXT --gen-meta JSON [--n-gen 512])\n"
+        "          --gen-out TXT --gen-meta JSON [--n-gen 512] | --gen --gen-list LIST --gen-dir DIR [--n-gen 512])\n"
         "         [--compat-out JSON] [--n-ctx N] [--n-batch 2048] [--n-ubatch 512] [-t 48] [-tb 96]\n"
         "         [--allow-fused] [--allow-no-iqk]\n");
 }
@@ -185,6 +187,8 @@ static args_t parse_args(int argc, char ** argv) {
         else if (k == "--gen-out")       a.gen_out = val();
         else if (k == "--gen-meta")      a.gen_meta = val();
         else if (k == "--n-gen")         a.n_gen = std::stoi(val());
+        else if (k == "--gen-list")      a.gen_list = val();
+        else if (k == "--gen-dir")       a.gen_dir = val();
         else if (k == "-h" || k == "--help") { usage(); exit(0); }
         else { usage(); die(RC_USAGE, "unknown argument %s", k.c_str()); }
     }
@@ -194,10 +198,11 @@ static args_t parse_args(int argc, char ** argv) {
     if (a.ref == "P" && !a.model_r.empty()) die(RC_USAGE, "--ref P takes no --model-r");
     if (a.tf_batch < 1) die(RC_USAGE, "--tf-batch must be >= 1");
     if (!a.check_only && !a.gen && (a.passages.empty() || a.out.empty())) { usage(); die(RC_USAGE, "--passages and --out are required"); }
-    if (a.gen && (a.gen_arm.size() != 1 || std::string("ABCD").find(a.gen_arm) == std::string::npos ||
+    if (a.gen && a.gen_list.empty() && (a.gen_arm.size() != 1 || std::string("ABCD").find(a.gen_arm) == std::string::npos ||
                   a.prompt_file.empty() || a.gen_out.empty() || a.gen_meta.empty())) {
-        usage(); die(RC_USAGE, "--gen needs --gen-arm A|B|C|D --prompt-file --gen-out --gen-meta");
+        usage(); die(RC_USAGE, "--gen needs --gen-arm A|B|C|D --prompt-file --gen-out --gen-meta, or --gen-list FILE --gen-dir DIR");
     }
+    if (a.gen && !a.gen_list.empty() && a.gen_dir.empty()) die(RC_USAGE, "--gen-list needs --gen-dir");
     return a;
 }
 
@@ -536,67 +541,107 @@ int main(int argc, char ** argv) {
 
     // ------------------------------------------------------------------ generation (coherence) mode
     if (a.gen) {
-        std::ifstream pf(a.prompt_file, std::ios::binary);
-        if (!pf) die(RC_INPUT, "cannot read %s", a.prompt_file.c_str());
-        std::string text((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
-        std::vector<llama_token> toks(text.size() + 16);
-        int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), toks.data(), (int32_t) toks.size(),
-                               llama_vocab_get_add_bos(vocab), false);
-        if (n < 2) die(RC_INPUT, "prompt tokenised to %d tokens", n);
-        toks.resize(n);
-        const char arm = a.gen_arm[0];
-        const bool pre_p = (arm == 'B' || arm == 'C');
-        const bool dec_p = (arm == 'C' || arm == 'D');
-        const uint32_t n_ctx = a.n_ctx > 0 ? a.n_ctx : (uint32_t) (n + a.n_gen + 64);
-        llama_context * cPre = make_ctx(pre_p ? mP : mD, a, n_ctx);
-        llama_context * cDec = (pre_p == dec_p) ? cPre : make_ctx(dec_p ? mP : mD, a, n_ctx);
-        double tp = now_ms();
-        prefill(cPre, toks.data(), n - 1, a.n_batch, "gen prefill");
-        tp = now_ms() - tp;
-        size_t sbytes = 0;
-        if (cDec != cPre) {
-            state_buf_t sb;
-            state_get(cPre, sb, n - 2, "gen handoff");
-            state_set(cDec, sb, "gen handoff");
-            sbytes = sb.size;
+        // one greedy generation: prefill on the arm's prefill weights, hand the state over if the decode weights differ
+        auto gen_one = [&](char arm, const std::string & prompt_path, const std::string & out_txt, const std::string & out_json) {
+            std::ifstream pf(prompt_path, std::ios::binary);
+            if (!pf) die(RC_INPUT, "cannot read %s", prompt_path.c_str());
+            std::string text((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+            std::vector<llama_token> toks(text.size() + 16);
+            int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), toks.data(), (int32_t) toks.size(),
+                                   llama_vocab_get_add_bos(vocab), false);
+            if (n < 2) die(RC_INPUT, "prompt %s tokenised to %d tokens", prompt_path.c_str(), n);
+            toks.resize(n);
+            const bool pre_p = (arm == 'B' || arm == 'C');
+            const bool dec_p = (arm == 'C' || arm == 'D');
+            const uint32_t n_ctx = a.n_ctx > 0 ? a.n_ctx : (uint32_t) (n + a.n_gen + 64);
+            llama_context * cPre = make_ctx(pre_p ? mP : mD, a, n_ctx);
+            llama_context * cDec = (pre_p == dec_p) ? cPre : make_ctx(dec_p ? mP : mD, a, n_ctx);
+            double tp = now_ms();
+            prefill(cPre, toks.data(), n - 1, a.n_batch, "gen prefill");
+            tp = now_ms() - tp;
+            size_t sbytes = 0;
+            if (cDec != cPre) {
+                state_buf_t sb;
+                state_get(cPre, sb, n - 2, "gen handoff");
+                state_set(cDec, sb, "gen handoff");
+                sbytes = sb.size;
+            }
+            std::string out;
+            int gen = 0;
+            bool stopped = false;
+            llama_token cur = toks[n - 1];
+            double td = now_ms();
+            llama_batch b = llama_batch_init(1, 0, 1);
+            for (; gen < a.n_gen; ++gen) {
+                b.n_tokens = 1; b.token[0] = cur; b.pos[0] = n - 1 + gen; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
+                decode_or_die(cDec, b, "gen decode");
+                const float * lg = llama_get_logits_ith(cDec, 0);
+                int best = 0;
+                for (int v = 1; v < nv; ++v) if (lg[v] > lg[best]) best = v;
+                if (!std::isfinite(lg[best])) die(RC_NONFINITE, "non-finite logits at generated token %d (%s)", gen, prompt_path.c_str());
+                if (llama_vocab_is_eog(vocab, best)) { stopped = true; break; }
+                char piece[512];
+                const int k = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, false);
+                if (k > 0) out.append(piece, k);
+                cur = best;
+            }
+            td = now_ms() - td;
+            llama_batch_free(b);
+            if (cDec != cPre) llama_free(cDec);
+            llama_free(cPre);
+            FILE * fo = fopen(out_txt.c_str(), "wb");
+            if (!fo) die(RC_IO, "cannot write %s", out_txt.c_str());
+            fwrite(out.data(), 1, out.size(), fo);
+            fclose(fo);
+            // the .json is written last (tmp + rename): its presence marks the item done (resume key)
+            const std::string tmpj = out_json + ".tmp";
+            FILE * fm = fopen(tmpj.c_str(), "w");
+            if (!fm) die(RC_IO, "cannot write %s", tmpj.c_str());
+            fprintf(fm, "{\"schema\":\"epyc.new13.gen.v1\",\"arm\":\"%c\",\"prompt\":\"%s\",\"prompt_tokens\":%d,\"gen_tokens\":%d,\"finish\":\"%s\","
+                        "\"state_bytes\":%zu,\"prefill_ms\":%s,\"decode_ms\":%s}\n",
+                    arm, json_escape(prompt_path).c_str(), n, gen, stopped ? "stop" : "length", sbytes, fmt_g(tp).c_str(), fmt_g(td).c_str());
+            fclose(fm);
+            if (rename(tmpj.c_str(), out_json.c_str()) != 0) die(RC_IO, "cannot rename %s", tmpj.c_str());
+            logf_("gen arm %c %s: prompt %d tokens, generated %d (%s), prefill %.1f s, decode %.1f s",
+                  arm, prompt_path.c_str(), n, gen, stopped ? "stop" : "length", tp / 1000, td / 1000);
+        };
+
+        int rc = RC_OK;
+        if (a.gen_list.empty()) {
+            gen_one(a.gen_arm[0], a.prompt_file, a.gen_out, a.gen_meta);
+        } else {
+            std::ifstream lf(a.gen_list);
+            if (!lf) die(RC_INPUT, "cannot read %s", a.gen_list.c_str());
+            std::string line;
+            double t_items = 0.0;
+            int n_items = 0;
+            while (std::getline(lf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream ls(line);
+                std::string arm, id, path;
+                if (!std::getline(ls, arm, '\t') || !std::getline(ls, id, '\t') || !std::getline(ls, path)) die(RC_INPUT, "bad gen-list line: %s", line.c_str());
+                if (arm.size() != 1 || std::string("ABCD").find(arm) == std::string::npos) die(RC_INPUT, "bad arm in gen-list: %s", arm.c_str());
+                const std::string dir = a.gen_dir + "/" + arm;
+                const std::string oj = dir + "/" + id + ".json", ot = dir + "/" + id + ".txt";
+                if (access(oj.c_str(), F_OK) == 0) { logf_("gen %s/%s done (resume skip)", arm.c_str(), id.c_str()); continue; }
+                if (!a.stop_file.empty() && access(a.stop_file.c_str(), F_OK) == 0) {
+                    logf_("stop file present: stopping before gen %s/%s", arm.c_str(), id.c_str()); rc = RC_STOPPED; break;
+                }
+                const double est_s = n_items ? 1.3 * t_items / n_items / 1000.0 : 300.0;
+                if (a.deadline > 0 && (double) time(nullptr) + est_s > (double) a.deadline) {
+                    logf_("deadline: stopping before gen %s/%s", arm.c_str(), id.c_str()); rc = RC_STOPPED; break;
+                }
+                mkdir(a.gen_dir.c_str(), 0755);
+                mkdir(dir.c_str(), 0755);
+                const double t = now_ms();
+                gen_one(arm[0], path, ot, oj);
+                t_items += now_ms() - t;
+                ++n_items;
+            }
         }
-        std::string out;
-        int gen = 0;
-        bool stopped = false;
-        llama_token cur = toks[n - 1];
-        double td = now_ms();
-        llama_batch b = llama_batch_init(1, 0, 1);
-        for (; gen < a.n_gen; ++gen) {
-            b.n_tokens = 1; b.token[0] = cur; b.pos[0] = n - 1 + gen; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
-            decode_or_die(cDec, b, "gen decode");
-            const float * lg = llama_get_logits_ith(cDec, 0);
-            int best = 0;
-            for (int v = 1; v < nv; ++v) if (lg[v] > lg[best]) best = v;
-            if (!std::isfinite(lg[best])) die(RC_NONFINITE, "non-finite logits at generated token %d", gen);
-            if (llama_vocab_is_eog(vocab, best)) { stopped = true; break; }
-            char piece[512];
-            const int k = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, false);
-            if (k > 0) out.append(piece, k);
-            cur = best;
-        }
-        td = now_ms() - td;
-        llama_batch_free(b);
-        FILE * fo = fopen(a.gen_out.c_str(), "wb");
-        if (!fo) die(RC_IO, "cannot write %s", a.gen_out.c_str());
-        fwrite(out.data(), 1, out.size(), fo);
-        fclose(fo);
-        FILE * fm = fopen(a.gen_meta.c_str(), "w");
-        if (!fm) die(RC_IO, "cannot write %s", a.gen_meta.c_str());
-        fprintf(fm, "{\"schema\":\"epyc.new13.gen.v1\",\"arm\":\"%c\",\"prompt_tokens\":%d,\"gen_tokens\":%d,\"finish\":\"%s\","
-                    "\"state_bytes\":%zu,\"prefill_ms\":%s,\"decode_ms\":%s}\n",
-                arm, n, gen, stopped ? "stop" : "length", sbytes, fmt_g(tp).c_str(), fmt_g(td).c_str());
-        fclose(fm);
-        logf_("gen arm %c: prompt %d tokens, generated %d (%s)", arm, n, gen, stopped ? "stop" : "length");
-        if (cDec != cPre) llama_free(cDec);
-        llama_free(cPre);
         llama_model_free(mP); llama_model_free(mD); if (mR) llama_model_free(mR);
         llama_backend_free();
-        return RC_OK;
+        return rc;
     }
 
     if (a.check_only) {
