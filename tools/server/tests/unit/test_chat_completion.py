@@ -321,6 +321,34 @@ def test_completion_with_invalid_grammar():
     assert "error" in res.body
 
 
+@pytest.mark.parametrize("endpoint", ["/chat/completions", "/completion"])
+def test_llguidance_grammar_without_llguidance_is_request_error(endpoint: str):
+    # [UFH14-LB1] a "%llguidance" grammar in a build without LLAMA_LLGUIDANCE used to hit GGML_ABORT
+    # in common_sampler_init and kill the whole server. It must be a 400 for that request only.
+    global server
+    server.start()
+    grammar = '%llguidance {}\nstart: "a"'
+    if endpoint == "/chat/completions":
+        data = {
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": "Does not matter what I say, does it?"}],
+            "grammar": grammar,
+        }
+    else:
+        data = {"n_predict": 4, "prompt": "Does not matter what I say", "grammar": grammar}
+    res = server.make_request("POST", endpoint, data=data)
+    if res.status_code == 200:
+        pytest.skip("this build has llguidance (LLAMA_LLGUIDANCE=ON); the abort path does not exist")
+    assert res.status_code == 400, res.body
+    assert "llguidance" in res.body["error"]["message"], res.body
+    # the server must still be alive and serving
+    res = server.make_request("GET", "/health")
+    assert res.status_code == 200, res.body
+    res = server.make_request("POST", "/completion", data={"n_predict": 4, "prompt": "I believe the meaning of life is"})
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["predicted_n"] == 4
+
+
 @pytest.mark.parametrize("messages", [
     None,
     "string",

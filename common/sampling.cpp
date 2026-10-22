@@ -208,7 +208,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 #ifdef LLAMA_USE_LLGUIDANCE
         grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
 #else
-        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
+        // [UFH14-LB1] a request-supplied grammar must never kill the process: throw instead of
+        // GGML_ABORT so the server's launch_slot catch turns it into a 400 invalid_request_error
+        // ("Failed to initialize samplers: ...") and the server keeps serving.
+        throw std::runtime_error("llguidance grammar (\"%llguidance\" prefix) requested, but this build has no "
+                                 "llguidance support (cmake -DLLAMA_LLGUIDANCE=ON)");
 #endif // LLAMA_USE_LLGUIDANCE
     } else {
         std::vector<std::string> trigger_patterns;
