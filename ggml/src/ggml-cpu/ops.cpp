@@ -10008,6 +10008,11 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
     if (params->use_ref || !ggml_iqk_fa_enabled()) {
         return false;
     }
+#if !defined(__AVX2__)
+    // the NEON load_apply_mask_and_scale in iqk/fa/ still reads the mask as binary {0, -inf};
+    // only the x86 path applies the additive mask of GGML_OP_FLASH_ATTN_EXT: ggml kernel
+    return false;
+#endif
 
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
