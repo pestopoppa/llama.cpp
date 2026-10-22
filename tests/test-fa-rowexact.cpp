@@ -29,14 +29,30 @@
 //   finite    no -inf anywhere: an ALiBi-like ramp from 0 (newest cell) to -16 (oldest) plus noise
 //             (a reader that treats any non-zero mask value as masked sees every cell masked)
 //   deadrow   additive causal rows, except row 0 is -inf everywhere (expected output: zeros)
+//   emptytg   every row -inf everywhere (AKX-ALL-LB4.7): each N=1 call is an empty TG row; at n_kv > 256
+//             the iqk runtime range trim narrows nek1 to 0 (ik_llama master aborts there, #1923), at
+//             n_kv 256 there is no trim and the row goes through a split-KV combine with every partial
+//             fully masked. Expected output: zeros, equal to the mainline reference
+//
+// Every candidate output is NaN-filled before its compute (AKX-ALL-LB4.7), so a kernel that leaves a
+// row unwritten is finite=0, never a pass on stale memory. --stale-control is the positive control:
+// the candidates stay NaN-filled and are never computed, so every RESULT line must read
+// "control=stale ... finite=0 ... verdict=FAIL" (exit 1).
 //
 // Shape: the Q38FN-class CPU long-context attention (D 256, 2 KV heads, GQA 12). Inputs deterministic.
+// The iqk split-KV combines run at N=1 only. --kv-heads 1 reaches the nek2 == 1 ones: at n_kv 256
+// (8 KV chunks, GQA 12) P1 with 1-2 threads and P2 with 4, 8 or 16; the default 2 reaches the GQA one
+// (P3) while 2*n_kv >= 32*threads. So deadrow or emptytg at n_kv 256 with FA_ROWEXACT_THREADS <= 16
+// sends a fully masked N=1 row through a split-KV combine (no range trim below n_kv 288).
 //
-// usage: test-fa-rowexact [--iqk-fa 0|1] [--masks k1,k2,..] [--tol X] [--ref-vkq f32|default] [n_kv ...]
-//        (default n_kv: 8192 65536; --iqk-fa unset = the build default, on when compiled in)
+// usage: test-fa-rowexact [--iqk-fa 0|1] [--masks k1,k2,..] [--tol X] [--ref-vkq f32|default]
+//                         [--kv-heads N] [--gqa N] [--stale-control] [n_kv ...]
+//        (default n_kv: 8192 65536; --iqk-fa unset = the build default, on when compiled in;
+//         default masks: causal,additive,ragged,finite,deadrow; n_kv a multiple of 32, >= 256)
 //   env  FA_ROWEXACT_THREADS (default 8), FA_ROWEXACT_TYPES=f16,q8_0 (default both)
-// One RESULT line per (type, n_kv, mask). Exit 0 iff every case is PASS, 1 if any FAIL, 2 on a setup
-// error (bad argument, --iqk-fa 1 on a build without the iqk kernel, allocation or compute failure).
+// One RESULT line per (type, n_kv, mask): types x n_kv x masks lines. Exit 0 iff every case is PASS,
+// 1 if any FAIL, 2 on a setup error (bad argument, --iqk-fa 1 on a build without the iqk kernel,
+// allocation or compute failure).
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -53,9 +69,9 @@
 #include <vector>
 
 static constexpr int64_t D      = 256;
-static constexpr int64_t NH_KV  = 2;
-static constexpr int64_t GQA    = 12;
-static constexpr int64_t NH_Q   = NH_KV * GQA;
+static int64_t           NH_KV  = 2;            // --kv-heads (AKX-ALL-LB4.7: 1 reaches the nek2 == 1 iqk paths)
+static int64_t           GQA    = 12;           // --gqa
+static int64_t           NH_Q   = NH_KV * GQA;  // set again after the arguments are parsed
 static constexpr int64_t NQ     = 5;
 static constexpr int64_t KV_BLK = 32;
 
@@ -104,6 +120,9 @@ static float mask_value(const std::string & kind, int64_t n_kv, int64_t r, int64
         if (r == 0) { return -INFINITY; }
         return j <= causal_last ? rnd(-1.0f, 1.0f) : -INFINITY;
     }
+    if (kind == "emptytg") {
+        return -INFINITY;
+    }
     if (kind == "ragged") {
         const int64_t nb   = n_kv / KV_BLK;
         // row 0 sees every cell; rows 1-4 end 53, 79, 131, 157 cells before the end (blocks nb-2, nb-3, nb-5, nb-5)
@@ -119,7 +138,7 @@ static float mask_value(const std::string & kind, int64_t n_kv, int64_t r, int64
     if (kind == "finite") {
         return -16.0f * (float) (n_kv - 1 - j) / (float) n_kv + rnd(-0.5f, 0.5f);
     }
-    fprintf(stderr, "unknown mask kind '%s' (causal, additive, ragged, finite, deadrow)\n", kind.c_str());
+    fprintf(stderr, "unknown mask kind '%s' (causal, additive, ragged, finite, deadrow, emptytg)\n", kind.c_str());
     exit(2);
 }
 
@@ -152,6 +171,15 @@ struct err_acc {
     double nmse() const { return den > 0.0 ? num / den : (num > 0.0 ? INFINITY : 0.0); }
 };
 
+// AKX-ALL-LB4.7: every candidate output starts as NaN, so a kernel that skips writing a row (stale
+// dst) shows up as finite=0 instead of passing on whatever the allocator left there
+static void nan_fill(ggml_tensor * t) {
+    float * x = (float *) t->data;
+    for (int64_t i = 0; i < ggml_nelements(t); ++i) { x[i] = NAN; }
+}
+
+static bool g_stale_control = false; // --stale-control: candidates are NaN-filled and never computed
+
 // returns 0 PASS, 1 FAIL, 2 setup error
 static int run_case(ggml_type type_kv, int64_t n_kv, const std::string & mkind, int n_threads, double tol) {
     const size_t kv_bytes = ggml_row_size(type_kv, D) * n_kv * NH_KV;
@@ -181,8 +209,9 @@ static int run_case(ggml_type type_kv, int64_t n_kv, const std::string & mkind, 
     // candidate N=5
     ggml_tensor * out5 = ggml_flash_attn_ext(ctx, q, k, v, m5, scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out5, GGML_PREC_F32);
+    nan_fill(out5);
     uint64_t c0 = iqk_calls();
-    if (!compute(ctx, out5, n_threads, false)) { ggml_free(ctx); return 2; }
+    if (!g_stale_control && !compute(ctx, out5, n_threads, false)) { ggml_free(ctx); return 2; }
     uint64_t dc = iqk_calls() - c0;
     iqk_n += dc;
     if ((dc > 0) != iqk_expected) { iqk_count_ok = false; }
@@ -209,8 +238,9 @@ static int run_case(ggml_type type_kv, int64_t n_kv, const std::string & mkind, 
         memcpy(mr->data, (char *) m5->data + r*m5->nb[1], n_kv*sizeof(ggml_fp16_t));
         ggml_tensor * out1 = ggml_flash_attn_ext(ctx, qr, k, v, mr, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out1, GGML_PREC_F32);
+        nan_fill(out1);
         c0 = iqk_calls();
-        if (!compute(ctx, out1, n_threads, false)) { ggml_free(ctx); return 2; }
+        if (!g_stale_control && !compute(ctx, out1, n_threads, false)) { ggml_free(ctx); return 2; }
         dc = iqk_calls() - c0;
         iqk_n += dc;
         if ((dc > 0) != iqk_expected) { iqk_count_ok = false; }
@@ -300,9 +330,10 @@ static int run_case(ggml_type type_kv, int64_t n_kv, const std::string & mkind, 
     const bool finite = e_c5_ref.finite && c1_finite && e_c5_or.finite && e_ref_or.finite;
     const bool pass   = finite && iqk_count_ok && !ref_used_iqk &&
                         e_c5_ref.nmse() <= tol && c1_ref_nmse_max <= tol && e_c5_or.nmse() <= tol;
-    printf("RESULT type=%s n_kv=%lld mask=%s D=%lld kv_heads=%lld gqa=%lld N=%lld iqk=%s iqk_calls=%llu iqk_count_ok=%d ref_used_iqk=%d "
+    printf("RESULT %stype=%s n_kv=%lld mask=%s D=%lld kv_heads=%lld gqa=%lld N=%lld iqk=%s iqk_calls=%llu iqk_count_ok=%d ref_used_iqk=%d "
            "nmse_cand_ref=%.3e max_abs_cand_ref=%.3e nmse_cand1_ref_max=%.3e nmse_cand_oracle=%.3e nmse_ref_oracle=%.3e "
            "rows_differing=%d max_abs_n1_n5=%.3e rowexact=%s finite=%d tol=%.1e verdict=%s\n",
+           g_stale_control ? "control=stale " : "",
            ggml_type_name(type_kv), (long long) n_kv, mkind.c_str(), (long long) D, (long long) NH_KV, (long long) GQA, (long long) NQ,
            iqk_expected ? "on" : "off", (unsigned long long) iqk_n, (int) iqk_count_ok, (int) ref_used_iqk,
            e_c5_ref.nmse(), e_c5_ref.max_abs, c1_ref_nmse_max, e_c5_or.nmse(), e_ref_or.nmse(),
@@ -344,6 +375,14 @@ int main(int argc, char ** argv) {
         } else if (a == "--masks") {
             masks = split_csv(next());
             for (const auto & m : masks) { mask_value(m, 4*KV_BLK, 0, 0); } // validates the names (exits 2)
+        } else if (a == "--kv-heads") {
+            NH_KV = atoll(next().c_str());
+            if (NH_KV < 1) { fprintf(stderr, "--kv-heads expects a positive integer\n"); return 2; }
+        } else if (a == "--gqa") {
+            GQA = atoll(next().c_str());
+            if (GQA < 1) { fprintf(stderr, "--gqa expects a positive integer\n"); return 2; }
+        } else if (a == "--stale-control") {
+            g_stale_control = true;
         } else if (a == "--tol") {
             tol = atof(next().c_str());
         } else if (a == "--ref-vkq") {
@@ -358,6 +397,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (kvs.empty()) { kvs = { 8192, 65536 }; }
+    NH_Q = NH_KV * GQA;
     g_state = 0x9E3779B97F4A7C15ull; // the --masks validation above consumed random numbers
 
     // The ggml kernel reads GGML_FA_VKQ_F32 once, at its first FLASH_ATTN_EXT: set it before any compute.
@@ -377,8 +417,9 @@ int main(int argc, char ** argv) {
     std::string types = "f16,q8_0";
     if (const char * e = getenv("FA_ROWEXACT_TYPES")) { types = e; }
 
-    printf("test-fa-rowexact: threads=%d iqk=%s GGML_FA_VKQ_F32=%s GGML_FA_SPLIT_KV=%s tol=%.1e masks=",
-           n_threads, !g_set_iqk ? "not_compiled" : (iqk_on() ? "on" : "off"),
+    printf("test-fa-rowexact: threads=%d iqk=%s kv_heads=%lld gqa=%lld%s GGML_FA_VKQ_F32=%s GGML_FA_SPLIT_KV=%s tol=%.1e masks=",
+           n_threads, !g_set_iqk ? "not_compiled" : (iqk_on() ? "on" : "off"), (long long) NH_KV, (long long) GQA,
+           g_stale_control ? " control=stale" : "",
            getenv("GGML_FA_VKQ_F32") ? getenv("GGML_FA_VKQ_F32") : "(unset)",
            getenv("GGML_FA_SPLIT_KV") ? getenv("GGML_FA_SPLIT_KV") : "(unset)", tol);
     for (size_t i = 0; i < masks.size(); ++i) { printf("%s%s", i ? "," : "", masks[i].c_str()); }
