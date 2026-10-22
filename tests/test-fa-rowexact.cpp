@@ -33,11 +33,25 @@
 //             the iqk runtime range trim narrows nek1 to 0 (ik_llama master aborts there, #1923), at
 //             n_kv 256 there is no trim and the row goes through a split-KV combine with every partial
 //             fully masked. Expected output: zeros, equal to the mainline reference
+//   swa       sliding window (AKX-ALL-LB4.8): row r sees the W cells ending at its causal edge,
+//             (n_kv - N + r - W, n_kv - N + r], additive values, -inf elsewhere. "swa" is W = n_kv/2;
+//             "swa:W" sets W (e.g. swa:7000). W <= 3/4 n_kv: the iqk N=1 range trim cuts both ends
+//             (trailing trim). W > 3/4 n_kv (n_kv 8192, swa:7000): no trim, so the N=1 split-KV path
+//             sees the ~1188-cell masked prefix: whole leading chunks fully masked once the chunks are
+//             shorter (default heads: 16+ threads, 1024-cell chunks), masked leading k-blocks inside
+//             the first chunk below that. At N=5 with q8_0 K, a thread that owns all 5 rows of a head
+//             (threads dividing the Q head count: 1, 4, 8 at 24 heads) runs the q_step 4 tile through
+//             the q_step >= 4 Q8_0 repack branch (the ik_llama #1205 failure class)
 //
 // Every candidate output is NaN-filled before its compute (AKX-ALL-LB4.7), so a kernel that leaves a
 // row unwritten is finite=0, never a pass on stale memory. --stale-control is the positive control:
 // the candidates stay NaN-filled and are never computed, so every RESULT line must read
 // "control=stale ... finite=0 ... verdict=FAIL" (exit 1).
+//
+// Row-exactness is not an iqk property (AKX-ALL-LB4.8): the iqk split-KV paths run only at
+// neq1 == 1, and their partition depends on the thread count and on the mask-driven range trim, so
+// N=1 vs N=5 bytes differ by design. rowexact=NOT_ROW_EXACT is the EXPECTED iqk verdict, and the fold
+// gate is the tolerance route against the use_ref reference and the oracle, never byte identity.
 //
 // Shape: the Q38FN-class CPU long-context attention (D 256, 2 KV heads, GQA 12). Inputs deterministic.
 // The iqk split-KV combines run at N=1 only. --kv-heads 1 reaches the nek2 == 1 ones: at n_kv 256
@@ -123,6 +137,18 @@ static float mask_value(const std::string & kind, int64_t n_kv, int64_t r, int64
     if (kind == "emptytg") {
         return -INFINITY;
     }
+    if (kind == "swa" || kind.rfind("swa:", 0) == 0) {
+        int64_t w = n_kv / 2;
+        if (kind != "swa") {
+            char * end = nullptr;
+            w = strtoll(kind.c_str() + 4, &end, 10);
+            if (end == kind.c_str() + 4 || *end != '\0' || w < 1) {
+                fprintf(stderr, "mask kind '%s': the window must be a positive integer (swa:W)\n", kind.c_str());
+                exit(2);
+            }
+        }
+        return j <= causal_last && j > causal_last - w ? rnd(-1.0f, 1.0f) : -INFINITY;
+    }
     if (kind == "ragged") {
         const int64_t nb   = n_kv / KV_BLK;
         // row 0 sees every cell; rows 1-4 end 53, 79, 131, 157 cells before the end (blocks nb-2, nb-3, nb-5, nb-5)
@@ -138,7 +164,7 @@ static float mask_value(const std::string & kind, int64_t n_kv, int64_t r, int64
     if (kind == "finite") {
         return -16.0f * (float) (n_kv - 1 - j) / (float) n_kv + rnd(-0.5f, 0.5f);
     }
-    fprintf(stderr, "unknown mask kind '%s' (causal, additive, ragged, finite, deadrow, emptytg)\n", kind.c_str());
+    fprintf(stderr, "unknown mask kind '%s' (causal, additive, ragged, finite, deadrow, emptytg, swa, swa:W)\n", kind.c_str());
     exit(2);
 }
 
