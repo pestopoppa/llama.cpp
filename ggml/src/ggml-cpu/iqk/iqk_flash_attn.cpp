@@ -202,12 +202,15 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         // Given that the mask is the same for all layers, ideally we should determine the
         // cache bounds once, and reuse for the whole graph. But even with this simple hack
         // we get non-negligible performance gains for SWA models and long context.
+        // AKX-ALL-LB4: the mask is additive, so a cell is masked only when it is -inf (fp16 0xfc00);
+        // ik_llama trimmed every cell != +0.0, dropping visible cells of a non-binary mask
+        constexpr uint16_t kMaskNegInf = 0xfc00;
         auto umask = (const uint16_t *)mask;
         for (; first_k < last_k; ++first_k) {
-            if (umask[first_k] == 0) break;
+            if (umask[first_k] != kMaskNegInf) break;
         }
         for (; last_k > first_k; --last_k) {
-            if (umask[last_k-1] == 0) break;
+            if (umask[last_k-1] != kMaskNegInf) break;
         }
         int non = 32*((last_k - first_k + 31)/32);
         first_k = std::max(0, last_k - non);

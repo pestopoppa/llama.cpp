@@ -869,51 +869,36 @@ struct FlashMS {
         }
         return F16::reduce_max<k_step>(vk);
     }
-    static inline __m256 apply_mask(int l, const char * mask, __m256 val, [[maybe_unused]] __m256 vinf) {
-        return _mm256_add_ps(val, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)mask+l)));
-        //auto m128 = _mm_loadu_si128((const __m128i *)mask+l);
-        //m128 = _mm_cmpeq_epi16(m128, _mm_setzero_si128());
-        //auto m256 = _mm256_cvtepi16_epi32(m128);
-        //auto mf = _mm256_castsi256_ps(_mm256_or_si256(m256, _mm256_slli_epi32(m256, 16)));
-        //return _mm256_or_ps(_mm256_and_ps(mf, val), _mm256_andnot_ps(mf, vinf));
+    // AKX-ALL-LB4 iqk port: the GGML_OP_FLASH_ATTN_EXT mask is ADDITIVE, applied after scale and
+    // softcap: s = softcap*tanh(scale*kq) + mask (ggml-cpu ops.cpp; the ggml kernel skips a cell whose
+    // mask is -inf). ik_llama treated it as binary {0, -inf}: on AVX512 (HAVE_FANCY_SIMD) any mask
+    // value != 0 masked the cell, and on AVX2 the mask was added BEFORE the scale. A finite non-zero
+    // mask value (an additive mask such as test-backend-ops' random [-1,1] one) was turned into -inf,
+    // every row came out fully masked and FA returned zeros. Here a -inf mask cell gives -inf
+    // whatever kq holds (garbage in masked K cells cannot leak); any other value is added after
+    // scale/softcap. Binary {0, -inf} masks give the same scores as before.
+    static inline __m256 apply_mask(int l, const char * mask, __m256 val, __m256 vinf) {
+        auto vm = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)mask+l));
+        return _mm256_blendv_ps(_mm256_add_ps(val, vm), vinf, _mm256_cmp_ps(vm, vinf, _CMP_EQ_OQ));
     }
 #ifdef __AVX512F__
     static inline __m512 apply_mask(int l, const char * mask, __m512 val, __m512 vinf) {
-        auto m256 = _mm256_loadu_si256((const __m256i *)mask+l);
-        m256 = _mm256_cmpeq_epi16(m256, _mm256_setzero_si256());
-        auto m512 = _mm512_cvtepi16_epi32(m256);
-        auto mf = _mm512_castsi512_ps(_mm512_or_si512(m512, _mm512_slli_epi32(m512, 16)));
-        return _mm512_or_ps(_mm512_and_ps(mf, val), _mm512_andnot_ps(mf, vinf));
+        auto vm = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)mask+l));
+        return _mm512_mask_blend_ps(_mm512_cmp_ps_mask(vm, vinf, _CMP_EQ_OQ), _mm512_add_ps(val, vm), vinf);
     }
 #endif
     inline float load_apply_mask_and_scale(int j, F16::Data * vk, const char * mask) {
-#ifdef HAVE_FANCY_SIMD
-        auto vzero = _mm256_set1_epi16(0);
-        auto vinf  = _mm512_set1_ps(-INFINITY);
+        auto vinf = F16::set1(-INFINITY);
         if (softcap <= 0) {
             for (int l = 0; l < k_step/F16::block_size; ++l) {
-                auto m16 = _mm256_cmpeq_epi16_mask(_mm256_loadu_si256((const __m256i *)mask + l), vzero);
-                vk[l] = _mm512_mask_mul_ps(vinf, m16, vscale, F16::load(cache + k_step*j + F16::block_size*l));
+                vk[l] = apply_mask(l, mask, F16::mul(vscale, F16::load(cache + k_step*j + F16::block_size*l)), vinf);
             }
         } else {
             auto v_softcap = F16::set1(softcap);
             for (int l = 0; l < k_step/F16::block_size; ++l) {
-                auto m16 = _mm256_cmpeq_epi16_mask(_mm256_loadu_si256((const __m256i *)mask + l), vzero);
-                vk[l] = _mm512_mask_mul_ps(vinf, m16, v_softcap, v_tanh(F16::mul(vscale, F16::load(cache + k_step*j + F16::block_size*l))));
+                vk[l] = apply_mask(l, mask, F16::mul(v_softcap, v_tanh(F16::mul(vscale, F16::load(cache + k_step*j + F16::block_size*l)))), vinf);
             }
         }
-#else
-        auto vinf  = F16::set1(-INFINITY);
-        for (int l = 0; l < k_step/F16::block_size; ++l) {
-            vk[l] = apply_mask(l, mask, F16::load(cache + k_step*j + F16::block_size*l), vinf);
-        }
-        if (softcap <= 0) {
-            for (int l = 0; l < k_step/F16::block_size; ++l) vk[l] = F16::mul(vscale, vk[l]);
-        } else {
-            auto v_softcap = F16::set1(softcap);
-            for (int l = 0; l < k_step/F16::block_size; ++l) vk[l] = F16::mul(v_softcap, v_tanh(F16::mul(vscale, vk[l])));
-        }
-#endif
         return F16::reduce_max<k_step>(vk);
     }
 #endif
@@ -1344,6 +1329,26 @@ struct FlashQKfp32 {
     }
 };
 
+// AKX-ALL-LB4 iqk port: how many KV cells a q_step tile must visit. Trailing k_step blocks whose
+// mask is -inf (fp16 0xfc00) in EVERY row of the tile are skipped. ik_llama tested a single cell
+// (the block's first cell in the tile's last row) against +0.0, which only holds for a causal
+// {0, -inf} mask: with an additive mask (any finite non-zero value) or a non-causal one every block
+// looked masked, no KV block was visited, S stayed 0 and the row came out zero (or hit S > 0).
+template <int q_step, int k_step>
+static inline int fa_kv_extent(const char * mask, int stride_m, int nk1) {
+    constexpr uint16_t kMaskNegInf = 0xfc00;
+    int ik = nk1;
+    for (; ik >= k_step; ik -= k_step) {
+        for (int j = 0; j < q_step; ++j) {
+            auto m = (const uint16_t *)(mask + j*stride_m) + (ik - k_step);
+            for (int l = 0; l < k_step; ++l) {
+                if (m[l] != kMaskNegInf) return ik;
+            }
+        }
+    }
+    return ik;
+}
+
 template <int Dk, int Dv, int q_step, int k_step, typename KHelper, typename VHelper, typename KQHelper>
 void compute_helper(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, int stride_m, int stride_qkv,
         FlashMS<q_step, k_step>& fms,
@@ -1362,10 +1367,7 @@ void compute_helper(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, in
         KQHelper::convert(q_step, stride_q, q, q_f16);
 #endif
         auto mr = mask;
-        auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
-        int ik = nk1 - k_step;
-        for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
-        ik += k_step;
+        const int ik = fa_kv_extent<q_step, k_step>(mr, stride_m, nk1);
         for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #ifdef __aarch64__
             KQHelper::multiply_mask_kq(kh, Dk, stride_m, q_f16, mr, fms);
@@ -1427,10 +1429,7 @@ void compute_helper_q(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, 
             auto q8r = (typename HelperQ80R8<Dk>::block_q8 *)qptr;
             HelperQ80::convert<Dk>(q_step, stride_q, q, q8r);
             auto mr = mask;
-            auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
-            int ik = nk1 - k_step;
-            for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
-            ik += k_step;
+            const int ik = fa_kv_extent<q_step, k_step>(mr, stride_m, nk1);
             for (int k1 = 0; k1 < ik/k_step; ++k1) {
                 HelperQ80R8<Dk>::repack(k_step, kh.block, kh.stride, q8r8);
                 KQHelper::mul_mask_kq(khr8, stride_m, q8r, mr, fms);
@@ -1458,10 +1457,7 @@ void compute_helper_q(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, 
         perf.accum_nolock(0, t1);
 #endif
         auto mr = mask;
-        auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
-        int ik = nk1 - k_step;
-        for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
-        ik += k_step;
+        const int ik = fa_kv_extent<q_step, k_step>(mr, stride_m, nk1);
         for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #if FA_TIMING
             t1 = Perf::cur_time();
@@ -1980,10 +1976,7 @@ struct FlashAttnBF16 {
             perf.accum_nolock(0, t1);
 #endif
             auto mr = mask;
-            auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
-            int ik = nk1 - k_step;
-            for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
-            ik += k_step;
+            const int ik = fa_kv_extent<q_step, k_step>(mr, stride_m, nk1);
             for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #if FA_TIMING
                 //t1 = Perf::cur_time();
