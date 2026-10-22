@@ -200,6 +200,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     lparams.no_perf = params.no_perf;
 
+    // SPEC-RNG.1: the switch is argv/request (params.rng_poskey); LLAMA_RNG_POSKEY=0 only forces it off (diagnostic kill switch)
+    if (params.rng_poskey && llama_rng_poskey_killed()) {
+        LOG_WRN("%s: LLAMA_RNG_POSKEY=0 kill switch set, position-keyed RNG disabled for this sampler\n", __func__);
+        params.rng_poskey = false;
+    }
+
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
@@ -383,7 +389,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+            samplers.push_back(params.rng_poskey ? llama_sampler_init_dist_poskey(params.seed) : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -407,6 +413,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     if (rbudget && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
+    if (params.rng_poskey && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling does not implement the position-keyed RNG (rng_poskey), disabling backend sampling\n", __func__);
 
         params.backend_sampling = false;
     }
@@ -766,7 +778,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         }
 
         const uint64_t spec_pos = gsmpl->n_accepted; // absolute position of the token being decided
-        const bool poskey = llama_rng_poskey_enabled();
+        const bool poskey = gsmpl->params.rng_poskey;
         const float u_acc = poskey
             ? (float) llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_ACC)
             : 0.0f;

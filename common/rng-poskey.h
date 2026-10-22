@@ -2,7 +2,11 @@
 // SPEC-RNG.1 (experimental): position-keyed counter RNG.
 // u = SplitMix64-finalizer(seed, absolute position, role) -> uniform double in [0,1).
 // Stateless: the draw for position P is identical regardless of how many other draws happened
-// before it (np 1 vs 4, speculative depth 0 vs 3). Enabled only when LLAMA_RNG_POSKEY=1.
+// before it (np 1 vs 4, speculative depth 0 vs 3).
+//
+// ONE-champion rule: the feature is selected by ARGV (--rng-poskey on|off) or per REQUEST ("rng_poskey": true), never by the
+// environment. LLAMA_RNG_POSKEY=0 is kept only as a diagnostic KILL SWITCH: it forces the position-keyed path off wherever
+// a sampler is constructed; no environment value can turn it on.
 #include <cstdint>
 #include <cstdlib>
 
@@ -26,7 +30,9 @@ static inline double llama_rng_poskey_u01(uint64_t seed, uint64_t pos, uint64_t 
     return (double) (h >> 11) * (1.0 / 9007199254740992.0); // 53 bits -> [0,1)
 }
 
-static inline bool llama_rng_poskey_enabled() {
-    static const bool v = [] { const char * e = std::getenv("LLAMA_RNG_POSKEY"); return e && e[0] == '1'; }();
-    return v;
+// true when the diagnostic kill switch LLAMA_RNG_POSKEY=0 is set. Read at sampler CONSTRUCTION only (never per draw), uncached
+// so a test can set/unset it between constructions.
+static inline bool llama_rng_poskey_killed() {
+    const char * e = std::getenv("LLAMA_RNG_POSKEY");
+    return e && e[0] == '0';
 }

@@ -114,6 +114,7 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     no_cache_idle_slots: bool = False
+    rng_poskey: str | None = None  # SPEC-RNG.1: --rng-poskey on|off
     log_path: str | None = None
     prefill_budget_decoding: int | None = None
     prefill_budget_target_ms: int | None = None
@@ -279,6 +280,8 @@ class ServerProcess:
             server_args.extend(["--prefill-budget-target-ms", self.prefill_budget_target_ms])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
+        if self.rng_poskey is not None:
+            server_args.extend(["--rng-poskey", self.rng_poskey])
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:

@@ -2136,6 +2136,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling());
     add_opt(common_arg(
+        {"--rng-poskey"}, "[on|off]",
+        "position-keyed counter RNG for seeded sampling (dist sampler and speculative verifier): the draw for the token at absolute position P depends only on (seed, P), "
+        "so seeded output is identical across -np and speculative depth. Per-request override: \"rng_poskey\". Experimental. (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.sampling.rng_poskey = true;
+            } else if (is_falsey(value)) {
+                params.sampling.rng_poskey = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --rng-poskey: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_sampling());
+    add_opt(common_arg(
         {"-bs", "--backend-sampling"},
         "enable backend sampling (experimental) (default: disabled)",
         [](common_params & params) {

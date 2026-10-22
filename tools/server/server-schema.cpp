@@ -195,6 +195,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
         ->set_desc("Use backend sampling instead of llama.cpp sampling"));
 
+    add((new field_bool("rng_poskey", params.sampling.rng_poskey))
+        ->set_desc("Position-keyed counter RNG for seeded sampling: output depends only on (seed, absolute position), not on np interleaving or speculative depth (experimental)"));
+
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
 
