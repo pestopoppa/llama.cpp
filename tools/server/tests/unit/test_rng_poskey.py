@@ -139,7 +139,7 @@ def prob_vec(entry: dict) -> list[tuple[int, float]]:
 
 
 def check_divergence(label: str, a: list[dict], b: list[dict]) -> int:
-    """a, b: raw response bodies per prompt (n_probs=10, post_sampling_probs=true). Returns the number of diverging prompts (reported only);
+    """a, b: raw response bodies per prompt (n_probs=40 = top_k, post_sampling_probs=true). Returns the number of diverging prompts (reported only);
     asserts the divergences are logit drift, never a misaligned RNG."""
     n_div = 0
     misaligned: list[str] = []
@@ -182,7 +182,7 @@ def test_poskey_np4_serial_equals_np1():
 @pytest.mark.parametrize("pair", ["np1_vs_np4", "depth0_vs_depth3"])
 def test_poskey_divergence_is_low_margin(pair):
     """former byte-identity pairs, now: any divergence must be explained by logit drift (see module docstring and check_divergence)"""
-    probs = {"n_probs": 10, "post_sampling_probs": True}
+    probs = {"n_probs": 40, "post_sampling_probs": True}   # = top_k: the FULL post-sampling candidate set, so the membership check sees tail tokens
     if pair == "np1_vs_np4":
         a = boot_run(1, 0, "on", 1, full=True, **probs)
         b = boot_run(4, 0, "on", 4, full=True, **probs)        # concurrent: 4 requests in flight, interleaved in 4 slots
