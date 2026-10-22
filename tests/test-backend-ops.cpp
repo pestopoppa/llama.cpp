@@ -5904,18 +5904,25 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const ggml_type state_type; // [TAG_GDN_STATE_BF16] F32 (default) or BF16 recurrent state
     ggml_tensor * state_input = nullptr;
     ggml_tensor * final_state = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        // state_type is appended only when it is not F32 so every pre-existing case keeps its name
+        std::string s = VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        if (state_type != GGML_TYPE_F32) {
+            s += "," + VAR_TO_STR(state_type);
+        }
+        return s;
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
+            ggml_type state_type = GGML_TYPE_F32)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), state_type(state_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -5937,7 +5944,7 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, state_type, head_size, head_size, head_count * v_repeat, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
@@ -10546,6 +10553,31 @@ static void autokernel_add_served_shape_lowbit_cases(std::vector<std::unique_ptr
 }
 // AK-SERVED-SHAPE-END
 
+// Opt-in case sets that are NOT part of the default eval corpus (the AutoKernel gates pin the
+// default corpus per op, so new cases that only matter for a specific experimental change stay
+// out of it). TEST_BACKEND_OPS_EXTRA_CASES is a comma-separated list of set names, e.g.
+//   TEST_BACKEND_OPS_EXTRA_CASES=gdn_bf16_state test-backend-ops -b CPU -o GATED_DELTA_NET
+static bool test_backend_ops_extra_case_set(const char * name) {
+    const char * env = std::getenv("TEST_BACKEND_OPS_EXTRA_CASES");
+    if (env == nullptr) {
+        return false;
+    }
+    const std::string list = env;
+    const std::string want = name;
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t end = list.find(',', start);
+        if (end == std::string::npos) {
+            end = list.size();
+        }
+        if (list.compare(start, end - start, want) == 0) {
+            return true;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
@@ -12287,6 +12319,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+
+    // [CH-LB1] BF16 recurrent state, opt-in set "gdn_bf16_state" (kept out of the default corpus): the
+    // CPU backend refuses it in supports_op, so on CPU these report "not supported [CPU]" (and a GPU
+    // backend that supports a BF16 state is skipped, since the CPU reference cannot run it):
+    //   TEST_BACKEND_OPS_EXTRA_CASES=gdn_bf16_state test-backend-ops -b CPU -o GATED_DELTA_NET
+    if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
+    }
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).

@@ -345,6 +345,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-exl3.cpp)
+# [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
+llama_build_and_test(test-gdn-state-guard.cpp)
 
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-backend-ops NAME test-backend-ops-iqk
