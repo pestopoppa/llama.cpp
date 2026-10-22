@@ -429,6 +429,14 @@ if (NOT GGML_BACKEND_DL)
     # not registered with ctest; run it explicitly: test-fa-rowexact [n_kv ...]
     llama_build(test-fa-rowexact.cpp)
 
+    # [AKX-ALL-LB4.6] the iqk FA work-buffer sizer vs the split-KV consumers it reserves for: pure
+    # arithmetic over nth, n_kv and every -inf range trim, plus undersized-sizer mutants that must be
+    # caught. It calls the real iqk_fa_work_buffer_size, which only the ON build's libggml-cpu exports.
+    if (GGML_IQK_FLASH_ATTENTION AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        llama_build(test-iqk-fa-worksize.cpp)
+        llama_test(test-iqk-fa-worksize)
+    endif()
+
     # parallel tensor repack: 1 vs N threads byte-identical for every parallelized repack
     llama_build_and_test(test-repack-parallel.cpp)
     target_include_directories(test-repack-parallel PRIVATE

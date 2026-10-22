@@ -47,6 +47,11 @@ inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float
 }
 }
 
+// AKX-ALL-LB4.6: ik_llama #2442 (GQA, nek2 > 1) + #2710 (MLA/MQA, nek2 == 1) verbatim, i.e. ik master
+// c12b5ac L50-L90 without the ik-only indexer pre-block. The old formula sized the split-KV partials
+// from the untrimmed K->ne[1], while the kernel re-partitions on the nek1 the -inf range trim leaves
+// (and P2/P3 can use more slots than nth): the graph plan reserved too little. Gate:
+// tests/test-iqk-fa-worksize.cpp (consumer-vs-sizer enumeration over nth, n_kv and every trim).
 size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto Q = dst->src[0];
     auto K = dst->src[1];
@@ -58,50 +63,22 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     }
     if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
         if (K->ne[2] > 1) {
-            int gcd = simple_gcd(K->ne[2], nth);
-            int nth_k  = nth/gcd;
-            int nek2_k = K->ne[2]/gcd;
-            int nchunk = nek2_k*K->ne[1]/32;
-            int npt = (nchunk + nth_k - 1)/nth_k;
-            int nk;
-            if (npt*nth_k == nchunk) {
-                nk = 32 * (K->ne[1]*K->ne[2]/(32*nth));
-            } else {
-                //int nm = std::max(1, npt/8);
-                int nm = 1;
-                while (true) {
-                    if (nm*4 >= npt) break;
-                    nm *= 2;
-                }
-                nk = 32*nm;
-            }
-            int nkk = (K->ne[1] + nk - 1)/nk;
-            int nstep_k = K->ne[2]*nkk;
+            // Cover any nek1 that iqk_flash_attn_noalibi narrows to at run time.
+            int nstep_k = K->ne[2]*((K->ne[1] + 31)/32);
+            if (nstep_k > 4*nth + K->ne[2]) nstep_k = 4*nth + K->ne[2];
             size_t result_size = (V->ne[0] + 16)*Q->ne[2]/K->ne[2]*sizeof(float);
             size += nstep_k*result_size;
             return size;
         }
-        int nstep_k = K->ne[1]/32;
-        if (nstep_k >= 4*nth) {
-            auto size_thread = (V->ne[0] + 16)*rk2*sizeof(float);
-            size += size_thread*nth;
-            return size;
+        // With nth >= rk2 the consumer can fall through to the chunked loop, which uses up to 4*nth slots.
+        int nstep_k = nth;
+        if (nth >= rk2) {
+            nstep_k = (K->ne[1] + 31)/32;
+            if (nstep_k > 4*nth) nstep_k = 4*nth;
+            if (nstep_k < nth) nstep_k = nth;
         }
-        int gcd_k   = simple_gcd(nstep_k, nth);
-        if (gcd_k >= 1) {
-            int nth_k = nth/gcd_k;
-            int nq_per_thread = (rk2 + nth_k - 1)/nth_k;
-            if (nq_per_thread > 1) {
-                auto size_thread = (V->ne[0] + 16)*nq_per_thread*sizeof(float);
-                size += size_thread*nth;
-                return size;
-            }
-        }
-        int rv2 = Q->ne[2] / V->ne[2];
-        if (Q->ne[1] == 1 && Q->ne[3] == 1 && rk2 > 1 && rk2 == rv2 && K->ne[1]*K->ne[2] >= 32*nth) {
-            auto result_size = (V->ne[0] + 16)*rk2*sizeof(float);
-            size += result_size*nth;
-        }
+        size_t result_size = (V->ne[0] + 16)*rk2*sizeof(float);
+        size += nstep_k*result_size;
         return size;
     }
     return size;
