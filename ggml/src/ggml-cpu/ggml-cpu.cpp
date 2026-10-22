@@ -477,6 +477,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_GATED_DELTA_NET:
+            // [CH-LB1] the CPU kernel reads and writes the recurrent state as F32 only. A BF16 state
+            // ([TAG_GDN_STATE_BF16], selected by GGML_CUDA_GDN_STATE_BF16 regardless of backend) would be
+            // reinterpreted as float and produce silent garbage, so refuse it here.
+            return op->src[5] != nullptr && op->src[5]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         default:
             return true;
     }

@@ -11844,6 +11844,15 @@ void ggml_compute_forward_gated_delta_net(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // [CH-LB1] the CPU kernel is F32-only for the recurrent state and for dst (which carries the
+    // state region). supports_op refuses a BF16 state; this abort catches any path that bypasses it
+    // (a direct ggml_graph_compute, a scheduler forced onto CPU) instead of computing garbage.
+    if (dst->src[5]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        GGML_ABORT("gated_delta_net: CPU backend supports an F32 recurrent state only (state type %s, dst type %s); "
+                   "unset GGML_CUDA_GDN_STATE_BF16 for any model whose GDN layers run on CPU",
+                   ggml_type_name(dst->src[5]->type), ggml_type_name(dst->type));
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
