@@ -252,6 +252,14 @@ static void fused_moe(
             for (int64_t e = 0; e < n_expert; e++) {
                 if (probs[e] > bestv) { bestv = probs[e]; best = (int32_t) e; }
             }
+            // non-finite router logits (an all-NaN probs row) leave best == -1;
+            // probs[-1] = -INF then overwrites the malloc chunk header and the
+            // vector's free aborts with "double free or corruption (out)"
+            // (NEW-10 GSQ smoke 2026-10-22, FD-DIV-1). Fail loudly instead.
+            if (best < 0) {
+                GGML_ABORT("fused_moe: non-finite router logits (no top-k winner at j=%lld); "
+                           "set GGML_FUSED_DECODE_OFF=1 to use the graph path", (long long) j);
+            }
             sel[j] = best;
             probs[best] = -INFINITY;
         }
@@ -1472,6 +1480,7 @@ void fused_ple(
     {
         const struct ggml_type_traits * qtt = ggml_get_type_traits(table->type);
         const size_t row_bytes = ggml_row_size(table->type, head_dim);
+        if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) {
         fprintf(stderr, "  ple table: name=%s type=%d ne=[%lld,%lld] row_bytes=%zu buf=%s buft=%s to_float=%p\n",
                 table->name, (int) table->type, (long long) table->ne[0], (long long) table->ne[1], row_bytes,
                 table->buffer ? ggml_backend_buffer_name(table->buffer) : "-",
@@ -1489,6 +1498,7 @@ void fused_ple(
                 (unsigned char) r0[24], (unsigned char) r0[25], (unsigned char) r0[26], (unsigned char) r0[27],
                 (unsigned char) r0[28], (unsigned char) r0[29], (unsigned char) r0[30], (unsigned char) r0[31],
                 (unsigned char) r0[32], (unsigned char) r0[33], (unsigned char) r0[34], (unsigned char) r0[35]);
+        }
         for (int64_t h = 0; h < n_heads; h++) {
             const char * row = (const char *) table->data + (size_t) rows[h] * row_bytes;
             if (table->type == GGML_TYPE_F32) {
@@ -1548,7 +1558,7 @@ void fused_ple(
             double ss = 0.0;
             for (int64_t i = 0; i < n_embd; i++) ss += (double) (xc[i] * xc[i]);
             const float sc = 1.0f / sqrtf((float) (ss / n_embd) + eps);
-            fprintf(stderr, "  fused query c=%lld: ss/n=%.6e sc=%.6f first=%.6g qn0=%.6g\n",
+            if (getenv("GGML_FUSED_DECODE_TRACE") != NULL) fprintf(stderr, "  fused query c=%lld: ss/n=%.6e sc=%.6f first=%.6g qn0=%.6g\n",
                     (long long) c, ss / n_embd, (double) sc, (double) (xc[0] * sc * qn[c * n_embd]), (double) qn[c * n_embd]);
             for (int64_t i = 0; i < n_embd; i++) query_n[c * n_embd + i] = xc[i] * sc * qn[c * n_embd + i];
         }
@@ -1595,7 +1605,18 @@ void fused_ple(
     const int64_t kern = hp.ple_conv_kernel;
     const int64_t dil = hp.ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
+    // the kernel keeps its file type (F32 in UD-IQ4_XS, F16 in GSQ-RCO); the
+    // graph casts it to F32 before the multiply (qwen4exp.cpp build_ple), so
+    // widen it here the same way — reading an F16 tensor through a float*
+    // reads twice its byte size (past the tensor) and yields garbage
+    std::vector<float> w_f32;
     const float * w = (const float *) L.ple_conv1d->data;
+    if (L.ple_conv1d->type != GGML_TYPE_F32) {
+        const int64_t nw = ggml_nelements(L.ple_conv1d);
+        w_f32.resize(nw);
+        ggml_get_type_traits(L.ple_conv1d->type)->to_float(L.ple_conv1d->data, w_f32.data(), nw);
+        w = w_f32.data();
+    }
     std::vector<float> conv_out(hc_dim);
     {
         // the window: state + the current norm_conv, in the graph's channel-major
@@ -1618,7 +1639,7 @@ void fused_ple(
             float sumf = 0.0f;
             for (int64_t k = 0; k < kern; k++) {
                 const int64_t pos = hist - (kern - 1 - k) * dil;
-                sumf += window[c * (hist + 1) + pos] * w[(size_t) k + c * 4];
+                sumf += window[c * (hist + 1) + pos] * w[(size_t) k + c * kern];
             }
             conv_out[c] = sumf;
         }
@@ -1694,6 +1715,61 @@ static void fused_embd(const struct ggml_tensor * tok_embd, int32_t tok, float *
     }
 }
 
+// the fused path's layout contract, checked before any state is touched so a
+// refusal falls through to the graph cleanly:
+//   * every weight it reads through FusedMM/lora_mm (a plain per-row vec_dot at
+//     data + row*nb[1]) or gathers by row must be in the plain row layout — a
+//     CPU_REPACK tensor (tensor->extra != nullptr) is interleaved and the plain
+//     vec_dot reads garbage scales (NEW-10: GSQ-RCO stores ffn_down_shexp as
+//     IQ4_NL, which GGML_IQK=1 still routes to the iq4_nl_8x8 repack, so the
+//     shared-expert down returned NaN at layer 0). The one repack-aware mirror is
+//     fused_moe's IQ4_NL ffn_down_exps.
+//   * every tensor it reads through a raw float* must be F32.
+static bool fused_tensor_plain(const struct ggml_tensor * t) {
+    return t == nullptr || t->extra == nullptr;
+}
+static bool fused_tensor_f32(const struct ggml_tensor * t) {
+    return t == nullptr || t->type == GGML_TYPE_F32;
+}
+static bool fused_weights_supported(const struct llama_model_qwen4exp & model, const char ** why) {
+    const struct ggml_tensor * plain_model[] = {
+        model.tok_embd, model.per_layer_tok_embd, model.output, model.hc_head_down, model.hc_head_up,
+    };
+    for (const auto * t : plain_model) {
+        if (!fused_tensor_plain(t)) { *why = t->name; return false; }
+    }
+    const struct ggml_tensor * f32_model[] = { model.hc_head_norm, model.output_s };
+    for (const auto * t : f32_model) {
+        if (!fused_tensor_f32(t)) { *why = t->name; return false; }
+    }
+    for (const auto & L : model.layers) {
+        const struct ggml_tensor * plain[] = {
+            L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject,
+            L.wqkv, L.wqkv_gate, L.ssm_beta, L.ssm_alpha, L.ssm_out,
+            L.wq, L.wk, L.wv, L.wo, L.index_k_proj, L.index_q_proj,
+            L.ple_key, L.ple_value,
+            L.ffn_gate_inp, L.ffn_gate_inp_shexp, L.ffn_up_shexp, L.ffn_gate_shexp, L.ffn_down_shexp,
+            L.ffn_up_exps, L.ffn_gate_exps,
+        };
+        for (const auto * t : plain) {
+            if (!fused_tensor_plain(t)) { *why = t->name; return false; }
+        }
+        if (!fused_tensor_plain(L.ffn_down_exps) && L.ffn_down_exps->type != GGML_TYPE_IQ4_NL) {
+            *why = L.ffn_down_exps->name; return false;
+        }
+        const struct ggml_tensor * f32[] = {
+            L.hc_attn_norm, L.hc_ffn_norm, L.ssm_dt, L.ssm_a, L.ssm_norm, L.ssm_conv1d,
+            L.attn_q_norm, L.attn_k_norm, L.index_k_norm, L.index_q_norm,
+            L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
+            L.wq_s, L.wk_s, L.wv_s, L.wo_s,
+        };
+        for (const auto * t : f32) {
+            if (!fused_tensor_f32(t)) { *why = t->name; return false; }
+        }
+    }
+    return true;
+}
+
 bool llama_model_qwen4exp::fused_decode(
         const llama_ubatch & ubatch,
         const struct llama_memory_context_i * mctx_in,
@@ -1710,6 +1786,22 @@ bool llama_model_qwen4exp::fused_decode(
     const int64_t n_layer_slot = hparams.n_layer() + 1;
     const auto * mctx = static_cast<const llama_memory_hybrid_idx_context *>(mctx_in);
     if (mctx == nullptr || mctx->get_attn() == nullptr) return false;
+
+    {
+        // the layout contract is fixed at load; decide it once per model
+        static const llama_model_qwen4exp * checked = nullptr;
+        static bool supported = false;
+        if (checked != this) {
+            const char * why = "";
+            supported = fused_weights_supported(*this, &why);
+            checked = this;
+            if (!supported) {
+                LLAMA_LOG_WARN("%s: fused decode disabled for this model: %s is repacked or not F32 "
+                               "where the fused path needs it; decoding on the graph path\n", __func__, why);
+            }
+        }
+        if (!supported) return false;
+    }
 
     const int64_t n_embd = hparams.n_embd;
     const int64_t hc = hparams.dsv4_hc_mult;
