@@ -1435,6 +1435,11 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    /// @details SPEC-RNG.1 (experimental): llama_sampler_init_dist with a position-keyed counter RNG. The draw for the token at absolute
+    ///          accepted position P depends only on (seed, P): invariant to np interleaving and to extra speculative draws at the same position.
+    ///          Not applied on the backend-sampling path. Env LLAMA_RNG_POSKEY=0 is a diagnostic kill switch (falls back to llama_sampler_init_dist).
+    LLAMA_API struct llama_sampler * llama_sampler_init_dist_poskey(uint32_t seed);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

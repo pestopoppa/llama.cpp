@@ -1028,7 +1028,8 @@ struct llama_sampler_dist : public llama_sampler_backend {
 
     ggml_tensor * inp_uniform;
 
-    uint64_t n_accepted = 0; // SPEC-RNG.1: absolute position counter (LLAMA_RNG_POSKEY=1)
+    uint64_t n_accepted = 0; // SPEC-RNG.1: absolute position counter
+    bool     poskey     = false; // SPEC-RNG.1: draw u from (seed_cur, n_accepted, role) instead of the stateful rng (llama_sampler_init_dist_poskey)
 };
 
 static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token) {
@@ -1077,7 +1078,7 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const double rnd = llama_rng_poskey_enabled()
+    const double rnd = ctx->poskey
         ? llama_rng_poskey_u01(ctx->seed_cur, ctx->n_accepted, LLAMA_RNG_ROLE_DIST)
         : dist(ctx->rng);
 
@@ -1131,6 +1132,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
 
         result_ctx->rng = ctx->rng;
         result_ctx->n_accepted = ctx->n_accepted;
+        result_ctx->poskey = ctx->poskey;
     }
 
     return result;
@@ -1238,7 +1240,7 @@ static struct llama_sampler_i llama_sampler_dist_i = {
     /* .backend_set_input = */ llama_sampler_dist_backend_set_input,
 };
 
-struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+static struct llama_sampler * llama_sampler_init_dist_impl(uint32_t seed, bool poskey) {
     auto seed_cur = get_rng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_dist_i,
@@ -1249,8 +1251,20 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .rng         = */ std::mt19937(seed_cur),
             /* .inp_uniform = */ nullptr,
             /* .n_accepted  = */ 0,
+            /* .poskey      = */ poskey,
         }
     );
+}
+
+struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+    return llama_sampler_init_dist_impl(seed, false);
+}
+
+// SPEC-RNG.1 (experimental): same distribution as llama_sampler_init_dist, but the uniform draw for the token at absolute accepted
+// position P is SplitMix64(seed, P, role), so seeded output does not depend on np interleaving or speculative depth.
+// LLAMA_RNG_POSKEY=0 in the environment is a diagnostic kill switch (falls back to the stateful rng); nothing in the environment enables it.
+struct llama_sampler * llama_sampler_init_dist_poskey(uint32_t seed) {
+    return llama_sampler_init_dist_impl(seed, !llama_rng_poskey_killed());
 }
 
 // top-k

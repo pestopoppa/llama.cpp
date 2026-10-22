@@ -83,6 +83,7 @@ json task_params::to_json(bool only_metrics) const {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
+            {"rng_poskey",                sampling.rng_poskey},
             {"lora",                      lora},
         };
     }
@@ -143,6 +144,7 @@ json task_params::to_json(bool only_metrics) const {
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
+        {"rng_poskey",                sampling.rng_poskey},
         {"lora",                      lora},
     };
 }

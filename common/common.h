@@ -294,6 +294,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // SPEC-RNG.1 (experimental): position-keyed counter RNG for the dist sampler and the speculative verifier (see common/rng-poskey.h).
+    // Default off; set by argv (--rng-poskey on|off) and overridable per request ("rng_poskey"). Env LLAMA_RNG_POSKEY=0 is a kill switch only.
+    bool rng_poskey = false;
+
     bool has_logit_bias() const {
         return !logit_bias.empty();
     }
