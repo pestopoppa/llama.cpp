@@ -272,6 +272,11 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     R += j*Dv;
                     accumulate_qkv(Dv, M, S, Mj[j], Sj[j], Racc, R);
                 }
+                // AKX-ALL-LB4.7: every partial was fully masked, accumulate_qkv never wrote Racc: zeros
+                if (M == -INFINITY) {
+                    std::memset(Racc, 0, Dv*sizeof(float));
+                    continue;
+                }
                 float norm = S > 0 ? 1/S : 1;
                 for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
             }
@@ -340,6 +345,11 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         R += jj*Dv;
                         accumulate_qkv(Dv, M, S, Mj[jj], Sj[jj], Racc, R);
                     }
+                    // AKX-ALL-LB4.7: every partial was fully masked, accumulate_qkv never wrote Racc: zeros
+                    if (M == -INFINITY) {
+                        std::memset(Racc, 0, Dv*sizeof(float));
+                        continue;
+                    }
                     float norm = S > 0 ? 1/S : 1;
                     for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
                 }
@@ -404,6 +414,14 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 const float * Mj = this_result + Dv*rk2;
                 const float * Sj = Mj + rk2;
                 accumulate_qkv(Dv, M, S, Mj[il], Sj[il], Racc, R);
+            }
+            // AKX-ALL-LB4.7: every partial was fully masked, accumulate_qkv never wrote Racc, so it still
+            // held whatever dst held before (the sinks branch below would only scale it by 0, and NaN*0
+            // stays NaN). Mainline FA writes zeros for a fully-masked row, with or without sinks (a sink
+            // only adds to the denominator), as the unsplit path does since dd756036a.
+            if (M == -INFINITY) {
+                std::memset(Racc, 0, Dv*sizeof(float));
+                continue;
             }
             if (sinks) {
                 float s = ((const float *)sinks)[iq2];
