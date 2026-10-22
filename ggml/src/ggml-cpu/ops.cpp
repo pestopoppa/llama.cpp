@@ -9261,6 +9261,57 @@ static inline bool ggml_fa_mask_run_is_neginf(const ggml_fp16_t * mp, const int6
     return diff == 0;
 }
 
+#if defined(__AVX512F__)
+// workspace-ec Option A: register-resident FP32 VKQ accumulator for F16 V, DV <= 256 (NR = DV/16 zmm registers).
+// acc = acc*ms + sum_j w[j] * v_j over one block of cells; the accumulator is loaded and stored once per block,
+// and the loop body has no calls, so it stays in registers for the whole block.
+template <int NR>
+static void fa_vacc_f16_block(float * GGML_RESTRICT acc, const float ms, const char * const * vrows, const float * w, const int n) {
+    __m512 r[NR];
+    const __m512 vms = _mm512_set1_ps(ms);
+    for (int i = 0; i < NR; ++i) {
+        r[i] = _mm512_mul_ps(_mm512_loadu_ps(acc + 16*i), vms);
+    }
+    for (int j = 0; j < n; ++j) {
+        const ggml_fp16_t * vp = (const ggml_fp16_t *) vrows[j];
+        const __m512 wj = _mm512_set1_ps(w[j]);
+        for (int i = 0; i < NR; ++i) {
+            r[i] = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(vp + 16*i))), wj, r[i]);
+        }
+    }
+    for (int i = 0; i < NR; ++i) {
+        _mm512_storeu_ps(acc + 16*i, r[i]);
+    }
+}
+
+typedef void (*fa_vacc_f16_block_t)(float *, float, const char * const *, const float *, int);
+
+static fa_vacc_f16_block_t fa_vacc_f16_select(const int64_t DV) {
+    if (DV % 16 != 0) {
+        return nullptr;
+    }
+    switch (DV / 16) {
+        case  1: return fa_vacc_f16_block< 1>;
+        case  2: return fa_vacc_f16_block< 2>;
+        case  3: return fa_vacc_f16_block< 3>;
+        case  4: return fa_vacc_f16_block< 4>;
+        case  5: return fa_vacc_f16_block< 5>;
+        case  6: return fa_vacc_f16_block< 6>;
+        case  7: return fa_vacc_f16_block< 7>;
+        case  8: return fa_vacc_f16_block< 8>;
+        case  9: return fa_vacc_f16_block< 9>;
+        case 10: return fa_vacc_f16_block<10>;
+        case 11: return fa_vacc_f16_block<11>;
+        case 12: return fa_vacc_f16_block<12>;
+        case 13: return fa_vacc_f16_block<13>;
+        case 14: return fa_vacc_f16_block<14>;
+        case 15: return fa_vacc_f16_block<15>;
+        case 16: return fa_vacc_f16_block<16>;
+        default: return nullptr;
+    }
+}
+#endif
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9355,15 +9406,35 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     //                       on FA-bound shapes).
     //   GGML_FA_VKQ_F16=1 : legacy FP16 accumulation without the check (bit-exact replay of the old binary,
     //                       NaN included). Takes precedence over GGML_FA_VKQ_F32.
-    enum { FA_VKQ_HYBRID = 0, FA_VKQ_F16 = 1, FA_VKQ_F32 = 2 };
+    //   GGML_FA_VKQ_REG=1 : (x86 AVX512, DV <= 256, DV % 16 == 0) FP32 accumulator held in zmm registers over
+    //                       blocks of 64 cells (scores first, one rescale per block); falls back to the default
+    //                       where unavailable. Precedence: F16 > F32 > REG > default.
+    //   GGML_FA_VKQ_REG=auto: shape-gated option A: REG when DV >= 256 (any rows) or when the op has a single
+    //                       query row (neq1 == 1, any DV); the default hybrid otherwise. Bench (Qwen3.5-0.8B
+    //                       D=256 / Qwen3-1.7B D=128, f16 KV, 16k): REG wins tg at both D and pp5 at D=256, loses
+    //                       pp5 at D=128 -- the gate keeps the wins and drops the loss.
+    //   The CPU reference backend (use_ref, test-backend-ops) never takes REG, so a REG run is checked against the
+    //   default hybrid instead of against itself.
+    enum { FA_VKQ_HYBRID = 0, FA_VKQ_F16 = 1, FA_VKQ_F32 = 2, FA_VKQ_REG = 3, FA_VKQ_REG_AUTO = 4 };
     static const int fa_vkq_mode = [](){
         auto on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
         if (on("GGML_FA_VKQ_F16")) return (int) FA_VKQ_F16;
         if (on("GGML_FA_VKQ_F32")) return (int) FA_VKQ_F32;
+        const char * r = getenv("GGML_FA_VKQ_REG");
+        if (r != nullptr && strcmp(r, "auto") == 0) return (int) FA_VKQ_REG_AUTO;
+        if (on("GGML_FA_VKQ_REG")) return (int) FA_VKQ_REG;
         return (int) FA_VKQ_HYBRID;
     }();
+#if defined(__AVX512F__)
+    const bool want_reg = !params->use_ref &&
+        (fa_vkq_mode == FA_VKQ_REG || (fa_vkq_mode == FA_VKQ_REG_AUTO && (DV >= 256 || neq1 == 1)));
+    const fa_vacc_f16_block_t vacc_reg = (v->type == GGML_TYPE_F16 && want_reg) ? fa_vacc_f16_select(DV) : nullptr;
+#else
+    const void * vacc_reg = nullptr;
+#endif
+    const bool vkq_reg       = vacc_reg != nullptr;
     const bool vkq_f16_first = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F32;
-    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode == FA_VKQ_HYBRID;
+    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F16 && fa_vkq_mode != FA_VKQ_F32;
 
     int ith = params->ith;
 
@@ -9494,7 +9565,70 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
         };
 
-        if (vkq_f16_first) {
+#if defined(__AVX512F__)
+        // Option A: block-scored online softmax, register-resident FP32 accumulator; result in VKQ32
+        auto accumulate_reg = [&]() {
+            constexpr int64_t BLK = 64;
+            float        sb[BLK];
+            const char * vr[BLK];
+
+            S = 0.0f;
+            M = -INFINITY;
+            memset(VKQ32, 0, DV*sizeof(float));
+
+            for (int64_t ic0 = ic_start; ic0 < ic_end; ic0 += BLK) {
+                const int64_t ic1 = std::min(ic0 + BLK, ic_end);
+                int n = 0;
+                for (int64_t ic = ic0; ic < ic1; ++ic) {
+                    // skip whole aligned runs of -INF mask values, as the other per-cell loops do (exact)
+                    if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic1 && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
+                        ic += GGML_FA_MASK_RUN - 1;
+                        continue;
+                    }
+                    const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                    if (mv == -INFINITY) {
+                        continue;
+                    }
+                    float s;
+                    const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                    kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+                    s = s*scale;
+                    if (logit_softcap != 0.0f) {
+                        s = logit_softcap*tanhf(s);
+                    }
+                    sb[n] = s + mv;
+                    vr[n] = (const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3);
+                    ++n;
+                }
+                if (n == 0) {
+                    continue;
+                }
+                float bm = sb[0];
+                for (int j = 1; j < n; ++j) {
+                    bm = std::max(bm, sb[j]);
+                }
+                const float Mnew = std::max(M, bm);
+                if (Mnew == -INFINITY) {
+                    continue;
+                }
+                const float ms = M == -INFINITY ? 0.0f : expf(M - Mnew);
+                float bs = 0.0f;
+                for (int j = 0; j < n; ++j) {
+                    sb[j] = expf(sb[j] - Mnew);
+                    bs += sb[j];
+                }
+                S = S*ms + bs;
+                M = Mnew;
+                vacc_reg(VKQ32, ms, vr, sb, n);
+            }
+        };
+#endif
+
+        if (vkq_reg) {
+#if defined(__AVX512F__)
+            accumulate_reg();
+#endif
+        } else if (vkq_f16_first) {
             // FP16 accumulator: the legacy loop, kept inline and straight-line (an outlined lambda costs up to
             // ~15% FA time on FA-bound shapes); bit-identical to the legacy kernel
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
@@ -9556,7 +9690,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             accumulate(false); // FP32 accumulator (GGML_FA_VKQ_F32=1, or V not F16)
         }
 
-        if (vkq_check) {
+        if (vkq_check && !vkq_reg) {
             // exponent all-ones <=> inf or NaN; bit test so it survives -ffinite-math-only
             uint32_t bad = 0;
             for (int64_t d = 0; d < DV; ++d) {
