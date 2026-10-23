@@ -271,8 +271,19 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
             const uint16_t ref_s_bits = std::is_same_v<Block, block_q8_1>
                 ? GGML_FP32_TO_FP16(ref_d * ref_isum)
                 : (uint16_t)(int16_t)ref_isum;
-            const uint16_t actual_d = i < nb4 ? y4[i4].d[ir] : y[i].d;
-            const uint16_t actual_s = i < nb4 ? y4[i4].d[ir+4] : y[i].s;
+            uint16_t actual_d;
+            uint16_t actual_s;
+            if (i < nb4) {
+                actual_d = y4[i4].d[ir];
+                actual_s = y4[i4].d[ir+4];
+            } else if constexpr (std::is_same_v<Block, block_q8_1>) {
+                // block_q8_1 keeps d/s inside the ggml-common union (named under GGML_COMMON_DECL_CPP)
+                actual_d = y[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+                actual_s = y[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.s;
+            } else {
+                actual_d = y[i].d;
+                actual_s = y[i].s;
+            }
             const int8_t * actual_qs = i < nb4 ? y4[i4].qs + QK8_1*ir : y[i].qs;
 
             assert(actual_d == ref_d_bits);
