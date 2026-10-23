@@ -329,6 +329,15 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+# Hardware-free structural contract: llama-bench parse_cmd_params must not leave
+# any scalar (notably autokernel_harden) indeterminate.  No build product needed.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-llama-bench-params-init
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-bench-params-init.py)
+    set_tests_properties(test-llama-bench-params-init PROPERTIES LABELS "main;python")
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

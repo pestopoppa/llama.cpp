@@ -607,7 +607,17 @@ static ggml_type ggml_type_from_name(const std::string & s) {
 }
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
-    cmd_params        params;
+    // Value-initialise: cmd_params is an aggregate with no default member
+    // initialisers, so a bare `cmd_params params;` leaves every scalar
+    // indeterminate.  `params = cmd_params_defaults` is NOT an option: the
+    // vector fields are appended to below and filled from the defaults only
+    // when still empty, so pre-seeding them would merge user values with the
+    // defaults.  Every scalar with a meaningful default is copied explicitly;
+    // `{}` makes any scalar a future edit forgets deterministic (0/false)
+    // instead of garbage.  Before this, autokernel_harden was indeterminate
+    // and roughly half of all runs took the hardened protocol unrequested.
+    // tests/test-llama-bench-params-init.py enforces this structurally.
+    cmd_params        params{};
     std::string       arg;
     bool              invalid_param = false;
     const std::string arg_prefix    = "--";
@@ -623,6 +633,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.hf_token             = cmd_params_defaults.hf_token;
+    params.autokernel_harden    = cmd_params_defaults.autokernel_harden;
+    params.autokernel_seed      = cmd_params_defaults.autokernel_seed;
+    params.autokernel_ready_file     = cmd_params_defaults.autokernel_ready_file;
+    params.autokernel_continue_file  = cmd_params_defaults.autokernel_continue_file;
+    params.autokernel_ready_token    = cmd_params_defaults.autokernel_ready_token;
+    params.autokernel_ready_timeout_ms = cmd_params_defaults.autokernel_ready_timeout_ms;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
