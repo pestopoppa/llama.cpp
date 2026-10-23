@@ -1757,6 +1757,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+#ifdef LLAMA_LB7_PROBES
+    // UFH14-LB7.1 probe: one line per load. scan_us = LCP scan over the cached entries; tgt_us / dft_us wrap the
+    // target / draft llama_state_seq_set_data call (the io_read line printed inside each call splits it);
+    // free_tgt_us / free_dft_us = releasing each restored host copy (they run in this order: scan, tgt, free_tgt, dft, free_dft).
+    const int64_t lb7p_t0      = ggml_time_us();
+    const size_t  lb7p_n_states = states.size();
+    int64_t lb7p_t_scan = 0, lb7p_tgt_us = 0, lb7p_dft_us = 0, lb7p_free_tgt_us = 0, lb7p_free_dft_us = 0;
+    size_t  lb7p_b_tgt = 0, lb7p_b_dft = 0;
+    int     lb7p_found = 0, lb7p_n_tok = 0;
+    auto lb7p_emit = [&](int ok) {
+        SRV_INF("lb7p: load slot=%d t0_us=%lld n_states=%zu found=%d n_tok=%d scan_us=%lld bytes_tgt=%zu tgt_us=%lld free_tgt_us=%lld bytes_dft=%zu dft_us=%lld free_dft_us=%lld total_us=%lld ok=%d\n",
+                id_slot, (long long) lb7p_t0, lb7p_n_states, lb7p_found, lb7p_n_tok, (long long) (lb7p_t_scan - lb7p_t0),
+                lb7p_b_tgt, (long long) lb7p_tgt_us, (long long) lb7p_free_tgt_us, lb7p_b_dft, (long long) lb7p_dft_us,
+                (long long) lb7p_free_dft_us,
+                (long long) (ggml_time_us() - lb7p_t0), ok);
+    };
+#endif
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1786,22 +1803,43 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+#ifdef LLAMA_LB7_PROBES
+    lb7p_t_scan = ggml_time_us();
+#endif
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+#ifdef LLAMA_LB7_PROBES
+        lb7p_found = 1;
+        lb7p_n_tok = it_best->prompt.n_tokens();
+#endif
 
         {
             auto & data = it_best->data.main;
 
             const size_t size = data.size();
+#ifdef LLAMA_LB7_PROBES
+            const int64_t lb7p_ta = ggml_time_us();
+#endif
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+#ifdef LLAMA_LB7_PROBES
+            const int64_t lb7p_tb = ggml_time_us();
+            lb7p_b_tgt  = size;
+            lb7p_tgt_us = lb7p_tb - lb7p_ta;
+#endif
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
+#ifdef LLAMA_LB7_PROBES
+                lb7p_emit(0);
+#endif
 
                 return false;
             }
 
             data.clear();
             data.shrink_to_fit();
+#ifdef LLAMA_LB7_PROBES
+            lb7p_free_tgt_us = ggml_time_us() - lb7p_tb;
+#endif
         }
 
         {
@@ -1811,15 +1849,29 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 GGML_ASSERT(ctx_dft);
 
                 const size_t size = data.size();
+#ifdef LLAMA_LB7_PROBES
+                const int64_t lb7p_ta = ggml_time_us();
+#endif
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+#ifdef LLAMA_LB7_PROBES
+                const int64_t lb7p_tb = ggml_time_us();
+                lb7p_b_dft  = size;
+                lb7p_dft_us = lb7p_tb - lb7p_ta;
+#endif
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
+#ifdef LLAMA_LB7_PROBES
+                    lb7p_emit(0);
+#endif
 
                     return false;
                 }
 
                 data.clear();
                 data.shrink_to_fit();
+#ifdef LLAMA_LB7_PROBES
+                lb7p_free_dft_us = ggml_time_us() - lb7p_tb;
+#endif
             }
         }
 
@@ -1827,6 +1879,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         states.erase(it_best);
     }
+#ifdef LLAMA_LB7_PROBES
+    lb7p_emit(1);
+#endif
 
     return true;
 }

@@ -308,11 +308,18 @@ struct server_slot {
 
     server_prompt prompt;
 
+#ifdef LLAMA_LB7_PROBES
+    int64_t lb7p_t_launch_us = 0; // UFH14-LB7.1: when process_single_task launched this slot's current task
+#endif
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
+#ifdef LLAMA_LB7_PROBES
+        const int64_t lb7p_t0 = ggml_time_us();
+#endif
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -321,15 +328,38 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+#ifdef LLAMA_LB7_PROBES
+        const int64_t lb7p_t1 = ggml_time_us();
+#endif
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
+#ifdef LLAMA_LB7_PROBES
+            SRV_INF("lb7p: save slot=%d n_tok=%d t0_us=%lld bytes_tgt=%zu bytes_dft=%zu size_us=%lld alloc_us=%lld tgt_us=-1 dft_us=-1 ok=0\n",
+                    id, (int) prompt.tokens.size(), (long long) lb7p_t0, cur_size_tgt, cur_size_dft,
+                    (long long) (lb7p_t1 - lb7p_t0), (long long) (ggml_time_us() - lb7p_t1));
+#endif
             return false;
         }
 
+#ifdef LLAMA_LB7_PROBES
+        const int64_t lb7p_t2 = ggml_time_us();
+#endif
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+#ifdef LLAMA_LB7_PROBES
+        const int64_t lb7p_t3 = ggml_time_us();
+#endif
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+#ifdef LLAMA_LB7_PROBES
+        // UFH14-LB7.1 probe: one line per completed save (idle-slot save or LRU victim save). tgt_us / dft_us wrap
+        // the target / draft llama_state_seq_get_data call; the io_write line printed inside each call splits it.
+        const int64_t lb7p_t4 = ggml_time_us();
+        SRV_INF("lb7p: save slot=%d n_tok=%d t0_us=%lld bytes_tgt=%zu bytes_dft=%zu size_us=%lld alloc_us=%lld tgt_us=%lld dft_us=%lld ok=1\n",
+                id, (int) prompt.tokens.size(), (long long) lb7p_t0, cur_size_tgt, cur_size_dft,
+                (long long) (lb7p_t1 - lb7p_t0), (long long) (lb7p_t2 - lb7p_t1),
+                (long long) (lb7p_t3 - lb7p_t2), (long long) (lb7p_t4 - lb7p_t3));
+#endif
 
         return true;
     }
@@ -1024,6 +1054,10 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+#ifdef LLAMA_LB7_PROBES
+    int64_t lb7p_t_iter_us = 0; // UFH14-LB7.1: start of the current update_slots() iteration
+#endif
+
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1670,6 +1704,11 @@ private:
     }
 
     server_slot * get_available_slot(const server_task & task) {
+#ifdef LLAMA_LB7_PROBES
+        const int64_t lb7p_t0 = ggml_time_us();
+        const char *  lb7p_how = "none";
+        int64_t lb7p_t_sel = 0, lb7p_save_us = 0, lb7p_load_us = 0, lb7p_update_us = 0;
+#endif
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1679,6 +1718,9 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+#ifdef LLAMA_LB7_PROBES
+                lb7p_how = "id";
+#endif
             }
         }
 
@@ -1720,6 +1762,9 @@ private:
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             sim_best, slot_prompt_similarity, f_keep);
+#ifdef LLAMA_LB7_PROBES
+                    lb7p_how = "lcp";
+#endif
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -1748,11 +1793,17 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+#ifdef LLAMA_LB7_PROBES
+                lb7p_how = "lru";
+#endif
 
                 update_cache = true;
             }
         }
 
+#ifdef LLAMA_LB7_PROBES
+        lb7p_t_sel = ggml_time_us();
+#endif
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1765,17 +1816,36 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
+#ifdef LLAMA_LB7_PROBES
+                const int64_t lb7p_t_saved = ggml_time_us();
+                lb7p_save_us = lb7p_t_saved - t_start;
+#endif
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+#ifdef LLAMA_LB7_PROBES
+                const int64_t lb7p_t_loaded = ggml_time_us();
+                lb7p_load_us = lb7p_t_loaded - lb7p_t_saved;
+#endif
 
                 prompt_cache->update();
+#ifdef LLAMA_LB7_PROBES
+                lb7p_update_us = ggml_time_us() - lb7p_t_loaded;
+#endif
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
         }
 
+#ifdef LLAMA_LB7_PROBES
+        // UFH14-LB7.1 probe: one line per slot selection. select_us = LCP/LRU scan; save/load/update_us = the
+        // prompt-cache update (victim save, server_prompt_cache::load incl. a failed-load clear, cache trim).
+        SRV_INF("lb7p: gas id_task=%d slot=%d how=%s update_cache=%d t0_us=%lld select_us=%lld save_us=%lld load_us=%lld update_us=%lld total_us=%lld\n",
+                task.id, ret ? ret->id : -1, lb7p_how, (int) update_cache, (long long) lb7p_t0,
+                (long long) (lb7p_t_sel - lb7p_t0), (long long) lb7p_save_us, (long long) lb7p_load_us,
+                (long long) lb7p_update_us, (long long) (ggml_time_us() - lb7p_t0));
+#endif
         return ret;
     }
 
@@ -2712,7 +2782,13 @@ private:
 
                     const int id_task = task.id;
 
+#ifdef LLAMA_LB7_PROBES
+                    const int64_t lb7p_t0 = ggml_time_us();
+#endif
                     server_slot * slot = get_available_slot(task);
+#ifdef LLAMA_LB7_PROBES
+                    const int64_t lb7p_t_gas = ggml_time_us();
+#endif
 
                     //
                     // slot scheduling logic
@@ -2750,23 +2826,60 @@ private:
                         break; // drop the task
                     }
 
+#ifdef LLAMA_LB7_PROBES
+                    const int64_t lb7p_t_launch = ggml_time_us();
+                    slot->lb7p_t_launch_us = lb7p_t_launch;
+                    int     lb7p_n_idle = 0, lb7p_n_saved = 0;
+                    int64_t lb7p_saveupd_us = 0, lb7p_update_us = 0, lb7p_clear_us = 0;
+#endif
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+#ifdef LLAMA_LB7_PROBES
+                                const int64_t lb7p_ta = ggml_time_us();
+                                lb7p_n_idle++;
+#endif
 
                                 if (slot.prompt_save(*prompt_cache)) {
+#ifdef LLAMA_LB7_PROBES
+                                    const int64_t lb7p_tb = ggml_time_us();
+                                    lb7p_n_saved++;
+#endif
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+#ifdef LLAMA_LB7_PROBES
+                                    lb7p_update_us += ggml_time_us() - lb7p_tb;
+#endif
                                 }
+#ifdef LLAMA_LB7_PROBES
+                                const int64_t lb7p_tc = ggml_time_us();
+                                lb7p_saveupd_us += lb7p_tc - lb7p_ta;
+#endif
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
+#ifdef LLAMA_LB7_PROBES
+                                lb7p_clear_us += ggml_time_us() - lb7p_tc;
+#endif
                             }
                         }
                     }
+#ifdef LLAMA_LB7_PROBES
+                    // UFH14-LB7.1 probe: one line per launched task. gas_us = get_available_slot (incl. any prompt-cache
+                    // update), launch_us = launch_slot(s)_with_task, idle_* = the cache-idle-slots loop that follows
+                    // every launch (save = prompt_save copies, update = cache trim, clear = seq_rm of the cleared slots).
+                    {
+                        const int64_t lb7p_t_end = ggml_time_us();
+                        SRV_INF("lb7p: pst id_task=%d slot=%d t0_us=%lld gas_us=%lld launch_us=%lld idle_us=%lld n_idle=%d n_idle_saved=%d idle_save_us=%lld idle_update_us=%lld idle_clear_us=%lld total_us=%lld\n",
+                                id_task, slot->id, (long long) lb7p_t0, (long long) (lb7p_t_gas - lb7p_t0),
+                                (long long) (lb7p_t_launch - lb7p_t_gas), (long long) (lb7p_t_end - lb7p_t_launch),
+                                lb7p_n_idle, lb7p_n_saved, (long long) (lb7p_saveupd_us - lb7p_update_us),
+                                (long long) lb7p_update_us, (long long) lb7p_clear_us, (long long) (lb7p_t_end - lb7p_t0));
+                    }
+#endif
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -3232,6 +3345,9 @@ private:
 #endif
 
     void update_slots() {
+#ifdef LLAMA_LB7_PROBES
+        lb7p_t_iter_us = ggml_time_us();
+#endif
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3643,6 +3759,15 @@ private:
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+#ifdef LLAMA_LB7_PROBES
+                        // UFH14-LB7.1 probe: update_slots admission of a launched task. since_launch_us = launch ->
+                        // t_start_process_prompt (other tasks' work in between + earlier iterations); since_iter_us =
+                        // time spent in this update_slots() iteration before the slot was admitted.
+                        SRV_INF("lb7p: admit id_task=%d slot=%d t_us=%lld n_tokens=%d since_launch_us=%lld since_iter_us=%lld\n",
+                                slot.task->id, slot.id, (long long) slot.t_start_process_prompt, slot.task->n_tokens(),
+                                (long long) (slot.t_start_process_prompt - slot.lb7p_t_launch_us),
+                                (long long) (slot.t_start_process_prompt - lb7p_t_iter_us));
+#endif
 
                         // print prompt tokens (for debugging)
                         /*if (1) {

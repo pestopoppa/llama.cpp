@@ -2341,6 +2341,19 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
 
+#ifdef LLAMA_LB7_PROBES
+    // UFH14-LB7.1 probe: the save writes one transfer per contiguous cell range per layer (K and V). Also printed by
+    // the size pass (llama_state_seq_get_size), which copies nothing: the parser keys copies on the io_write line.
+    {
+        size_t lb7p_cells = 0;
+        for (const auto & range : cr.data) {
+            lb7p_cells += range.second - range.first;
+        }
+        LLAMA_LOG_INFO("lb7p: kv_write strm=%u n_ranges=%zu cells=%zu n_layer=%u v_trans=%u\n",
+                cr.strm, cr.data.size(), lb7p_cells, n_layer, v_trans);
+    }
+#endif
+
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
@@ -2611,6 +2624,22 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
         return false;
     }
+
+#ifdef LLAMA_LB7_PROBES
+    // UFH14-LB7.1 probe: which read path this restore takes. contiguous=0 is the per-cell scatter path
+    // (one read_tensor per cell per layer for K and V); n_runs = contiguous runs of destination cells.
+    {
+        size_t lb7p_n_runs = 0;
+        if (!sinfo.idxs.empty() && !sinfo.idxs[0].empty()) {
+            lb7p_n_runs = 1;
+            for (size_t i = 1; i < sinfo.idxs[0].size(); ++i) {
+                lb7p_n_runs += sinfo.idxs[0][i] != sinfo.idxs[0][i - 1] + 1 ? 1 : 0;
+            }
+        }
+        LLAMA_LOG_INFO("lb7p: kv_read strm=%u cells=%u contiguous=%d n_runs=%zu n_layer=%u v_trans=%u\n",
+                strm, cell_count, (int) sinfo.is_contiguous(), lb7p_n_runs, n_layer, v_trans);
+    }
+#endif
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {

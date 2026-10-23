@@ -31,6 +31,12 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# UFH14-LB7.1: prompt-cache timing probes in server-context.cpp / server-task.cpp (debug only, never production).
+if (LLAMA_LB7_PROBES)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_LB7_PROBES)
+    message(STATUS "llama-server: UFH14-LB7.1 lb7p probes compiled in (LLAMA_LB7_PROBES=ON)")
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
