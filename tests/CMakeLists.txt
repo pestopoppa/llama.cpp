@@ -235,6 +235,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-qwen4exp-fused-rope.cpp)
     llama_build_and_test(test-dca.cpp)
+    llama_test(test-llama-archs NAME test-yarn-kshift LABEL main ARGS --yarn-kshift -s 1234)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
