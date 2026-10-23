@@ -8450,11 +8450,15 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const bool kv_view; // create K/V as views of a larger buffer (like a KV cache); false = dense allocation (upstream dc72703fc)
     ggml_tensor * cache_k = nullptr;
     ggml_tensor * cache_v = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        // G10 (INF-48): upstream appends kv_view to every case name (VARS_TO_STR15). Here it is appended ONLY when false, so
+        // the names of all pre-existing cases stay byte-identical (pinned case corpora and -p filters keep matching).
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
+               (kv_view ? std::string() : std::string(",kv_view=0"));
     }
 
     double max_nmse_err() override {
@@ -8470,9 +8474,10 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        bool kv_view = true)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8500,7 +8505,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -8514,7 +8519,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -8559,6 +8564,25 @@ struct test_flash_attn_ext : public test_case {
     bool grad_precise() override {
         return true;
     }
+};
+
+// G10 (INF-48): a test_flash_attn_ext that carries a stable id in its case name (",g10=NN" appended to vars()), so the imported
+// upstream cases can be selected in isolation with `-p 'g10='` (or one at a time with `-p 'g10=07$'`) and parsed per case.
+// Behaviour is otherwise identical to test_flash_attn_ext (prec is always GGML_PREC_F32, as in every imported upstream case).
+struct test_flash_attn_ext_g10 : public test_flash_attn_ext {
+    const int g10_id;
+
+    std::string vars() override {
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), ",g10=%02d", g10_id);
+        return test_flash_attn_ext::vars() + suffix;
+    }
+
+    test_flash_attn_ext_g10(int id, int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                            bool mask, bool sinks, float max_bias, float logit_softcap, ggml_type type_K, ggml_type type_V,
+                            std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool kv_view = true)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, GGML_PREC_F32, type_K, type_V, permute, kv_view),
+          g10_id(id) {}
 };
 
 // GGML_OP_CROSS_ENTROPY_LOSS
@@ -9657,6 +9681,67 @@ static const ggml_type other_types[] = {
 // Workaround long compile time with msvc
 #pragma optimize("", off)
 #endif
+
+// G10 / INF-48: backend-agnostic FLASH_ATTN_EXT cases imported from upstream tests/test-backend-ops.cpp @ 70aff2525
+// (metal : dequantize quantized KV to F16 before flash attention, #27390; plus the dense-KV cases of dc72703fc, #25494, and the
+// large-KV F16 cases of the SYCL oneDNN fix). Our v10 production tree (ffc1bac82) has none of them. Its default EVAL corpus (the
+// one `test-backend-ops test` compares against the CPU reference) has no FLASH_ATTN_EXT case above kv=1024; kv 4096-16384 (F16,
+// hs 64/128, nb=1) and kv 5776/7680 exist only in make_test_cases_perf(), which times and does not compare outputs.
+// Registered ONLY when AUTOKERNEL_CORRECTNESS_CASE_SET=g10_fa_import_v1, so the default FLASH_ATTN_EXT corpus keeps its size and
+// names (same convention as odd_gqa7_d64_q1_v1). Select with `-o FLASH_ATTN_EXT -p 'g10='`. This literal is for STANDALONE runs;
+// the AutoKernel controller's reviewed selector pin is deliberately not widened here.
+//   tier 1, ids 01-17: the 17 upstream make_test_cases_eval additions that build on our tree
+//     01-06 q8_0 KV: 01 kv=113 (KV pad), 02 kv=1024, 03 kv=1024 permuted, 04 kv=1025 odd + sinks + ALiBi + softcap + nr3=2,
+//           05 kv=1025 nb=64 permuted, 06 kv=16384 decode (first upstream case >= 10000)
+//     07-09 MLA 576/512 q8_0 (V is a view of K): kv=113 nb=1, kv=1024 nb=1, kv=1024 nb=64
+//     10-13 F16 large-KV (Qwen3.6-27B geometry 256/256 nr=6, llama-class control 128/128 nr=4): kv=4096 and kv=16384 at nb=512
+//     14-17 q8_0 KV allocated dense (kv_view=false) at nb=75: layouts {0,2,1,3} x3 (nr=1, nr=4, kv=1024) and native {0,1,2,3}
+//   tier 2, ids 18-25: upstream make_test_cases_PERF-only long-context shapes (timing-only upstream), run here as CORRECTNESS cases
+//     because the G10 gate is "FAIL at kv >= 10000" and these are the only upstream shapes at kv = 10000 / 20000:
+//     256/256 nh=2 nr=16, {q8_0, f16} x {nb=1, nb=512} x {kv=10000, kv=20000}
+// NOT imported: 4 Q2_0 mixed-quant cases (GGML_TYPE_Q2_0 does not exist in this tree), the SYCL prefill loop (kv 1024/2048, 36
+// cases, SYCL-XMX-path specific) and 5 perf-only q8_0 nb=1 timing points at kv <= 4096.
+static void autokernel_add_g10_fa_import_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const char * case_set = std::getenv("AUTOKERNEL_CORRECTNESS_CASE_SET");
+    if (case_set == nullptr || std::strcmp(case_set, "g10_fa_import_v1") != 0) {
+        return;
+    }
+    const ggml_type Q8 = GGML_TYPE_Q8_0;
+    const ggml_type F16 = GGML_TYPE_F16;
+    const std::array<int32_t, 4> P_NATIVE = {0, 1, 2, 3};
+    const std::array<int32_t, 4> P_CACHE  = {0, 2, 1, 3};
+
+    // tier 1, upstream 70aff2525: q8_0 KV
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 1, 256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, Q8, Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 2, 256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, Q8, Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 3, 256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, Q8, Q8, P_CACHE));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 4, 256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, Q8, Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 5, 256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, Q8, Q8, P_CACHE));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 6, 256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, Q8, Q8));
+    // tier 1, upstream 70aff2525: MLA shape (build_graph makes V a view of K when type_K == type_V and 576/512)
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 7, 576, 512, 1, {20, 1},   113,   1, true, false, 0, 0, Q8, Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 8, 576, 512, 1, {20, 1},  1024,   1, true, false, 0, 0, Q8, Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10( 9, 576, 512, 1, {20, 1},  1024,  64, true, false, 0, 0, Q8, Q8));
+    // tier 1, upstream large-KV F16 loop
+    test_cases.emplace_back(new test_flash_attn_ext_g10(10, 256, 256, 4, {6, 1},   4096, 512, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(11, 128, 128, 8, {4, 1},   4096, 512, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(12, 256, 256, 4, {6, 1},  16384, 512, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(13, 128, 128, 8, {4, 1},  16384, 512, true, false, 0, 0, F16, F16));
+    // tier 1, upstream dc72703fc: dense-allocated (non-view) quant K/V at batch >= 64
+    test_cases.emplace_back(new test_flash_attn_ext_g10(14,  64,  64, 4, {1, 1},    512,  75, true, false, 0, 0, Q8, Q8, P_CACHE,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(15,  64,  64, 4, {4, 1},    512,  75, true, false, 0, 0, Q8, Q8, P_CACHE,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(16,  64,  64, 4, {1, 1},   1024,  75, true, false, 0, 0, Q8, Q8, P_CACHE,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(17,  64,  64, 4, {1, 1},    512,  75, true, false, 0, 0, Q8, Q8, P_NATIVE, false));
+    // tier 2, upstream make_test_cases_perf long-context shapes run as correctness
+    test_cases.emplace_back(new test_flash_attn_ext_g10(18, 256, 256, 2, {16, 1},  10000,   1, true, false, 0, 0, Q8,  Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(19, 256, 256, 2, {16, 1},  20000,   1, true, false, 0, 0, Q8,  Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(20, 256, 256, 2, {16, 1},  10000,   1, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(21, 256, 256, 2, {16, 1},  20000,   1, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(22, 256, 256, 2, {16, 1},  10000, 512, true, false, 0, 0, Q8,  Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(23, 256, 256, 2, {16, 1},  20000, 512, true, false, 0, 0, Q8,  Q8));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(24, 256, 256, 2, {16, 1},  10000, 512, true, false, 0, 0, F16, F16));
+    test_cases.emplace_back(new test_flash_attn_ext_g10(25, 256, 256, 2, {16, 1},  20000, 512, true, false, 0, 0, F16, F16));
+}
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
@@ -11215,6 +11300,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+
+    // G10 / INF-48: upstream long-context and quantized-KV FA cases, opt-in via AUTOKERNEL_CORRECTNESS_CASE_SET=g10_fa_import_v1
+    autokernel_add_g10_fa_import_cases(test_cases);
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
