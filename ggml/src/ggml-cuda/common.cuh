@@ -1234,6 +1234,19 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
 
+    // Free the captured graph and its executable now instead of holding them until the next capture replaces them.
+    // The caller must have synchronized the stream the executable was launched on.
+    void release_captured() {
+        if (instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
+        }
+        if (graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            graph = nullptr;
+        }
+    }
+
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);

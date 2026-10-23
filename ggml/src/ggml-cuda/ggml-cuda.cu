@@ -4155,10 +4155,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool freshly_instantiated = false;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            freshly_instantiated = true;
         }
-        if (cuda_graph_update_required) { // Update graph executable
+        if (cuda_graph_update_required && !freshly_instantiated) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
@@ -4221,6 +4223,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+#if defined(GGML_USE_HIP)
+                    // GPU-LEAK-1c: the stale executable can never be launched again (the next launch follows a capture).
+                    // Previously it was kept and patched with cudaGraphExecUpdate at the next capture; on ROCm 6.2 the
+                    // resources of an update/instantiate cycle are suspected not to be returned (E1 shape: +290 MiB per
+                    // request on the v10 store build, 0 with graphs off; mechanism unconfirmed). Release it here, while it
+                    // is idle, and re-instantiate from scratch.
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    graph->release_captured();
+#endif // GGML_USE_HIP
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
