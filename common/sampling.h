@@ -113,6 +113,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// SPEC-GRAM.1(2) measurement counters (experimental branch only; counting does not change what is sampled).
+// Process-wide and monotonic, summed over every common_sampler in the process. A caller that wants per-request
+// values takes a snapshot before the request and subtracts it afterwards; that is exact only while one sampler
+// with a grammar runs at a time (llama-server -np 1, sequential requests). Draft-model samplers carry no grammar,
+// so in a speculative server only the target sampler moves these counters.
+struct common_sampler_grammar_stats {
+    uint64_t n_check       = 0; // single-token grammar checks of the chain's pick (grammar_first == false path)
+    uint64_t n_resample    = 0; // checks that rejected the pick -> full-vocab grammar apply + resample
+    uint64_t n_first       = 0; // grammar_first == true full-vocab grammar applies (e.g. the temp > 0 residual verify)
+    uint64_t t_check_us    = 0; // time in the single-token checks
+    uint64_t t_resample_us = 0; // time in the resample (set_logits + grammar over the vocab + chain)
+    uint64_t t_first_us    = 0; // time in the grammar_first applies
+};
+common_sampler_grammar_stats common_sampler_grammar_stats_get();
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

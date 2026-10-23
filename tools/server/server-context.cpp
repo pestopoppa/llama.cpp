@@ -385,6 +385,9 @@ struct server_slot {
     int32_t n_spec_exact_extra = 0;  // INF-70 E2a: extra target tokens decoded by LLAMA_SPEC_EXACT drop/redecode
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // SPEC-GRAM.1(2): process-wide grammar counters at this slot's task launch (per-request delta, exact with -np 1)
+    common_sampler_grammar_stats gram_stats_start;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -617,6 +620,22 @@ struct server_slot {
         if (n_draft_total > 0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_n_steps    = n_draft_verif_steps;
+        }
+
+        {
+            const common_sampler_grammar_stats now = common_sampler_grammar_stats_get();
+            const uint64_t n_check = now.n_check - gram_stats_start.n_check;
+            const uint64_t n_first = now.n_first - gram_stats_start.n_first;
+            if (n_check > 0 || n_first > 0) {
+                timings.has_grammar_stats   = true;
+                timings.grammar_n_check     = n_check;
+                timings.grammar_n_resample  = now.n_resample - gram_stats_start.n_resample;
+                timings.grammar_n_first     = n_first;
+                timings.grammar_check_ms    = 1e-3 * (double) (now.t_check_us    - gram_stats_start.t_check_us);
+                timings.grammar_resample_ms = 1e-3 * (double) (now.t_resample_us - gram_stats_start.t_resample_us);
+                timings.grammar_first_ms    = 1e-3 * (double) (now.t_first_us    - gram_stats_start.t_first_us);
+            }
         }
 
         return timings;
@@ -1901,6 +1920,7 @@ private:
         if (task.need_sampling()) {
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                slot.gram_stats_start = common_sampler_grammar_stats_get();
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);

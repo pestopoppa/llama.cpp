@@ -9,6 +9,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -437,6 +438,25 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
+// SPEC-GRAM.1(2) measurement counters, see common_sampler_grammar_stats in sampling.h
+static std::atomic<uint64_t> g_gram_n_check{0};
+static std::atomic<uint64_t> g_gram_n_resample{0};
+static std::atomic<uint64_t> g_gram_n_first{0};
+static std::atomic<uint64_t> g_gram_t_check_us{0};
+static std::atomic<uint64_t> g_gram_t_resample_us{0};
+static std::atomic<uint64_t> g_gram_t_first_us{0};
+
+common_sampler_grammar_stats common_sampler_grammar_stats_get() {
+    common_sampler_grammar_stats s;
+    s.n_check       = g_gram_n_check.load(std::memory_order_relaxed);
+    s.n_resample    = g_gram_n_resample.load(std::memory_order_relaxed);
+    s.n_first       = g_gram_n_first.load(std::memory_order_relaxed);
+    s.t_check_us    = g_gram_t_check_us.load(std::memory_order_relaxed);
+    s.t_resample_us = g_gram_t_resample_us.load(std::memory_order_relaxed);
+    s.t_first_us    = g_gram_t_first_us.load(std::memory_order_relaxed);
+    return s;
+}
+
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
@@ -591,7 +611,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(rbudget, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
+        const int64_t t0_first = ggml_time_us();
         llama_sampler_apply(grmr, &cur_p);
+        g_gram_t_first_us.fetch_add((uint64_t) (ggml_time_us() - t0_first), std::memory_order_relaxed);
+        g_gram_n_first.fetch_add(1, std::memory_order_relaxed);
     }
 
     llama_sampler_apply(chain, &cur_p);
@@ -604,10 +627,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
     {
+        const int64_t t0_check = ggml_time_us();
+
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
 
         llama_sampler_apply(grmr, &single_token_data_array);
+
+        g_gram_t_check_us.fetch_add((uint64_t) (ggml_time_us() - t0_check), std::memory_order_relaxed);
+        g_gram_n_check.fetch_add(1, std::memory_order_relaxed);
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
@@ -617,6 +645,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+    const int64_t t0_resample = ggml_time_us();
+    struct gram_resample_timer { // counts the resample on every exit from here, including the assert below
+        int64_t t0;
+        ~gram_resample_timer() {
+            g_gram_t_resample_us.fetch_add((uint64_t) (ggml_time_us() - t0), std::memory_order_relaxed);
+            g_gram_n_resample.fetch_add(1, std::memory_order_relaxed);
+        }
+    } gram_resample_timer_guard { t0_resample };
+
     gsmpl->set_logits(ctx, idx);
 
     llama_sampler_apply(rbudget,  &cur_p);

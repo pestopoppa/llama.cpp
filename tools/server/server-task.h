@@ -287,6 +287,17 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    int32_t draft_n_steps = 0; // SPEC-GRAM.1(2): target verification steps (reported with draft_n)
+
+    // SPEC-GRAM.1(2) grammar counters for this request (delta of common_sampler_grammar_stats over the slot's
+    // task; exact with -np 1). Only included when the request ran any grammar check or grammar-first apply.
+    bool     has_grammar_stats   = false;
+    uint64_t grammar_n_check     = 0;
+    uint64_t grammar_n_resample  = 0;
+    uint64_t grammar_n_first     = 0;
+    double   grammar_check_ms    = 0.0;
+    double   grammar_resample_ms = 0.0;
+    double   grammar_first_ms    = 0.0;
 
     json to_json() const;
 };

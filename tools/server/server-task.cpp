@@ -261,6 +261,16 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["draft_n_steps"] = draft_n_steps;
+    }
+
+    if (has_grammar_stats) {
+        base["grammar_n_check"]     = grammar_n_check;
+        base["grammar_n_resample"]  = grammar_n_resample;
+        base["grammar_n_first"]     = grammar_n_first;
+        base["grammar_check_ms"]    = grammar_check_ms;
+        base["grammar_resample_ms"] = grammar_resample_ms;
+        base["grammar_first_ms"]    = grammar_first_ms;
     }
 
     return base;
