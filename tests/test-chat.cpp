@@ -6061,6 +6061,75 @@ static void test_msg_diffs_compute() {
     }
 }
 
+// UFH14-LB4.1: a history-echoed tool call whose `arguments` string is not valid JSON.
+// For templates with supports_object_arguments, workaround::func_args_not_string parses the
+// string into an object and throws std::runtime_error (NOT std::invalid_argument) on failure.
+// No model: pure template application.
+static void test_func_args_not_string_invalid_json_history() {
+    LOG_DBG("%s\n", __func__);
+
+    // Iterating arguments with `items` makes the capability probe detect object arguments.
+    const std::string mock_template =
+        "{%- for message in messages -%}\n"
+        "  {%- if message.tool_calls -%}\n"
+        "    {%- for tc in message.tool_calls -%}\n"
+        "      {{- '<|call|>' + tc.function.name -}}\n"
+        "      {%- for k, v in tc.function.arguments|items -%}{{- k + '=' + (v|string) + ';' -}}{%- endfor -%}\n"
+        "    {%- endfor -%}\n"
+        "  {%- else -%}\n"
+        "    {{- '<|' + message.role + '|>' + message.content + '<|end|>' -}}\n"
+        "  {%- endif -%}\n"
+        "{%- endfor -%}";
+
+    auto tmpls = common_chat_templates_ptr(common_chat_templates_init(/* model= */ nullptr, mock_template));
+
+    auto make_inputs = [](const std::string & arguments) {
+        common_chat_templates_inputs inputs;
+        common_chat_msg user;
+        user.role    = "user";
+        user.content = "hi";
+        common_chat_msg assistant;
+        assistant.role = "assistant";
+        assistant.tool_calls.push_back({ "get_weather", arguments, "call_1" });
+        inputs.messages              = { user, assistant };
+        inputs.add_generation_prompt = false;
+        return inputs;
+    };
+
+    // Control: valid JSON arguments are parsed to an object and rendered.
+    {
+        auto params = common_chat_templates_apply(tmpls.get(), make_inputs("{\"city\":\"Paris\"}"));
+        if (params.prompt.find("<|call|>get_weather") == std::string::npos ||
+            params.prompt.find("city=Paris;") == std::string::npos) {
+            throw std::runtime_error("Test failed: valid JSON tool-call arguments were not rendered as an object: " + params.prompt);
+        }
+    }
+
+    // Truncated / invalid JSON arguments echoed back in history: documented behaviour is a throw.
+    {
+        bool        threw               = false;
+        bool        is_invalid_argument = false;
+        std::string what;
+        try {
+            common_chat_templates_apply(tmpls.get(), make_inputs("{\"city\":\"Par"));
+        } catch (const std::invalid_argument & e) {
+            threw = true; is_invalid_argument = true; what = e.what();
+        } catch (const std::runtime_error & e) {
+            threw = true; what = e.what();
+        }
+        if (!threw) {
+            throw std::runtime_error("Test failed: invalid JSON tool-call arguments did not throw");
+        }
+        if (is_invalid_argument) {
+            throw std::runtime_error("Test failed: expected std::runtime_error, got std::invalid_argument (would map to 400)");
+        }
+        if (what.find("Failed to parse tool call arguments as JSON") == std::string::npos) {
+            throw std::runtime_error("Test failed: unexpected exception message: " + what);
+        }
+        LOG_ERR("func_args_not_string: invalid JSON args -> std::runtime_error (not invalid_argument): %s\n", what.c_str());
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -6139,6 +6208,7 @@ int main(int argc, char ** argv) {
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
+        test_func_args_not_string_invalid_json_history();
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
