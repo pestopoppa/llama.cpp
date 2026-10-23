@@ -2580,6 +2580,25 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// GGML_CUDA_GRAPH_MEMLOG=1: log the device's free memory around every graph capture/instantiate/update/release, so a probe
+// can attribute VRAM growth to the step that causes it (GPU-LEAK-1c). Whole-device numbers: meaningful on an exclusive card.
+static bool ggml_cuda_graph_memlog_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GRAPH_MEMLOG") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_graph_memlog(const char * what, size_t * prev_free) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const double delta_mib = *prev_free ? ((double) *prev_free - (double) free_b) / 1048576.0 : 0.0;
+    GGML_LOG_INFO("%s: GRAPH_MEMLOG %-12s used=%.1f MiB (d=%+.1f MiB vs previous mark)\n", __func__, what,
+                  (double) (total_b - free_b) / 1048576.0, delta_mib);
+    *prev_free = free_b;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -4157,8 +4176,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         bool freshly_instantiated = false;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            size_t mark = 0;
+            if (ggml_cuda_graph_memlog_enabled()) { ggml_cuda_graph_memlog("pre-inst", &mark); }
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
             freshly_instantiated = true;
+            if (ggml_cuda_graph_memlog_enabled()) { ggml_cuda_graph_memlog("post-inst", &mark); }
         }
         if (cuda_graph_update_required && !freshly_instantiated) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -4230,7 +4252,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     // request on the v10 store build, 0 with graphs off; mechanism unconfirmed). Release it here, while it
                     // is idle, and re-instantiate from scratch.
                     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    size_t mark = 0;
+                    if (ggml_cuda_graph_memlog_enabled()) { ggml_cuda_graph_memlog("pre-release", &mark); }
                     graph->release_captured();
+                    if (ggml_cuda_graph_memlog_enabled()) { ggml_cuda_graph_memlog("post-release", &mark); }
 #endif // GGML_USE_HIP
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
