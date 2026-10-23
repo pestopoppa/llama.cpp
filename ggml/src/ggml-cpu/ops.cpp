@@ -9262,7 +9262,8 @@ static inline bool ggml_fa_mask_run_is_neginf(const ggml_fp16_t * mp, const int6
 }
 
 #if defined(__AVX512F__)
-// workspace-ec Option A: register-resident FP32 VKQ accumulator for F16 V, DV <= 256 (NR = DV/16 zmm registers).
+// workspace-ec Option A: register-resident FP32 VKQ accumulator for F16 V, DV <= 256 (NR = DV/16 zmm registers); DV = 512 as two
+// halves of 16 registers (fa_vacc_f16_block_x2).
 // acc = acc*ms + sum_j w[j] * v_j over one block of cells; the accumulator is loaded and stored once per block,
 // and the loop body has no calls, so it stays in registers for the whole block.
 template <int NR>
@@ -9286,6 +9287,22 @@ static void fa_vacc_f16_block(float * GGML_RESTRICT acc, const float ms, const c
 
 typedef void (*fa_vacc_f16_block_t)(float *, float, const char * const *, const float *, int);
 
+// Largest block of cells fa_vacc_f16_block* is called with (accumulate_reg's BLK).
+static constexpr int GGML_FA_REG_BLK = 64;
+
+// DV = 2*16*NR (D512): 2*NR zmm accumulators would fill all 32 zmm registers and spill, so the row is accumulated as two
+// independent halves of NR registers each. Every output lane has its own accumulator, so the two halves together are
+// exactly what a 2*NR-wide block would compute (same weights, same order of V rows per lane); only the w[] loop runs twice.
+template <int NR>
+static void fa_vacc_f16_block_x2(float * GGML_RESTRICT acc, const float ms, const char * const * vrows, const float * w, const int n) {
+    const char * vhi[GGML_FA_REG_BLK];
+    for (int j = 0; j < n; ++j) {
+        vhi[j] = vrows[j] + NR*16*sizeof(ggml_fp16_t);
+    }
+    fa_vacc_f16_block<NR>(acc,         ms, vrows, w, n);
+    fa_vacc_f16_block<NR>(acc + NR*16, ms, vhi,   w, n);
+}
+
 static fa_vacc_f16_block_t fa_vacc_f16_select(const int64_t DV) {
     if (DV % 16 != 0) {
         return nullptr;
@@ -9307,6 +9324,7 @@ static fa_vacc_f16_block_t fa_vacc_f16_select(const int64_t DV) {
         case 14: return fa_vacc_f16_block<14>;
         case 15: return fa_vacc_f16_block<15>;
         case 16: return fa_vacc_f16_block<16>;
+        case 32: return fa_vacc_f16_block_x2<16>; // DV = 512
         default: return nullptr;
     }
 }
@@ -9406,7 +9424,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     //                       on FA-bound shapes).
     //   GGML_FA_VKQ_F16=1 : legacy FP16 accumulation without the check (bit-exact replay of the old binary,
     //                       NaN included). Takes precedence over GGML_FA_VKQ_F32.
-    //   GGML_FA_VKQ_REG=1 : (x86 AVX512, DV <= 256, DV % 16 == 0) FP32 accumulator held in zmm registers over
+    //   GGML_FA_VKQ_REG=1 : (x86 AVX512, DV <= 256 or DV == 512, DV % 16 == 0) FP32 accumulator held in zmm registers over
     //                       blocks of 64 cells (scores first, one rescale per block); falls back to the default
     //                       where unavailable. Precedence: F16 > F32 > REG > default.
     //   GGML_FA_VKQ_REG=auto: shape-gated option A: REG when DV >= 256 (any rows) or when the op has a single
@@ -9568,7 +9586,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 #if defined(__AVX512F__)
         // Option A: block-scored online softmax, register-resident FP32 accumulator; result in VKQ32
         auto accumulate_reg = [&]() {
-            constexpr int64_t BLK = 64;
+            constexpr int64_t BLK = GGML_FA_REG_BLK;
             float        sb[BLK];
             const char * vr[BLK];
 
