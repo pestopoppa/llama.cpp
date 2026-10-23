@@ -9362,8 +9362,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         if (on("GGML_FA_VKQ_F32")) return (int) FA_VKQ_F32;
         return (int) FA_VKQ_HYBRID;
     }();
-    const bool vkq_f16_first = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F32;
-    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode == FA_VKQ_HYBRID;
+    // The CPU reference backend (use_ref, test-backend-ops oracle) always accumulates in FP32 whatever the knobs
+    // say: an FP16-accumulating oracle disagrees with any FP32-accurate path beyond ~24k cells (V11-086).
+    const bool vkq_f16_first = v->type == GGML_TYPE_F16 && fa_vkq_mode != FA_VKQ_F32 && !params->use_ref;
+    const bool vkq_check     = v->type == GGML_TYPE_F16 && fa_vkq_mode == FA_VKQ_HYBRID && !params->use_ref;
 
     int ith = params->ith;
 
