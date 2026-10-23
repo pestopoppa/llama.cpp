@@ -30,7 +30,7 @@
 // Usage (the corpus comes from -f exactly like llama-perplexity; run it with the store's libs and
 // prove linkage first - see INF-72-RT1/trace_job.sh):
 //   MOE_TRACE_OUT=dir MOE_TRACE_DOMAIN=prose llama-moe-trace -m model.gguf -f corpus.txt
-//       -c 1024 -b 512 -t 16 -tb 16 -ngl 0 --no-warmup
+//       -c 1024 -b 512 -t 16 -tb 16 -ngl 0 --no-mmap -fa on
 //
 // Environment:
 //   MOE_TRACE_OUT            output directory (required)
@@ -262,6 +262,7 @@ int main(int argc, char ** argv) {
     params.cb_eval           = moe_trace_cb;
     params.cb_eval_user_data = &d.st;
     params.warmup            = false;
+    params.fit_params        = false;   // a CPU-only tool with explicit -c / -ngl: nothing to fit, and no extra load pass
 
     auto llama_init = common_init_from_params(params);
     auto * model = llama_init->model();

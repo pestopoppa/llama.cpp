@@ -54,7 +54,7 @@ production store's libs of the SAME commit (as `llama-weight-handoff` does): lin
 
 ```bash
 MOE_TRACE_OUT=/path/out MOE_TRACE_DOMAIN=prose MOE_TRACE_MAX_SAMPLES=512 MOE_TRACE_SHARD_SAMPLES=64 \
-GGML_IQK=1 llama-moe-trace -m model.gguf -f corpus.txt -c 1024 -b 512 -t 16 -tb 16 -ngl 0 --no-warmup
+GGML_IQK=1 llama-moe-trace -m model.gguf -f corpus.txt -c 1024 -b 512 -t 16 -tb 16 -ngl 0 --no-mmap -fa on
 MOE_TRACE_SELFTEST_ONLY=1 llama-moe-trace      # no model: reader + guard + sha256 + int16 proof
 ```
 
