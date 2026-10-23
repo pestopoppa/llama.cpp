@@ -119,6 +119,12 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# UFH14-LB7.1 (experimental instrument, never production): prompt-cache timing probes, one "lb7p:" log line per event,
+# in libllama (state I/O flush of each llama_state_seq_get/set_data call, KV read path contiguous vs scatter, KV write
+# ranges) and in llama-server (process_single_task, get_available_slot, prompt_save, server_prompt_cache::load,
+# update_slots admission). OFF (default) = every probe is preprocessed out.
+option(LLAMA_LB7_PROBES "llama: compile the UFH14-LB7.1 prompt-cache timing probes (debug only)" OFF)
+
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)

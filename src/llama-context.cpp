@@ -3019,10 +3019,38 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
+#ifdef LLAMA_LB7_PROBES
+        // UFH14-LB7.1 probe: one line per flush = one llama_state_seq_get_data call (target or draft context).
+        // ser_us = serialization walk (ctor -> flush), flush_us = all deferred device->host copies; transfers of
+        // >= 1 MiB are timed individually (big_*) so the small-transfer remainder separates count from bandwidth.
+        const int64_t lb7p_t0 = ggml_time_us();
+        size_t  lb7p_bytes = 0, lb7p_n_big = 0, lb7p_b_big = 0, lb7p_n_host = 0;
+        int64_t lb7p_us_big = 0;
+        for (const auto & winfo : winfos) {
+            lb7p_bytes += winfo.size;
+            lb7p_n_host += ggml_backend_buffer_is_host(winfo.tensor->buffer) ? 1 : 0;
+            if (winfo.size >= (1u << 20)) {
+                const int64_t lb7p_tb = ggml_time_us();
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                lb7p_us_big += ggml_time_us() - lb7p_tb;
+                lb7p_n_big++;
+                lb7p_b_big += winfo.size;
+            } else {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+        }
+        if (!winfos.empty()) {
+            const int64_t lb7p_t1 = ggml_time_us();
+            LLAMA_LOG_INFO("lb7p: io_write t0_us=%lld n_xfer=%zu n_host=%zu bytes=%zu ser_us=%lld flush_us=%lld n_big=%zu bytes_big=%zu big_us=%lld\n",
+                    (long long) lb7p_t0, winfos.size(), lb7p_n_host, lb7p_bytes, (long long) (lb7p_t0 - lb7p_t_ctor),
+                    (long long) (lb7p_t1 - lb7p_t0), lb7p_n_big, lb7p_b_big, (long long) lb7p_us_big);
+        }
+#else
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+#endif
     }
 
     void write(const void * src, size_t size) override {
@@ -3064,6 +3092,9 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+#ifdef LLAMA_LB7_PROBES
+    const int64_t lb7p_t_ctor = ggml_time_us();
+#endif
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3071,10 +3102,38 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_read_host() {
+#ifdef LLAMA_LB7_PROBES
+        // UFH14-LB7.1 probe: one line per flush = one llama_state_seq_set_data call (target or draft context).
+        // ser_us = deserialization walk incl. find_slot (ctor -> flush), flush_us = all deferred host->device copies;
+        // transfers of >= 1 MiB are timed individually (big_*). A temporary magic-only reader (no transfers) logs nothing.
+        const int64_t lb7p_t0 = ggml_time_us();
+        size_t  lb7p_bytes = 0, lb7p_n_big = 0, lb7p_b_big = 0, lb7p_n_host = 0;
+        int64_t lb7p_us_big = 0;
+        for (const auto & rinfo : rinfos) {
+            lb7p_bytes += rinfo.size;
+            lb7p_n_host += ggml_backend_buffer_is_host(rinfo.tensor->buffer) ? 1 : 0;
+            if (rinfo.size >= (1u << 20)) {
+                const int64_t lb7p_tb = ggml_time_us();
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+                lb7p_us_big += ggml_time_us() - lb7p_tb;
+                lb7p_n_big++;
+                lb7p_b_big += rinfo.size;
+            } else {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
+        }
+        if (!rinfos.empty()) {
+            const int64_t lb7p_t1 = ggml_time_us();
+            LLAMA_LOG_INFO("lb7p: io_read t0_us=%lld n_xfer=%zu n_host=%zu bytes=%zu ser_us=%lld flush_us=%lld n_big=%zu bytes_big=%zu big_us=%lld\n",
+                    (long long) lb7p_t0, rinfos.size(), lb7p_n_host, lb7p_bytes, (long long) (lb7p_t0 - lb7p_t_ctor),
+                    (long long) (lb7p_t1 - lb7p_t0), lb7p_n_big, lb7p_b_big, (long long) lb7p_us_big);
+        }
+#else
         // flush the reads
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+#endif
     }
 
     void read(void * dst, size_t size) override {
@@ -3116,6 +3175,9 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+#ifdef LLAMA_LB7_PROBES
+    const int64_t lb7p_t_ctor = ggml_time_us();
+#endif
 };
 
 class llama_io_write_file : public llama_io_write_i {

@@ -69,3 +69,8 @@ if (GGML_CPU_PROF)
 endif()
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# UFH14-LB7.1: state I/O + KV path probes (llama-context.cpp, llama-kv-cache.cpp), PRIVATE to libllama.
+if (LLAMA_LB7_PROBES)
+    target_compile_definitions(llama PRIVATE LLAMA_LB7_PROBES)
+endif()
