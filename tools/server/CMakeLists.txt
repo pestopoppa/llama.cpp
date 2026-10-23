@@ -31,6 +31,14 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# GPU-ZOS-1a: compile the update_slots() pre_decode/decode/post_decode/sampling timers (server-context.cpp DEBUG_TIMINGS).
+# Debug instrument only: it adds a llama_synchronize() after every decode and a log line every 5 s. Never in production.
+option(LLAMA_SERVER_DEBUG_TIMINGS "llama-server: compile the DEBUG_TIMINGS update_slots timers (debug only)" OFF)
+if (LLAMA_SERVER_DEBUG_TIMINGS)
+    target_compile_definitions(${TARGET} PRIVATE DEBUG_TIMINGS)
+    message(STATUS "llama-server: DEBUG_TIMINGS timers compiled in (LLAMA_SERVER_DEBUG_TIMINGS=ON)")
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
