@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -3212,6 +3213,8 @@ private:
     }
 
 // #define DEBUG_TIMINGS
+// GPU-ZOS-1a: or configure with -DLLAMA_SERVER_DEBUG_TIMINGS=ON (tools/server/CMakeLists.txt, default OFF), which defines
+// DEBUG_TIMINGS for the server-context target only; every other target and the ggml/llama libraries are compiled as without it.
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3243,6 +3246,25 @@ private:
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+
+            // GPU-ZOS-1a: the averages above are cumulative since process start (warmup, prefill and every arm mixed in).
+            // One machine-readable line with the RAW running sums and counts, the wall clock and the number of generating
+            // slots, so a reader can take deltas between two lines that bracket a steady decode window.
+            int n_slots_gen = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    n_slots_gen++;
+                }
+            }
+            const int64_t t_wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            SRV_INF("debug-timings: wall_us=%" PRId64 " slots_gen=%d"
+                    " n_pre_decode=%" PRId64 " t_pre_decode_us=%" PRId64
+                    " n_decode=%" PRId64 " t_decode_us=%" PRId64
+                    " n_post_decode=%" PRId64 " t_post_decode_us=%" PRId64
+                    " n_sampl=%" PRId64 " t_sampl_us=%" PRId64 "\n",
+                    t_wall_us, n_slots_gen,
+                    n_pre_decode, t_pre_decode, n_decode, t_decode, n_post_decode, t_post_decode, n_sampl, t_sampl);
         }
 #endif
 
