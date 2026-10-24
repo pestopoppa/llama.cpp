@@ -3508,6 +3508,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-host-mirror"}, "SPEC",
+        "HSF-5.P (experimental): keep a host-pinned, NUMA-bound write-through mirror of the KV cache plus a\n"
+        "recurrent-state checkpoint every k decode steps, so slot save/restore read pinned host memory\n"
+        "SPEC: on | comma-separated k=<steps>(6),node=<numa node|-1>(3),mode=lag|fresh(lag),piece_mib=<n>(1024),path=auto|ce|kernel(auto)\n"
+        "(default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.kv_host_mirror = value.empty() ? "on" : value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

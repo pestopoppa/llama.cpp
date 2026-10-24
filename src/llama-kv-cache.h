@@ -173,6 +173,26 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // HSF-5.P host KV mirror (experimental). With no observer set (the default) nothing below changes behaviour.
+    struct write_observer {
+        virtual ~write_observer() = default;
+        // cells `idxs` of stream `strm` were (re)written in every K/V layer
+        virtual void on_cells_written(uint32_t strm, const uint32_t * idxs, size_t n) = 0;
+        // the whole cache content changed in place (K-shift, stream copy, clear with data)
+        virtual void on_invalidate_all() = 0;
+    };
+
+    void set_write_observer(write_observer * obs) { observer = obs; }
+
+    // the per-layer base K and V tensors ([n_embd, kv_size, n_stream], null layers skipped)
+    void get_mirror_tensors(std::vector<ggml_tensor *> & out) const;
+
+    bool get_v_trans()      const { return v_trans; }
+    bool get_shares_cells() const { return other != nullptr; }
+
+    // state_write() keeps only cells with pos <= cap when cap >= 0 (a lag-mode mirror save); -1 = all cells
+    mutable llama_pos state_write_pos_cap = -1;
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -319,6 +339,9 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // HSF-5.P: null unless a host KV mirror is enabled
+    write_observer * observer = nullptr;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

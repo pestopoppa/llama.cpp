@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/kv-host-mirror.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -5447,6 +5448,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // HSF-5.P host KV mirror (experimental); only looked up when the mirror is enabled
+    if (strcmp(name, "ggml_backend_kv_mirror_get_ops") == 0) {
+        return (void *)ggml_backend_cuda_kv_mirror_get_ops;
     }
     return nullptr;
 }

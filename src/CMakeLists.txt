@@ -28,6 +28,8 @@ add_library(llama
             llama-kv-cache-dsa.cpp
             llama-kv-compress.cpp
             llama-kv-cache-dsv4.cpp
+            llama-kv-host-mirror.cpp
+            llama-kv-host-mirror-bind.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp

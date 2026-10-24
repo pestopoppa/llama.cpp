@@ -377,6 +377,9 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        if (observer) {
+            observer->on_invalidate_all();
+        }
     }
 }
 
@@ -856,6 +859,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 }
             }
         }
+
+        if (observer) {
+            observer->on_invalidate_all();
+        }
     }
 
     if (do_shift) {
@@ -868,6 +875,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
+
+        if (observer) {
+            observer->on_invalidate_all();
+        }
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
@@ -1190,6 +1201,24 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // HSF-5.P host KV mirror: these cells get new K/V rows in this ubatch (state restores come through here too)
+    if (observer) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            observer->on_cells_written(sinfo.strm[s], sinfo.idxs[s].data(), sinfo.idxs[s].size());
+        }
+    }
+}
+
+void llama_kv_cache::get_mirror_tensors(std::vector<ggml_tensor *> & out) const {
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            out.push_back(layer.k);
+        }
+        if (layer.v) {
+            out.push_back(layer.v);
+        }
     }
 }
 
@@ -2182,6 +2211,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+
+            // HSF-5.P lag-mode mirror save: only the prefix covered by the recurrent checkpoint (default -1: no cap)
+            if (state_write_pos_cap >= 0) {
+                add_cell = add_cell && cells.pos_get(i) <= state_write_pos_cap;
+            }
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
