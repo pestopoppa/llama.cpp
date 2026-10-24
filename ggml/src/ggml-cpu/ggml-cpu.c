@@ -3877,7 +3877,7 @@ struct ggml_cpu_prof_meta {
 static struct ggml_cpu_prof_meta * ggml_cpu_prof_meta = NULL;
 static int                         ggml_cpu_prof_meta_n = 0;
 
-static uint64_t ggml_cpu_prof_graph_idx     = 0;   // graph evaluations seen
+static uint64_t ggml_cpu_prof_graph_idx     = 0; static void ggml_cpu_prof_eval_open(const struct ggml_cgraph * cgraph, uint64_t gi, int nth, int acc); static int64_t ggml_cpu_prof_eval_t_last = 0;   // graph evaluations seen; AKX-ALL-LB3.2a per-eval record: see end of file
 static uint64_t ggml_cpu_prof_graphs_acc    = 0;   // graph evaluations accumulated
 static int      ggml_cpu_prof_skip          = -1;
 static int      ggml_cpu_prof_nodes_written = 0;
@@ -4762,7 +4762,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
         }
         ggml_cpu_prof_shape_seen(cgraph->n_nodes, prof_acc);
-        ggml_cpu_prof_last_nth = params.nth;
+        ggml_cpu_prof_last_nth = params.nth; ggml_cpu_prof_eval_open(cgraph, gi, params.nth, prof_acc);
     }
 #endif
 
@@ -4843,7 +4843,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_CPU_PROF
                 if (st0 != 0) {
                     const uint64_t dt   = (uint64_t)(st1 - st0);
-                    const uint64_t wall = (uint64_t)(ggml_time_us() - st0);
+                    const uint64_t wall = (uint64_t)(ggml_time_us() - st0); ggml_cpu_prof_eval_t_last = st0 + (int64_t) wall;
                     ggml_cpu_prof_total_ns      += dt;
                     ggml_cpu_prof_total_wall_ns += wall;
                     ggml_cpu_prof_ns[node->op]      += dt;
@@ -4902,7 +4902,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // compute only -- what the pre-2026-09-02 profiler could see.
         if (t0 != 0) {
             const uint64_t dt   = (uint64_t)(t1 - t0);
-            const uint64_t wall = (uint64_t)(ggml_time_us() - t0);
+            const uint64_t wall = (uint64_t)(ggml_time_us() - t0); ggml_cpu_prof_eval_t_last = t0 + (int64_t) wall;
             ggml_cpu_prof_total_ns      += dt;
             ggml_cpu_prof_total_wall_ns += wall;
             if (prof_node_idx < ggml_cpu_prof_node_cap) {
@@ -5742,3 +5742,242 @@ void ggml_cpu_init(void) {
 
     ggml_critical_section_end();
 }
+
+#ifdef GGML_CPU_PROF
+// AKX-ALL-LB3.2a (2026-10-24): per-EVALUATION record of the INF-70 per-node profile.
+//
+// The INF-70 accumulators are summed over every accumulated graph evaluation of the process and dumped once at exit,
+// so a llama-bench process that runs a 64k depth prefill, warmups and several (n_prompt, n_depth) tests cannot be
+// split into its timed phases.  This keeps, per graph evaluation, the DELTA of the per-node wall/compute
+// accumulators (thread 0, wall measured after the graph barrier, i.e. the critical path including barrier wait and
+// straggler imbalance) together with the evaluation index `gi` (the same number the GGML_CPU_PROF_VERBOSE
+// "[cpu_prof] graph_eval idx=" line prints) and CLOCK_MONOTONIC open/last-node timestamps (ggml_time_us).  A
+// reader assigns evaluations to llama-bench's timed `prompt run` phases from the stderr order of those lines.
+//
+//   GGML_CPU_PROF_EVAL_FILE=<path>  enable (requires GGML_CPU_PROF); written ONCE at exit, nothing is written while
+//                                   the process runs.  Without it this code returns at its first test.
+//
+// File format (tab separated):
+//   S <key-hex> <n_nodes>                                      one per distinct graph topology (op+name sequence)
+//   N <idx> <op> <name> <src0-name> <src1-name> <ne0> <ne1> <ne2> <ne3>   node table of the preceding S
+//   E <gi> <acc> <key-hex> <n_nodes> <nth> <t_open_us> <t_last_us> <tot_wall_us> <tot_compute_us>
+//   W <idx>:<wall_us>:<compute_us> ...                         nodes with a non-zero delta of the preceding E
+//   T <truncated 0|1> <n_evals>                                trailer
+// tot_wall_us includes INF-70 SYNC-2 solo runs, which are charged to no node index: solo = tot_wall - sum(W wall).
+// Cost: thread 0, at graph start, one FNV-1a pass over the node names plus a copy of two uint64 arrays.
+struct ggml_cpu_prof_eval_rec {
+    uint64_t gi;
+    int      acc;
+    int      n_nodes;
+    int      nth;
+    uint64_t key;
+    int64_t  t_open;
+    int64_t  t_last;
+    uint64_t tot_wall;
+    uint64_t tot_comp;
+    size_t   off;      // into ggml_cpu_prof_eval_buf, 2*n_nodes uint32 (wall, compute); SIZE_MAX = no node data
+};
+struct ggml_cpu_prof_eval_shape {
+    uint64_t key;
+    int      n_nodes;
+    char *   text;     // pre-formatted N lines
+};
+static int                               ggml_cpu_prof_eval_state  = -1;  // -1 unknown, 0 off, 1 on
+static struct ggml_cpu_prof_eval_rec *   ggml_cpu_prof_evals       = NULL;
+static size_t                            ggml_cpu_prof_evals_n     = 0;
+static size_t                            ggml_cpu_prof_evals_cap   = 0;
+static uint32_t *                        ggml_cpu_prof_eval_buf    = NULL;
+static size_t                            ggml_cpu_prof_eval_buf_n  = 0;
+static size_t                            ggml_cpu_prof_eval_buf_cap = 0;
+static uint64_t *                        ggml_cpu_prof_eval_prev_w = NULL;
+static uint64_t *                        ggml_cpu_prof_eval_prev_c = NULL;
+static int                               ggml_cpu_prof_eval_prev_cap = 0;
+static uint64_t                          ggml_cpu_prof_eval_prev_tw = 0;
+static uint64_t                          ggml_cpu_prof_eval_prev_tc = 0;
+static int                               ggml_cpu_prof_eval_is_open = 0;
+static int                               ggml_cpu_prof_eval_truncated = 0;
+static struct ggml_cpu_prof_eval_shape * ggml_cpu_prof_eval_shapes = NULL;
+static int                               ggml_cpu_prof_eval_shapes_n = 0;
+#define GGML_CPU_PROF_EVAL_MAX_U32 ((size_t) 1 << 28)   // 1 GiB of node deltas, then stop recording (T line says so)
+
+static uint64_t ggml_cpu_prof_eval_key(const struct ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        h = (h ^ (uint64_t) (nd->op + 1)) * 1099511628211ULL;
+        for (const char * c = nd->name; *c; c++) {
+            h = (h ^ (uint64_t) (unsigned char) *c) * 1099511628211ULL;
+        }
+        h = (h ^ 0xffu) * 1099511628211ULL;
+    }
+    return h ^ (uint64_t) cgraph->n_nodes;
+}
+
+static void ggml_cpu_prof_eval_note_shape(const struct ggml_cgraph * cgraph, uint64_t key) {
+    for (int i = 0; i < ggml_cpu_prof_eval_shapes_n; i++) {
+        if (ggml_cpu_prof_eval_shapes[i].key == key) {
+            return;
+        }
+    }
+    struct ggml_cpu_prof_eval_shape * ns = (struct ggml_cpu_prof_eval_shape *) realloc(ggml_cpu_prof_eval_shapes,
+        (size_t) (ggml_cpu_prof_eval_shapes_n + 1) * sizeof(struct ggml_cpu_prof_eval_shape));
+    if (ns == NULL) {
+        ggml_cpu_prof_eval_truncated = 1;
+        return;
+    }
+    ggml_cpu_prof_eval_shapes = ns;
+    const size_t per = 64 + 3*GGML_MAX_NAME + 4*24;
+    char * text = (char *) malloc((size_t) cgraph->n_nodes * per + 1);
+    if (text == NULL) {
+        ggml_cpu_prof_eval_truncated = 1;
+        return;
+    }
+    size_t len = 0;
+    text[0] = '\0';
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * nd = cgraph->nodes[i];
+        const int w = snprintf(text + len, per, "N\t%d\t%s\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld\n", i,
+                               ggml_op_name(nd->op), nd->name,
+                               nd->src[0] ? nd->src[0]->name : "-", nd->src[1] ? nd->src[1]->name : "-",
+                               (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3]);
+        if (w > 0) {
+            len += ((size_t) w < per) ? (size_t) w : per - 1;
+        }
+    }
+    struct ggml_cpu_prof_eval_shape * s = &ggml_cpu_prof_eval_shapes[ggml_cpu_prof_eval_shapes_n++];
+    s->key     = key;
+    s->n_nodes = cgraph->n_nodes;
+    s->text    = text;
+}
+
+static void ggml_cpu_prof_eval_close(void) {
+    if (!ggml_cpu_prof_eval_is_open) {
+        return;
+    }
+    ggml_cpu_prof_eval_is_open = 0;
+    struct ggml_cpu_prof_eval_rec * r = &ggml_cpu_prof_evals[ggml_cpu_prof_evals_n - 1];
+    r->t_last   = ggml_cpu_prof_eval_t_last;
+    r->tot_wall = ggml_cpu_prof_total_wall_ns - ggml_cpu_prof_eval_prev_tw;
+    r->tot_comp = ggml_cpu_prof_total_ns      - ggml_cpu_prof_eval_prev_tc;
+    if (r->off != SIZE_MAX) {
+        uint32_t * b = ggml_cpu_prof_eval_buf + r->off;
+        for (int i = 0; i < r->n_nodes; i++) {
+            const int in = i < ggml_cpu_prof_node_cap && i < ggml_cpu_prof_eval_prev_cap;
+            b[2*i + 0] = in ? (uint32_t) (ggml_cpu_prof_node_wall_ns[i] - ggml_cpu_prof_eval_prev_w[i]) : 0;
+            b[2*i + 1] = in ? (uint32_t) (ggml_cpu_prof_node_ns[i]      - ggml_cpu_prof_eval_prev_c[i]) : 0;
+        }
+    }
+}
+
+static void ggml_cpu_prof_eval_write(void) {
+    ggml_cpu_prof_eval_close();
+    const char * path = getenv("GGML_CPU_PROF_EVAL_FILE");
+    if (path == NULL) {
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (f == NULL) {
+        fprintf(stderr, "[cpu_prof] could not open GGML_CPU_PROF_EVAL_FILE=%s\n", path);
+        return;
+    }
+    fprintf(f, "# ggml-cpu-prof-eval/1 units=us clock=CLOCK_MONOTONIC\n");
+    for (int i = 0; i < ggml_cpu_prof_eval_shapes_n; i++) {
+        fprintf(f, "S\t%016llx\t%d\n", (unsigned long long) ggml_cpu_prof_eval_shapes[i].key, ggml_cpu_prof_eval_shapes[i].n_nodes);
+        fputs(ggml_cpu_prof_eval_shapes[i].text, f);
+    }
+    for (size_t e = 0; e < ggml_cpu_prof_evals_n; e++) {
+        const struct ggml_cpu_prof_eval_rec * r = &ggml_cpu_prof_evals[e];
+        fprintf(f, "E\t%llu\t%d\t%016llx\t%d\t%d\t%lld\t%lld\t%llu\t%llu\n", (unsigned long long) r->gi, r->acc,
+                (unsigned long long) r->key, r->n_nodes, r->nth, (long long) r->t_open, (long long) r->t_last,
+                (unsigned long long) r->tot_wall, (unsigned long long) r->tot_comp);
+        if (r->off != SIZE_MAX) {
+            fputs("W", f);
+            const uint32_t * b = ggml_cpu_prof_eval_buf + r->off;
+            for (int i = 0; i < r->n_nodes; i++) {
+                if (b[2*i] != 0 || b[2*i + 1] != 0) {
+                    fprintf(f, "\t%d:%u:%u", i, b[2*i], b[2*i + 1]);
+                }
+            }
+            fputs("\n", f);
+        }
+    }
+    fprintf(f, "T\t%d\t%llu\n", ggml_cpu_prof_eval_truncated, (unsigned long long) ggml_cpu_prof_evals_n);
+    fclose(f);
+    fprintf(stderr, "[cpu_prof] wrote %s (%llu evals)\n", path, (unsigned long long) ggml_cpu_prof_evals_n);
+}
+
+// thread 0, at graph start, right after the INF-70 setup (so the node accumulators already cover n_nodes when acc)
+static void ggml_cpu_prof_eval_open(const struct ggml_cgraph * cgraph, uint64_t gi, int nth, int acc) {
+    if (ggml_cpu_prof_eval_state < 0) {
+        ggml_cpu_prof_eval_state = getenv("GGML_CPU_PROF_EVAL_FILE") != NULL ? 1 : 0;
+        if (ggml_cpu_prof_eval_state) {
+            atexit(ggml_cpu_prof_eval_write);
+        }
+    }
+    if (ggml_cpu_prof_eval_state == 0) {
+        return;
+    }
+    ggml_cpu_prof_eval_close();
+    const int64_t t_open = ggml_time_us();
+    if (ggml_cpu_prof_eval_truncated) {
+        return;
+    }
+    if (ggml_cpu_prof_evals_n == ggml_cpu_prof_evals_cap) {
+        const size_t cap = ggml_cpu_prof_evals_cap ? 2*ggml_cpu_prof_evals_cap : 1024;
+        struct ggml_cpu_prof_eval_rec * ne = (struct ggml_cpu_prof_eval_rec *) realloc(ggml_cpu_prof_evals, cap*sizeof(*ne));
+        if (ne == NULL) {
+            ggml_cpu_prof_eval_truncated = 1;
+            return;
+        }
+        ggml_cpu_prof_evals     = ne;
+        ggml_cpu_prof_evals_cap = cap;
+    }
+    const uint64_t key = ggml_cpu_prof_eval_key(cgraph);
+    ggml_cpu_prof_eval_note_shape(cgraph, key);
+    struct ggml_cpu_prof_eval_rec * r = &ggml_cpu_prof_evals[ggml_cpu_prof_evals_n];
+    r->gi = gi; r->acc = acc; r->n_nodes = cgraph->n_nodes; r->nth = nth; r->key = key;
+    r->t_open = t_open; r->t_last = t_open; r->tot_wall = 0; r->tot_comp = 0; r->off = SIZE_MAX;
+    if (acc && cgraph->n_nodes <= ggml_cpu_prof_node_cap) {
+        const size_t need = 2*(size_t) cgraph->n_nodes;
+        if (ggml_cpu_prof_eval_buf_n + need > GGML_CPU_PROF_EVAL_MAX_U32) {
+            ggml_cpu_prof_eval_truncated = 1;
+            return;
+        }
+        if (ggml_cpu_prof_eval_buf_n + need > ggml_cpu_prof_eval_buf_cap) {
+            size_t cap = ggml_cpu_prof_eval_buf_cap ? 2*ggml_cpu_prof_eval_buf_cap : ((size_t) 1 << 22);
+            while (cap < ggml_cpu_prof_eval_buf_n + need) {
+                cap *= 2;
+            }
+            uint32_t * nb = (uint32_t *) realloc(ggml_cpu_prof_eval_buf, cap*sizeof(uint32_t));
+            if (nb == NULL) {
+                ggml_cpu_prof_eval_truncated = 1;
+                return;
+            }
+            ggml_cpu_prof_eval_buf     = nb;
+            ggml_cpu_prof_eval_buf_cap = cap;
+        }
+        if (ggml_cpu_prof_eval_prev_cap < ggml_cpu_prof_node_cap) {
+            uint64_t * pw = (uint64_t *) realloc(ggml_cpu_prof_eval_prev_w, (size_t) ggml_cpu_prof_node_cap*sizeof(uint64_t));
+            uint64_t * pc = pw ? (uint64_t *) realloc(ggml_cpu_prof_eval_prev_c, (size_t) ggml_cpu_prof_node_cap*sizeof(uint64_t)) : NULL;
+            if (pw) {
+                ggml_cpu_prof_eval_prev_w = pw;
+            }
+            if (pw == NULL || pc == NULL) {
+                ggml_cpu_prof_eval_truncated = 1;
+                return;
+            }
+            ggml_cpu_prof_eval_prev_c   = pc;
+            ggml_cpu_prof_eval_prev_cap = ggml_cpu_prof_node_cap;
+        }
+        memcpy(ggml_cpu_prof_eval_prev_w, ggml_cpu_prof_node_wall_ns, (size_t) cgraph->n_nodes*sizeof(uint64_t));
+        memcpy(ggml_cpu_prof_eval_prev_c, ggml_cpu_prof_node_ns,      (size_t) cgraph->n_nodes*sizeof(uint64_t));
+        r->off = ggml_cpu_prof_eval_buf_n;
+        ggml_cpu_prof_eval_buf_n += need;
+    }
+    ggml_cpu_prof_eval_prev_tw = ggml_cpu_prof_total_wall_ns;
+    ggml_cpu_prof_eval_prev_tc = ggml_cpu_prof_total_ns;
+    ggml_cpu_prof_eval_t_last  = t_open;
+    ggml_cpu_prof_evals_n++;
+    ggml_cpu_prof_eval_is_open = 1;
+}
+#endif // GGML_CPU_PROF
