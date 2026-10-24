@@ -1512,7 +1512,7 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
         for (auto & input : inputs) {
             const int64_t t0 = ggml_time_us();
             input->set_input(ubatch);
-            llama_host_prof_add(typeid(*input).name(), ggml_time_us() - t0, decode);
+            { const int64_t dt_ = ggml_time_us() - t0; llama_host_prof_add(typeid(*input).name(), dt_, decode); if (getenv("GGML_CPU_PROF_VERBOSE") != NULL) { fprintf(stderr, "[input_prof] n_tokens=%d us=%lld class=%s\n", (int) ubatch->n_tokens, (long long) dt_, typeid(*input).name()); } } // AKX-ALL-LB3.2a
         }
         return;
     }
