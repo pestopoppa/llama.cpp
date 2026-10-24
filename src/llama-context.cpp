@@ -4337,6 +4337,64 @@ bool llama_chunk_kv_rope_selfcheck(struct llama_context * ctx, llama_pos delta, 
     return kv->chunk_rope_selfcheck(ctx, delta, nmse_out);
 }
 
+void llama_context::set_allow_pos_holes(bool value) {
+    balloc->allow_pos_holes = value;
+}
+
+int32_t llama_chunk_kv_decode_at(struct llama_context * ctx, struct llama_batch batch) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: chunk-KV sparse decode refused: %s\n", __func__, why.c_str());
+        return -1;
+    }
+    if (batch.n_tokens <= 0 || !batch.token || !batch.pos || !batch.seq_id || !batch.n_seq_id) {
+        LLAMA_LOG_ERROR("%s: needs a token batch with explicit pos and seq_id\n", __func__);
+        return -1;
+    }
+
+    const llama_seq_id seq = batch.seq_id[0][0];
+    if (seq < 0 || (uint32_t) seq >= llama_n_seq_max(ctx)) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id %d\n", __func__, (int) seq);
+        return -1;
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq) {
+            LLAMA_LOG_ERROR("%s: one sequence per batch, one sequence per token\n", __func__);
+            return -1;
+        }
+        if (batch.pos[i] != batch.pos[0] + i) {
+            LLAMA_LOG_ERROR("%s: positions must be consecutive (token %d has pos %d, first %d)\n", __func__, i,
+                    (int) batch.pos[i], (int) batch.pos[0]);
+            return -1;
+        }
+    }
+    if (batch.pos[0] < 0) {
+        LLAMA_LOG_ERROR("%s: negative position %d\n", __func__, (int) batch.pos[0]);
+        return -1;
+    }
+
+    ctx->synchronize();
+
+    // a position already present in the sequence would become a second cell with the same pos: refuse
+    if (!kv->chunk_range_free(seq, batch.pos[0], batch.pos[0] + batch.n_tokens)) {
+        LLAMA_LOG_ERROR("%s: positions [%d, %d) are not free in sequence %d (seq_rm them first)\n", __func__,
+                (int) batch.pos[0], (int) (batch.pos[0] + batch.n_tokens), (int) seq);
+        return -1;
+    }
+
+    ctx->set_allow_pos_holes(true);
+    int32_t ret = -1;
+    try {
+        ret = llama_decode(ctx, batch);
+    } catch (...) {
+        ctx->set_allow_pos_holes(false);
+        throw;
+    }
+    ctx->set_allow_pos_holes(false);
+    return ret;
+}
+
 // llama adapter API
 
 int32_t llama_set_adapters_lora(

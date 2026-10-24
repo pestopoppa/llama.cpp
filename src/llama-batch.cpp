@@ -259,7 +259,7 @@ bool llama_batch_allocr::init(
                 continue;
             }
 
-            const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
+            const llama_pos p0 = memory && !allow_pos_holes ? memory->seq_pos_max(s) : -1;
 
             if (batch.token) {
                 if (p0 >= 0 && p0 >= seq_pos_min(s)) {
@@ -292,7 +292,7 @@ bool llama_batch_allocr::init(
                 continue;
             }
 
-            const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
+            const llama_pos p0 = memory && !allow_pos_holes ? memory->seq_pos_max(s) : -1;
 
             if (p0 >= 0) {
                 bool ok = true;

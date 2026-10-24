@@ -69,6 +69,14 @@ LLAMA_API bool llama_chunk_kv_apply_shift(struct llama_context * ctx);
 // over the model's distinct rope configurations. Returns false when it could not run.
 LLAMA_API bool llama_chunk_kv_rope_selfcheck(struct llama_context * ctx, llama_pos delta, double * nmse_out);
 
+// sparse recompute (KPF-62.4): decode a batch that fills a HOLE of a sequence, i.e. positions that were removed with
+// llama_memory_seq_rm while later positions (injected, stale chunk cells) are still present. llama_decode refuses that
+// batch (it requires Y = X + 1); this call waives that rule for this one decode. The batch must be one sequence, token
+// input, explicit consecutive positions none of which is present in the sequence. Causal masking is by position, so the
+// tokens attend every cell of the sequence with a lower position (fresh or stale) and their own fresh K/V replaces the
+// removed cells. Returns llama_decode's result, or -1 on refusal (unsupported memory or an invalid batch; cache unchanged).
+LLAMA_API int32_t llama_chunk_kv_decode_at(struct llama_context * ctx, struct llama_batch batch);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
