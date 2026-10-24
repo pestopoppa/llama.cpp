@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-host-mirror-bind.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -2064,6 +2065,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // HSF-5.P host KV mirror: poll finished copies, issue due recurrent checkpoints (never a host wait)
+    if (kv_mirror) {
+        kv_mirror->on_decode_begin();
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2424,6 +2430,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // HSF-5.P host KV mirror: one async copy of this step's KV cells, on a side stream after the launch
+    if (kv_mirror) {
+        kv_mirror->on_decode_end(batch_inp);
+    }
 
     return 0;
 }
@@ -3545,6 +3556,10 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         memory->state_read(io);
     }
 
+    if (kv_mirror) {
+        kv_mirror->on_state_read(-1);
+    }
+
     return io.n_bytes();
 }
 
@@ -3563,6 +3578,10 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
 
     if (memory) {
         memory->state_read(io, seq_id, flags);
+    }
+
+    if (kv_mirror) {
+        kv_mirror->on_state_read(seq_id);
     }
 
     return io.n_bytes();

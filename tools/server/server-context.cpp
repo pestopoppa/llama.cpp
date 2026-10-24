@@ -1268,6 +1268,14 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
+        // HSF-5.P host KV mirror (experimental, off unless --kv-host-mirror is given)
+        if (!params_base.kv_host_mirror.empty()) {
+            if (!llama_kv_mirror_enable(ctx_tgt, params_base.kv_host_mirror.c_str())) {
+                SRV_ERR("failed to enable the kv host mirror '%s'\n", params_base.kv_host_mirror.c_str());
+                return false;
+            }
+        }
+
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
@@ -2519,10 +2527,20 @@ private:
     }
 
     // returns false if the appendix could not be written completely
-    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+    // pos_cap >= 0 keeps only checkpoints with pos_max <= pos_cap (a lag-mode kv-host-mirror save, HSF-5.P)
+    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written, llama_pos pos_cap = -1) const {
         n_written = 0;
         if (slot.prompt.checkpoints.empty()) {
             return true;
+        }
+        if (pos_cap >= 0) {
+            size_t n_keep = 0;
+            for (const auto & cur : slot.prompt.checkpoints) {
+                n_keep += cur.pos_max <= pos_cap;
+            }
+            if (n_keep == 0) {
+                return true;
+            }
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {
@@ -2531,11 +2549,20 @@ private:
         }
         const uint32_t magic   = SLOT_CKPT_MAGIC;
         const uint32_t version = SLOT_CKPT_VERSION;
-        const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
+        uint32_t count = (uint32_t) slot.prompt.checkpoints.size();
+        if (pos_cap >= 0) {
+            count = 0;
+            for (const auto & cur : slot.prompt.checkpoints) {
+                count += cur.pos_max <= pos_cap;
+            }
+        }
         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
         for (const auto & cur : slot.prompt.checkpoints) {
+            if (pos_cap >= 0 && cur.pos_max > pos_cap) {
+                continue;
+            }
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
@@ -2888,16 +2915,40 @@ private:
 
                     const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+
+                    // HSF-5.P: with the kv host mirror on, the state comes from pinned host memory (no device read);
+                    // a lag-mode save may stop at the last recurrent checkpoint (n_saved < token_count)
+                    size_t nwrite  = 0;
+                    size_t n_saved = token_count;
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        nwrite = llama_kv_mirror_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count, &n_saved);
+                        if (nwrite == 0) {
+                            SLT_WRN(*slot, "%s", "kv host mirror save failed, falling back to a device save\n");
+                            n_saved = token_count;
+                        }
+                    }
+                    if (nwrite == 0) {
+                        nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    }
+                    const bool truncated = n_saved < token_count;
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        llama_kv_mirror_stats ms;
+                        llama_kv_mirror_get_stats(ctx_tgt, &ms);
+                        SLT_INF(*slot, "kv-host-mirror save: n_tokens=%zu/%zu fallback_bytes=%llu mirror_bytes=%llu replay_tokens=%d replay_steps=%d tail_copies=%llu ckpts=%llu/%llu\n",
+                                n_saved, token_count, (unsigned long long) ms.save_fallback_bytes, (unsigned long long) ms.save_mirror_bytes,
+                                ms.last_replay_tokens, ms.last_replay_steps, (unsigned long long) ms.n_tail_copies,
+                                (unsigned long long) ms.n_ckpt_complete, (unsigned long long) ms.n_ckpt_issued);
+                    }
 
                     size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt, truncated ? (llama_pos) n_saved - 1 : -1)) {
                         send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
                         break;
                     }
 
+                    // a truncated (lag) save carries no draft state: the drafter is rebuilt by the replay
                     size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+                    if (!truncated && !save_slot_draft(filepath, *slot, nwrite_dft)) {
                         send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -2910,7 +2961,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
+                    res->n_tokens = n_saved;
                     res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
@@ -2938,7 +2989,24 @@ private:
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    // HSF-5.P: with the kv host mirror on, stage the file in pinned memory and restore by bulk H2D / gather
+                    size_t nread = 0;
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        nread = llama_kv_mirror_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                        if (nread == 0) {
+                            SLT_WRN(*slot, "%s", "kv host mirror restore failed, falling back to a file restore\n");
+                        }
+                    }
+                    if (nread == 0) {
+                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    }
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        llama_kv_mirror_stats ms;
+                        llama_kv_mirror_get_stats(ctx_tgt, &ms);
+                        SLT_INF(*slot, "kv-host-mirror restore: device_bytes=%llu device_frags=%llu fallback_bytes=%llu\n",
+                                (unsigned long long) ms.restore_device_bytes, (unsigned long long) ms.restore_device_frags,
+                                (unsigned long long) ms.restore_fallback_bytes);
+                    }
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
