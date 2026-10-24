@@ -326,6 +326,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             FIXTURES_REQUIRED generate-models
         )
     endforeach()
+
+    # chunk-KV reuse (P1, KPF-62.6): G3 approximation-gate harness; the ctest runs only its built-in self-test
+    llama_build(test-chunk-kv-g3.cpp)
+    target_include_directories(test-chunk-kv-g3 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_test(
+        test-chunk-kv-g3
+        NAME test-chunk-kv-g3-selftest
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen3-dense.gguf" -ctk f32 -ctv f32 --g3-self-test
+    )
+    set_tests_properties(test-chunk-kv-g3-selftest PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
