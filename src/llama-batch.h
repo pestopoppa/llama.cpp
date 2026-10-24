@@ -114,6 +114,12 @@ public:
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
+    // chunk-KV sparse recompute (experimental): when true, init() does not require a sequence's batch positions to
+    // continue the memory (Y = X + 1, or X < Y for M-RoPE), so a batch may fill a HOLE of a sequence (positions removed
+    // by seq_rm). Positions inside the batch must still be continuous. Set only around one decode by
+    // llama_chunk_kv_decode_at(), which first checks that the positions are free. Not touched by clear().
+    bool allow_pos_holes = false;
+
 private:
     void clear();
 

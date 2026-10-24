@@ -2408,6 +2408,20 @@ bool llama_kv_cache::chunk_inject(llama_io_read_i & io, llama_seq_id seq_id, lla
     return true;
 }
 
+bool llama_kv_cache::chunk_range_free(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 size_t llama_kv_cache::chunk_read_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out) const {
     if (!chunk_supported() || p1 <= p0) {
         return 0;
