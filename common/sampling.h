@@ -111,6 +111,48 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// GPU-ZOS-2 C2a (`LLAMA_ZOS2=greedy-fast`, experimental): an exact greedy fast path for the
+// verification rows of speculative decoding. Returns exactly what
+//
+//      common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false, nullptr)
+//
+// returns, and leaves the grammar, the reasoning budget, the penalty/DRY history and the `prev`
+// ring in the same state (every returned token goes through common_sampler_accept, as there).
+//
+// Per row, when the sampler is provably greedy (common_sampler_greedy_fast_select below, plus no
+// grammar, no reasoning budget and no backend-sampled row), the token is the unique argmax of
+// logit + logit_bias over the raw logits row, found in one scan instead of running the chain.
+// Any other row -- a tied maximum, a NaN, a non-finite maximum, a backend-sampled row, or an
+// ineligible sampler -- is sampled by common_sampler_sample, i.e. the champion path.
+//
+// Differences that cannot change a returned token: on a fast row the chain does not run, so the
+// candidate buffer (common_sampler_get_candidates) is stale -- callers must not request n_probs --
+// the `dist` sampler's RNG is not advanced (at temp <= 0 with top-k > 0 its draw never changes
+// the selected token), and the chain's perf counters do not count the row.
+//
+// n_fast / n_fallback (optional) are incremented by the number of rows taken by the fast path and
+// by the chain respectively.
+std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        int64_t * n_fast     = nullptr,
+        int64_t * n_fallback = nullptr);
+
+// GPU-ZOS-2 C2a row kernel, model-free (exposed for tests/test-sampling-greedy-fast.cpp).
+// Returns the token the sampling chain built from `params` would select on this raw logits row,
+// or LLAMA_TOKEN_NULL when that cannot be decided exactly without running the chain:
+//   - params not provably greedy: requires mirostat 0, temp <= 0 with no dynamic temperature, a
+//     TEMPERATURE and a top-k (> 0) sampler in the chain, n_probs 0, and every other sampler a
+//     no-op (penalties neutral, dry_multiplier 0, top_n_sigma <= 0, typ_p >= 1, xtc_probability
+//     <= 0) or max-preserving (top-p, min-p); infill and adaptive-p are never eligible;
+//   - the row has a NaN, a tied maximum, or a non-finite maximum (after logit_bias).
+// logit_bias is applied exactly as llama_sampler_logit_bias does on an id-ordered full-vocab row:
+// entries in order, `logit += bias`, out-of-range tokens ignored. The caller guarantees there is
+// no grammar and no reasoning-budget sampler.
+llama_token common_sampler_greedy_fast_select(const struct common_params_sampling & params, const float * logits, int32_t n_vocab);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

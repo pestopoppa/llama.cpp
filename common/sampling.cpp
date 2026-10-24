@@ -717,6 +717,208 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+// GPU-ZOS-2 C2a: true when the chain common_sampler_init builds from these params selects the unique
+// maximum of logit + logit_bias whenever that maximum is unique and finite and the row has no NaN.
+// Every sampler llama_sampler_temp_impl sees before it either is a no-op for these values or keeps the
+// maximum (top-k, top-p, min-p), the temp <= 0 branch then keeps only the first strict maximum, and
+// top-k > 0 leaves the array sorted so `dist` selects index 0 (that maximum) for every RNG draw.
+static bool greedy_fast_params_ok(const common_params_sampling & p) {
+    if (p.mirostat != 0 || p.n_probs != 0) {
+        return false;
+    }
+    if (!(p.temp <= 0.0f) || !(p.dynatemp_range <= 0.0f)) {
+        return false; // also rejects NaN
+    }
+
+    bool has_temp  = false;
+    bool has_top_k = false;
+
+    for (const auto type : p.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(p.penalty_last_n == 0 ||
+                      (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (p.dry_multiplier != 0.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (!(p.top_n_sigma <= 0.0f)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                if (p.top_k > 0) {
+                    has_top_k = true;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (!(p.typ_p >= 1.0f)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (!std::isfinite(p.top_p)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (!std::isfinite(p.min_p)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (!(p.xtc_probability <= 0.0f)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                has_temp = true;
+                break;
+            default:
+                // INFILL, ADAPTIVE_P and anything added later: not provably greedy
+                return false;
+        }
+    }
+
+    return has_temp && has_top_k;
+}
+
+llama_token common_sampler_greedy_fast_select(const struct common_params_sampling & params, const float * logits, int32_t n_vocab) {
+    if (logits == nullptr || n_vocab <= 0 || !greedy_fast_params_ok(params)) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    // biased values, exactly as llama_sampler_logit_bias_apply computes them on an id-ordered row:
+    // per entry in order, logit += bias; tokens outside [0, n_vocab) match no candidate
+    std::vector<std::pair<llama_token, float>> biased;
+    for (const auto & lb : params.logit_bias) {
+        if (lb.token < 0 || lb.token >= n_vocab) {
+            continue;
+        }
+        auto it = std::find_if(biased.begin(), biased.end(),
+                [&](const std::pair<llama_token, float> & e) { return e.first == lb.token; });
+        if (it == biased.end()) {
+            biased.emplace_back(lb.token, logits[lb.token]);
+            it = biased.end() - 1;
+        }
+        it->second += lb.bias;
+    }
+    std::sort(biased.begin(), biased.end(),
+            [](const std::pair<llama_token, float> & a, const std::pair<llama_token, float> & b) { return a.first < b.first; });
+
+    float       best = -INFINITY;
+    llama_token arg  = LLAMA_TOKEN_NULL;
+    bool        tie  = false;
+    bool        nan  = false;
+
+    auto visit = [&](llama_token t, float v) {
+        if (v > best) {
+            best = v;
+            arg  = t;
+            tie  = false;
+        } else if (v == best) {
+            tie = true;
+        } else if (v != v) {
+            nan = true;
+        }
+    };
+
+    llama_token t = 0;
+    for (const auto & e : biased) {
+        for (; t < e.first; ++t) {
+            visit(t, logits[t]);
+        }
+        visit(t, e.second);
+        ++t;
+    }
+    for (; t < n_vocab; ++t) {
+        visit(t, logits[t]);
+    }
+
+    if (nan || tie || arg == LLAMA_TOKEN_NULL || !std::isfinite(best)) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    return arg;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        int64_t * n_fast,
+        int64_t * n_fallback) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    // the INF-70 E2a per-row diagnostic lives in the champion function; keep it complete
+    static const bool diag_accept = getenv("LLAMA_SPEC_DIAG_ACCEPT") != NULL;
+    if (diag_accept || gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr) {
+        auto result = common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false, nullptr);
+        if (n_fallback) {
+            *n_fallback += (int64_t) result.size();
+        }
+        return result;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+    auto sample_row = [&](int idx) -> llama_token {
+        llama_synchronize(ctx);
+
+        if (llama_get_sampled_token_ith (ctx, idx) == LLAMA_TOKEN_NULL &&
+            llama_get_sampled_probs_ith (ctx, idx) == nullptr &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+            const auto tm = gsmpl->tm();
+
+            const llama_token id = common_sampler_greedy_fast_select(gsmpl->params, llama_get_logits_ith(ctx, idx), n_vocab);
+            if (id != LLAMA_TOKEN_NULL) {
+                if (n_fast) {
+                    (*n_fast)++;
+                }
+                return id;
+            }
+        }
+
+        if (n_fallback) {
+            (*n_fallback)++;
+        }
+        return common_sampler_sample(gsmpl, ctx, idx, false);
+    };
+
+    // same row order, accept calls and stop rule as common_sampler_sample_and_accept_n
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const llama_token id = sample_row(idxs[i]);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = sample_row(idxs[i]);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,

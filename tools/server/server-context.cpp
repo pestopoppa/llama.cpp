@@ -29,6 +29,9 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 // INF-70 E2a: exactness modes for greedy speculative verification, read once from LLAMA_SPEC_EXACT.
 // On a target whose multi-token forward is not row-exact against its single-token forward (qwen4exp:
@@ -116,6 +119,191 @@ static bool rowexact_threshold_configured() {
     const long threshold = strtol(value, &end, 10);
     return errno == 0 && end != value && *end == '\0' && threshold > 0;
 }
+
+// GPU-ZOS-2 (experimental, default OFF): one knob, three separately gated tokens, read once from LLAMA_ZOS2.
+// Design: epyc-root docs/design/gpu-zos-2-one-step-lag-design-20261024.md (sections 4 and 8).
+//   lazy-save       (C1)  skip the per-round common_sampler_clone in batched speculative verification when no
+//                         restore can read it (no checkpoint restore and no LLAMA_SPEC_EXACT drop/redecode).
+//   greedy-fast     (C2a) exact greedy fast path for verification rows (common_sampler_sample_and_accept_n_greedy_fast).
+//   overlap-process (C3)  run common_speculative_process (DFlash feature injection on ctx_dft) on a worker thread
+//                         while the main thread samples the verification rows of a pure-verify batch.
+// Grammar: comma-separated tokens, or `all`. Unset or empty = everything off; an unknown token warns and is ignored.
+// With the knob unset every guarded site executes the champion statements in its else-branch.
+struct zos2_knobs {
+    bool lazy_save       = false;
+    bool greedy_fast     = false;
+    bool overlap_process = false;
+};
+
+static zos2_knobs zos2_knobs_parse() {
+    zos2_knobs k;
+    const char * v = getenv("LLAMA_ZOS2");
+    if (v == nullptr || *v == 0) {
+        return k;
+    }
+    std::string s(v);
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t end = s.find(',', pos);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        std::string tok = s.substr(pos, end - pos);
+        // trim spaces
+        while (!tok.empty() && isspace((unsigned char) tok.front())) { tok.erase(tok.begin()); }
+        while (!tok.empty() && isspace((unsigned char) tok.back()))  { tok.pop_back(); }
+        if (tok == "lazy-save") {
+            k.lazy_save = true;
+        } else if (tok == "greedy-fast") {
+            k.greedy_fast = true;
+        } else if (tok == "overlap-process") {
+            k.overlap_process = true;
+        } else if (tok == "all") {
+            k.lazy_save = k.greedy_fast = k.overlap_process = true;
+        } else if (!tok.empty()) {
+            LOG_WRN("unknown LLAMA_ZOS2 token '%s' (expected lazy-save|greedy-fast|overlap-process|all), ignoring it\n", tok.c_str());
+        }
+        pos = end + 1;
+    }
+    return k;
+}
+
+// parsed once per process
+static const zos2_knobs & zos2_knobs_get() {
+    static const zos2_knobs k = zos2_knobs_parse();
+    return k;
+}
+
+// GPU-ZOS-2 C3: one persistent worker that runs common_speculative_process(spec, batch) for one step at a time.
+// The batch arrays are copied at submit, so the worker never reads the server batch. The main thread owns
+// `in_flight`; `has_job`/`done`/`result`/`t_us` are exchanged under `mtx`. The thread starts on first use only.
+struct zos2_process_worker {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::thread             th;
+    bool started = false;
+    bool stop    = false;
+    bool has_job = false;
+    bool done    = true;
+    bool result  = true;
+    int64_t t_us = 0;
+
+    bool in_flight = false; // main thread only
+
+    common_speculative * spec = nullptr;
+
+    std::vector<llama_token>    token;
+    std::vector<llama_pos>      pos;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_seq_id>   seq_id_flat;
+    std::vector<llama_seq_id *> seq_id;
+    std::vector<int8_t>         logits;
+    llama_batch                 view = {};
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            cv.wait(lock, [&] { return stop || has_job; });
+            if (has_job) {
+                has_job = false;
+                lock.unlock();
+                const int64_t t0 = ggml_time_us();
+                bool ok = false;
+                try {
+                    ok = common_speculative_process(spec, view);
+                } catch (const std::exception & e) {
+                    LOG_ERR("GPU-ZOS-2: common_speculative_process threw on the worker: %s\n", e.what());
+                    ok = false;
+                }
+                const int64_t t1 = ggml_time_us();
+                lock.lock();
+                result = ok;
+                t_us   = t1 - t0;
+                done   = true;
+                cv.notify_all();
+                continue;
+            }
+            if (stop) {
+                return;
+            }
+        }
+    }
+
+    void submit(common_speculative * s, const llama_batch & b) {
+        GGML_ASSERT(!in_flight);
+        GGML_ASSERT(b.token != nullptr && b.embd == nullptr);
+
+        const int32_t n = b.n_tokens;
+        token.assign(b.token, b.token + n);
+        pos.assign(b.pos, b.pos + n);
+        n_seq_id.assign(b.n_seq_id, b.n_seq_id + n);
+        logits.assign(b.logits, b.logits + n);
+        seq_id_flat.clear();
+        for (int32_t i = 0; i < n; ++i) {
+            for (int32_t j = 0; j < b.n_seq_id[i]; ++j) {
+                seq_id_flat.push_back(b.seq_id[i][j]);
+            }
+        }
+        seq_id.resize(n);
+        size_t off = 0;
+        for (int32_t i = 0; i < n; ++i) {
+            seq_id[i] = seq_id_flat.data() + off;
+            off += b.n_seq_id[i];
+        }
+        view = { n, token.data(), nullptr, pos.data(), n_seq_id.data(), seq_id.data(), logits.data() };
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (!started) {
+                started = true;
+                th = std::thread([this] { run(); });
+            }
+            spec    = s;
+            done    = false;
+            has_job = true;
+        }
+        cv.notify_all();
+        in_flight = true;
+    }
+
+    // wait for the in-flight job; returns its result (true when nothing was in flight)
+    bool join(int64_t & t_process_us) {
+        t_process_us = 0;
+        if (!in_flight) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&] { return done; });
+        in_flight    = false;
+        t_process_us = t_us;
+        return result;
+    }
+
+    void shutdown() {
+        int64_t t_unused = 0;
+        if (in_flight && !join(t_unused)) {
+            LOG_ERR("%s", "GPU-ZOS-2: an un-joined speculative process job failed at shutdown\n");
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (!started) {
+                return;
+            }
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        started = false;
+        stop    = false;
+    }
+
+    ~zos2_process_worker() {
+        shutdown();
+    }
+};
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1012,7 +1200,21 @@ private:
     spec_exact_mode spec_exact        = spec_exact_mode_from_env();
     bool            spec_exact_warned = false;
 
+    // GPU-ZOS-2: LLAMA_ZOS2, parsed once per process (default: every token off)
+    const zos2_knobs & zos2 = zos2_knobs_get();
+
     common_speculative_ptr spec;
+
+    // GPU-ZOS-2 C3: declared after `spec` so that it is destroyed (and its thread joined) before it
+    zos2_process_worker zos2_worker;
+
+    // GPU-ZOS-2 C3: per-slot results of phase 1 (verification sampling ahead of the worker join), by slot.id
+    struct zos2_pre_verify {
+        bool               valid = false;
+        llama_tokens       accepted;
+        common_sampler_ptr smpl_save;
+    };
+    std::vector<zos2_pre_verify> zos2_pre;
 
     bool add_bos_token = true;
 
@@ -1047,6 +1249,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (zos2.overlap_process) {
+            zos2_worker.shutdown(); // GPU-ZOS-2 C3: nothing may touch spec/ctx_dft after this point
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1373,6 +1579,10 @@ private:
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
+
+        // GPU-ZOS-2: the gate reads this line (design section 8)
+        SRV_INF("GPU-ZOS-2: LLAMA_ZOS2 lazy-save=%d greedy-fast=%d overlap-process=%d\n",
+                (int) zos2.lazy_save, (int) zos2.greedy_fast, (int) zos2.overlap_process);
 
         if (spec_exact != SPEC_EXACT_OFF) {
             SRV_INF("speculative exactness mode (LLAMA_SPEC_EXACT) = %s, target seq_rm type = %d\n",
@@ -3134,6 +3344,25 @@ private:
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
 
+    // GPU-ZOS-2 sub-timers of the speculative post_decode/decode work. They accumulate only under DEBUG_TIMINGS
+    // (scoped_timer is a no-op otherwise); the greedy-fast row counts accumulate whenever greedy-fast runs.
+    int64_t t_zos2_verify      = 0; // verification sampling (chain or greedy-fast), per slot-round
+    int64_t n_zos2_verify      = 0;
+    int64_t t_zos2_clone       = 0; // common_sampler_clone (smpl_save), per slot-round
+    int64_t n_zos2_clone       = 0;
+    int64_t t_zos2_rollback    = 0; // common_context_seq_rm on ctx_tgt and ctx_dft, per slot-round
+    int64_t n_zos2_rollback    = 0;
+    int64_t t_zos2_emit        = 0; // token_to_piece + process_token loop, per slot-round
+    int64_t n_zos2_emit        = 0;
+    int64_t t_zos2_process     = 0; // common_speculative_process inline in decode(), per sub-batch
+    int64_t n_zos2_process     = 0;
+    int64_t t_zos2_process_wrk = 0; // common_speculative_process on the overlap-process worker, per step
+    int64_t n_zos2_process_wrk = 0;
+    int64_t t_zos2_join_wait   = 0; // main thread blocked in the worker join, per step
+    int64_t n_zos2_join_wait   = 0;
+    int64_t n_zos2_gf_fast     = 0; // greedy-fast rows taken by the fast path
+    int64_t n_zos2_gf_fallback = 0; // greedy-fast rows routed to the chain (C2a fallback: tie, NaN, ineligible, ...)
+
     // decode-aware prefill budget (--prefill-budget-decoding / --prefill-budget-target-ms)
     // while any slot is generating, every server iteration carries the decode/verify rows plus a chunk of
     // a neighbour's prompt; the chunk's cost grows with the occupied KV cells, so a full n_batch chunk can
@@ -3261,9 +3490,21 @@ private:
                     " n_pre_decode=%" PRId64 " t_pre_decode_us=%" PRId64
                     " n_decode=%" PRId64 " t_decode_us=%" PRId64
                     " n_post_decode=%" PRId64 " t_post_decode_us=%" PRId64
-                    " n_sampl=%" PRId64 " t_sampl_us=%" PRId64 "\n",
+                    " n_sampl=%" PRId64 " t_sampl_us=%" PRId64
+                    // GPU-ZOS-2.1: sub-timers appended after the 1a fields, same raw sum/count convention
+                    " n_verify=%" PRId64 " t_verify_us=%" PRId64
+                    " n_clone=%" PRId64 " t_clone_us=%" PRId64
+                    " n_rollback=%" PRId64 " t_rollback_us=%" PRId64
+                    " n_emit=%" PRId64 " t_emit_us=%" PRId64
+                    " n_process=%" PRId64 " t_process_us=%" PRId64
+                    " n_process_wrk=%" PRId64 " t_process_wrk_us=%" PRId64
+                    " n_join_wait=%" PRId64 " t_join_wait_us=%" PRId64
+                    " n_gf_fast=%" PRId64 " n_gf_fallback=%" PRId64 "\n",
                     t_wall_us, n_slots_gen,
-                    n_pre_decode, t_pre_decode, n_decode, t_decode, n_post_decode, t_post_decode, n_sampl, t_sampl);
+                    n_pre_decode, t_pre_decode, n_decode, t_decode, n_post_decode, t_post_decode, n_sampl, t_sampl,
+                    n_zos2_verify, t_zos2_verify, n_zos2_clone, t_zos2_clone, n_zos2_rollback, t_zos2_rollback,
+                    n_zos2_emit, t_zos2_emit, n_zos2_process, t_zos2_process, n_zos2_process_wrk, t_zos2_process_wrk,
+                    n_zos2_join_wait, t_zos2_join_wait, n_zos2_gf_fast, n_zos2_gf_fallback);
         }
 #endif
 
@@ -3360,6 +3601,14 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        // GPU-ZOS-2 C3: belt and braces -- never leave update_slots with a worker job in flight
+        if (zos2.overlap_process && zos2_worker.in_flight) {
+            int64_t t_unused = 0;
+            if (!zos2_worker.join(t_unused)) {
+                SRV_ERR("%s", "GPU-ZOS-2: speculative process job failed (joined at the end of update_slots)\n");
             }
         }
 
@@ -4179,6 +4428,101 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // GPU-ZOS-2 C1: can any acceptance count of this round read smpl_save? Same predicate as use_ckpt_tgt in
+    // post_decode with the worst case n_rollback = n_draft, plus the LLAMA_SPEC_EXACT drop/redecode bonus path.
+    bool zos2_need_save(const server_slot & slot, size_t n_draft) const {
+        if (use_serial_speculative_verify(slot)) {
+            return false;
+        }
+        return spec_exact == SPEC_EXACT_DROP || spec_exact == SPEC_EXACT_REDECODE ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+    }
+
+    // GPU-ZOS-2 C2a: engaged per slot for greedy requests that read no probabilities; the common function
+    // checks the rest of the chain (grammar, reasoning budget, penalties, ...) and falls back row by row.
+    bool zos2_greedy_fast_engaged(const server_slot & slot) const {
+        return zos2.greedy_fast && slot.task->params.sampling.temp <= 0.0f && slot.task->params.sampling.n_probs == 0;
+    }
+
+    // GPU-ZOS-2 C3: verification sampling of one slot for phase 1 of an overlapped step. n_probs == 0 is part of
+    // the overlap predicate, so this is the champion verify statement with out_dists == nullptr.
+    llama_tokens zos2_verify_rows(server_slot & slot) {
+        const size_t n_draft = slot.spec_draft.size();
+
+        const bool can_rollback =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+
+        scoped_timer t_verify(t_zos2_verify, n_zos2_verify);
+
+        if (zos2_greedy_fast_engaged(slot)) {
+            return common_sampler_sample_and_accept_n_greedy_fast(
+                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                    &n_zos2_gf_fast, &n_zos2_gf_fallback);
+        }
+
+        return can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                    slot.spec_dists.size() == slot.spec_draft.size()
+            ? common_sampler_sample_and_accept_n(
+                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists,
+                    false, nullptr)
+            : common_sampler_sample_and_accept_n(
+                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                    false, nullptr);
+    }
+
+    // GPU-ZOS-2 C3: true only for a PURE VERIFY batch that one sub-batch covers: every processing slot is a
+    // generating, drafting, batched-verify slot with no possible restore and no probabilities, its rows are all in
+    // this batch, there are no other rows, and the only speculative implementation is DFlash. Then nothing between
+    // the worker's start and its join in post_decode touches ctx_dft or the speculative state: post_decode's first
+    // loop has no prompt slot to begin(), and every accept/seq_rm(ctx_dft)/restore runs after the join.
+    bool zos2_overlap_eligible(int32_t off, const llama_batch & batch_view) const {
+        if (!spec || off != 0 || batch_view.n_tokens != batch.size() || spec_exact != SPEC_EXACT_OFF) {
+            return false;
+        }
+        if (batch_view.token == nullptr || batch_view.embd != nullptr) {
+            return false;
+        }
+
+        bool has_dflash = false;
+        for (const auto type : params_base.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                has_dflash = true;
+            } else if (type != COMMON_SPECULATIVE_TYPE_NONE) {
+                return false;
+            }
+        }
+        if (!has_dflash) {
+            return false;
+        }
+
+        int32_t n_rows = 0;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty() ||
+                slot.ctx_dft == nullptr || !slot.task || slot.task->params.sampling.n_probs > 0) {
+                return false;
+            }
+            if (use_serial_speculative_verify(slot) || zos2_need_save(slot, slot.spec_draft.size())) {
+                return false;
+            }
+            if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
+                return false;
+            }
+            for (const int32_t i : slot.spec_i_batch) {
+                if (i < 0 || i >= batch_view.n_tokens) {
+                    return false;
+                }
+            }
+            n_rows += (int32_t) slot.spec_i_batch.size();
+        }
+
+        return n_rows == batch_view.n_tokens;
+    }
+
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4283,11 +4627,22 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        if (zos2.overlap_process && zos2_overlap_eligible(off, batch_view)) {
+            // GPU-ZOS-2 C3: logits and extracted hidden states to the host first, then the drafter's feature
+            // injection runs on the worker while post_decode samples the verification rows; post_decode joins it
+            // (and rethrows its failure) before anything reads or writes ctx_dft or the speculative state.
+            // Known benign race, by design: process() calls llama_synchronize(ctx_tgt) again on the worker while the
+            // main thread's sampling calls do the same; both find the stream idle and store the same zero values.
+            llama_synchronize(ctx_tgt);
+            zos2_worker.submit(spec.get(), batch_view);
+        } else {
+            scoped_timer t_process(t_zos2_process, n_zos2_process);
         if (!common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
+        }
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -4471,6 +4826,19 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        // GPU-ZOS-2 C3: however post_decode exits, an in-flight worker job is joined first (no-op otherwise)
+        struct zos2_join_guard {
+            server_context_impl & ctx;
+            ~zos2_join_guard() {
+                if (ctx.zos2_worker.in_flight) {
+                    int64_t t_unused = 0;
+                    if (!ctx.zos2_worker.join(t_unused)) {
+                        SRV_ERR("%s", "GPU-ZOS-2: speculative process job failed (joined on an error path)\n");
+                    }
+                }
+            }
+        } zos2_guard { *this };
+
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4586,6 +4954,62 @@ private:
             slot.print_timings_tg();
         });
 
+        // GPU-ZOS-2 C3: phase 1 -- verification sampling of every speculating slot, in slot order, while the worker
+        // injects step k's features into ctx_dft; then the join. Phase 2 is the loop below, unchanged except that it
+        // takes phase 1's result. Only the interleaving across independent slots changes: phase 2 of a slot never
+        // writes the ctx_tgt logits that phase 1 of a later slot reads.
+        bool zos2_phase1 = false;
+        if (zos2.overlap_process && zos2_worker.in_flight) {
+            zos2_phase1 = true;
+
+            if (zos2_pre.size() < slots.size()) {
+                zos2_pre.resize(slots.size());
+            }
+            for (auto & pre : zos2_pre) {
+                pre.valid = false;
+                pre.accepted.clear();
+                pre.smpl_save.reset();
+            }
+
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                    return;
+                }
+
+                GGML_ASSERT(slot.spec_i_batch.size() == slot.spec_draft.size() + 1);
+
+                auto & pre = zos2_pre.at(slot.id);
+
+                // the overlap predicate guarantees need_save == false; without lazy-save the clone still runs (and is
+                // timed) so that the overlap-process arm alone keeps the champion's work
+                if (!zos2.lazy_save) {
+                    scoped_timer t_clone(t_zos2_clone, n_zos2_clone);
+                    pre.smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                }
+
+                pre.accepted = zos2_verify_rows(slot);
+                pre.valid    = true;
+            });
+
+            int64_t t_process_wrk = 0;
+            bool    ok_process    = false;
+            {
+                scoped_timer t_join(t_zos2_join_wait, n_zos2_join_wait);
+                ok_process = zos2_worker.join(t_process_wrk);
+            }
+#ifdef DEBUG_TIMINGS
+            t_zos2_process_wrk += t_process_wrk;
+            n_zos2_process_wrk += 1;
+#else
+            GGML_UNUSED(t_process_wrk);
+#endif
+            if (!ok_process) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+
+                throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
@@ -4631,8 +5055,23 @@ private:
                     // defect is the draft-mtp / batched-verify path below). n_probs stays
                     // empty for tokens accepted through this path.
                     accepted = sample_and_accept_dspark_serial(slot, off);
+                } else if (zos2_phase1 && zos2_pre.at(slot.id).valid) {
+                    // GPU-ZOS-2 C3 phase 2: phase 1 cloned (unless lazy-save) and sampled exactly as the branch below
+                    // would; want_probs is false and spec_exact is off under the overlap predicate
+                    auto & pre = zos2_pre.at(slot.id);
+                    smpl_save = std::move(pre.smpl_save);
+                    accepted  = std::move(pre.accepted);
+                    pre.valid = false;
+                    slot.spec_i_batch.clear();
                 } else {
+                    if (zos2.lazy_save && !zos2_need_save(slot, n_draft)) {
+                        // GPU-ZOS-2 C1: no path below can read smpl_save this round -- the checkpoint restore needs
+                        // n_rollback > n_rs_seq on RS or a FULL context, and spec_exact_bonus needs drop/redecode --
+                        // so the clone is skipped and smpl_save stays null (spec_exact_bonus treats null as "no").
+                    } else {
+                        scoped_timer t_clone(t_zos2_clone, n_zos2_clone);
                     smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                    }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
@@ -4644,6 +5083,15 @@ private:
                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
                     std::vector<std::vector<llama_token_data>> * out_dists = want_post_sampling_dist ? &verify_dists : nullptr;
+                    {
+                        scoped_timer t_verify(t_zos2_verify, n_zos2_verify);
+                    if (zos2_greedy_fast_engaged(slot)) {
+                        // GPU-ZOS-2 C2a: temp <= 0 and n_probs == 0, so the champion statement below takes its second
+                        // branch with out_dists == nullptr; this returns exactly what that returns
+                        accepted = common_sampler_sample_and_accept_n_greedy_fast(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                &n_zos2_gf_fast, &n_zos2_gf_fallback);
+                    } else {
                     accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
                                     slot.spec_dists.size() == slot.spec_draft.size()
                         ? common_sampler_sample_and_accept_n(
@@ -4652,6 +5100,8 @@ private:
                         : common_sampler_sample_and_accept_n(
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 false, out_dists);
+                    }
+                    }
                     slot.spec_i_batch.clear();
 
                     if (spec_exact == SPEC_EXACT_DROP || spec_exact == SPEC_EXACT_REDECODE) {
@@ -4709,6 +5159,10 @@ private:
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        if (zos2.lazy_save || zos2_phase1) {
+                            // GPU-ZOS-2: unreachable by the need_save / overlap predicates; fail loudly if not
+                            GGML_ASSERT(smpl_save && "GPU-ZOS-2: checkpoint restore without a saved sampler");
+                        }
                         slot.smpl = std::move(smpl_save);
 
                         return;
@@ -4749,11 +5203,15 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            {
+                scoped_timer t_rollback(t_zos2_rollback, n_zos2_rollback);
             common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
             if (slot.ctx_dft) {
                 common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
             }
+            }
 
+            scoped_timer t_emit(t_zos2_emit, n_zos2_emit);
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
