@@ -96,8 +96,9 @@ Importer: `/mnt/raid0/llm/venvs/llama-gguf-convert/bin/python tools/exl3/exl3_im
   canonical (same class as llama.cpp's Q8_K activations); prefill is fp32 (≈ the fp16 rounding
   floor of the canonical reference). The artifact keeps the UD BF16 indexer and IQ4_NL n-gram
   table, so it is not byte-identical to turboderp's model in those two places.
-* INF-64 fused decode (`qwen4exp-fused.cpp`) is engaged by default for single-token decode in
-  this tree and is single-threaded (4-layer F16 probe at 8 threads: 135.8 ms/token fused vs 36.9
+* INF-64 fused decode (`qwen4exp-fused.cpp`) was engaged by default for single-token decode in
+  this tree (since champion C5 it is OFF by default and opt-in via `GGML_FUSED_DECODE_ON=1`)
+  and is single-threaded (4-layer F16 probe at 8 threads: 135.8 ms/token fused vs 36.9
   ms graph); the codified recipe disables it. EXL3 models always take the graph path.
 * Housekeeping: the scratchpad `/tmp/claude-1000/-workspace/654db1ee-…/scratchpad` is shared with
   the main session — one early file write there (`moe.txt`) may have overwritten an older file of

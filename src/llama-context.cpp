@@ -1386,10 +1386,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the fused decode fast path (INF-64): single-token decode on a fully
     // CPU-resident model runs the fused layer functions instead of the graph;
     // any failure falls through to the graph path below
+    // it is OPT-IN (default OFF since champion C5): it runs only with
+    // GGML_FUSED_DECODE_ON=1 and without GGML_FUSED_DECODE_OFF (OFF wins), see
+    // llama_fused_decode_env_enabled(); on the real UD-IQ4_XS Q38FN model it was
+    // measured to diverge from the graph and to be ~20x slower (FD-DIV-1a), and a
+    // second fused-MoE defect is open (FD-DIV-1b, INF-67)
     // the fused path produces logits only; it exports no t_h_nextn, so an MTP
     // draft target must stay on the graph path or the draft head sees no hidden state
     // EXL3 weights need the matrix executor's aux sources; the fused path calls vec_dot directly
-    if (getenv("GGML_FUSED_DECODE_OFF") == NULL && model.supports_fused_decode() && model.exl3_aux.empty() &&
+    if (llama_fused_decode_env_enabled() && model.supports_fused_decode() && model.exl3_aux.empty() &&
             gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
         // snapshot the previous graph's per-layer inputs (the fused path may
@@ -4217,6 +4222,17 @@ struct ggml_cgraph * llama_graph_reserve(
 
 int64_t llama_n_fused_decode(const struct llama_context * ctx) {
     return ctx->get_n_fused_decode();
+}
+
+bool llama_fused_decode_env_enabled(void) {
+    // GGML_FUSED_DECODE_OFF (any value) forces the graph path and wins over ON;
+    // it is kept for back-compat and is a no-op on its own now that OFF is the default
+    if (getenv("GGML_FUSED_DECODE_OFF") != NULL) {
+        return false;
+    }
+    // GGML_FUSED_DECODE_ON opts in; unset, empty or "0" keeps the default graph path
+    const char * on = getenv("GGML_FUSED_DECODE_ON");
+    return on != NULL && on[0] != '\0' && strcmp(on, "0") != 0;
 }
 
 // llama adapter API

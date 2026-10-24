@@ -1,7 +1,8 @@
 // INF-64 validation harness: fused-vs-graph single-token decode logit diff.
 // One model, two contexts; both decode the same prompt batch (graph path),
 // then K single-token decodes. ctx_g runs with GGML_FUSED_DECODE_OFF=1
-// (graph path), ctx_f with the env unset (fused fast path). Greedy tokens
+// (graph path), ctx_f with only GGML_FUSED_DECODE_ON=1 (the fused fast path
+// is opt-in; OFF wins when both are set). Greedy tokens
 // from the graph ctx feed both contexts. Per-step max-abs-diff + NMSE.
 // Optionally compares the batch-decode logits against a reference file
 // (argv[3], the logits-ref.bin captured pre-fusion on the same tree).
@@ -86,6 +87,7 @@ int main(int argc, char ** argv) {
 
     // single-token steps: graph ctx drives the greedy token stream
     const bool ext_off = getenv("GGML_FUSED_DECODE_OFF") != NULL;
+    setenv("GGML_FUSED_DECODE_ON", "1", 1); // the fused path is opt-in; an external OFF still wins
     llama_batch sb = llama_batch_init(1, 0, 1);
     for (int s = 1; s <= steps; s++) {
         const int tok = greedy_argmax(lg, n_vocab);

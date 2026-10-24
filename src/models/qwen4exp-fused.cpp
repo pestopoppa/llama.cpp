@@ -5,7 +5,10 @@
 // function, so the numerics mirror the decomposed graph bit for bit.
 //
 // Invoked only for the single-token decode ubatch on the CPU backend, behind
-// model.supports_fused_decode() (see llama-context.cpp process_ubatch).
+// model.supports_fused_decode() (see llama-context.cpp process_ubatch), and only
+// when the environment opts in: the path is OFF by default and runs only with
+// GGML_FUSED_DECODE_ON=1 (GGML_FUSED_DECODE_OFF, if set, wins). It stays opt-in
+// until the fused-MoE divergence (FD-DIV-1b, INF-67) is fixed.
 
 #include "ggml.h"
 #include "ggml-cpu.h"

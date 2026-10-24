@@ -6,7 +6,7 @@
 // and n_ctx_orig_yarn. This test builds a tiny synthetic qwen4exp model, prefills
 // the same prompt through the graph in two contexts, then decodes token by token
 // with the fused path disabled (GGML_FUSED_DECODE_OFF=1) in one context and
-// enabled in the other, and compares
+// enabled (GGML_FUSED_DECODE_ON=1 alone) in the other, and compares
 //   - the roped K rows and the roped indexer rows that each decode step wrote
 //     into the cache (the direct rope observable: a rope-geometry mismatch is an
 //     O(1) relative error there), and
@@ -20,6 +20,12 @@
 // vacuously: the fused path must have served every decode step
 // (llama_n_fused_decode), and the graph's own K rows under each non-native
 // configuration must differ from the native ones.
+//
+// It also pins the knob semantics (champion C5): the fused path is OFF by
+// default. With neither GGML_FUSED_DECODE_ON nor GGML_FUSED_DECODE_OFF set, a
+// single-token decode must resolve to the graph path (llama_n_fused_decode stays
+// 0); OFF alone and ON+OFF (OFF wins) must too; ON alone must run fused (the
+// positive control that keeps the default check from passing vacuously).
 
 #include "common.h"
 #include "ggml.h"
@@ -238,6 +244,8 @@ static cfg_result run_cfg(llama_model * model, const rope_cfg & rc, const std::v
     const uint32_t n_layer = llama_model_n_layer(model);
     const std::vector<llama_token> prompt(toks.begin(), toks.begin() + n_prompt);
 
+    // the fused path is opt-in: ON for the whole run, OFF (which wins) toggled per decode
+    setenv("GGML_FUSED_DECODE_ON", "1", 1);
     setenv("GGML_FUSED_DECODE_OFF", "1", 1);
     prefill(ref.get(), prompt);
     prefill(fus.get(), prompt);
@@ -252,6 +260,7 @@ static cfg_result run_cfg(llama_model * model, const rope_cfg & rc, const std::v
         r.logits_nmse = std::max(r.logits_nmse, nmse(a, b));
     }
     setenv("GGML_FUSED_DECODE_OFF", "1", 1);
+    unsetenv("GGML_FUSED_DECODE_ON");
     r.n_fused = llama_n_fused_decode(fus.get()) - n_fused0;
     if (llama_n_fused_decode(ref.get()) != 0) {
         throw std::runtime_error("the reference context ran the fused path");
@@ -269,6 +278,71 @@ static cfg_result run_cfg(llama_model * model, const rope_cfg & rc, const std::v
     r.idx_nmse = nmse(cache_rows(mref->get_mem_idx(), n_layer, r0, r1),
                       cache_rows(mfus->get_mem_idx(), n_layer, r0, r1));
     return r;
+}
+
+// the knob truth table, on the env resolver and end to end on the decode path
+struct knob_case {
+    const char * name;
+    const char * on;  // nullptr = unset
+    const char * off; // nullptr = unset
+    bool fused;       // expected: the fused path serves single-token decode
+};
+
+static void set_or_unset(const char * name, const char * val) {
+    if (val) {
+        setenv(name, val, 1);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static bool check_knob_default(llama_model * model, const std::vector<llama_token> & toks, size_t n_prompt) {
+    const knob_case cases[] = {
+        { "default (neither set)", nullptr, nullptr, false },
+        { "OFF=1 only",            nullptr, "1",     false },
+        { "ON=0",                  "0",     nullptr, false },
+        { "ON=1 + OFF=1 (OFF wins)", "1",   "1",     false },
+        { "ON=1 only",             "1",     nullptr, true  },
+    };
+    const size_t n_dec = 4;
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::vector<llama_token> prompt(toks.begin(), toks.begin() + n_prompt);
+    bool ok = true;
+    for (const knob_case & kc : cases) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 128;
+        cp.n_batch = 128;
+        cp.n_ubatch = 64;
+        cp.n_threads = 4;
+        cp.n_threads_batch = 4;
+        llama_context_ptr ctx(llama_init_from_model(model, cp));
+        if (!ctx) {
+            fprintf(stderr, "knob %s: context init failed\n", kc.name);
+            ok = false;
+            continue;
+        }
+        set_or_unset("GGML_FUSED_DECODE_ON", kc.on);
+        set_or_unset("GGML_FUSED_DECODE_OFF", kc.off);
+        const bool resolved = llama_fused_decode_env_enabled();
+        try {
+            prefill(ctx.get(), prompt);
+            for (size_t i = n_prompt; i < n_prompt + n_dec; i++) {
+                decode_one(ctx.get(), toks[i], (llama_pos) i, n_vocab);
+            }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "knob %s: %s\n", kc.name, e.what());
+            ok = false;
+            continue;
+        }
+        const int64_t n_fused = llama_n_fused_decode(ctx.get());
+        const bool pass = resolved == kc.fused && (kc.fused ? n_fused == (int64_t) n_dec : n_fused == 0);
+        printf("knob %-24s resolver=%d fused=%" PRId64 "/%zu expect_fused=%d  %s\n",
+               kc.name, (int) resolved, n_fused, n_dec, (int) kc.fused, pass ? "OK" : "FAIL");
+        ok = ok && pass;
+    }
+    unsetenv("GGML_FUSED_DECODE_ON");
+    unsetenv("GGML_FUSED_DECODE_OFF");
+    return ok;
 }
 
 int main(int argc, char ** argv) {
@@ -315,7 +389,8 @@ int main(int argc, char ** argv) {
         { "freq-base-1e4",  LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED, 1.0e4f, 0.0f,  0  },
     };
 
-    bool ok = true;
+    // the default must resolve to the graph path before anything else is trusted
+    bool ok = check_knob_default(model.get(), toks, n_prompt);
     std::vector<float> ref_k_native;
     for (const rope_cfg & rc : cfgs) {
         cfg_result r;

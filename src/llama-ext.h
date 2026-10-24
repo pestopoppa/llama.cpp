@@ -20,6 +20,13 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // path (no graph). Lets tests prove the fused path actually ran.
 LLAMA_API int64_t llama_n_fused_decode(const struct llama_context * ctx);
 
+// Whether the environment opts in to the fused single-token decode path
+// (read on every decode). The fused path is OFF by default: it runs only with
+// GGML_FUSED_DECODE_ON set to a non-empty value other than "0", and
+// GGML_FUSED_DECODE_OFF (any value, kept for back-compat) forces the graph path
+// and wins when both are set.
+LLAMA_API bool llama_fused_decode_env_enabled(void);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
