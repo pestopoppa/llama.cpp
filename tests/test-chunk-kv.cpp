@@ -3,6 +3,7 @@
 // Run with -m <attention-only gguf> -ctk f32 -ctv f32 (the f32 K cache is what G1 prescribes; a quantized K cache
 // re-quantizes on shift and is not an exactness test). With a hybrid / recurrent model the same binary asserts the
 // clean REFUSAL instead (return 0 / false, cache and decode untouched), which is the phase-1 contract.
+// Optional --g1-capture-jsonl PATH writes per-position G1 sufficient statistics for prospective native capture.
 //
 // Gates (P0_THRESHOLDS.md, section 2): K/V NMSE <= 1e-6 after a shift with no recompute, logits NMSE <= 1e-5 at the
 // suffix, round-trip self-check NMSE <= 1e-6. The measured values are printed so the margin is visible.
@@ -18,7 +19,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <random>
+#include <string>
 #include <vector>
 
 static int n_fail = 0;
@@ -74,6 +78,46 @@ static bool read_kv(llama_context * ctx, llama_seq_id seq, llama_pos p0, llama_p
     return llama_chunk_kv_read_f32(ctx, seq, p0, p1, k.data(), v.data(), &n_v) == n_k;
 }
 
+static bool write_g1_position_rows(std::ofstream & out, llama_pos delta, const char * component,
+        const char * comparison, const std::vector<float> & values, const std::vector<float> & reference,
+        size_t n_layers, size_t n_positions, llama_pos first_position) {
+    if (values.size() != reference.size() || n_layers == 0 || n_positions == 0 ||
+            values.size() % (n_layers*n_positions) != 0) {
+        return false;
+    }
+    out << std::setprecision(17);
+    const size_t width = values.size() / (n_layers*n_positions);
+    for (size_t p = 0; p < n_positions; ++p) {
+        double sum_sq_error = 0.0;
+        double reference_sq_norm = 0.0;
+        size_t element_count = 0;
+        size_t mismatch_count = 0;
+        for (size_t layer = 0; layer < n_layers; ++layer) {
+            const size_t base = (layer*n_positions + p)*width;
+            for (size_t j = 0; j < width; ++j) {
+                const float value = values[base + j];
+                const float ref = reference[base + j];
+                const double difference = (double) value - (double) ref;
+                sum_sq_error += difference*difference;
+                reference_sq_norm += (double) ref*(double) ref;
+                mismatch_count += component[0] == 'l'
+                    ? (memcmp(&value, &ref, sizeof(float)) != 0)
+                    : (value != ref);
+                ++element_count;
+            }
+        }
+        if (!std::isfinite(sum_sq_error) || !std::isfinite(reference_sq_norm)) {
+            return false;
+        }
+        out << "{\"schema\":\"epyc.chunk_kv.g1_position.v1\",\"delta\":" << delta
+            << ",\"position\":" << (first_position + (llama_pos) p)
+            << ",\"component\":\"" << component << "\",\"comparison\":\"" << comparison
+            << "\",\"sum_sq_error\":" << sum_sq_error << ",\"reference_sq_norm\":" << reference_sq_norm
+            << ",\"element_count\":" << element_count << ",\"mismatch_count\":" << mismatch_count << "}\n";
+    }
+    return (bool) out;
+}
+
 static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t n_ctx_seq = 1024) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 8;
@@ -112,7 +156,8 @@ static void test_refusal(const common_params & params, llama_model * model, int 
     llama_free(ctx);
 }
 
-static void test_attention(const common_params & params, llama_model * model, int n_vocab) {
+static void test_attention(const common_params & params, llama_model * model, int n_vocab,
+        const std::string & g1_capture_path) {
     // CKV_N_CHUNK (default 24, clamped to [24, 512]): a longer chunk gives rounding drift in the G1-ref reference more chances to show
     // (it scales with tokens x dims x depth); the KPF-62.8 k-quant fixture runs it at 512.
     const int n_chunk  = std::min(512, std::max(24, getenv("CKV_N_CHUNK") ? atoi(getenv("CKV_N_CHUNK")) : 24)); // <= n_batch
@@ -126,6 +171,17 @@ static void test_attention(const common_params & params, llama_model * model, in
     llama_context * ctx = make_ctx(params, model, n_ctx_seq);
     CHECK(ctx != nullptr);
     if (!ctx) return;
+
+    std::ofstream g1_capture;
+    if (!g1_capture_path.empty()) {
+        g1_capture.open(g1_capture_path, std::ios::out | std::ios::trunc);
+        if (!g1_capture) {
+            fprintf(stderr, "cannot open G1 capture %s\n", g1_capture_path.c_str());
+            n_fail++;
+            llama_free(ctx);
+            return;
+        }
+    }
 
     char why[256] = {0};
     CHECK(llama_chunk_kv_supported(ctx, why, sizeof(why)));
@@ -229,6 +285,24 @@ static void test_attention(const common_params & params, llama_model * model, in
         const double nv_add = nmse(v_a, v_r);
         const double nl_add = nmse(l_a, l_r);
 
+        if (g1_capture.is_open()) {
+            const size_t n_layer_pos = (size_t) n_layer;
+            const bool captured =
+                write_g1_position_rows(g1_capture, delta, "k", "inject_vs_seq_add", k_i, k_a, n_layer_pos,
+                                       (size_t) n_chunk, delta) &&
+                write_g1_position_rows(g1_capture, delta, "v", "inject_vs_seq_add", v_i, v_a, n_layer_pos,
+                                       (size_t) n_chunk, delta) &&
+                write_g1_position_rows(g1_capture, delta, "logits", "inject_vs_seq_add", l_i, l_a, 1,
+                                       (size_t) n_suffix, delta + n_chunk) &&
+                write_g1_position_rows(g1_capture, delta, "k", "inject_vs_in_place_ref", k_i, k_r,
+                                       n_layer_pos, (size_t) n_chunk, delta) &&
+                write_g1_position_rows(g1_capture, delta, "v", "inject_vs_in_place_ref", v_i, v_r,
+                                       n_layer_pos, (size_t) n_chunk, delta) &&
+                write_g1_position_rows(g1_capture, delta, "logits", "inject_vs_in_place_ref", l_i, l_r, 1,
+                                       (size_t) n_suffix, delta + n_chunk);
+            CHECK(captured);
+        }
+
         if (nk > 1e-6 || nv > 1e-6) { // diagnostic: where does the error sit? (V is position-free: any V error is drift of the reference encode)
             const size_t per_k = k_i.size() / n_layer;
             const size_t per_v = v_i.size() / n_layer;
@@ -278,6 +352,10 @@ static void test_attention(const common_params & params, llama_model * model, in
     printf("VERDICT G1a (inject == in-tree seq_add, bit-for-bit): %s\n", g1a_pass ? "PASS" : "FAIL");
     printf("VERDICT G1-ref (pre-registered, ref = encode in place at delta; K/V <= 1e-6, logits <= 1e-5): %s%s\n",
             g1_ref_pass ? "PASS" : "FAIL", ref_info ? " (informational: CKV_G1_REF_INFORMATIONAL=1)" : "");
+    if (g1_capture.is_open()) {
+        g1_capture.flush();
+        CHECK((bool) g1_capture);
+    }
 
     // 4. delta = 0 is an exact copy (no rotation is queued), also for a range that does not start at 0
     {
@@ -366,13 +444,28 @@ static void test_off_identical(const common_params & params, llama_model * model
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    std::string g1_capture_path;
+    std::vector<char *> llama_argv = { argv[0] };
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--g1-capture-jsonl") == 0) {
+            if (i + 1 >= argc || !g1_capture_path.empty()) {
+                fprintf(stderr, "--g1-capture-jsonl needs one path and may be specified once\n");
+                return 2;
+            }
+            g1_capture_path = argv[++i];
+        } else {
+            llama_argv.push_back(argv[i]);
+        }
+    }
+    llama_argv.push_back(nullptr);
+
     common_params params;
     params.sampling.seed = 1234;
     params.n_predict = 1;
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse((int) llama_argv.size() - 1, llama_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
@@ -390,8 +483,12 @@ int main(int argc, char ** argv) {
     const bool attention_only = !llama_model_is_recurrent(model) && !llama_model_is_hybrid(model);
 
     if (attention_only) {
-        test_attention(params, model, n_vocab);
+        test_attention(params, model, n_vocab, g1_capture_path);
     } else {
+        if (!g1_capture_path.empty()) {
+            fprintf(stderr, "G1 capture requires an attention-only model\n");
+            return 2;
+        }
         test_refusal(params, model, n_vocab);
     }
     test_off_identical(params, model, n_vocab);
