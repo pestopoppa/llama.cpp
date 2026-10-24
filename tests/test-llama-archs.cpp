@@ -504,6 +504,13 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
+    // deepseek41 and its DSpark drafter load a bespoke GGUF layout (compress_ratios, kv/index source layer ids,
+    // string scoring_func, u32 rope_theta, nextn-free trunk, ...) that this generic fixture does not emit;
+    // load_arch_hparams aborts on the first missing key (expert_feed_forward_length, then expert_weights_scale,
+    // ...). Skipped like deepseek4 until a dedicated fixture exists (CH-20.2); real coverage is the DS41 gates.
+    if (arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_DEEPSEEK41_DSPARK) {
+        return false;
+    }
 
     // FIXME some models are segfaulting with WebGPU:
 #ifdef GGML_USE_WEBGPU
