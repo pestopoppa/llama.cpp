@@ -639,6 +639,8 @@ struct common_params {
     int32_t prefill_budget_decoding  = 0; // max prompt tokens per server iteration while any slot is generating (0 = off: fill up to n_batch)
     int32_t prefill_budget_target_ms = 0; // adaptive prefill budget: size it so an iteration with decoding slots takes about this long (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t chunk_store_mib     = 0;     // chunk-KV reuse store budget in MiB (experimental, attention-only memory); 0 = feature off
+    int32_t chunk_max_tokens    = 8192;  // chunk-KV reuse: longest chunk the isolated encoder accepts (its context size)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

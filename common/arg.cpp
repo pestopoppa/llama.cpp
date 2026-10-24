@@ -1560,6 +1560,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFILL_BUDGET_TARGET_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--chunk-store-mib"}, "N",
+        string_format("chunk-KV reuse (experimental): budget in MiB of the content-keyed chunk store that serves the `kv_chunks` "
+            "request field; attention-only models; 0 = off, requests are then served exactly as without it (default: %d)", params.chunk_store_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--chunk-store-mib must be >= 0");
+            }
+            params.chunk_store_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CHUNK_STORE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--chunk-max-tokens"}, "N",
+        string_format("chunk-KV reuse (experimental): longest chunk the isolated encoder accepts; sets the encoder context size (default: %d)", params.chunk_max_tokens),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--chunk-max-tokens must be >= 1");
+            }
+            params.chunk_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CHUNK_MAX_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
