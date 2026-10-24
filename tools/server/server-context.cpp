@@ -7,6 +7,8 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-chunk-store.h"
+#include "server-chunk-recompute.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -21,6 +23,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <numeric>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -501,6 +504,8 @@ struct server_slot {
 #ifdef LLAMA_LB7_PROBES
     int64_t lb7p_t_launch_us = 0; // UFH14-LB7.1: when process_single_task launched this slot's current task
 #endif
+    // chunk-KV reuse outcome of the current task (null = the task sent no kv_chunks); reported under timings.kv_chunks
+    json chunk_report = nullptr;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -510,6 +515,12 @@ struct server_slot {
 #ifdef LLAMA_LB7_PROBES
         const int64_t lb7p_t0 = ggml_time_us();
 #endif
+        // chunk-KV: an approximate state must never seed exact-prefix reuse from the prompt cache
+        if (prompt.approx) {
+            SLT_DBG(*this, "%s", "chunk-KV: approximate prompt state is not saved to the prompt cache\n");
+            return false;
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -645,6 +656,8 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        chunk_report = nullptr;
     }
 
     void init_sampler() const {
@@ -835,6 +848,10 @@ struct server_slot {
 
         if (task && !task->params.kv_reorder_report.is_null()) {
             timings.kv_reorder = task->params.kv_reorder_report;
+        }
+
+        if (!chunk_report.is_null()) {
+            timings.kv_chunks = chunk_report;
         }
 
         // Add speculative metrics
@@ -1272,6 +1289,13 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // chunk-KV reuse (P1, KPF-62.5; off unless --chunk-store-mib > 0): content-keyed store of isolated-encode K/V blobs,
+    // the isolated encoder context (positions 0..n-1, no predecessor) and the model fingerprint inside every store key
+    std::unique_ptr<server_chunk::store> chunk_store;
+    llama_context * ctx_chunk = nullptr; // owned
+    std::string     chunk_fp;
+    std::string     chunk_off_reason;    // why the store is off (empty when on)
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -1290,6 +1314,11 @@ private:
     void destroy() {
         if (zos2.overlap_process) {
             zos2_worker.shutdown(); // GPU-ZOS-2 C3: nothing may touch spec/ctx_dft after this point
+        }
+        chunk_store.reset();
+        if (ctx_chunk) {
+            llama_free(ctx_chunk);
+            ctx_chunk = nullptr;
         }
 
         spec.reset();
@@ -1742,6 +1771,8 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel));
         }
 
+        chunk_init();
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1975,7 +2006,7 @@ private:
         std::vector<json> cand_src;
 
         auto add_cand = [&](const server_prompt & sp, json src) {
-            if (sp.tokens.empty() || sp.tokens.has_media()) {
+            if (sp.tokens.empty() || sp.tokens.has_media() || sp.approx) {
                 return;
             }
             server_reorder::candidate c;
@@ -2066,6 +2097,274 @@ private:
         SRV_INF("kv_reorder: applied, candidate %s, reusable prefix %d -> %d (common %d), pieces %d, moved %d tokens, %.2f ms\n",
                 cand_src[res.candidate].dump().c_str(), res.baseline_prefix, res.reordered_prefix, res.common_prefix,
                 res.n_pieces, n_moved, report["plan_ms"].get<double>());
+    }
+
+    // chunk-KV reuse (P1, KPF-62.5): set up the store at load time. Off (champion behaviour) unless --chunk-store-mib > 0.
+    // Refuses, with a logged reason, on memory the chunk API cannot serve (hybrid / recurrent / SWA), with a multimodal
+    // projector, and with speculative decoding / MTP / DFlash (the drafter's own KV would not see the injected chunks:
+    // ctx_dft coverage is a refusal in v1). The K re-rotation self-check (P0_THRESHOLDS section 2, NMSE <= 1e-6) runs and
+    // is logged on every launch; a failure disables the store.
+    void chunk_init() {
+        chunk_store.reset();
+        if (ctx_chunk) {
+            llama_free(ctx_chunk);
+            ctx_chunk = nullptr;
+        }
+        chunk_fp.clear();
+        chunk_off_reason.clear();
+
+        if (params_base.chunk_store_mib <= 0) {
+            chunk_off_reason = "chunk store off (--chunk-store-mib 0)";
+            return;
+        }
+
+        auto off = [&](const std::string & why) {
+            chunk_off_reason = why;
+            SRV_WRN("chunk-KV store DISABLED: %s; requests with kv_chunks are served as without it\n", why.c_str());
+        };
+
+        char why[256] = {0};
+        if (!llama_chunk_kv_supported(ctx_tgt, why, sizeof(why))) {
+            return off(std::string("memory not supported: ") + why);
+        }
+        if (mctx) {
+            return off("a multimodal projector is loaded (mtmd chunks are excluded in v1)");
+        }
+        if (spec || ctx_dft) {
+            return off("speculative decoding / MTP / DFlash is active (drafter KV coverage is not implemented in v1)");
+        }
+        // the K-shift graph re-rotates EVERY cell of every stream (a zero shift for cells that do not move). With a
+        // quantized K cache that re-quantizes the cells of other slots, so an inject would change requests that carry no
+        // chunk. f32/f16/bf16 K: a zero rotation is an exact identity.
+        if (ggml_is_quantized(params_base.cache_type_k)) {
+            return off(string_format("quantized K cache (%s): a K re-rotation would re-quantize other slots' cells; use -ctk f16 or f32",
+                    ggml_type_name(params_base.cache_type_k)));
+        }
+
+        double worst = 0.0;
+        for (llama_pos d : { 1, 17, 300, 4096 }) {
+            double e = -1.0;
+            const bool ran  = llama_chunk_kv_rope_selfcheck(ctx_tgt, d, &e);
+            const bool pass = ran && e >= 0.0 && e <= 1e-6;
+            SRV_INF("chunk-KV rope self-check: delta = %4d, round-trip NMSE = %.3e (limit 1e-6): %s\n", (int) d, e, pass ? "PASS" : "FAIL");
+            if (!pass) {
+                return off(string_format("rope self-check failed at delta %d (NMSE %.3e)", (int) d, e));
+            }
+            worst = std::max(worst, e);
+        }
+
+        auto cparams = common_context_params_to_llama(params_base);
+        cparams.n_ctx      = (uint32_t) params_base.chunk_max_tokens;
+        cparams.n_seq_max  = 1;
+        cparams.kv_unified = true;
+        cparams.n_rs_seq   = 0;
+        cparams.n_batch    = std::min<uint32_t>(cparams.n_batch, cparams.n_ctx);
+        cparams.n_ubatch   = std::min<uint32_t>(cparams.n_ubatch, cparams.n_batch);
+        ctx_chunk = llama_init_from_model(model_tgt, cparams);
+        if (!ctx_chunk) {
+            return off("failed to create the isolated-encode context");
+        }
+
+        // everything that changes a blob's bytes (server-chunk-store.h): GGUF identity, kernel build, cache types, FA, rope
+        {
+            std::error_code ec;
+            const auto fsize = std::filesystem::file_size(params_base.model.path, ec);
+            long long mtime = 0;
+            {
+                std::error_code ec2;
+                const auto t = std::filesystem::last_write_time(params_base.model.path, ec2);
+                if (!ec2) {
+                    mtime = (long long) std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+                }
+            }
+            chunk_fp = string_format("%s|size=%llu|mtime=%lld|%s|k=%s|v=%s|fa=%d|rope=%g,%g|yarn=%g,%g,%d|CKV1",
+                    params_base.model.path.c_str(), ec ? 0ULL : (unsigned long long) fsize, mtime, llama_build_info(),
+                    ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v), (int) cparams.flash_attn_type,
+                    cparams.rope_freq_base, cparams.rope_freq_scale, cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+                    (int) cparams.rope_scaling_type);
+        }
+
+        chunk_store = std::make_unique<server_chunk::store>((size_t) params_base.chunk_store_mib * 1024 * 1024);
+        SRV_INF("chunk-KV store enabled: budget %d MiB, max chunk %d tokens, rope self-check worst NMSE %.3e\n",
+                params_base.chunk_store_mib, params_base.chunk_max_tokens, worst);
+        SRV_INF("chunk-KV store fingerprint: %s\n", chunk_fp.c_str());
+    }
+
+    // isolated encode of one chunk at positions 0..n-1 in the encoder context, exported as a blob
+    bool chunk_encode(const server_chunk::tokens & ct, std::vector<uint8_t> & blob) {
+        if (!ctx_chunk || ct.empty() || (int32_t) ct.size() > params_base.chunk_max_tokens) {
+            return false;
+        }
+        auto * mem = llama_get_memory(ctx_chunk);
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        bool ok = server_chunk::decode_range(ctx_chunk, ct.data(), 0, (int32_t) ct.size(), 0, (int32_t) llama_n_batch(ctx_chunk), false) == 0;
+        if (ok) {
+            const size_t need = llama_chunk_kv_export(ctx_chunk, nullptr, 0, 0, 0, (llama_pos) ct.size());
+            blob.resize(need);
+            ok = need > 0 && llama_chunk_kv_export(ctx_chunk, blob.data(), blob.size(), 0, 0, (llama_pos) ct.size()) == need;
+        }
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        return ok;
+    }
+
+    // chunk-KV reuse (P1, KPF-62.5), opt-in per request. Called once per task when prompt processing starts, after the
+    // exact common prefix is settled and the slot holds exactly [0, n_past). Assembles [n_past, end of the last chunk)
+    // synchronously with server_chunk::assemble (KPF-62.4): gaps by exact prefill, chunks from the store (a miss is an
+    // isolated encode in ctx_chunk, then stored) injected at their offset, the selected tokens recomputed by
+    // explicit-position batches. The suffix is left to the ordinary prompt loop. Any refusal or failure leaves the slot at
+    // [0, n_past) and the request is served as without the field. A state with stale (unrecomputed) chunk cells is marked
+    // approximate so that it never seeds exact-prefix reuse. Mode "all" bypasses the store and decodes the
+    // n_batch-aligned region by explicit-position batches: identical to the plain prefill (gate G0a).
+    void kv_chunks_apply(server_slot & slot) {
+        const task_params & tp = slot.task->params;
+        const int64_t t_start = ggml_time_us();
+
+        json rep = json{ {"requested", true}, {"applied", false}, {"mode", server_chunk::select_mode_name(tp.kv_chunks_mode)} };
+        auto skip = [&](const std::string & why) {
+            rep["reason"] = why;
+            slot.chunk_report = rep;
+            SLT_INF(slot, "kv_chunks: not applied (%s)\n", why.c_str());
+        };
+
+        if (!chunk_store)                                  { return skip(chunk_off_reason.empty() ? "chunk store off" : chunk_off_reason); }
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) { return skip("not a completion task"); }
+        if (slot.task->tokens.has_media())                 { return skip("multimodal prompt"); }
+        if (slot.can_speculate() || slot.ctx_dft)          { return skip("speculative decoding active"); }
+        if (!lora_get_enabled_ids(slot.lora).empty() || slot.alora_invocation_start > 0) {
+            return skip("LoRA adapter active (adapters are not in the store key)");
+        }
+        if (slot.need_embd())                              { return skip("embeddings requested"); }
+        if (!tp.kv_reorder_segments.empty())               { return skip("kv_reorder and kv_chunks in one request are not supported"); }
+
+        const llama_tokens & prompt = slot.task->tokens.get_tokens();
+        const int32_t n_prompt = (int32_t) prompt.size();
+        const int32_t n_past   = slot.prompt.n_tokens();
+        if ((int32_t) slot.prompt.tokens.pos_next() != n_past) {
+            return skip("slot positions are not token indices");
+        }
+
+        // chunks sorted by offset with their pin flags; those inside the exact cached prefix (or straddling it) and
+        // those longer than the encoder accepts are dropped (prefilled exactly)
+        std::vector<size_t> order(tp.kv_chunks.size());
+        std::iota(order.begin(), order.end(), (size_t) 0);
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return tp.kv_chunks[a].offset < tp.kv_chunks[b].offset; });
+        std::vector<server_chunk::span> spans;
+        std::vector<bool> pins;
+        int32_t n_dropped_cached = 0, n_dropped_long = 0;
+        for (size_t i : order) {
+            const auto & sp = tp.kv_chunks[i];
+            if (sp.offset < n_past) {
+                n_dropped_cached++;
+                continue;
+            }
+            if (sp.n_tokens > params_base.chunk_max_tokens) {
+                n_dropped_long++;
+                continue;
+            }
+            spans.push_back(sp);
+            pins.push_back(i < tp.kv_chunks_pin.size() && tp.kv_chunks_pin[i]);
+        }
+        rep["n_chunks"]         = (int) tp.kv_chunks.size();
+        rep["n_dropped_cached"] = n_dropped_cached;
+        rep["n_dropped_long"]   = n_dropped_long;
+        if (spans.empty()) {
+            return skip("no chunk after the exact cached prefix");
+        }
+        {
+            std::string why;
+            // at least one suffix token after the last chunk: the ordinary loop must evaluate one token [TAG_PROMPT_LOGITS]
+            if (!server_chunk::validate_spans(spans, n_past, n_prompt - 1, why)) {
+                return skip(why);
+            }
+        }
+        const int32_t E = spans.back().offset + spans.back().n_tokens;
+
+        auto * mem = llama_get_memory(ctx_tgt);
+        llama_memory_seq_rm(mem, slot.id, n_past, -1);
+
+        int32_t n_hit = 0, n_miss = 0, n_encode_failed = 0;
+        size_t  hit_bytes = 0;
+        double  t_encode_ms = 0.0;
+        int32_t approx_from = -1;
+        std::vector<std::vector<uint8_t>> local(spans.size());
+
+        auto get_blob = [&](int32_t i) -> server_chunk::blob_ref {
+            const auto & sp = spans[i];
+            const server_chunk::tokens ct(prompt.begin() + sp.offset, prompt.begin() + sp.offset + sp.n_tokens);
+            if (server_chunk::entry * e = chunk_store->get(chunk_fp, ct)) {
+                n_hit++;
+                hit_bytes += e->blob.size();
+                if (pins[i]) {
+                    chunk_store->pin(e->k, true);
+                }
+                if (approx_from < 0) {
+                    approx_from = sp.offset;
+                }
+                return { e->blob.data(), e->blob.size() };
+            }
+            n_miss++;
+            const int64_t t_enc = ggml_time_us();
+            std::vector<uint8_t> blob;
+            if (!chunk_encode(ct, blob)) {
+                n_encode_failed++;
+                return {};
+            }
+            t_encode_ms += (ggml_time_us() - t_enc) / 1e3;
+            local[i] = blob;
+            chunk_store->put(chunk_fp, ct, std::move(blob), pins[i]);
+            if (approx_from < 0) {
+                approx_from = sp.offset;
+            }
+            return { local[i].data(), local[i].size() };
+        };
+
+        server_chunk::assemble_stats st;
+        int32_t p_done = n_past;
+        const int32_t ret = server_chunk::assemble(ctx_tgt, prompt.data(), spans, n_past, E, slot.id, llama_n_batch(ctx_tgt),
+                tp.kv_chunks_mode, tp.kv_chunks_window, get_blob, st, &p_done);
+        if (ret != 0) {
+            llama_memory_seq_rm(mem, slot.id, n_past, -1);
+            return skip(string_format("assembly failed (decode/inject %d); prefilled exactly instead", ret));
+        }
+
+        for (int32_t p = n_past; p < p_done; ++p) {
+            slot.prompt.tokens.push_back(prompt[p]);
+        }
+        slot.n_prompt_tokens_processed += st.n_gap + st.n_recomputed;
+
+        // stale cells remain unless every injected token was recomputed
+        const bool approx = st.n_injected > 0 && st.n_recomputed < st.n_injected && tp.kv_chunks_mode != server_chunk::SELECT_ALL;
+        if (approx) {
+            slot.prompt.approx      = true;
+            slot.prompt.approx_from = approx_from >= 0 ? approx_from : n_past;
+        }
+
+        int32_t n_chunk_tokens = 0;
+        for (const auto & sp : spans) {
+            n_chunk_tokens += sp.n_tokens;
+        }
+        rep["applied"]               = true;
+        rep["window"]                = tp.kv_chunks_mode == server_chunk::SELECT_HEAD ? tp.kv_chunks_window : 0;
+        rep["n_chunk_used"]          = (int) spans.size();
+        rep["n_chunk_tokens"]        = n_chunk_tokens;
+        rep["n_chunk_hit"]           = n_hit;
+        rep["n_chunk_miss"]          = n_miss;
+        rep["n_encode_failed"]       = n_encode_failed;
+        rep["n_chunk_injected"]      = st.n_injected;
+        rep["n_chunk_recomputed"]    = st.n_recomputed;
+        rep["n_gap"]                 = st.n_gap;
+        rep["chunk_store_hit_bytes"] = (uint64_t) hit_bytes;
+        rep["assembled_until"]       = p_done;
+        rep["approx"]                = approx;
+        rep["encode_ms"]             = t_encode_ms;
+        rep["assemble_ms"]           = (ggml_time_us() - t_start) / 1000.0;
+        rep["store_used_mib"]        = chunk_store->used_bytes() / (1024.0 * 1024.0);
+        rep["store_entries"]         = (uint64_t) chunk_store->size();
+        slot.chunk_report = rep;
+
+        SLT_INF(slot, "kv_chunks: applied, mode %s, %d chunks (%d hit, %d miss), injected %d, recomputed %d, gap %d, assembled [%d, %d)%s, %.2f ms\n",
+                server_chunk::select_mode_name(tp.kv_chunks_mode), (int) spans.size(), n_hit, n_miss, st.n_injected, st.n_recomputed,
+                st.n_gap, n_past, p_done, approx ? ", APPROXIMATE" : "", rep["assemble_ms"].get<double>());
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -3382,6 +3681,10 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (slot->prompt.approx) {
+                        send_error(task, "the slot state was built from reused chunks (chunk-KV approximation) and is not saved", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -4355,6 +4658,11 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // chunk-KV: only the exact part of an approximate state may be reused
+                                if (slot.prompt.approx) {
+                                    n_past = std::min(n_past, std::max(0, slot.prompt.approx_from));
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -4372,7 +4680,8 @@ private:
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
+                                // (never the cells of an approximate chunk-KV state)
+                                if (can_cache_reuse && n_cache_reuse > 0 && !slot.prompt.approx) {
                                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
                                     size_t head_c = n_past; // cache
@@ -4562,6 +4871,17 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        if (slot.prompt.approx && n_past <= slot.prompt.approx_from) {
+                            slot.prompt.approx      = false;
+                            slot.prompt.approx_from = -1;
+                        }
+
+                        // chunk-KV reuse (opt-in per request; KPF-62.5): assemble [n_past, end of the last chunk) from
+                        // reused chunks before the ordinary loop prefills the rest (branch beside the cache-reuse block)
+                        if (!slot.task->params.kv_chunks.empty()) {
+                            kv_chunks_apply(slot);
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {

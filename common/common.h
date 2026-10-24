@@ -646,6 +646,8 @@ struct common_params {
     bool    prefill_order_srpf       = false; // fill pending prompts shortest-remaining first instead of by slot index
     int32_t prefill_contend_cap      = 512;   // with prefill_order_srpf: max prompt tokens per iteration while >= 2 prompts are pending (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t chunk_store_mib     = 0;     // chunk-KV reuse store budget in MiB (experimental, attention-only memory); 0 = feature off
+    int32_t chunk_max_tokens    = 8192;  // chunk-KV reuse: longest chunk the isolated encoder accepts (its context size)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
