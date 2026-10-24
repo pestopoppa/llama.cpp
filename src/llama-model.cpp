@@ -2137,7 +2137,14 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 // Default OFF => F32 => byte-identical to upstream. Requires the fused GDN path (the default).
 static ggml_type gdn_recurrent_state_type() {
     const char * e = getenv("GGML_CUDA_GDN_STATE_BF16");
-    return (e && atoi(e) != 0) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    const bool bf16 = e && atoi(e) != 0;
+    if (bf16) {
+        // [CH-LB1] the variable is read regardless of backend; the CPU gated-delta-net kernel is
+        // F32-only and refuses a BF16 state (supports_op false, compute aborts), so say so up front.
+        LLAMA_LOG_WARN("%s: GGML_CUDA_GDN_STATE_BF16=%s -> BF16 GDN recurrent state; the CPU backend does not "
+                       "support it, so any GDN layer that runs on CPU will fail to schedule\n", __func__, e);
+    }
+    return bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
