@@ -30,7 +30,9 @@ LIB="$(ls "$BUILD"/bin/libllama.so* 2>/dev/null | head -1)"
 for sym in llama_chunk_kv_inject llama_chunk_kv_export llama_chunk_kv_rope_selfcheck llama_chunk_kv_decode_at; do
     nm -D "$LIB" | grep "$sym" >/dev/null || { echo "FAIL: $sym missing from $LIB (stale build)"; exit 2; }
 done
-strings "$BUILD/bin/llama-server" | grep -- "--chunk-store-mib" >/dev/null || { echo "FAIL: llama-server lacks --chunk-store-mib (stale build)"; exit 2; }
+# llama-server is a thin launcher; the option table lives in its shared libs (common/arg.cpp -> libllama-common*.so), so search the binary AND the libs it ships with
+found=0; for f in "$BUILD/bin/llama-server" "$BUILD"/bin/libllama-common*.so* "$BUILD"/bin/libllama-server-impl*.so*; do [ -e "$f" ] || continue; strings "$f" | grep -- "--chunk-store-mib" >/dev/null && { found=1; break; }; done
+[ "$found" = 1 ] || { echo "FAIL: --chunk-store-mib not in llama-server or its libs (stale build)"; exit 2; }
 
 export LD_LIBRARY_PATH="$BUILD/bin"
 MODELS="$BUILD/tests/test-models"
