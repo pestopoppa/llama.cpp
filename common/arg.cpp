@@ -1560,6 +1560,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFILL_BUDGET_TARGET_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-order"}, "{slot,srpf}",
+        "order in which the server fills each iteration's batch with pending prompts: 'slot' walks the slots by "
+        "index (a short prompt in a higher slot waits behind a long prefill in a lower one); 'srpf' takes the "
+        "prompt with the fewest remaining tokens first (default: slot)",
+        [](common_params & params, const std::string & value) {
+            if (value == "slot") {
+                params.prefill_order_srpf = false;
+            } else if (value == "srpf") {
+                params.prefill_order_srpf = true;
+            } else {
+                throw std::invalid_argument("invalid prefill-order value, expected 'slot' or 'srpf'");
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFILL_ORDER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-contend-cap"}, "N",
+        string_format("with --prefill-order srpf: max prompt tokens per server iteration while two or more prompts are "
+            "pending, so one long prefill cannot fill the batch in the iteration that carries a short prompt; "
+            "combines with the decode-aware budget as the lower of the two (default: %d, 0 = off)", params.prefill_contend_cap),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prefill-contend-cap must be non-negative");
+            }
+            params.prefill_contend_cap = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_CONTEND_CAP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

@@ -201,6 +201,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat-input-spans.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat-input-spans PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat-input-spans PRIVATE server-context)
+    llama_build_and_test(test-server-prefill-order.cpp)
+    target_include_directories(test-server-prefill-order PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

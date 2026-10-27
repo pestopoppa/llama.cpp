@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-prefill-order.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -3597,6 +3598,31 @@ private:
         }
         pb_iter.budget = prefill_budget_get(n_batch);
 
+        // --prefill-order srpf: visit the pending prompts shortest-remaining first, and cap the prompt tokens
+        // per iteration while two or more prompts are pending (--prefill-contend-cap); off = slot-index order
+        std::vector<server_slot *> prompt_order;
+        if (params_base.prefill_order_srpf) {
+            std::vector<server_prefill_order_entry> entries;
+            entries.reserve(slots.size());
+            for (size_t i = 0; i < slots.size(); i++) {
+                const auto & slot = slots[i];
+                server_prefill_order_entry e;
+                e.idx     = (int32_t) i;
+                e.pending = slot.task && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED);
+                if (e.pending) {
+                    e.can_split   = slot.can_split();
+                    e.n_remaining = slot.state == SLOT_STATE_STARTED
+                        ? slot.task->n_tokens()
+                        : slot.task->n_tokens() - slot.prompt.n_tokens();
+                }
+                entries.push_back(e);
+            }
+            for (const int32_t i : server_prefill_order_srpf(entries)) {
+                prompt_order.push_back(&slots[i]);
+            }
+            pb_iter.budget = server_prefill_contend_budget(entries, pb_iter.budget, n_batch, params_base.prefill_contend_cap);
+        }
+
         // batch.size() limit for adding prompt tokens (prompts that cannot be split still use n_batch)
         const int32_t n_prompt_limit = pb_iter.budget > 0 ? std::min(n_batch, pb_iter.n_decode_rows + pb_iter.budget) : n_batch;
 
@@ -3607,7 +3633,7 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            const auto fill_prompt = [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_prompt_limit) {
                     return; // batch is full (or the prefill budget is spent), skip remaining slots
                 }
@@ -4151,7 +4177,13 @@ private:
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
-            });
+            };
+
+            if (params_base.prefill_order_srpf) {
+                iterate(prompt_order, fill_prompt);
+            } else {
+                iterate(slots, fill_prompt);
+            }
         }
     }
 
