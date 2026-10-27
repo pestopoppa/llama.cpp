@@ -1914,7 +1914,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (ggml_cuda_df2_row_exact(src0, src1, dst, cc) || ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_log_mul_mat_route("MMVQ", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
