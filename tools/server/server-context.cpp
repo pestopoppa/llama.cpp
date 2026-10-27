@@ -15,6 +15,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "server-slot-state.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1267,6 +1268,14 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // HSF-5.P host KV mirror (experimental, off unless --kv-host-mirror is given)
+        if (!params_base.kv_host_mirror.empty()) {
+            if (!llama_kv_mirror_enable(ctx_tgt, params_base.kv_host_mirror.c_str())) {
+                SRV_ERR("failed to enable the kv host mirror '%s'\n", params_base.kv_host_mirror.c_str());
+                return false;
+            }
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -2615,9 +2624,6 @@ private:
 
     // the live draft state follows the checkpoints: the full draft context and the speculative state
     // the llama state payload holds the target context only
-    static constexpr uint32_t SLOT_DRAFT_MAGIC   = 0x54464453; // "SDFT"
-    static constexpr uint32_t SLOT_DRAFT_VERSION = 1;
-
     // returns false if the draft state could not be written completely
     bool save_slot_draft(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
         n_written = 0;
@@ -2636,14 +2642,7 @@ private:
             SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
             return false;
         }
-        const uint32_t magic   = SLOT_DRAFT_MAGIC;
-        const uint32_t version = SLOT_DRAFT_VERSION;
-        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
-        ckpt_write(ofs, &version, sizeof(version), n_written);
-        ckpt_write_buf(ofs, data_dft,  n_written);
-        ckpt_write_buf(ofs, data_spec, n_written);
-        ofs.flush();
-        if (!ofs) {
+        if (!server_slot_draft_write(ofs, data_dft, data_spec, n_written)) {
             SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
             return false;
         }
@@ -2664,16 +2663,15 @@ private:
         }
         const size_t n_avail = file_size - offset;
         size_t n_read = 0;
-        uint32_t magic   = 0;
-        uint32_t version = 0;
-        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_DRAFT_MAGIC) {
+        uint32_t magic = 0;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SERVER_SLOT_DRAFT_MAGIC) {
             return 0;
         }
+        ifs.seekg(offset);
+        n_read = 0;
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
-        if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_DRAFT_VERSION ||
-            !ckpt_read_buf(ifs, data_dft,  n_avail, n_read) ||
-            !ckpt_read_buf(ifs, data_spec, n_avail, n_read)) {
+        if (!server_slot_draft_read(ifs, n_avail, data_dft, data_spec, n_read)) {
             SLT_WRN(slot, "invalid draft state in '%s' - ignored\n", filepath.c_str());
             return 0;
         }
@@ -2888,7 +2886,32 @@ private:
 
                     const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+
+                    // The mirror save advances to the live boundary before appending draft/spec state.
+                    size_t nwrite  = 0;
+                    size_t n_saved = token_count;
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        nwrite = llama_kv_mirror_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count, &n_saved);
+                        if (nwrite == 0) {
+                            SLT_WRN(*slot, "%s", "kv host mirror save failed, falling back to a device save\n");
+                            n_saved = token_count;
+                        }
+                    }
+                    if (nwrite == 0) {
+                        nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    }
+                    if (n_saved != token_count) {
+                        send_error(task, "Unable to save slot: mirror state is not at the live boundary", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        llama_kv_mirror_stats ms;
+                        llama_kv_mirror_get_stats(ctx_tgt, &ms);
+                        SLT_INF(*slot, "kv-host-mirror save: n_tokens=%zu/%zu fallback_bytes=%llu mirror_bytes=%llu replay_tokens=%d replay_steps=%d tail_copies=%llu ckpts=%llu/%llu\n",
+                                n_saved, token_count, (unsigned long long) ms.save_fallback_bytes, (unsigned long long) ms.save_mirror_bytes,
+                                ms.last_replay_tokens, ms.last_replay_steps, (unsigned long long) ms.n_tail_copies,
+                                (unsigned long long) ms.n_ckpt_complete, (unsigned long long) ms.n_ckpt_issued);
+                    }
 
                     size_t nwrite_ckpt = 0;
                     if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
@@ -2910,7 +2933,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
+                    res->n_tokens = n_saved;
                     res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
@@ -2938,7 +2961,24 @@ private:
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    // HSF-5.P: with the kv host mirror on, stage the file in pinned memory and restore by bulk H2D / gather
+                    size_t nread = 0;
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        nread = llama_kv_mirror_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                        if (nread == 0) {
+                            SLT_WRN(*slot, "%s", "kv host mirror restore failed, falling back to a file restore\n");
+                        }
+                    }
+                    if (nread == 0) {
+                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    }
+                    if (llama_kv_mirror_is_enabled(ctx_tgt)) {
+                        llama_kv_mirror_stats ms;
+                        llama_kv_mirror_get_stats(ctx_tgt, &ms);
+                        SLT_INF(*slot, "kv-host-mirror restore: device_bytes=%llu device_frags=%llu fallback_bytes=%llu\n",
+                                (unsigned long long) ms.restore_device_bytes, (unsigned long long) ms.restore_device_frags,
+                                (unsigned long long) ms.restore_fallback_bytes);
+                    }
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);

@@ -956,6 +956,65 @@ extern "C" {
            llama_state_seq_flags   flags);
 
     //
+    // Host-pinned KV mirror (HSF-5.P, experimental). OFF unless llama_kv_mirror_enable() is called.
+    //
+    // A write-through image of the attention KV cache in pinned, NUMA-bound host memory, plus a recurrent-state
+    // checkpoint of each sequence every k decode steps. Copies run on a backend side stream after each step's
+    // launch (never inside a graph capture, never a host wait in decode). A slot save advances the recurrent
+    // checkpoint to live state and flushes dirty KV before reading host memory; a restore stages the file
+    // in pinned memory and moves it by bulk H2D / gather.
+    //
+    // spec: comma-separated key=value: k=<steps> (6), node=<numa node|-1> (3), mode=lag|fresh (lag),
+    //       piece_mib=<n> (1024), path=auto|ce|kernel (auto). "on" = defaults.
+    // Both mode spellings retain the periodic decode checkpoint schedule and save the complete live state.
+    // A successful save sets *n_token_saved to n_token_count; no replay tail is omitted.
+    struct llama_kv_mirror_stats {
+        uint64_t n_steps;             // decode calls seen
+        uint64_t n_tail_copies;       // async KV tail copies issued
+        uint64_t n_tail_frags;        // fragments in them
+        uint64_t tail_bytes;          // bytes in them
+        uint64_t n_ckpt_issued;       // recurrent checkpoints issued
+        uint64_t n_ckpt_complete;     // ... and completed
+        uint64_t ckpt_bytes;          // recurrent bytes copied
+        uint64_t n_saves;             // mirror saves
+        uint64_t n_saves_fresh_fallback; // reserved for compatibility (live saves need no lag fallback)
+        uint64_t save_mirror_bytes;   // tensor bytes served from host memory
+        uint64_t save_fallback_bytes; // tensor bytes that had to be read from the device
+        uint64_t n_restores;
+        uint64_t restore_device_bytes;   // moved by bulk H2D / gather
+        uint64_t restore_device_frags;
+        uint64_t restore_fallback_bytes; // moved by tensor_set
+        int32_t  last_replay_tokens;  // zero after a successful live save
+        int32_t  last_replay_steps;   // zero after a successful live save
+        uint64_t host_bytes;          // host tier size
+        uint64_t host_registered_pieces;
+    };
+
+    LLAMA_API bool llama_kv_mirror_enable(struct llama_context * ctx, const char * spec);
+
+    LLAMA_API bool llama_kv_mirror_is_enabled(const struct llama_context * ctx);
+
+    LLAMA_API size_t llama_kv_mirror_seq_save_file(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count,
+                          size_t * n_token_saved);
+
+    LLAMA_API size_t llama_kv_mirror_seq_load_file(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   dest_seq_id,
+                     llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
+
+    LLAMA_API void llama_kv_mirror_get_stats(
+      const struct llama_context * ctx,
+    struct llama_kv_mirror_stats * out);
+
+    //
     // Decoding
     //
 

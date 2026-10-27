@@ -17,6 +17,9 @@
 struct llama_model;
 class llama_batch_allocr;
 
+// HSF-5.P host KV mirror (experimental), see llama-kv-host-mirror-bind.h
+struct llama_kv_mirror;
+
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -72,6 +75,12 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    // HSF-5.P host KV mirror (experimental); defined in llama-kv-host-mirror-bind.cpp
+    bool              kv_mirror_enable(const char * spec);
+    llama_kv_mirror * get_kv_mirror() const { return kv_mirror.get(); }
+    size_t            kv_mirror_seq_load_file(const char * filepath, llama_seq_id seq_id, llama_token * tokens_out,
+                                              size_t n_token_capacity, size_t * n_token_count_out);
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -399,4 +408,8 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
     mutable int64_t n_fused_decode = 0; // number of ubatches served by model.fused_decode (no graph)
+
+    // HSF-5.P host KV mirror: null unless llama_kv_mirror_enable() was called. Declared last so it is destroyed
+    // first, while the memory and backends it observes still exist.
+    std::unique_ptr<llama_kv_mirror> kv_mirror;
 };

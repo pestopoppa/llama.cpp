@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
+#include "kv-mirror-test-utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +48,10 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+
+static bool kv_host_mirror_test = false;
+static std::atomic<size_t> kv_host_mirror_cases{0};
+static std::atomic<size_t> kv_host_mirror_bytes{0};
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -2794,6 +2799,21 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+        if (kv_host_mirror_test) {
+            try {
+                size_t bytes = kv_mirror_test_roundtrip(backend1, ctx.get());
+                if (ctx_weights) {
+                    bytes += kv_mirror_test_roundtrip(backend1, ctx_weights.get());
+                }
+                kv_host_mirror_bytes += bytes;
+                kv_host_mirror_cases++;
+            } catch (const std::exception & e) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, e.what());
+                result.hard_failure = true;
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
         }
         guard.snapshot();
 
@@ -13126,7 +13146,7 @@ static bool autokernel_stateful_self_test() {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
+    printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops] [--kv-host-mirror]", argv[0]);
     printf(" [--show-coverage] [--test-file <path>] [-j <n>] [--suite-seed <u64>] [--repeat-suite <n>] [--autokernel-properties] [--autokernel-layouts] [--autokernel-value-transforms] [--autokernel-hostile-distributions] [--autokernel-stateful]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
@@ -13175,6 +13195,8 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
             mode = MODE_TEST;
+        } else if (strcmp(argv[i], "--kv-host-mirror") == 0) {
+            kv_host_mirror_test = true;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
         } else if (strcmp(argv[i], "grad") == 0) {
@@ -13288,6 +13310,10 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (kv_host_mirror_test && mode != MODE_TEST) {
+        fprintf(stderr, "--kv-host-mirror requires test mode\n");
+        return 1;
+    }
     if (autokernel_properties && (mode != MODE_TEST || !suite_seed_enabled)) {
         fprintf(stderr, "--autokernel-properties requires test mode and --suite-seed\n");
         return 1;
@@ -13406,6 +13432,15 @@ int main(int argc, char ** argv) {
     }
 
     ggml_quantize_free();
+
+    if (kv_host_mirror_test) {
+        fprintf(stderr, "HSF_KV_MIRROR cases=%zu bytes=%zu d2h+h2d=verified\n",
+                kv_host_mirror_cases.load(), kv_host_mirror_bytes.load());
+        if (kv_host_mirror_cases == 0 || kv_host_mirror_bytes == 0) {
+            fprintf(stderr, "KV mirror probe did not reach any supported operation\n");
+            return 1;
+        }
+    }
 
     if (output_printer) {
         output_printer->print_footer();
