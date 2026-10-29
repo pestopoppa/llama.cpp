@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "llama-mmap.h"
 
 #include <algorithm>
 #include <cassert>
@@ -56,6 +57,60 @@ int main() {
     require(page_size_raw > 0, "page size available");
     const size_t page = static_cast<size_t>(page_size_raw);
     const size_t bytes = page * 6;
+
+    // The model loader can unmap unused file prefixes while retaining the
+    // original mmap base/size for tensor addressing. Expose only the active
+    // backing fragment so a later anonymous allocation in the hole is not
+    // mistaken for file-backed model data.
+    const int fragment_fd = static_cast<int>(syscall(SYS_memfd_create, "llama-mmap-evict-fragment-test", 0));
+    require(fragment_fd >= 0, "fragment memfd created");
+    require(ftruncate(fragment_fd, static_cast<off_t>(bytes)) == 0, "fragment memfd sized");
+    FILE * fragment_fp = fdopen(fragment_fd, "rb");
+    require(fragment_fp != nullptr, "fragment memfd wrapped as FILE");
+    {
+        llama_file file(fragment_fp);
+        llama_mmap mapped(&file, 0, false);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mapped.addr());
+        auto active = mapped.address_ranges();
+        require(active.size() == 1 && active[0].first == base && active[0].second == bytes,
+                "initial mmap active range covers the file");
+        mapped.unmap_fragment(0, page * 2);
+        active = mapped.address_ranges();
+        require(active.size() == 1 && active[0].first == base + page * 2 &&
+                active[0].second == bytes - page * 2,
+                "active ranges exclude a loader-unmapped prefix");
+        void * anonymous = mmap(reinterpret_cast<void *>(base + page), page,
+                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        require(anonymous == reinterpret_cast<void *>(base + page),
+                "anonymous test page reuses only the explicitly unmapped prefix");
+        llama_mmap_evict::plan active_plan({{active[0].first, active[0].second}});
+        require(!active_plan.add_tensor_use(0, anonymous, page),
+                "anonymous allocation in an unmapped prefix is not classified as mapped");
+        llama_mmap_evict::plan unaligned_plan({{active[0].first, active[0].second}});
+        require(unaligned_plan.add_tensor_use(0, reinterpret_cast<const void *>(base + page * 2 + 64),
+                                              page - 128),
+                "unaligned tensor fully inside a retained file mapping is recognized");
+        unaligned_plan.finalize(1);
+        require(unaligned_plan.after(0).size() == 1 && unaligned_plan.after(0)[0].offset == 0 &&
+                unaligned_plan.after(0)[0].size == page,
+                "unaligned retained tensor rounds to its actual backing page");
+        bool live_crossing_refused = false;
+        try {
+            llama_mmap_evict::plan crossing_plan({{active[0].first, active[0].second}});
+            crossing_plan.add_tensor_use(0, reinterpret_cast<const void *>(base + page * 2 - 64), 128);
+        } catch (const std::invalid_argument & error) {
+            const std::string message = error.what();
+            live_crossing_refused = message.find("tensor range partially overlaps") != std::string::npos &&
+                message.find("file_offset=0x") != std::string::npos;
+        }
+        require(live_crossing_refused,
+                "crossing from a reused anonymous VMA into a live file mapping remains fail-closed");
+        active_plan.finalize(1);
+        require(active_plan.after(0).empty(), "unmapped-prefix allocation produces no eviction range");
+        require(munmap(anonymous, page) == 0, "anonymous test page unmapped before teardown");
+    }
+    require(fclose(fragment_fp) == 0, "fragment FILE closed after mapping teardown");
+
     const int fd = static_cast<int>(syscall(SYS_memfd_create, "llama-mmap-evict-test", 0));
     require(fd >= 0, "memfd created");
     require(ftruncate(fd, static_cast<off_t>(bytes)) == 0, "memfd sized");

@@ -666,6 +666,24 @@ struct llama_mmap::impl {
     }
 #endif
 
+    std::vector<std::pair<uintptr_t, size_t>> address_ranges() const {
+        std::vector<std::pair<uintptr_t, size_t>> ranges;
+#ifdef _POSIX_MAPPED_FILES
+        ranges.reserve(mapped_fragments.size());
+        for (const auto & fragment : mapped_fragments) {
+            if (fragment.first < fragment.second) {
+                ranges.emplace_back(reinterpret_cast<uintptr_t>(addr) + fragment.first,
+                                    fragment.second - fragment.first);
+            }
+        }
+#elif defined(_WIN32)
+        if (addr != nullptr && size != 0) {
+            ranges.emplace_back(reinterpret_cast<uintptr_t>(addr), size);
+        }
+#endif
+        return ranges;
+    }
+
     void * addr;
     size_t size;
 };
@@ -676,6 +694,9 @@ llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+std::vector<std::pair<uintptr_t, size_t>> llama_mmap::address_ranges() const {
+    return pimpl->address_ranges();
+}
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

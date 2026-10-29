@@ -58,6 +58,11 @@ struct llama_mmap {
     size_t size() const;
     void * addr() const;
 
+    // Current VM ranges still backed by the file. Some model loaders unmap
+    // unused prefix/suffix fragments, so addr()+size() is only the original
+    // reservation and can later be reused by unrelated allocations.
+    std::vector<std::pair<uintptr_t, size_t>> address_ranges() const;
+
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
