@@ -4663,8 +4663,10 @@ private:
             // GPU-ZOS-2 C3: logits and extracted hidden states to the host first, then the drafter's feature
             // injection runs on the worker while post_decode samples the verification rows; post_decode joins it
             // (and rethrows its failure) before anything reads or writes ctx_dft or the speculative state.
-            // Known benign race, by design: process() calls llama_synchronize(ctx_tgt) again on the worker while the
-            // main thread's sampling calls do the same; both find the stream idle and store the same zero values.
+            // overlap_process admits DFlash only. Its worker encodes/decodes/synchronizes ctx_dft, which
+            // spec_init constructs separately from ctx_tgt; this target synchronization completes before submit,
+            // so the worker can read target hidden states without synchronizing ctx_tgt concurrently. Keep this
+            // ordering: concurrent llama_synchronize calls on one context race even when the stream is idle.
             llama_synchronize(ctx_tgt);
             zos2_worker.submit(spec.get(), batch_view);
         } else {
