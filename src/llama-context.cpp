@@ -2907,8 +2907,23 @@ bool llama_context::prepare_mmap_eviction_plan(ggml_cgraph * graph) {
         for (size_t source = 0; source < GGML_MAX_SRC; ++source) {
             const ggml_tensor * input = node->src[source];
             if (input == nullptr || input->data == nullptr) continue;
-            if (candidate->add_tensor_use(static_cast<size_t>(i), input->data, ggml_nbytes(input))) {
-                ++mapped_uses;
+            try {
+                if (candidate->add_tensor_use(static_cast<size_t>(i), input->data, ggml_nbytes(input))) {
+                    ++mapped_uses;
+                }
+            } catch (const std::exception & error) {
+                const char * buffer_name = input->buffer != nullptr ?
+                    ggml_backend_buffer_name(input->buffer) : "null";
+                throw std::invalid_argument(std::string(error.what()) +
+                    " graph_node=" + std::to_string(i) +
+                    " node_name=" + ggml_get_name(node) +
+                    " node_op=" + ggml_op_name(node->op) +
+                    " source_index=" + std::to_string(source) +
+                    " source_name=" + ggml_get_name(input) +
+                    " source_type=" + ggml_type_name(input->type) +
+                    " source_buffer=" + buffer_name +
+                    " source_data=" + std::to_string(reinterpret_cast<uintptr_t>(input->data)) +
+                    " source_bytes=" + std::to_string(ggml_nbytes(input)));
             }
         }
     }

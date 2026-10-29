@@ -5,6 +5,8 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -14,6 +16,39 @@
 #endif
 
 namespace llama_mmap_evict {
+
+// This is only used on a refused range, to capture enough process-local
+// provenance to distinguish a split/adjacent mmap view from an invalid span.
+static std::string describe_vmas(uintptr_t begin, uintptr_t end) {
+    std::ifstream maps("/proc/self/maps");
+    std::ostringstream out;
+    std::string line;
+    bool any = false;
+    while (std::getline(maps, line)) {
+        std::istringstream fields(line);
+        std::string address, perms, offset, device, inode;
+        if (!(fields >> address >> perms >> offset >> device >> inode)) continue;
+        const size_t dash = address.find('-');
+        if (dash == std::string::npos) continue;
+        uintptr_t vma_begin = 0, vma_end = 0;
+        try {
+            vma_begin = static_cast<uintptr_t>(std::stoull(address.substr(0, dash), nullptr, 16));
+            vma_end = static_cast<uintptr_t>(std::stoull(address.substr(dash + 1), nullptr, 16));
+        } catch (...) {
+            continue;
+        }
+        if (vma_end < begin || vma_begin > end) continue;
+        if (any) out << " ; ";
+        any = true;
+        out << "[" << std::hex << vma_begin << "," << vma_end << ")"
+            << " perms=" << perms << " file_offset=0x" << offset
+            << " dev=" << device << " inode=" << inode;
+        std::string path;
+        std::getline(fields, path);
+        if (!path.empty()) out << " path=" << path;
+    }
+    return any ? out.str() : "unavailable";
+}
 
 bool can_enable(bool existing_eval_callback) noexcept {
     return !existing_eval_callback;
@@ -69,7 +104,17 @@ bool plan::add_tensor_use(size_t node_index, const void * data, size_t bytes) {
             throw std::invalid_argument("tensor range partially overlaps mmap backing range: data=[" +
                     std::to_string(begin) + "," + std::to_string(end) + ") mapping[" +
                     std::to_string(i) + "]=[" + std::to_string(map_begin) + "," +
-                    std::to_string(map_end) + ") tensor_bytes=" + std::to_string(bytes));
+                    std::to_string(map_end) + ") tensor_bytes=" + std::to_string(bytes) +
+                    " all_mappings=" + [&]() {
+                        std::string result;
+                        for (size_t m = 0; m < mappings_.size(); ++m) {
+                            if (!result.empty()) result += ";";
+                            result += "[" + std::to_string(m) + "]=[" +
+                                std::to_string(mappings_[m].address) + "," +
+                                std::to_string(mappings_[m].address + mappings_[m].size) + ")";
+                        }
+                        return result;
+                    }() + " vmas=" + describe_vmas(begin, end));
         }
     }
     return false;

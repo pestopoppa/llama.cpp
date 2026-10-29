@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #include <unordered_map>
 
@@ -70,6 +71,22 @@ int main() {
     require(mprotect(writable, bytes, PROT_READ) == 0, "mapping made read-only");
 
     llama_mmap_evict::plan plan({{reinterpret_cast<uintptr_t>(writable), bytes}});
+    // A tensor that begins outside a claimed backing interval but extends into
+    // it must remain fail-closed. The error-only process map capture should
+    // identify the real VMA and its file offset for diagnosis.
+    bool overlap_refused = false;
+    try {
+        llama_mmap_evict::plan partial({{reinterpret_cast<uintptr_t>(writable) + page, page}});
+        partial.add_tensor_use(0, writable + page - 64, 128);
+    } catch (const std::invalid_argument & error) {
+        const std::string message = error.what();
+        overlap_refused = message.find("tensor range partially overlaps") != std::string::npos &&
+            message.find("all_mappings=") != std::string::npos &&
+            message.find("vmas=") != std::string::npos &&
+            message.find("file_offset=0x") != std::string::npos;
+    }
+    require(overlap_refused, "partial crossing refuses and reports actual VMA/file offset metadata");
+
     // Two aliases share pages 0-1; a third tensor overlaps page 1. Their
     // pages must remain resident until the latest graph use, not the first.
     require(plan.add_tensor_use(1, writable + 100, page * 2 - 100), "first alias use mapped");
