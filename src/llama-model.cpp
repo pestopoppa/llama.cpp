@@ -1580,7 +1580,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Experimental smoke-only switch for deployments that need to avoid
+    // eagerly faulting every non-lazy mmap shard into the page cache.  The
+    // default remains the existing prefetch behavior; setting the variable
+    // to exactly "1" only suppresses mmap prefetch/MAP_POPULATE and does not
+    // change model bytes, lazy tensor selection, or tensor placement.
+    const char * no_mmap_prefetch = std::getenv("LLAMA_NO_MMAP_PREFETCH");
+    const bool mmap_prefetch = no_mmap_prefetch == nullptr || std::strcmp(no_mmap_prefetch, "1") != 0;
+    if (!mmap_prefetch) {
+        LLAMA_LOG_INFO("model: mmap eager prefetch disabled by LLAMA_NO_MMAP_PREFETCH=1\n");
+    }
+    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
