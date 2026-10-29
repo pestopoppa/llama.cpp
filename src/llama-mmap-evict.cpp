@@ -66,7 +66,10 @@ bool plan::add_tensor_use(size_t node_index, const void * data, size_t bytes) {
             return true;
         }
         if (begin < map_begin && end > map_begin) {
-            throw std::invalid_argument("tensor range partially overlaps mmap backing range");
+            throw std::invalid_argument("tensor range partially overlaps mmap backing range: data=[" +
+                    std::to_string(begin) + "," + std::to_string(end) + ") mapping[" +
+                    std::to_string(i) + "]=[" + std::to_string(map_begin) + "," +
+                    std::to_string(map_end) + ") tensor_bytes=" + std::to_string(bytes));
         }
     }
     return false;
