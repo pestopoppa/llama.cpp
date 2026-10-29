@@ -13,7 +13,9 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -78,6 +80,10 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+static bool llama_mmap_eviction_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    return static_cast<llama_context *>(user_data)->mmap_eviction_eval(tensor, ask);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -180,6 +186,15 @@ llama_context::llama_context(
             }
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    const char * mmap_evict = std::getenv("LLAMA_MMAP_EVICT_LAST_USE");
+    if (mmap_evict != nullptr && std::strcmp(mmap_evict, "1") == 0) {
+        if (!llama_mmap_evict::can_enable(cparams.cb_eval != nullptr)) {
+            throw std::runtime_error("LLAMA_MMAP_EVICT_LAST_USE cannot replace an existing graph evaluation callback");
+        }
+        mmap_eviction_enabled = true;
+        LLAMA_LOG_WARN("%s: experimental process-local mmap page eviction enabled at graph last-use boundaries\n", __func__);
     }
 
     // Initialize backend samplers here so they are part of the sampling graph
@@ -1432,7 +1447,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (!mmap_eviction_enabled) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1444,6 +1461,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (mmap_eviction_enabled) {
+            if (!prepare_mmap_eviction_plan(gf)) {
+                LLAMA_LOG_ERROR("%s: failed to prove mapped tensor last-use boundaries; refusing experimental eviction\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_mmap_eviction_callback, this);
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2838,14 +2864,81 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    mmap_eviction_failed = false;
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+    if (mmap_eviction_failed) {
+        LLAMA_LOG_ERROR("%s: experimental mmap page advice failed; refusing graph result\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::prepare_mmap_eviction_plan(ggml_cgraph * graph) {
+    if (graph == nullptr) return false;
+    const int node_count = ggml_graph_n_nodes(graph);
+    if (node_count <= 0) return false;
+    std::vector<llama_mmap_evict::mapping> mappings;
+    auto append_model_mappings = [&](const llama_model & mapped_model) {
+        for (const auto & [address, size] : mapped_model.mmap_address_ranges()) {
+            const auto duplicate = std::find_if(mappings.begin(), mappings.end(), [&](const auto & item) {
+                return item.address == address && item.size == size;
+            });
+            if (duplicate == mappings.end()) mappings.push_back({address, size});
+        }
+    };
+    append_model_mappings(model);
+    if (cparams.ctx_other != nullptr) {
+        append_model_mappings(cparams.ctx_other->get_model());
+    }
+    if (mappings.empty()) return false;
+
+    auto candidate = std::make_unique<llama_mmap_evict::plan>(std::move(mappings));
+    size_t mapped_uses = 0;
+    for (int i = 0; i < node_count; ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node == nullptr) return false;
+        for (size_t source = 0; source < GGML_MAX_SRC; ++source) {
+            const ggml_tensor * input = node->src[source];
+            if (input == nullptr || input->data == nullptr) continue;
+            if (candidate->add_tensor_use(static_cast<size_t>(i), input->data, ggml_nbytes(input))) {
+                ++mapped_uses;
+            }
+        }
+    }
+    if (mapped_uses == 0) return false;
+
+    candidate->finalize(static_cast<size_t>(node_count));
+    std::unordered_map<const ggml_tensor *, size_t> boundaries;
+    for (int i = 0; i < node_count; ++i) {
+        if (!candidate->after(static_cast<size_t>(i)).empty()) {
+            boundaries.emplace(ggml_graph_node(graph, i), static_cast<size_t>(i));
+        }
+    }
+    if (boundaries.empty()) return false;
+    mmap_eviction_nodes = std::move(boundaries);
+    mmap_eviction_plan = std::move(candidate);
+    mmap_eviction_failed = false;
+    LLAMA_LOG_INFO("%s: planned %zu graph-boundary mapped-page eviction points from %zu tensor uses\n",
+            __func__, mmap_eviction_nodes.size(), mapped_uses);
+    return true;
+}
+
+bool llama_context::mmap_eviction_eval(ggml_tensor * tensor, bool ask) {
+    const auto it = mmap_eviction_nodes.find(tensor);
+    if (ask) return it != mmap_eviction_nodes.end();
+    if (it == mmap_eviction_nodes.end() || !mmap_eviction_plan ||
+            !mmap_eviction_plan->drop_after(it->second)) {
+        mmap_eviction_failed = true;
+        return true; // allow scheduler cleanup; graph_compute rejects its result
+    }
+    return true;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

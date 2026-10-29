@@ -2097,6 +2097,15 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+std::vector<std::pair<uintptr_t, size_t>> llama_model::mmap_address_ranges() const {
+    std::vector<std::pair<uintptr_t, size_t>> ranges;
+    ranges.reserve(pimpl->mappings.size());
+    for (const auto & mapping : pimpl->mappings) {
+        ranges.emplace_back(reinterpret_cast<uintptr_t>(mapping->addr()), mapping->size());
+    }
+    return ranges;
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }

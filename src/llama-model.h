@@ -9,6 +9,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -731,6 +732,10 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // Internal experimental support for process-local mapped-page reclamation.
+    // The returned address ranges describe this model's read-only mmap shards.
+    std::vector<std::pair<uintptr_t, size_t>> mmap_address_ranges() const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

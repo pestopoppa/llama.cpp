@@ -7,11 +7,13 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-mmap-evict.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -248,6 +250,11 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // Experimental opt-in mapped-page eviction, implemented at proven graph
+    // last-use boundaries. Not enabled for normal/full runs.
+    bool mmap_eviction_eval(ggml_tensor * tensor, bool ask);
+    bool prepare_mmap_eviction_plan(ggml_cgraph * graph);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -384,6 +391,11 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    bool mmap_eviction_enabled = false;
+    bool mmap_eviction_failed = false;
+    std::unique_ptr<llama_mmap_evict::plan> mmap_eviction_plan;
+    std::unordered_map<const ggml_tensor *, size_t> mmap_eviction_nodes;
 
     // perf
     mutable int64_t t_start_us  = 0;
