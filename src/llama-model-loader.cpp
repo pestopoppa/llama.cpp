@@ -510,6 +510,29 @@ namespace GGUFMeta {
                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
             }
 
+            // Expert routing counts may be stored as signed INT32 (Nemotron Bolt).
+            // Check each value before converting; get_arr() copies same-width
+            // signed/unsigned arrays without checking their numeric values.
+            if constexpr (std::is_same<T, uint32_t>::value) {
+                if (key == kv_name(LLM_KV_EXPERT_USED_COUNT)) {
+                    if (arr_info.gt != GGUF_TYPE_INT32 && arr_info.gt != GGUF_TYPE_UINT32) {
+                        throw std::runtime_error(format("key %s has unsupported expert count array type %s",
+                            key.c_str(), gguf_type_name(arr_info.gt)));
+                    }
+                    for (uint32_t i = 0; i < n; ++i) {
+                        const int64_t value = arr_info.gt == GGUF_TYPE_INT32
+                            ? static_cast<const int32_t *>(arr_info.data)[i]
+                            : static_cast<const uint32_t *>(arr_info.data)[i];
+                        if (value < 0 || value > LLAMA_MAX_EXPERTS) {
+                            throw std::runtime_error(format("key %s has out-of-range expert count at layer %u: %" PRId64,
+                                key.c_str(), i, value));
+                        }
+                        result[i] = static_cast<uint32_t>(value);
+                    }
+                    return true;
+                }
+            }
+
             return get_arr(key, result, required);
         }
 
