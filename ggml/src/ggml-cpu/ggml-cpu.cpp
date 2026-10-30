@@ -18,6 +18,7 @@ uint64_t ggml_cpu_iqk_fa_n_calls(void);
 #include <cctype>
 #include <string>
 #include <algorithm>
+#include <new>
 #include <vector>
 #include <thread>
 
@@ -123,6 +124,7 @@ struct ggml_backend_cpu_context {
 
     bool                use_ref;  // use reference implementation
     bool                disable_rowexact;
+    bool                fused_moe_upgate_q8;
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -141,6 +143,8 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
 struct ggml_backend_plan_cpu {
     struct ggml_cplan cplan;
     struct ggml_cgraph cgraph;
+    size_t base_work_size;
+    size_t allocated_size;
 };
 
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
@@ -150,6 +154,12 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
 
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
+    cpu_plan->base_work_size = cpu_plan->cplan.work_size;
+    if (cpu_ctx->fused_moe_upgate_q8) {
+        cpu_plan->cplan.work_size = std::max(cpu_plan->cplan.work_size,
+            ggml_cpu_fused_moe_upgate_q8_work_size(cgraph, cpu_plan->cplan.n_threads));
+    }
+    cpu_plan->allocated_size = cpu_plan->cplan.work_size;
 
     if (cpu_plan->cplan.work_size > 0) {
         cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
@@ -163,6 +173,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
     cpu_plan->cplan.disable_rowexact    = cpu_ctx->disable_rowexact;
+    cpu_plan->cplan.fused_moe_upgate_q8 = cpu_ctx->fused_moe_upgate_q8;
 
     return cpu_plan;
 }
@@ -182,7 +193,23 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 
     // Cached plans can be reused after the caller changes the per-backend policy.
     cpu_plan->cplan.disable_rowexact = cpu_ctx->disable_rowexact;
-
+    cpu_plan->cplan.fused_moe_upgate_q8 = cpu_ctx->fused_moe_upgate_q8;
+    // A cached plan can be created OFF and enabled later. Grow only its owned buffer,
+    // keeping the old buffer intact on allocation failure; OFF computes use the
+    // original planner size even after an ON compute used a larger allocation.
+    size_t needed = cpu_plan->base_work_size;
+    if (cpu_ctx->fused_moe_upgate_q8) {
+        needed = std::max(needed, ggml_cpu_fused_moe_upgate_q8_work_size(
+            &cpu_plan->cgraph, cpu_plan->cplan.n_threads));
+    }
+    if (needed > cpu_plan->allocated_size) {
+        uint8_t * replacement = new (std::nothrow) uint8_t[needed];
+        if (!replacement) return GGML_STATUS_ALLOC_FAILED;
+        delete[] cpu_plan->cplan.work_data;
+        cpu_plan->cplan.work_data = replacement;
+        cpu_plan->allocated_size = needed;
+    }
+    cpu_plan->cplan.work_size = needed;
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 }
 
@@ -190,6 +217,10 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    if (cpu_ctx->fused_moe_upgate_q8) {
+        cplan.work_size = std::max(cplan.work_size,
+            ggml_cpu_fused_moe_upgate_q8_work_size(cgraph, cplan.n_threads));
+    }
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -206,6 +237,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
     cplan.disable_rowexact    = cpu_ctx->disable_rowexact;
+    cplan.fused_moe_upgate_q8 = cpu_ctx->fused_moe_upgate_q8;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -251,6 +283,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
     ctx->disable_rowexact    = false;
+    ctx->fused_moe_upgate_q8 = false;
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
@@ -310,6 +343,12 @@ void ggml_backend_cpu_set_rowexact(ggml_backend_t backend_cpu, bool enabled) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->disable_rowexact = !enabled;
+}
+
+void ggml_backend_cpu_set_fused_moe_upgate(ggml_backend_t backend_cpu, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *) backend_cpu->context;
+    ctx->fused_moe_upgate_q8 = enable;
 }
 
 // CPU backend - device
@@ -750,6 +789,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_rowexact") == 0) {
         return (void *)ggml_backend_cpu_set_rowexact;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_fused_moe_upgate") == 0) {
+        return (void *)ggml_backend_cpu_set_fused_moe_upgate;
     }
 #ifdef GGML_IQK_FLASH_ATTENTION
     // AKX-ALL-LB4.5: iqk flash-attention runtime switch (NULL = the build has no iqk FA kernel)

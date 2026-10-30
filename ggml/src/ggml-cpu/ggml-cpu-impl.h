@@ -544,7 +544,13 @@ void ggml_barrier(struct ggml_threadpool * tp);
 bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 // iqk port (Stage 2): MoE expert GEMM fast path for GGML_OP_MUL_MAT_ID.
 bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// CH-19 Q8_0 single-token up+gate fusion; false preserves the unfused path.
+bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * params,
+        struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu);
+
 #endif
+// Additional activation workspace for the optional Q8_0 fusion; zero if no matching graph.
+size_t ggml_cpu_fused_moe_upgate_q8_work_size(const struct ggml_cgraph * cgraph, int n_threads);
 
 #if defined(GGML_IQK_FLASH_ATTENTION) && !defined(__cplusplus)
 // (C only: C++ TUs get the IQK_API declaration from iqk/iqk_mul_mat.h)

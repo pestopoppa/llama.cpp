@@ -394,6 +394,19 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // CH-19: Q8_0-only MoE up+gate+SwiGLU extension (argv switch; default off; Q4_K/Q5_K unchanged)
+        if (params.cpu_fused_moe_upgate) {
+            ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto * set_fused_fn = cpu_reg ? (decltype(ggml_backend_cpu_set_fused_moe_upgate) *)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_set_fused_moe_upgate") : nullptr;
+            if (set_fused_fn) {
+                set_fused_fn(backend_cpu, true);
+                LLAMA_LOG_INFO("%s: cpu_fused_moe_upgate_q8 = 1\n", __func__);
+            } else {
+                throw std::runtime_error("cpu_fused_moe_upgate requested but the CPU backend does not export it");
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -4081,6 +4094,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.cpu_fused_moe_upgate        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

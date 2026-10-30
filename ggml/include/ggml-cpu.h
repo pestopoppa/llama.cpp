@@ -25,6 +25,9 @@ extern "C" {
 
         // disable optional row-exact small-batch kernels for this computation
         bool disable_rowexact;
+
+        // CH-19 Q8_0 extension only; Q4_K/Q5_K fusion remains independently enabled.
+        bool fused_moe_upgate_q8;
     };
 
     // numa strategies
@@ -140,6 +143,7 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
     GGML_BACKEND_API void ggml_backend_cpu_set_rowexact(ggml_backend_t backend_cpu, bool enabled);
+    GGML_BACKEND_API void ggml_backend_cpu_set_fused_moe_upgate(ggml_backend_t backend_cpu, bool enable);
 
     // iqk CPU flash attention (AKX-ALL-LB4, compiled only with -DGGML_IQK_FLASH_ATTENTION=ON).
     // Process-wide runtime switch, set from argv (common: --cpu-iqk-fa on|off; llama-bench:

@@ -3758,6 +3758,7 @@ struct ggml_cplan ggml_graph_plan(
     cplan.work_size       = work_size;
     cplan.work_data       = NULL;
     cplan.disable_rowexact = false;
+    cplan.fused_moe_upgate_q8 = false;
 
     return cplan;
 }
@@ -4458,6 +4459,93 @@ static void ggml_cpu_prof_atexit(void) {
 }
 #endif
 
+#if defined(GGML_USE_IQK_MULMAT) && defined(IQK_IMPLEMENT)
+// CH-19.1: predicate for the fused MoE up+gate+SwiGLU node at nodes [node_n, node_n+2].
+// The up and gate MUL_MAT_IDs are SIBLINGS (both read the same src1 and expert ids; only the GLU
+// consumes them), not a chain, so ggml_can_fuse() -- which requires node i to consume node i-1 --
+// was always false here and the fused path never ran.  ggml_can_fuse_subgraph() checks the op
+// sequence, the COMPUTE flags, and that every use of the two MUL_MAT_IDs lies inside the subgraph
+// (no OUTPUT flag, no external view); the rest pins the exact form the fused kernel implements:
+//   - the two MUL_MAT_IDs are adjacent (either order), each used exactly once, and only by the GLU;
+//   - GLU = SWIGLU split form, not swapped: glu = silu(src[0]) * src[1], src[0] = gate, src[1] = up;
+//   - up and gate share src1 (the activations) and src[2] (the expert ids), and have identical shapes.
+// Graph metadata only, so every thread reaches the same answer.  On false nothing has been written.
+static bool ggml_cpu_can_fuse_moe_up_gate(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        struct ggml_tensor ** up_out,
+        struct ggml_tensor ** gate_out) {
+    static const enum ggml_op ops[3] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int outputs[1] = { node_n + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 3, ops, outputs, 1)) {
+        return false;
+    }
+    struct ggml_tensor * a   = cgraph->nodes[node_n];
+    struct ggml_tensor * b   = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    struct ggml_tensor * gate = glu->src[0];
+    struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, node_n) != 1 || ggml_node_get_use_count(cgraph, node_n + 1) != 1) {
+        return false;
+    }
+    if (a->view_src || b->view_src) {
+        return false;
+    }
+    if (up->src[1] != gate->src[1] || up->src[2] != gate->src[2]) {
+        return false;
+    }
+    if (!ggml_are_same_shape(up, gate) || !ggml_are_same_shape(glu, up)) {
+        return false;
+    }
+    *up_out   = up;
+    *gate_out = gate;
+    return true;
+}
+#endif
+
+// CH-19 Q8_0 only: reserve the 36-byte Q8_2_X4 activation rows used by the optional
+// helper. The ordinary Q8_0 MUL_MAT_ID planner reserves 34 bytes/32 elements and may
+// leave too little room when K or thread count grows. Called only with the option ON
+// by the CPU backend; OFF plans keep their original work_size and ABI behaviour.
+size_t ggml_cpu_fused_moe_upgate_q8_work_size(const struct ggml_cgraph * cgraph, int n_threads) {
+    size_t required = 0;
+#if defined(GGML_USE_IQK_MULMAT) && defined(IQK_IMPLEMENT)
+    if (n_threads <= 0) return 0;
+    for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * up = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (!ggml_cpu_can_fuse_moe_up_gate(cgraph, i, &up, &gate) ||
+                !up->src[0] || up->src[0]->type != GGML_TYPE_Q8_0) continue;
+        const struct ggml_tensor * src = up->src[1];
+        const struct ggml_tensor * ids = up->src[2];
+        if (!src || !ids || ids->ne[1] != 1 || src->ne[3] != 1 ||
+                src->ne[0] <= 0 || src->ne[0] % 32 != 0 ||
+                src->ne[1] <= 0 || src->ne[2] <= 0) continue;
+        const size_t blocks = (size_t) src->ne[0] / 32;
+        if (blocks > SIZE_MAX / 36) continue;
+        size_t bytes = blocks * 36;
+        if ((size_t) src->ne[1] > SIZE_MAX / bytes) continue;
+        bytes *= (size_t) src->ne[1];
+        if ((size_t) src->ne[2] > SIZE_MAX / bytes) continue;
+        bytes *= (size_t) src->ne[2];
+        if ((size_t) n_threads > SIZE_MAX / bytes) continue;
+        bytes *= (size_t) n_threads;
+        required = MAX(required, bytes);
+    }
+#else
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(n_threads);
+#endif
+    return required;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4671,6 +4759,19 @@ static int ggml_cpu_try_fuse_ops(
                     return 2;
                 }
             }
+        }
+    }
+    // CH-19 Q8_0 extension: leave the established Q4_K/Q5_K block above unchanged.
+    // The argv switch enables only this disjoint Q8_0 route; the helper also requires
+    // GGML_IQK=1 and GGML_IQK_Q8_0=1 and declines unsupported shapes before fusion.
+    if (node->op == GGML_OP_MUL_MAT_ID && cplan->fused_moe_upgate_q8 &&
+            node_n + 2 < cgraph->n_nodes) {
+        struct ggml_tensor * up = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (ggml_cpu_can_fuse_moe_up_gate(cgraph, node_n, &up, &gate) &&
+                up->src[0] && up->src[0]->type == GGML_TYPE_Q8_0 &&
+                ggml_iqk_try_moe_up_gate(params, up, gate, cgraph->nodes[node_n + 2])) {
+            return 2;
         }
     }
 #endif
