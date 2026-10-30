@@ -1,3 +1,4 @@
+#include "llama-profile.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -4481,7 +4482,9 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    const uint64_t profile_call = llama_profile_decode_begin(ctx, batch);
     const int ret = ctx->decode(batch);
+    llama_profile_decode_end(profile_call, ret);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

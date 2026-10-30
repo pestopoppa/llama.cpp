@@ -1,3 +1,4 @@
+#include "../../src/llama-profile.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -1945,7 +1946,34 @@ private:
         return true;
     }
 
+    // Native request identity and state, never inferred from graph counts.
+    void profile_slots() {
+        if (!llama_profile_enabled()) return;
+        json annotations = json::array();
+        for (const auto & slot : slots) {
+            if (!slot.task || !slot.is_processing()) continue;
+            annotations.push_back({{"slot", slot.id}, {"task", slot.task->id},
+                {"request_id", slot.task->params.oaicompat_cmpl_id},
+                {"state", int(slot.state)},
+                {"server_phase", slot.state == SLOT_STATE_GENERATING ? "generation" : "prompt"},
+                {"generated_before", slot.n_decoded},
+                {"draft_count", slot.spec_draft.size()},
+                {"target_ctx", string_format("%p", (void *) slot.ctx_tgt)},
+                {"drafter_ctx", string_format("%p", (void *) slot.ctx_dft)}});
+        }
+        llama_profile_slots(annotations.dump().c_str());
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
+        if (llama_profile_enabled()) {
+            json event = {{"event", "sampled_token"}, {"slot", slot.id},
+                {"task", slot.task->id}, {"request_id", slot.task->params.oaicompat_cmpl_id},
+                {"ordinal", slot.n_decoded}, {"token", result.tok},
+                {"target_ctx", string_format("%p", (void *) slot.ctx_tgt)}};
+            const std::string encoded = event.dump();
+            llama_profile_record(encoded.substr(1, encoded.size() - 2).c_str());
+        }
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -3531,6 +3559,7 @@ private:
 
         // generate the actual drafts (if any)
         {
+            profile_slots();
             common_speculative_draft(spec.get());
         }
 
@@ -4200,6 +4229,7 @@ private:
                     n_verification_rows, batch_view.n_tokens, rowexact_verify ? "true" : "false");
         }
 
+        profile_slots();
         const int ret = llama_decode(ctx_tgt, batch_view);
         if (reset_rowexact.active) {
             llama_set_rowexact(ctx_tgt, false);
@@ -4338,6 +4368,7 @@ private:
             GGML_ASSERT(add_ok);
             serial_batch.render();
 
+            profile_slots();
             const int ret = llama_decode(slot.ctx_tgt, serial_batch.batch);
             metrics.on_decoded(slots);
             if (ret != 0) {
@@ -4395,6 +4426,7 @@ private:
 
         auto decode = [&](server_batch & sb, const char * what) {
             sb.render();
+            profile_slots();
             const int ret = llama_decode(slot.ctx_tgt, sb.batch);
             metrics.on_decoded(slots);
             if (ret != 0) {
@@ -4706,6 +4738,15 @@ private:
             const int64_t t_now = ggml_time_us();
 
             const auto ids = std::move(slot.spec_draft);
+            if (llama_profile_enabled()) {
+                json event = {{"event", "spec_accept"}, {"slot", slot.id},
+                    {"task", slot.task->id}, {"request_id", slot.task->params.oaicompat_cmpl_id},
+                    {"generated_before", slot.n_decoded}, {"tested_draft_count", n_draft},
+                    {"accepted_tokens_including_bonus", ids},
+                    {"target_ctx", string_format("%p", (void *) slot.ctx_tgt)}};
+                const std::string encoded = event.dump();
+                llama_profile_record(encoded.substr(1, encoded.size() - 2).c_str());
+            }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
