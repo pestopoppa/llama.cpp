@@ -2856,15 +2856,14 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
         }
     }
 
-    // Serializing up to five rows preserves each element's arithmetic and each row's reduction order
-    // (consolidation C: 51c375478 widened the champion's three-row bound to five; SUM_ROWS small-case rule kept).
+    // Serializing up to three rows preserves each element's arithmetic and each row's reduction order.
     // Check both tensors: binary/unary/scale/dup/glu partition src[0], while fill partitions dst.
     const bool small_sum_rows = node->op == GGML_OP_SUM_ROWS && node->src[0] &&
         ggml_nelements(node) <= 4096 && ggml_nelements(node->src[0]) <= 4096;
-    if (!small_sum_rows && ggml_nrows(node) > 5) {
+    if (!small_sum_rows && ggml_nrows(node) > 3) {
         return false;
     }
-    if (!small_sum_rows && node->src[0] && ggml_nrows(node->src[0]) > 5) {
+    if (!small_sum_rows && node->src[0] && ggml_nrows(node->src[0]) > 3) {
         return false;
     }
     if (ggml_nelements(node) > ggml_cpu_tiny_solo_max) {
