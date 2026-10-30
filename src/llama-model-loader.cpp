@@ -521,8 +521,8 @@ namespace GGUFMeta {
                     }
                     for (uint32_t i = 0; i < n; ++i) {
                         const int64_t value = arr_info.gt == GGUF_TYPE_INT32
-                            ? static_cast<const int32_t *>(arr_info.data)[i]
-                            : static_cast<const uint32_t *>(arr_info.data)[i];
+                            ? static_cast<int64_t>(static_cast<const int32_t *>(arr_info.data)[i])
+                            : static_cast<int64_t>(static_cast<const uint32_t *>(arr_info.data)[i]);
                         if (value < 0 || value > LLAMA_MAX_EXPERTS) {
                             throw std::runtime_error(format("key %s has out-of-range expert count at layer %u: %" PRId64,
                                 key.c_str(), i, value));
