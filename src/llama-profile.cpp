@@ -58,7 +58,11 @@ struct capture {
     }
 };
 capture & state() { static capture c; return c; }
+std::atomic<uint64_t> scope_sequence{1};
+thread_local uint64_t scope_id = 0;
 thread_local std::string slots = "[]";
+thread_local const llama_context * target_ctx = nullptr;
+thread_local const llama_context * drafter_ctx = nullptr;
 void emit(const std::string & fields) {
     auto & c = state();
     std::ostringstream out;
@@ -78,22 +82,39 @@ void emit(const std::string & fields) {
     }
 }
 }
-void llama_profile_slots(const char * json) {
-    if (llama_profile_enabled()) slots = json;
+llama_profile_scope::llama_profile_scope(const char * json, const llama_context * target, const llama_context * drafter)
+    : active(llama_profile_enabled()), previous_scope(0), previous_target(nullptr), previous_drafter(nullptr) {
+    if (!active) return;
+    previous_scope = scope_id;
+    scope_id = scope_sequence++;
+    previous = slots;
+    previous_target = target_ctx;
+    previous_drafter = drafter_ctx;
+    slots = json;
+    target_ctx = target;
+    drafter_ctx = drafter;
+}
+llama_profile_scope::~llama_profile_scope() {
+    if (!active) return;
+    scope_id = previous_scope;
+    slots = std::move(previous);
+    target_ctx = previous_target;
+    drafter_ctx = previous_drafter;
 }
 void llama_profile_record(const char * json_fields) {
     if (llama_profile_enabled()) emit(json_fields);
 }
-uint64_t llama_profile_decode_begin(const llama_context * ctx, const llama_batch & batch) {
+uint64_t llama_profile_begin(const llama_context * ctx, const llama_batch & batch, const char * api) {
     if (!llama_profile_enabled()) return 0;
     auto & c = state();
     const uint64_t call = c.next++;
-    std::string label = "epyc.decode." + std::to_string(call);
+    std::string label = "epyc." + std::string(api) + "." + std::to_string(call);
     if (c.push(label.c_str()) < 0) fail("ROCTX push");
     std::ostringstream out;
-    out << "\"event\":\"decode_begin\",\"call_id\":" << call
+    out << "\"event\":\"" << api << "_begin\",\"api\":\"" << api << "\",\"call_id\":" << call
         << ",\"ctx\":\"" << ctx << "\",\"model\":\"" << llama_get_model(ctx)
-        << "\",\"slots\":" << slots << ",\"n_tokens\":" << batch.n_tokens << ",\"rows\":[";
+        << "\",\"scope_id\":" << ((ctx && (ctx == target_ctx || ctx == drafter_ctx)) ? scope_id : 0)
+        << ",\"slots\":" << ((ctx && (ctx == target_ctx || ctx == drafter_ctx)) ? slots : "[]") << ",\"n_tokens\":" << batch.n_tokens << ",\"rows\":[";
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (i) out << ',';
         out << "{\"index\":" << i << ",\"pos\":";
@@ -113,8 +134,8 @@ uint64_t llama_profile_decode_begin(const llama_context * ctx, const llama_batch
     emit(out.str());
     return call;
 }
-void llama_profile_decode_end(uint64_t call, int32_t result) {
+void llama_profile_end(uint64_t call, int32_t result, const char * api) {
     if (!call) return;
-    emit("\"event\":\"decode_end\",\"call_id\":" + std::to_string(call) + ",\"rc\":" + std::to_string(result));
+    emit("\"event\":\"" + std::string(api) + "_end\",\"api\":\"" + api + "\",\"call_id\":" + std::to_string(call) + ",\"rc\":" + std::to_string(result));
     if (state().pop() < 0) fail("ROCTX pop");
 }

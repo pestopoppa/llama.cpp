@@ -4471,7 +4471,9 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
+    const uint64_t profile_call = llama_profile_begin(ctx, batch, "encode");
     const int ret = ctx->encode(batch);
+    llama_profile_end(profile_call, ret, "encode");
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -4482,9 +4484,9 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const uint64_t profile_call = llama_profile_decode_begin(ctx, batch);
+    const uint64_t profile_call = llama_profile_begin(ctx, batch, "decode");
     const int ret = ctx->decode(batch);
-    llama_profile_decode_end(profile_call, ret);
+    llama_profile_end(profile_call, ret, "decode");
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

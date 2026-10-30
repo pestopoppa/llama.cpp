@@ -1947,8 +1947,7 @@ private:
     }
 
     // Native request identity and state, never inferred from graph counts.
-    void profile_slots() {
-        if (!llama_profile_enabled()) return;
+    std::string profile_slots() {
         json annotations = json::array();
         for (const auto & slot : slots) {
             if (!slot.task || !slot.is_processing()) continue;
@@ -1961,7 +1960,14 @@ private:
                 {"target_ctx", string_format("%p", (void *) slot.ctx_tgt)},
                 {"drafter_ctx", string_format("%p", (void *) slot.ctx_dft)}});
         }
-        llama_profile_slots(annotations.dump().c_str());
+        return annotations.dump();
+    }
+
+    template <typename F> auto profile_call(F && call) {
+        if (!llama_profile_enabled()) return call();
+        const std::string annotations = profile_slots();
+        const llama_profile_scope scope(annotations.c_str(), ctx_tgt, ctx_dft);
+        return call();
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -3559,8 +3565,7 @@ private:
 
         // generate the actual drafts (if any)
         {
-            profile_slots();
-            common_speculative_draft(spec.get());
+            profile_call([&] { common_speculative_draft(spec.get()); });
         }
 
         // make checkpoints if needed
@@ -4229,8 +4234,7 @@ private:
                     n_verification_rows, batch_view.n_tokens, rowexact_verify ? "true" : "false");
         }
 
-        profile_slots();
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        const int ret = profile_call([&] { return llama_decode(ctx_tgt, batch_view); });
         if (reset_rowexact.active) {
             llama_set_rowexact(ctx_tgt, false);
             reset_rowexact.active = false;
@@ -4291,7 +4295,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!profile_call([&] { return common_speculative_process(spec.get(), batch_view); })) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -4368,8 +4372,7 @@ private:
             GGML_ASSERT(add_ok);
             serial_batch.render();
 
-            profile_slots();
-            const int ret = llama_decode(slot.ctx_tgt, serial_batch.batch);
+            const int ret = profile_call([&] { return llama_decode(slot.ctx_tgt, serial_batch.batch); });
             metrics.on_decoded(slots);
             if (ret != 0) {
                 throw std::runtime_error(string_format(
@@ -4377,7 +4380,7 @@ private:
                         i, ret));
             }
 
-            if (!common_speculative_process(spec.get(), serial_batch.batch)) {
+            if (!profile_call([&] { return common_speculative_process(spec.get(), serial_batch.batch); })) {
                 throw std::runtime_error("failed to process serial DSpark target verification token");
             }
 
@@ -4426,13 +4429,12 @@ private:
 
         auto decode = [&](server_batch & sb, const char * what) {
             sb.render();
-            profile_slots();
-            const int ret = llama_decode(slot.ctx_tgt, sb.batch);
+            const int ret = profile_call([&] { return llama_decode(slot.ctx_tgt, sb.batch); });
             metrics.on_decoded(slots);
             if (ret != 0) {
                 throw std::runtime_error(string_format("LLAMA_SPEC_EXACT %s decode failed: llama_decode returned %d", what, ret));
             }
-            if (!common_speculative_process(spec.get(), sb.batch)) {
+            if (!profile_call([&] { return common_speculative_process(spec.get(), sb.batch); })) {
                 throw std::runtime_error(string_format("LLAMA_SPEC_EXACT %s: failed to process speculative batch", what));
             }
             slot.n_spec_exact_extra += sb.size();
@@ -4536,7 +4538,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    profile_call([&] { common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens()); });
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4729,7 +4731,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                profile_call([&] { common_speculative_accept(spec.get(), slot.id, accepted.size() - 1); });
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_dists.clear();
