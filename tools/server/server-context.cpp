@@ -4483,7 +4483,31 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // Diagnostic only: emit exact target input rows before each decode. Disabled by default.
+        // pb_iter.n_decode_rows is the decode prefix of this server batch; `off` is its view offset.
+        static uint64_t item4_trace_id = 0;
+        const char * item4_trace_env = getenv("LLAMA_KPF_ITEM4_TRACE");
+        const bool item4_trace = item4_trace_env && atoi(item4_trace_env) == 1;
+        const uint64_t trace_id = item4_trace ? ++item4_trace_id : 0;
+        if (item4_trace) {
+            SRV_INF("KPF_ITEM4_BEGIN id=%" PRIu64 " off=%d rows=%d decode_prefix=%d\n",
+                    trace_id, off, batch_view.n_tokens, pb_iter.n_decode_rows);
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                const int nseq = batch_view.n_seq_id[i];
+                const int owner = nseq == 1 ? batch_view.seq_id[i][0] : -1;
+                int task_id = -1;
+                for (const auto & slot : slots) {
+                    if (slot.id == owner && slot.task) { task_id = slot.task->id; break; }
+                }
+                SRV_INF("KPF_ITEM4_ROW id=%" PRIu64 " row=%d owner=%d task=%d nseq=%d pos=%d output=%d phase=%s\n",
+                        trace_id, i, owner, task_id, nseq, batch_view.pos[i], (int) batch_view.logits[i],
+                        off + i < pb_iter.n_decode_rows ? "decode" : "prefill");
+            }
+        }
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (item4_trace) {
+            SRV_INF("KPF_ITEM4_END id=%" PRIu64 " ret=%d\n", trace_id, ret);
+        }
 
         metrics.on_decoded(slots);
 
