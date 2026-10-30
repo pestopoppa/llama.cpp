@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -975,6 +976,29 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+
+    // Diagnostic only: record occupied physical runs and exact owners before allocation.
+    // Only use for spec-off unified target (n_swa == 0, one stream). No KV mutation.
+    const char * layout_env = getenv("LLAMA_KPF_LAYOUT_TRACE");
+    if (layout_env && atoi(layout_env) == 1) {
+        static uint64_t layout_id = 0;
+        const uint64_t id = ++layout_id;
+        LLAMA_LOG_INFO("KPF_LAYOUT_BEGIN id=%" PRIu64 " streams=%u swa=%u nseq=%u tokens=%u\n",
+                       id, n_stream, n_swa, ubatch.n_seqs_unq, ubatch.n_tokens);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            LLAMA_LOG_INFO("KPF_LAYOUT_STREAM id=%" PRIu64 " stream=%u size=%u used=%u head=%u\n",
+                           id, s, cells.size(), cells.get_used(), v_heads[s]);
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i)) continue;
+                unsigned mask = 0;
+                for (int seq = 0; seq < 4; ++seq) if (cells.seq_has(i, seq)) mask |= 1u << seq;
+                LLAMA_LOG_INFO("KPF_LAYOUT_CELL id=%" PRIu64 " stream=%u cell=%u pos=%d mask=%u owners=%d\n",
+                               id, s, i, cells.pos_get(i), mask, cells.seq_count(i));
+            }
+        }
+        LLAMA_LOG_INFO("KPF_LAYOUT_END id=%" PRIu64 "\n", id);
+    }
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
