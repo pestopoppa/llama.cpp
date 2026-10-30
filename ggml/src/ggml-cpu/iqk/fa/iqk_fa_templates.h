@@ -2245,4 +2245,3 @@ IQK_FA_CASE(iqk_fa_96_96);
 IQK_FA_CASE(iqk_fa_64_64);
 
 #endif
-
