@@ -11070,30 +11070,6 @@ static void autokernel_add_served_shape_lowbit_cases(std::vector<std::unique_ptr
 // default corpus per op, so new cases that only matter for a specific experimental change stay
 // out of it). TEST_BACKEND_OPS_EXTRA_CASES is a comma-separated list of set names, e.g.
 //   TEST_BACKEND_OPS_EXTRA_CASES=gdn_bf16_state test-backend-ops -b CPU -o GATED_DELTA_NET
-static bool test_backend_ops_extra_case_set(const char * name) {
-    const char * env = std::getenv("TEST_BACKEND_OPS_EXTRA_CASES");
-    if (env == nullptr) {
-        return false;
-    }
-    const std::string list = env;
-    const std::string want = name;
-    size_t start = 0;
-    while (start <= list.size()) {
-        size_t end = list.find(',', start);
-        if (end == std::string::npos) {
-            end = list.size();
-        }
-        if (list.compare(start, end - start, want) == 0) {
-            return true;
-        }
-        start = end + 1;
-    }
-    return false;
-}
-
-// Opt-in case sets that are NOT part of the default eval corpus (the AutoKernel gates pin the
-// default corpus per op, so new cases that only matter for a specific experimental change stay
-// out of it). TEST_BACKEND_OPS_EXTRA_CASES is a comma-separated list of set names, e.g.
 //   TEST_BACKEND_OPS_EXTRA_CASES=fa_cpu_long_ctx test-backend-ops -b CPU -o FLASH_ATTN_EXT
 static bool test_backend_ops_extra_case_set(const char * name) {
     const char * env = std::getenv("TEST_BACKEND_OPS_EXTRA_CASES");
