@@ -157,8 +157,8 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
     if (!has_target_hidden_size) {
         LLAMA_LOG_WARN(
-                "%s: missing target_hidden_size; using legacy draft hidden size %u and requiring "
-                "the runtime target model to match\n",
+                "%s: missing target_hidden_size; legacy draft hidden size %u is unverified; "
+                "runtime target-size check pending\n",
                 __func__, n_embd_tgt);
     }
     if (target_layer_ids.size() > std::numeric_limits<uint32_t>::max() / n_embd_tgt) {

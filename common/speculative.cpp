@@ -1362,6 +1362,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_layer_tgt   = llama_model_n_layer(model_tgt);
 
         int32_t n_embd_tgt_expected = n_embd_dec;
+        bool legacy_target_hidden_size = false;
         char target_hidden_size_buf[32] = {};
         if (llama_model_meta_val_str(model_dft, "dflash.target_hidden_size",
                 target_hidden_size_buf, sizeof(target_hidden_size_buf)) >= 0) {
@@ -1381,15 +1382,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_INF("%s: target hidden size %d derived from the drafter's main_proj\n",
                     __func__, n_embd_tgt_expected);
         } else {
-            LOG_WRN(
-                    "%s: missing dflash.target_hidden_size; using legacy draft hidden size %d and "
-                    "requiring it to match the target model\n",
-                    __func__, n_embd_tgt_expected);
+            legacy_target_hidden_size = true;
+        }
+        if (n_embd_tgt_expected <= 0 || n_embd_tgt <= 0) {
+            throw std::runtime_error("DFlash target hidden size is unknown or nonpositive");
         }
         if (n_embd_tgt_expected != n_embd_tgt) {
             throw std::runtime_error(
                     "DFlash expected target hidden size " + std::to_string(n_embd_tgt_expected) +
                     " does not match target model hidden size " + std::to_string(n_embd_tgt));
+        }
+        if (legacy_target_hidden_size) {
+            LOG_INF("%s: legacy draft hidden size %d verified matching target hidden size %d\n",
+                    __func__, n_embd_tgt_expected, n_embd_tgt);
         }
         if (target_layer_ids_n > (uint32_t) std::numeric_limits<int32_t>::max() / n_embd_tgt) {
             throw std::runtime_error("DFlash target feature width overflows int32_t");
