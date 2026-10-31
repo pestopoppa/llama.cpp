@@ -1242,7 +1242,7 @@ private:
                             has_draft ? "draft model" : "MTP context",
                             total / (1024.0 * 1024.0));
                 } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                    SRV_WRN("[spec] failed to measure %s memory; fit reservation may be incomplete: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
                 }
             }
