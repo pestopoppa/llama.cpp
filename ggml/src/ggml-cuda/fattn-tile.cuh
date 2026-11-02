@@ -1028,11 +1028,15 @@ static __global__ void flash_attn_tile(
             if (threadIdx.x == 0) {
                 KQ_sum_combine[threadIdx.y] = KQ_sum[0];
             }
-
-            return;
         }
 
+        // The producer warps must participate before exiting: this barrier
+        // publishes their shared VKQ and KQ_sum values to the consumer warps.
         __syncthreads();
+
+        if (threadIdx.y % np != 0) {
+            return;
+        }
 
 #pragma unroll
         for (int ip = 1; ip < np; ++ip) {
