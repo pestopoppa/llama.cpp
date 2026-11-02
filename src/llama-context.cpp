@@ -4345,6 +4345,17 @@ size_t llama_chunk_kv_read_f32(struct llama_context * ctx, llama_seq_id seq_id, 
     return kv->chunk_read_f32(seq_id, p0, p1, k_out, v_out, n_v_out);
 }
 
+size_t llama_chunk_kv_read_layer_k_f32(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        uint32_t layer, float * out, size_t capacity) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) return 0;
+    ctx->synchronize();
+    ctx->memory_update(false);
+    if (kv->get_has_shift()) return 0;
+    return kv->chunk_read_layer_k_f32(seq_id, p0, p1, layer, out, capacity);
+}
+
 bool llama_chunk_kv_apply_shift(struct llama_context * ctx) {
     ctx->synchronize();
     return ctx->memory_update(false);

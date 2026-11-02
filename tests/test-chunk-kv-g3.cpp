@@ -4,7 +4,8 @@
 // P0_THRESHOLDS section 8) and the verdicts are scripts/chunk-kv/g3_gate.py, so the gate logic lives in one place.
 //
 //   test-chunk-kv-g3 -m MODEL -ctk f32 -ctv f32 [-t N] [-b N -ub N] --g3-corpus FILE.jsonl --g3-out DIR
-//                    [--g3-ids FILE] [--g3-modes head,none,all-inject] [--g3-window 64] [--g3-n-cont 64]
+//                    [--g3-ids FILE] [--g3-modes head,none,all-inject,kdev] [--g3-window 64] [--g3-n-cont 64]
+//                    [--g3-kdev-layer N --g3-kdev-r R] (offline full-reference K; no online-speed claim)
 //                    [--g3-store-mib 4096] [--g3-max-requests N]
 //   test-chunk-kv-g3 -m TINY_MODEL -ctk f32 -ctv f32 --g3-self-test          (synthetic corpus, harness sanity, ctest)
 //
@@ -31,6 +32,7 @@
 #include "llama-ext.h"
 
 #include "server-chunk-recompute.h"
+#include "chunk-kv-selector.h"
 #include "server-chunk-store.h"
 
 #include <nlohmann/json.hpp>
@@ -62,6 +64,9 @@ struct g3_args {
     int64_t store_mib    = 4096;
     int32_t max_requests = 0;
     bool    self_test    = false;
+    bool    modes_explicit = false;
+    int32_t kdev_layer   = -1;
+    double  kdev_r       = -1;
 };
 
 struct request {
@@ -135,15 +140,28 @@ static bool split_args(int argc, char ** argv, g3_args & a, std::vector<char *> 
         else if (k == "--g3-store-mib")  { if (!need(v)) return false; a.store_mib = atoll(v.c_str()); }
         else if (k == "--g3-max-requests") { if (!need(v)) return false; a.max_requests = atoi(v.c_str()); }
         else if (k == "--g3-self-test")  { a.self_test = true; }
+        else if (k == "--g3-kdev-layer") {
+            if (!need(v)) return false;
+            char * end = nullptr; const long x = std::strtol(v.c_str(), &end, 10);
+            if (!end || *end || end == v.c_str() || x < 0 || x > INT32_MAX) return false;
+            a.kdev_layer = int32_t(x);
+        } else if (k == "--g3-kdev-r") {
+            if (!need(v)) return false;
+            char * end = nullptr; const double x = std::strtod(v.c_str(), &end);
+            if (!end || *end || end == v.c_str() || !std::isfinite(x) || x < 0 || x > 1) return false;
+            a.kdev_r = x;
+        }
         else if (k == "--g3-modes") {
             if (!need(v)) return false;
             a.modes.clear();
+            a.modes_explicit = true;
             std::stringstream ss(v);
             std::string m;
             while (std::getline(ss, m, ',')) {
                 server_chunk::select_mode sm;
-                if (!server_chunk::parse_select_mode(m, sm) || sm == server_chunk::SELECT_ALL) {
-                    fprintf(stderr, "bad --g3-modes entry '%s' (head, none, all-inject)\n", m.c_str());
+                if (m == "kdev") sm = server_chunk::SELECT_KDEV;
+                else if (!server_chunk::parse_select_mode(m, sm) || sm == server_chunk::SELECT_ALL) {
+                    fprintf(stderr, "bad --g3-modes entry '%s' (head, none, all-inject, kdev)\n", m.c_str());
                     return false;
                 }
                 a.modes.push_back(sm);
@@ -266,10 +284,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "need --g3-corpus FILE and --g3-out DIR (or --g3-self-test)\n");
         return 2;
     }
+    if (std::find(a.modes.begin(), a.modes.end(), server_chunk::SELECT_KDEV) != a.modes.end() &&
+        (a.kdev_layer < 0 || a.kdev_r < 0)) {
+        fprintf(stderr, "kdev requires explicit --g3-kdev-layer and --g3-kdev-r\n"); return 2;
+    }
     if (a.self_test) {
         a.n_cont = std::min(a.n_cont, 8);
         a.window = std::min(a.window, 16);
-        a.modes  = { server_chunk::SELECT_ALL_INJECT, server_chunk::SELECT_HEAD, server_chunk::SELECT_NONE };
+        if (!a.modes_explicit) a.modes = { server_chunk::SELECT_ALL_INJECT, server_chunk::SELECT_HEAD, server_chunk::SELECT_NONE };
     }
 
     common_params params;
@@ -407,7 +429,9 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "request %s: reference decode failed\n", r.id.c_str());
             return 3;
         }
-        llama_memory_seq_rm(mem, s_ref, -1, -1);
+        // Only kdev retains the full-reference K oracle; legacy modes keep their original lifecycle.
+        if (std::find(a.modes.begin(), a.modes.end(), server_chunk::SELECT_KDEV) == a.modes.end())
+            llama_memory_seq_rm(mem, s_ref, -1, -1);
         const size_t n_rows = ref_rows.size() / n_vocab;
         std::vector<double> lse(n_rows);
         for (size_t k = 0; k < n_rows; ++k) lse[k] = logsumexp(ref_rows.data() + k*n_vocab, n_vocab);
@@ -443,7 +467,27 @@ int main(int argc, char ** argv) {
 
             server_chunk::assemble_stats st;
             int32_t p_done = -1;
-            const int32_t ret = server_chunk::assemble(ctx, r.toks.data(), r.chunks, 0, E, s_arm, n_batch, mode, a.window, get_blob, st, &p_done);
+            json kdev_chunks = json::array();
+            const server_chunk::kdev_selector kdev = [&](const server_chunk::span & sp, llama_seq_id seq,
+                                                        std::vector<server_chunk::run> & runs) {
+                const llama_pos end = sp.offset + sp.n_tokens;
+                const size_t n = llama_chunk_kv_read_layer_k_f32(ctx, s_ref, sp.offset, end, uint32_t(a.kdev_layer), nullptr, 0);
+                const size_t nc = llama_chunk_kv_read_layer_k_f32(ctx, seq, sp.offset, end, uint32_t(a.kdev_layer), nullptr, 0);
+                if (!n || n != nc || n % size_t(sp.n_tokens) != 0 || n / size_t(sp.n_tokens) > INT32_MAX) return false;
+                std::vector<float> fresh(n), cached(n);
+                if (llama_chunk_kv_read_layer_k_f32(ctx, s_ref, sp.offset, end, uint32_t(a.kdev_layer), fresh.data(), n) != n ||
+                    llama_chunk_kv_read_layer_k_f32(ctx, seq, sp.offset, end, uint32_t(a.kdev_layer), cached.data(), n) != n) return false;
+                try {
+                    const auto result = chunk_kv_selector::select(sp.offset, sp.n_tokens, int32_t(n / size_t(sp.n_tokens)), a.kdev_r, fresh, cached);
+                    for (const auto & x : result.runs) runs.push_back({x.begin, x.end});
+                    kdev_chunks.push_back({{"offset", sp.offset}, {"n_tokens", sp.n_tokens}, {"layer", a.kdev_layer},
+                        {"target_r", result.target_r}, {"target_tokens", result.target_tokens},
+                        {"selected_tokens", result.selected_tokens}, {"realized_r", result.realized_r}});
+                } catch (const std::exception &) { return false; }
+                return true;
+            };
+            const int32_t ret = server_chunk::assemble(ctx, r.toks.data(), r.chunks, 0, E, s_arm, n_batch, mode, a.window, get_blob, st, &p_done,
+                                                       mode == server_chunk::SELECT_KDEV ? &kdev : nullptr);
             if (ret != 0 || p_done != E || st.n_no_blob != 0) {
                 fprintf(stderr, "request %s mode %s: assembly failed (ret %d, done %d of %d, no-blob %d)\n", r.id.c_str(),
                         server_chunk::select_mode_name(mode), ret, p_done, E, st.n_no_blob);
@@ -494,6 +538,10 @@ int main(int argc, char ** argv) {
                 {"store_hits", store.get_stats().hits - hits0}, {"store_misses", store.get_stats().misses - miss0},
                 {"t_ref_ms", t_ref}, {"t_assemble_ms", t_asm}, {"t_arm_ms", t_arm},
             };
+            if (mode == server_chunk::SELECT_KDEV) {
+                jr["kdev_chunks"] = kdev_chunks;
+                jr["selector_oracle"] = "full recompute reference, offline quality instrument; not online speed";
+            }
             if (mode == server_chunk::SELECT_ALL_INJECT) {
                 jr["bit_identical_to_ref"] = exact;
                 if (!exact) {
@@ -518,7 +566,9 @@ int main(int argc, char ** argv) {
             {"n_vocab", n_vocab}, {"n_requests", (int) reqs.size()}, {"corpus", a.corpus}, {"ids", a.ids},
             {"window", a.window}, {"n_cont", a.n_cont}, {"n_batch", n_batch}, {"n_ubatch", (int) llama_n_ubatch(ctx)},
             {"n_threads", params.cpuparams.n_threads}, {"type_k", ggml_type_name(cparams.type_k)}, {"type_v", ggml_type_name(cparams.type_v)},
-            {"selector", "head-window-v0 (KPF-62.3 selector not landed)"},
+            {"selector", "head-window-v0 or kdev offline reference K, as named by each arm"},
+            {"kdev_layer", a.kdev_layer}, {"kdev_target_r", a.kdev_r},
+            {"kdev_scope", "full-graph reference K, offline quality only; no online speed claim"},
             {"scored_rows", "logits at every suffix position after the last chunk, plus after each of n_cont teacher-forced tokens of the reference greedy continuation"},
             {"sanity_all_inject_bit_identical", n_fail == 0},
         };

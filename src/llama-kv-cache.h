@@ -206,6 +206,9 @@ public:
     // k_out/v_out null it only counts. Does NOT apply a pending K-shift: call the update first.
     size_t chunk_read_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out = nullptr) const;
 
+    // Diagnostic, exact layer identity and caller capacity; 0 on missing layer/range/insufficient capacity.
+    size_t chunk_read_layer_k_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t il, float * out, size_t capacity) const;
+
     // startup self-check of the K re-rotation: rotate random K by +d then -d through the same graph the shift uses, for
     // every distinct rope configuration of the model. nmse_out = worst NMSE over configurations (f64 accumulation).
     bool chunk_rope_selfcheck(llama_context * lctx, llama_pos delta, double * nmse_out);

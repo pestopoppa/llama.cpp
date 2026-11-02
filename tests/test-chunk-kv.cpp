@@ -216,6 +216,24 @@ static void test_attention(const common_params & params, llama_model * model, in
 
     std::vector<float> k_src, v_src;
     CHECK(read_kv(ctx, 0, 0, n_chunk, k_src, v_src));
+    // Layer-specific diagnostic readback must match the existing ordered
+    // all-layer read and never write a short caller buffer.
+    size_t layer_offset = 0;
+    for (int32_t layer = 0; layer < llama_model_n_layer(model); ++layer) {
+        const size_t count = llama_chunk_kv_read_layer_k_f32(ctx, 0, 0, n_chunk, layer, nullptr, 0);
+        if (!count) continue; // model layer without a KV cache
+        std::vector<float> layer_k(count, 123.0f);
+        CHECK(llama_chunk_kv_read_layer_k_f32(ctx, 0, 0, n_chunk, layer, layer_k.data(), count - 1) == 0);
+        CHECK(std::all_of(layer_k.begin(), layer_k.end(), [](float x) { return x == 123.0f; }));
+        CHECK(llama_chunk_kv_read_layer_k_f32(ctx, 0, 0, n_chunk, layer, layer_k.data(), count) == count);
+        CHECK(layer_offset + count <= k_src.size());
+        if (layer_offset + count <= k_src.size()) CHECK(std::equal(layer_k.begin(), layer_k.end(), k_src.begin() + layer_offset));
+        layer_offset += count;
+    }
+    CHECK(layer_offset == k_src.size());
+    CHECK(llama_chunk_kv_read_layer_k_f32(ctx, 0, 0, n_chunk, UINT32_MAX, nullptr, 0) == 0);
+    CHECK(llama_chunk_kv_read_layer_k_f32(ctx, 0, n_chunk, n_chunk + 1, 0, nullptr, 0) == 0);
+
 
     // 3. G1 for several deltas. The same chunk is placed at [delta, delta + n_chunk) three ways, each in its own sequence
     //    (separate KV streams, identical cell layout):

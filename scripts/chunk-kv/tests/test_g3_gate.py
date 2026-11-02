@@ -37,6 +37,15 @@ class CoverageGateTest(unittest.TestCase):
         self.pos[('0-0', 'none')] = [{'row': 0, 'pos': 0, 'kl': float('nan'), 'nmse': 0, 'top1': 1}]
         self.assertTrue(gate.evaluate(self.reqs, self.pos, 'head', 'none', 1)['overall'].startswith('INVALID'))
 
+    def test_kdev_arm_uses_same_gate_and_missing_data_refuses(self):
+        for rid, mode in list(self.reqs):
+            if mode == 'head':
+                self.reqs[(rid, 'kdev')] = dict(self.reqs.pop((rid, mode)), mode='kdev')
+                self.pos[(rid, 'kdev')] = self.pos.pop((rid, mode))
+        self.assertEqual(gate.evaluate(self.reqs, self.pos, 'kdev', 'none', 1)['overall'], 'PASS')
+        self.pos[('0-0', 'kdev')] = []
+        self.assertTrue(gate.evaluate(self.reqs, self.pos, 'kdev', 'none', 1)['overall'].startswith('INVALID'))
+
     def test_missing_retention_is_never_a_pass(self):
         self.assertTrue(gate.evaluate(self.reqs, self.pos, 'head', 'none')['overall'].startswith('INCOMPLETE'))
 

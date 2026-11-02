@@ -520,3 +520,5 @@ if (TARGET gguf-model-data)
 endif()
 
 llama_build_and_test(test-chunk-kv-selector.cpp)
+llama_build_and_test(test-chunk-kv-kdev-contract.cpp)
+target_include_directories(test-chunk-kv-kdev-contract PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)

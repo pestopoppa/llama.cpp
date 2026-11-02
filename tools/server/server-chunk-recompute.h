@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@ enum select_mode {
     SELECT_HEAD       = 1,
     SELECT_ALL        = 2, // r = 100%, store bypassed (G0a)
     SELECT_ALL_INJECT = 3, // diagnostic: inject, then recompute every chunk token (G0a-inj, harness sanity arm)
+    SELECT_KDEV      = 4, // offline only: oracle-backed check-layer K deviation
 };
 
 inline const char * select_mode_name(select_mode m) {
@@ -51,6 +53,7 @@ inline const char * select_mode_name(select_mode m) {
         case SELECT_HEAD:       return "head";
         case SELECT_ALL:        return "all";
         case SELECT_ALL_INJECT: return "all-inject";
+        case SELECT_KDEV:       return "kdev";
     }
     return "?";
 }
@@ -102,6 +105,7 @@ inline std::vector<run> select_runs(const span & sp, select_mode mode, int32_t w
     std::vector<run> out;
     switch (mode) {
         case SELECT_NONE:
+        case SELECT_KDEV: // requires an explicit callback in assemble; never default to an empty selection
             break;
         case SELECT_ALL:
         case SELECT_ALL_INJECT:
@@ -115,6 +119,22 @@ inline std::vector<run> select_runs(const span & sp, select_mode mode, int32_t w
     }
     return out;
 }
+
+// A K-deviation plan must cover the mandatory first 64 tokens and consist of
+// ordered non-overlapping runs inside its chunk. Missing or malformed plans refuse.
+inline bool valid_kdev_runs(const span & sp, const std::vector<run> & runs) {
+    if (sp.offset < 0 || sp.n_tokens <= 0 || int64_t(sp.offset) + sp.n_tokens > INT32_MAX || runs.empty()) return false;
+    const int32_t end = sp.offset + sp.n_tokens;
+    if (runs.front().p0 != sp.offset || runs.front().p1 < sp.offset + std::min<int32_t>(64, sp.n_tokens)) return false;
+    int32_t previous = sp.offset;
+    for (const auto & r : runs) {
+        if (r.p0 < previous || r.p0 < sp.offset || r.p1 <= r.p0 || r.p1 > end ||
+            (r.p0 - sp.offset) % 64 != 0 || (r.p1 != end && (r.p1 - sp.offset) % 64 != 0)) return false;
+        previous = r.p1;
+    }
+    return true;
+}
+using kdev_selector = std::function<bool(const span &, llama_seq_id, std::vector<run> &)>;
 
 inline int32_t runs_tokens(const std::vector<run> & runs) {
     int32_t n = 0;
@@ -244,8 +264,9 @@ struct assemble_stats {
 template <typename F>
 inline int32_t assemble(llama_context * ctx, const llama_token * toks, const std::vector<span> & spans, int32_t p_begin,
         int32_t p_end, llama_seq_id seq, int32_t n_batch, select_mode mode, int32_t window, F && get_blob,
-        assemble_stats & st, int32_t * p_done) {
+        assemble_stats & st, int32_t * p_done, const kdev_selector * selector = nullptr) {
     *p_done = p_begin;
+    if (mode == SELECT_KDEV && !selector) return -1;
 
     if (mode == SELECT_ALL) {
         const int32_t end = aligned_end(p_begin, p_end, n_batch);
@@ -290,7 +311,8 @@ inline int32_t assemble(llama_context * ctx, const llama_token * toks, const std
         }
         st.n_injected += sg.p1 - sg.p0;
 
-        const auto runs = select_runs(spans[sg.i_chunk], mode, window);
+        auto runs = select_runs(spans[sg.i_chunk], mode, window);
+        if (mode == SELECT_KDEV && (!(*selector)(spans[sg.i_chunk], seq, runs) || !valid_kdev_runs(spans[sg.i_chunk], runs))) return -1;
         const int32_t ret = recompute_runs(ctx, toks, runs, seq, n_batch);
         if (ret != 0) {
             return ret;

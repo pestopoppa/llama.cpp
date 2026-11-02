@@ -2409,6 +2409,27 @@ bool llama_kv_cache::chunk_range_free(llama_seq_id seq_id, llama_pos p0, llama_p
     return true;
 }
 
+size_t llama_kv_cache::chunk_read_layer_k_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t il, float * out, size_t capacity) const {
+    if (p0 < 0 || p1 <= p0) return 0;
+    const size_t n_pos = size_t(p1 - p0);
+    size_t offset = 0, needed = 0;
+    for (const auto & layer : layers) {
+        const size_t width = hparams.n_embd_k_gqa(layer.il);
+        if (width == 0 || n_pos > SIZE_MAX / width || offset > SIZE_MAX - n_pos*width) return 0;
+        const size_t count = n_pos*width;
+        if (layer.il == il) { needed = count; break; }
+        offset += count;
+    }
+    if (!needed || (out && capacity < needed)) return 0;
+    const size_t total = chunk_read_f32(seq_id, p0, p1, nullptr, nullptr);
+    if (!total || offset > total || needed > total - offset) return 0;
+    if (!out) return needed;
+    std::vector<float> all(total);
+    if (chunk_read_f32(seq_id, p0, p1, all.data(), nullptr) != total) return 0;
+    std::copy(all.begin() + offset, all.begin() + offset + needed, out);
+    return needed;
+}
+
 size_t llama_kv_cache::chunk_read_f32(llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out) const {
     if (!chunk_supported() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0 || p1 <= p0) {
         return 0;

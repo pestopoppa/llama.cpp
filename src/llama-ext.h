@@ -69,6 +69,11 @@ LLAMA_API size_t llama_chunk_kv_read_f32(
                        float * v_out,
                       size_t * n_v_out);
 
+// Diagnostic K readback for one exact model layer, in position-major [position][K width] order.
+// Null output queries float count. Non-null requires capacity >= that count; unsupported/missing/refused returns zero.
+LLAMA_API size_t llama_chunk_kv_read_layer_k_f32(struct llama_context * ctx, llama_seq_id seq_id,
+        llama_pos p0, llama_pos p1, uint32_t layer, float * out, size_t capacity);
+
 // apply any pending K re-rotation now (a decode does it anyway); returns true if work was done
 LLAMA_API bool llama_chunk_kv_apply_shift(struct llama_context * ctx);
 
