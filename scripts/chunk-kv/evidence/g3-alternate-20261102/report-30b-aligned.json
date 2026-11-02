@@ -1,0 +1,40 @@
+{
+  "combined_alternate_inputs": {
+    "corpus.jsonl": "a9e07e1fa1ff01d31efea9e92489979952538076d92bb658bcdfde44d27640b1",
+    "report.json": "577010688e3517296f61b6a35c8037f343c239f01729cd3309449a7e9dd4ac7f",
+    "tasks.jsonl": "7cd46b67423dab73b5874d0f1ff05f117d38fc7b3f2811efa7b8ff93484b5832"
+  },
+  "corpus_sha256": "1ba08db04c43d771a413fb1e04406a08f0afb81db3cb2959a24d83c9007f7859",
+  "gate_bucket_counts": {
+    "1024": 337,
+    "16384": 125,
+    "4096": 275,
+    "8192": 183
+  },
+  "identity": {
+    "libraries": {
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-base.so.0.16.0": "4947fbf9b8ecfe3cdd3e637f93646e4269e6320bc225685d44128482926c0abd",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-cpu.so.0.16.0": "2bfebb9fbbc5918bf7b7739ec42cc1fac2b3f6046306384c27ff258c7599d7db",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml.so.0.16.0": "cf7bef53c23a1d65db5d1da0acbfcc24e2c6b302fdf39f98385182759542370d",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama-common.so.0.0.10427": "a3c4106326f85239dc5d500357748a99e84ed9b7717e17114a530e8e2fbdf78a",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama.so.0.0.10427": "5046b366442d3f62fcd5172951ff79508176e349413ce6afbe50a21237d19d2e"
+    },
+    "model_header_sha256": "f1160241ad4fe90965353ab4f13396874c57f21231526280f26da5864b082952",
+    "token_input_sha256": "678ba082ef071be319fbc44d4ac60fa97eae9e121a1fb41d196217c0716035e2",
+    "tokenizer_sha256": "bd11558f90b759b93ad07d71823c03a0360d0b20d992c2e92aeacd21f6a4e124"
+  },
+  "input_records": 536,
+  "limitations": [
+    "not B7 traffic",
+    "question-first prompts are constructed from original questions and prompts",
+    "exact-token-match task metric not admitted",
+    "no model inference"
+  ],
+  "long_records_retained": 489,
+  "manifest_request_count": 1172,
+  "refusal": null,
+  "schema": "epyc.kpf62.longqa-alternate.v1",
+  "source_selection_sha256": "7301df5b63562eb34c103ff9c654ad8c835d381f92130092211c746d928ed01f",
+  "status": "STRUCTURALLY_ELIGIBLE_NOT_APPROVED",
+  "tasks_sha256": "b54becc472610fea2daa8f7da8f34d92cb1670a01a5a403bdf15986820fc65d7"
+}

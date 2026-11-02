@@ -1,0 +1,36 @@
+{
+  "combined_music_sha256": "9570eee6364fd5a316b380099c33a7a9b6d65951ce257a66e20a172f0f0d5ff4",
+  "corpus_sha256": "631e217e01060d1f62e9ca614dcf0ee6af4c9b73448ce8c22accdb383e495e32",
+  "gate_bucket_counts": {
+    "1024": 327,
+    "16384": 7,
+    "4096": 194,
+    "8192": 8
+  },
+  "identity": {
+    "libraries": {
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-base.so.0.16.0": "4947fbf9b8ecfe3cdd3e637f93646e4269e6320bc225685d44128482926c0abd",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-cpu.so.0.16.0": "2bfebb9fbbc5918bf7b7739ec42cc1fac2b3f6046306384c27ff258c7599d7db",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml.so.0.16.0": "cf7bef53c23a1d65db5d1da0acbfcc24e2c6b302fdf39f98385182759542370d",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama-common.so.0.0.10427": "a3c4106326f85239dc5d500357748a99e84ed9b7717e17114a530e8e2fbdf78a",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama.so.0.0.10427": "5046b366442d3f62fcd5172951ff79508176e349413ce6afbe50a21237d19d2e"
+    },
+    "model_header_sha256": "bc85f42a131e0aab2ca3e661859588b9b39101c803cb6d87bb4dab3afa978e92",
+    "token_input_sha256": "bfd18c757d6c96682ae4fc8db14c961d0a13c447ba8e63e3d98bcda10c367fbd",
+    "tokenizer_sha256": "b6a0a23cd20744c01bc3b592400b94ddcf479665eec586ded24e3d4c60dcd2d8"
+  },
+  "input_records": 347,
+  "limitations": [
+    "not B7 traffic",
+    "question-first prompts are constructed from original questions and prompts",
+    "exact-token-match task metric not admitted",
+    "no model inference"
+  ],
+  "long_records_retained": 281,
+  "manifest_request_count": 0,
+  "refusal": "gate split requires >=50 requests per length bucket",
+  "schema": "epyc.kpf62.longqa-alternate.v1",
+  "source_selection_sha256": "50a7f5efc5aacfc7b82a86bc148e8101e4460c689312017aabbd4196bea86cfa",
+  "status": "NOT_G3_ELIGIBLE",
+  "tasks_sha256": "dd909049fb4305d0d464d447aedb0c272ec210bf7931d50d1c3c5c21c68c35fa"
+}

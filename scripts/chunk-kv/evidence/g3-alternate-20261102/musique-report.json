@@ -1,0 +1,36 @@
+{
+  "gate_bucket_counts": {
+    "1024": 323,
+    "16384": 0,
+    "4096": 1,
+    "8192": 0
+  },
+  "lib_dir": "/mnt/micron/rtg58-kpf623-g3-20261102/bin",
+  "library_sha256": {
+    "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-base.so.0.16.0": "4947fbf9b8ecfe3cdd3e637f93646e4269e6320bc225685d44128482926c0abd",
+    "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-cpu.so.0.16.0": "2bfebb9fbbc5918bf7b7739ec42cc1fac2b3f6046306384c27ff258c7599d7db",
+    "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml.so.0.16.0": "cf7bef53c23a1d65db5d1da0acbfcc24e2c6b302fdf39f98385182759542370d",
+    "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama-common.so.0.0.10427": "a3c4106326f85239dc5d500357748a99e84ed9b7717e17114a530e8e2fbdf78a",
+    "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama.so.0.0.10427": "5046b366442d3f62fcd5172951ff79508176e349413ce6afbe50a21237d19d2e"
+  },
+  "limitations": [
+    "alternate dataset, not B7 traffic",
+    "no full model-byte identity asserted",
+    "no G3 decision or task metric approval",
+    "raw input and gold are unmodified",
+    "no model inference performed"
+  ],
+  "model_header_bytes": 10996704,
+  "model_header_sha256": "bc85f42a131e0aab2ca3e661859588b9b39101c803cb6d87bb4dab3afa978e92",
+  "model_path": "/mnt/raid0/llm/models/Qwen3.8-27B-Q8_0.gguf",
+  "original_requests": 393,
+  "retained_requests": 393,
+  "schema": "epyc.kpf62.musique-alternate.v1",
+  "selection_sha256": "dcd2b4551dae5cb4d80771ad7ffd67d7d3b9ee3a17cd1916dd14698e3fb84109",
+  "source_sha256": "cc7f247be3bc358b33eba282f00ebc6747c68e71fce4499c94a17ec0d6317800",
+  "status": "NOT_G3_ELIGIBLE",
+  "structural_refusal": "gate split requires >=50 requests per length bucket",
+  "tokenized_corpus_sha256": "9570eee6364fd5a316b380099c33a7a9b6d65951ce257a66e20a172f0f0d5ff4",
+  "tokenized_tasks_sha256": "d302b70bf382593434ca0be70e6d16f2a93e4072e1bd3a9604c75251a180cf52",
+  "tokenizer_sha256": "b6a0a23cd20744c01bc3b592400b94ddcf479665eec586ded24e3d4c60dcd2d8"
+}

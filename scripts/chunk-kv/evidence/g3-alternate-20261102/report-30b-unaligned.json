@@ -1,0 +1,40 @@
+{
+  "combined_alternate_inputs": {
+    "corpus.jsonl": "411c50833fb056ba846e2fe49b555ac620bfc0f84c7dbf815110323af26dd90f",
+    "report.json": "d24c27b2c4189b9d816c9fdf1b9fd95ac8f6ebcb9596b5ae4ed3ab86aa03e747",
+    "tasks.jsonl": "11a61112cc2181d895bfe66f540abe5a414148ffb994a0718a070239c9996ce5"
+  },
+  "corpus_sha256": "d95650836df56f219eacf0497d76616ac870c784c2dbd72283f8ea1d13f8f5d4",
+  "gate_bucket_counts": {
+    "1024": 327,
+    "16384": 12,
+    "4096": 17,
+    "8192": 14
+  },
+  "identity": {
+    "libraries": {
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-base.so.0.16.0": "4947fbf9b8ecfe3cdd3e637f93646e4269e6320bc225685d44128482926c0abd",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml-cpu.so.0.16.0": "2bfebb9fbbc5918bf7b7739ec42cc1fac2b3f6046306384c27ff258c7599d7db",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libggml.so.0.16.0": "cf7bef53c23a1d65db5d1da0acbfcc24e2c6b302fdf39f98385182759542370d",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama-common.so.0.0.10427": "a3c4106326f85239dc5d500357748a99e84ed9b7717e17114a530e8e2fbdf78a",
+      "/mnt/micron/rtg58-kpf623-g3-20261102/bin/libllama.so.0.0.10427": "5046b366442d3f62fcd5172951ff79508176e349413ce6afbe50a21237d19d2e"
+    },
+    "model_header_sha256": "f1160241ad4fe90965353ab4f13396874c57f21231526280f26da5864b082952",
+    "token_input_sha256": "678ba082ef071be319fbc44d4ac60fa97eae9e121a1fb41d196217c0716035e2",
+    "tokenizer_sha256": "b6a0a23cd20744c01bc3b592400b94ddcf479665eec586ded24e3d4c60dcd2d8"
+  },
+  "input_records": 536,
+  "limitations": [
+    "not B7 traffic",
+    "question-first prompts are constructed from original questions and prompts",
+    "exact-token-match task metric not admitted",
+    "no model inference"
+  ],
+  "long_records_retained": 24,
+  "manifest_request_count": 0,
+  "refusal": "gate split requires >=50 requests per length bucket",
+  "schema": "epyc.kpf62.longqa-alternate.v1",
+  "source_selection_sha256": "7301df5b63562eb34c103ff9c654ad8c835d381f92130092211c746d928ed01f",
+  "status": "NOT_G3_ELIGIBLE",
+  "tasks_sha256": "9552910e480523cd4a16f0d291a98bc05e01ecd3bfcc3529207d27c110028900"
+}
