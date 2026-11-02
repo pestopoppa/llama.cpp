@@ -553,3 +553,7 @@ target_include_directories(test-chunk-kv-kdev-contract PRIVATE ${PROJECT_SOURCE_
 
 llama_build_and_test(test-server-prompt-fork.cpp)
 target_link_libraries(test-server-prompt-fork PRIVATE mtmd)
+
+# Test-only cascade attention oracle; no serving dispatch is enabled.
+add_executable(test-cascade-attention-reference test-cascade-attention-reference.cpp)
+llama_test(test-cascade-attention-reference)
