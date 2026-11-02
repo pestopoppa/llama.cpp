@@ -336,6 +336,7 @@ struct server_slot {
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        content_changed();
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -352,6 +353,10 @@ struct server_slot {
         }
 
         prompt.clear();
+
+        kv_altered = false;
+
+        content_changed();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -385,6 +390,32 @@ struct server_slot {
     int32_t n_spec_exact_extra = 0;  // INF-70 E2a: extra target tokens decoded by LLAMA_SPEC_EXACT drop/redecode
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // [KPF-16] cross-slot prefix fork telemetry for the current task (set at launch, cleared in reset())
+    bool         fork_enabled  = false; // --slot-fork-min-tokens > 0 and the memory supports it
+    int32_t      fork_n_tokens = 0;     // prompt tokens taken from the fork (0 = no fork)
+    int32_t      fork_src_slot = -1;
+    const char * fork_src_kind = "none"; // none | checkpoint | end | kv
+
+    // [KPF-11] the cached cells no longer equal a fresh prefill of prompt.tokens (context shift, KV compression
+    // eviction): never a fork source. Cleared when the cells are rebuilt from position 0.
+    bool kv_altered = false;
+
+    // [P2] content epoch: bumped whenever tokens this slot already holds may stop being a prefix of its
+    // content (clear, truncation below the cached length, --cache-ram load, fork-into, copy from a parent,
+    // context shift, KV compression, slot restore). Pure appends (prompt chunks, generated tokens) and the
+    // within-step speculative tail never bump it. Starts at 0; only increases.
+    uint64_t content_epoch = 0;
+
+    void content_changed() {
+        content_epoch++;
+    }
+
+    void fork_reset() {
+        fork_n_tokens = 0;
+        fork_src_slot = -1;
+        fork_src_kind = "none";
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -414,6 +445,8 @@ struct server_slot {
         n_draft_verif_steps = 0;
         n_spec_exact_extra = 0;
         n_accepted_per_pos.clear();
+
+        fork_reset();
 
         task_prev = std::move(task);
         task.reset();
@@ -619,6 +652,15 @@ struct server_slot {
             timings.draft_n_accepted = n_draft_accepted;
         }
 
+        if (fork_enabled) {
+            timings.fork_enabled  = true;
+            timings.n_fork_tokens = fork_n_tokens;
+            timings.fork_src_slot = fork_src_slot;
+            timings.fork_src_kind = fork_src_kind;
+            timings.id_slot       = id;
+            timings.id_task       = task ? task->id : -1;
+        }
+
         return timings;
     }
 
@@ -794,6 +836,7 @@ struct server_slot {
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
         other.prompt = prompt.clone();
+        other.content_changed();
         other.init_sampler();
     }
 
@@ -1036,6 +1079,17 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    // [KPF-11] cross-slot prefix fork
+    enum slot_fork_mode_t {
+        SLOT_FORK_NONE = 0, // off (--slot-fork-min-tokens 0, the A/B control) or unsupported
+        SLOT_FORK_KV,       // pure position-addressed KV: fork at any position, plain zero-copy seq_cp
+        SLOT_FORK_CKPT,     // recurrent/hybrid or SWA: attention-only share + PARTIAL_ONLY state from a checkpoint
+    };
+    slot_fork_mode_t slot_fork_mode = SLOT_FORK_NONE;
+
+    uint64_t n_slot_forks_total       = 0;
+    uint64_t n_slot_fork_tokens_total = 0;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1519,6 +1573,11 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        slot_fork_mode = init_slot_fork_mode();
+        for (auto & slot : slots) {
+            slot.fork_enabled = slot_fork_mode != SLOT_FORK_NONE;
+        }
+
         // propagate new defaults back to caller
         params = params_base;
 
@@ -1640,6 +1699,328 @@ private:
         }
 
         return true;
+    }
+
+    //
+    // [KPF-11..14] cross-slot prefix fork
+    //
+
+    slot_fork_mode_t init_slot_fork_mode() {
+        const int32_t n_min = params_base.slot_fork_min_tokens;
+        if (n_min <= 0) {
+            return SLOT_FORK_NONE; // the champion path: nothing below runs
+        }
+
+        auto off = [&](const char * why) {
+            SRV_WRN("--slot-fork-min-tokens %d: cross-slot prefix fork disabled: %s\n", n_min, why);
+            return SLOT_FORK_NONE;
+        };
+
+        if (params_base.n_parallel < 2) {
+            return off("needs --parallel >= 2");
+        }
+        if (!params_base.kv_unified) {
+            return off("needs --kv-unified (a zero-copy share needs both sequences in one KV stream)");
+        }
+        if (mctx) {
+            return off("not supported with multimodal");
+        }
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            return off("the context has no memory");
+        }
+
+        const bool need_ckpt =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
+            n_swa > 0;
+
+        slot_fork_mode_t mode = SLOT_FORK_NONE;
+
+        if (!need_ckpt) {
+            if (ctx_dft && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                return off("the draft context needs checkpoints while the target does not");
+            }
+            mode = SLOT_FORK_KV;
+        } else {
+            if (params_base.n_ctx_checkpoints <= 0) {
+                return off("needs context checkpoints (--ctx-checkpoints > 0)");
+            }
+            // capability probes: an empty range changes nothing
+            if (!llama_memory_seq_cp_ext(llama_get_memory(ctx_tgt), 0, 1, 0, 0, LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY)) {
+                return off("the target memory cannot share attention cells");
+            }
+            if (ctx_dft && !llama_memory_seq_cp_ext(llama_get_memory(ctx_dft), 0, 1, 0, 0, LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY)) {
+                return off("the draft memory cannot share attention cells");
+            }
+            mode = SLOT_FORK_CKPT;
+        }
+
+        SRV_INF("cross-slot prefix fork enabled: mode = %s, min tokens = %d, cache_idle_slots = %d\n",
+                mode == SLOT_FORK_KV ? "kv" : "checkpoint", n_min, (int) params_base.cache_idle_slots);
+
+        return mode;
+    }
+
+    // the reuse the dst slot already has for this task: its own LCP or checkpoint, including what a
+    // --cache-ram load in get_available_slot just put there
+    int32_t slot_fork_own_reuse(const server_slot & dst, const server_task & task) const {
+        const int32_t lcp = dst.prompt.tokens.get_common_prefix(task.tokens);
+        if (lcp <= 0) {
+            return 0;
+        }
+
+        if (slot_fork_mode == SLOT_FORK_KV || lcp == dst.prompt.n_tokens()) {
+            return lcp;
+        }
+
+        int32_t best = 0;
+        for (const auto & ckpt : dst.prompt.checkpoints) {
+            if (ckpt.n_tokens <= lcp) {
+                best = std::max<int32_t>(best, ckpt.n_tokens);
+            }
+        }
+
+        return best;
+    }
+
+    struct slot_fork_candidate {
+        server_slot * src = nullptr;
+        int32_t       p   = 0;
+        const common_prompt_checkpoint * ckpt = nullptr; // kind == checkpoint
+        const char *  kind = "none";
+        bool          idle = false;
+    };
+
+    // pick the largest fork position over every other slot, busy ones included.
+    // ties: idle source first, then the most recently used
+    slot_fork_candidate find_fork_source(const server_slot & dst, const server_task & task, const std::vector<common_adapter_lora_info> & dst_lora) {
+        slot_fork_candidate best;
+
+        const int32_t n_task = task.tokens.size();
+        const int32_t n_min  = params_base.slot_fork_min_tokens;
+
+        auto consider = [&](server_slot & src, int32_t p, const common_prompt_checkpoint * ckpt, const char * kind) {
+            const bool idle = !src.is_processing();
+            bool better = best.src == nullptr || p > best.p;
+            if (!better && p == best.p) {
+                if (idle != best.idle) {
+                    better = idle;
+                } else {
+                    better = src.t_last_used > best.src->t_last_used;
+                }
+            }
+            if (better) {
+                best = { &src, p, ckpt, kind, idle };
+            }
+        };
+
+        for (auto & src : slots) {
+            if (src.id == dst.id) {
+                continue;
+            }
+            // a child waiting for its parent is about to be overwritten by copy_state_to
+            if (src.state == SLOT_STATE_WAIT_OTHER) {
+                continue;
+            }
+            if (src.prompt.tokens.empty() || src.prompt.tokens.has_mtmd || src.kv_altered) {
+                continue;
+            }
+            // the cached KV was computed under src's adapters
+            if (!are_lora_equal(src.lora, dst_lora)) {
+                continue;
+            }
+
+            const int32_t lcp = src.prompt.tokens.get_common_prefix(task.tokens);
+            if (lcp < n_min) {
+                continue;
+            }
+
+            const llama_pos src_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), src.id);
+
+            if (slot_fork_mode == SLOT_FORK_KV) {
+                const int32_t p = std::min(lcp, n_task - 1);
+                // src must hold every position in [0, p)
+                if (llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id) != 0 || src_pos_max < p - 1) {
+                    continue;
+                }
+                consider(src, p, nullptr, "kv");
+                continue;
+            }
+
+            // SLOT_FORK_CKPT
+            // the exact end of an idle source: snapshot its live non-rollbackable state at launch
+            if (!src.is_processing() && src.prompt.n_tokens() == lcp && lcp < n_task && src_pos_max == lcp - 1 && n_swa == 0) {
+                consider(src, lcp, nullptr, "end");
+            }
+
+            for (const auto & ckpt : src.prompt.checkpoints) {
+                const int32_t p = (int32_t) ckpt.n_tokens;
+                if (p <= 0 || p > lcp || p >= n_task || p < n_min) {
+                    continue;
+                }
+                if (ckpt.data_tgt.empty() || (ctx_dft && ckpt.data_dft.empty())) {
+                    continue;
+                }
+                // positions must equal token indices, and src must still hold the attention cells
+                if (ckpt.pos_max + 1 != p || src_pos_max < p - 1) {
+                    continue;
+                }
+                // SWA: the same acceptance test pre_decode applies when it restores a checkpoint, so dst does not
+                // fall back to a full re-process right after the fork
+                if (n_swa > 0 && !(ckpt.pos_min < std::max(0, p - n_swa) || ckpt.pos_min == 0)) {
+                    continue;
+                }
+                consider(src, p, &ckpt, "checkpoint");
+            }
+        }
+
+        return best;
+    }
+
+    // dst becomes exactly what it would be had it processed task.tokens[0, p) itself: attention cells
+    // [0, p) shared with src (zero copy), non-rollbackable state at p in dst's OWN rows, prompt tokens and
+    // checkpoints up to p. pre_decode then takes n_past = p through its ordinary path.
+    void do_slot_fork(server_slot & dst, const server_task & task, const slot_fork_candidate & c) {
+        const int64_t t_start = ggml_time_us();
+
+        server_slot & src = *c.src;
+        const int32_t p   = c.p;
+
+        common_prompt_checkpoint snap;
+        const common_prompt_checkpoint * ckpt = c.ckpt;
+
+        if (slot_fork_mode == SLOT_FORK_CKPT && ckpt == nullptr) {
+            // kind == end: the idle source's live state is the state at p
+            snap.id_task = -1;
+            snap.update_pos(p,
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id),
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), src.id));
+            snap.update_tgt(ctx_tgt, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            snap.update_dft(ctx_dft, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_speculative_get_state(spec.get(), src.id, snap.data_spec);
+            // the junction is what the next sibling forks from, once this idle source is purged
+            snap.pinned = true;
+            ckpt = &snap;
+        }
+
+        // target
+        common_context_seq_rm(ctx_tgt, dst.id, -1, -1);
+        if (slot_fork_mode == SLOT_FORK_KV) {
+            common_context_seq_cp(ctx_tgt, src.id, dst.id, 0, p);
+        } else {
+            if (!common_context_seq_cp_attn(ctx_tgt, src.id, dst.id, 0, p)) {
+                GGML_ABORT("attention-only seq_cp failed after a successful capability probe");
+            }
+            ckpt->load_tgt(ctx_tgt, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+
+        // draft
+        if (ctx_dft) {
+            common_context_seq_rm(ctx_dft, dst.id, -1, -1);
+            if (slot_fork_mode == SLOT_FORK_KV) {
+                common_context_seq_cp(ctx_dft, src.id, dst.id, 0, p);
+            } else {
+                if (!common_context_seq_cp_attn(ctx_dft, src.id, dst.id, 0, p)) {
+                    GGML_ABORT("attention-only seq_cp failed on the draft context after a successful capability probe");
+                }
+                ckpt->load_dft(ctx_dft, dst.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+
+        if (slot_fork_mode == SLOT_FORK_CKPT) {
+            // the drafter's stashed boundary state (e.g. eagle3 g_embd), as the slot's own restore does
+            common_speculative_set_state(spec.get(), dst.id, ckpt->data_spec);
+        }
+
+        // prompt: tokens [0, p) and the source checkpoints that lie inside them
+        {
+            server_tokens toks = task.tokens.clone();
+            toks.keep_first(p);
+            dst.prompt.tokens = std::move(toks);
+        }
+
+        dst.prompt.checkpoints.clear();
+        for (const auto & cur : src.prompt.checkpoints) {
+            if (cur.n_tokens <= p && cur.pos_max < p) {
+                dst.prompt.checkpoints.push_back(cur);
+            }
+        }
+        if (ckpt == &snap) {
+            // the source may already carry a pinned checkpoint of this exact state (e.g. its `checkpoint_at: [-1]`):
+            // that one was cloned above, so do not hold the same snapshot twice
+            const bool have = std::any_of(dst.prompt.checkpoints.begin(), dst.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & cur) {
+                        return cur.pinned && cur.n_tokens == snap.n_tokens && cur.pos_max == snap.pos_max;
+                    });
+            if (!have) {
+                dst.prompt.checkpoints.push_back(std::move(snap));
+            }
+        }
+        // keep the capacity bound: drop the oldest unpinned first
+        while (dst.prompt.checkpoints.size() > (size_t) std::max(1, params_base.n_ctx_checkpoints)) {
+            auto it = std::find_if(dst.prompt.checkpoints.begin(), dst.prompt.checkpoints.end(),
+                    [](const common_prompt_checkpoint & cur) { return !cur.pinned; });
+            if (it == dst.prompt.checkpoints.end()) {
+                break;
+            }
+            dst.prompt.checkpoints.erase(it);
+        }
+
+        dst.kv_altered    = false;
+        dst.content_changed();
+        dst.fork_n_tokens = p;
+        dst.fork_src_slot = src.id;
+        dst.fork_src_kind = c.kind;
+
+        n_slot_forks_total       += 1;
+        n_slot_fork_tokens_total += p;
+
+        SLT_INF(dst, "slot fork: src = %d (%s), kind = %s, n_fork_tokens = %d, task.n_tokens = %d, t = %.2f ms\n",
+                src.id, c.idle ? "idle" : "busy", c.kind, p, (int) task.tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    bool slot_fork_eligible(const server_task & task, const std::vector<common_adapter_lora_info> & lora) const {
+        if (slot_fork_mode == SLOT_FORK_NONE) {
+            return false;
+        }
+        if (task.type != SERVER_TASK_TYPE_COMPLETION) {
+            return false;
+        }
+        // n > 1 children copy the parent's whole state at DONE_PROMPT (copy_state_to)
+        if (task.is_child()) {
+            return false;
+        }
+        if (!task.params.cache_prompt || !task.params.slot_fork) {
+            return false;
+        }
+        if (task.tokens.has_mtmd || lora_all_alora(lora)) {
+            return false;
+        }
+        return (int32_t) task.tokens.size() > params_base.slot_fork_min_tokens;
+    }
+
+    // the adapters launch_slot_with_task will give the slot for this task
+    std::vector<common_adapter_lora_info> task_lora(const server_task & task) const {
+        return task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+    }
+
+    void try_slot_fork(server_slot & dst, const server_task & task) {
+        if (!slot_fork_eligible(task, dst.lora)) {
+            return;
+        }
+
+        const slot_fork_candidate best = find_fork_source(dst, task, dst.lora);
+        if (best.src == nullptr || best.p < params_base.slot_fork_min_tokens) {
+            return;
+        }
+
+        const int32_t own = slot_fork_own_reuse(dst, task);
+        if (best.p <= own) {
+            SLT_DBG(dst, "slot fork skipped: own reuse %d >= fork %d from slot %d\n", own, best.p, best.src->id);
+            return;
+        }
+
+        do_slot_fork(dst, task, best);
     }
 
     server_slot * get_slot_by_id(int id_slot) {
@@ -1766,7 +2147,23 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // [KPF-11] a fork at least as long as the best --cache-ram hit wins: it is zero copy, and the RAM
+                // entry (which load() would consume) stays in RAM. The fork itself is taken at launch.
+                bool skip_load = false;
+                if (slot_fork_mode != SLOT_FORK_NONE) {
+                    const auto lora = task_lora(task);
+                    if (slot_fork_eligible(task, lora)) {
+                        const auto cand = find_fork_source(*ret, task, lora);
+                        if (cand.src != nullptr && cand.p >= params_base.slot_fork_min_tokens &&
+                                cand.p >= prompt_cache->best_lcp(ret->prompt, task.tokens)) {
+                            SLT_DBG(*ret, "skipping --cache-ram load: fork of %d tokens from slot %d is at least as long\n",
+                                    cand.p, cand.src->id);
+                            skip_load = true;
+                        }
+                    }
+                }
+
+                if (!skip_load && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -1833,6 +2230,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
+                    slot.content_changed();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -1930,6 +2328,13 @@ private:
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
         } else {
             slot.smpl.reset();
+        }
+
+        // [KPF-14] the fork is taken at launch: before the [TAG_IDLE_SLOT_CLEAR] loop in process_single_task can
+        // clear an idle source. Clearing the source afterwards drops only its own seq bit.
+        slot.fork_reset();
+        if (slot_fork_mode != SLOT_FORK_NONE) {
+            try_slot_fork(slot, task);
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -2433,14 +2838,37 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // pinned: [KPF-15] requested through `checkpoint_at`; the erase loops below never evict a pinned checkpoint
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool pinned = false) {
         const int id_task = slot.task->id;
+
+        {
+            const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & cur : slot.prompt.checkpoints) {
+                if (cur.n_tokens != n_tokens || cur.pos_max != pos_max) {
+                    continue;
+                }
+                if (pinned) {
+                    // a checkpoint already taken at this exact point only needs the pin
+                    cur.pinned = true;
+                    SLT_TRC(slot, "pinned existing context checkpoint (n_tokens = %" PRId64 ")\n", n_tokens);
+                    return;
+                }
+                if (cur.pinned) {
+                    // [KPF-15] a pinned checkpoint (checkpoint_at, or inherited through a fork) already holds this
+                    // exact state: an unpinned second copy only costs memory. Pinned checkpoints exist only when
+                    // the fork features are in use, so the champion path is unchanged.
+                    SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " already held (pinned)\n", n_tokens);
+                    return;
+                }
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (!it->pinned && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2453,18 +2881,25 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed - the oldest unpinned one [KPF-15]
+            auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [](const common_prompt_checkpoint & c) { return !c.pinned; });
+            if (it == slot.prompt.checkpoints.end()) {
+                break; // only pinned checkpoints left: bounded by the request's checkpoint_at (<= 8 each)
+            }
+
+            const auto & cur = *it;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.pinned  = pinned;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2477,9 +2912,42 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, pinned ? ", pinned" : "");
+    }
+
+    // [KPF-15] pinned checkpoint at the end of the prompt, for `checkpoint_at` -1 or == n_tokens
+    void maybe_create_end_checkpoint(server_slot & slot) {
+        const auto & ckpt_at = slot.task->params.checkpoint_at;
+        if (ckpt_at.empty()) {
+            return;
+        }
+
+        const int32_t n_task = slot.task->n_tokens();
+        const bool want = std::binary_search(ckpt_at.begin(), ckpt_at.end(), -1) ||
+                          std::binary_search(ckpt_at.begin(), ckpt_at.end(), n_task);
+        if (!want) {
+            return;
+        }
+
+        const bool need_ckpt =
+            params_base.n_ctx_checkpoints > 0 &&
+            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+             n_swa > 0);
+        if (!need_ckpt || slot.prompt.n_tokens() != n_task || slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0) {
+            return;
+        }
+
+        create_checkpoint(slot, 0, pos_min, pos_max, true);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -2822,8 +3290,81 @@ private:
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
 
+                    // [KPF-16] one O(n_cells) pass, only when the fork is enabled (off = champion: no scan)
+                    const bool kv_stats = slot_fork_mode != SLOT_FORK_NONE;
+                    llama_memory_cell_stats kv_pool = { 0, 0, 0 };
+                    std::vector<int64_t> kv_private(slots.size(), 0);
+                    std::vector<int64_t> kv_shared (slots.size(), 0);
+                    if (kv_stats) {
+                        llama_memory_get_cell_stats(llama_get_memory(ctx_tgt), &kv_pool, (int32_t) slots.size(), kv_private.data(), kv_shared.data());
+                    }
+                    int64_t kv_logical = 0;
+
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
+
+                        if (kv_stats) {
+                            kv_logical += kv_private[slot.id] + kv_shared[slot.id];
+
+                            slot_data["kv_cells"] = {
+                                {"private", kv_private[slot.id]},
+                                {"shared",  kv_shared[slot.id]},
+                            };
+                            slot_data["kv_pool"] = {
+                                {"size",   kv_pool.n_size},
+                                {"used",   kv_pool.n_used},
+                                {"shared", kv_pool.n_shared},
+                            };
+                            slot_data["fork"] = {
+                                {"n_fork_tokens", slot.fork_n_tokens},
+                                {"src_slot",      slot.fork_src_slot},
+                                {"src_kind",      slot.fork_src_kind},
+                            };
+                            // [P2] prefix hash ladder: FNV-1a 64 over the token ids (int32, little endian) of the
+                            // first n tokens, at every checkpoint position and at the slot's full length. One pass.
+                            std::vector<int64_t> marks;
+                            for (const auto & cur : slot.prompt.checkpoints) {
+                                marks.push_back(cur.n_tokens);
+                            }
+                            const int64_t n_slot_tokens = slot.prompt.n_tokens();
+                            std::map<int64_t, std::string> ladder;
+                            {
+                                std::vector<int64_t> want = marks;
+                                want.push_back(n_slot_tokens);
+                                std::sort(want.begin(), want.end());
+                                uint64_t hsh = 1469598103934665603ULL;
+                                size_t   iw  = 0;
+                                for (int64_t i = 0; i <= n_slot_tokens && iw < want.size(); ++i) {
+                                    while (iw < want.size() && want[iw] == i) {
+                                        ladder[i] = string_format("%016" PRIx64, hsh);
+                                        iw++;
+                                    }
+                                    if (i == n_slot_tokens) {
+                                        break;
+                                    }
+                                    const uint32_t t = (uint32_t) slot.prompt.tokens[i];
+                                    for (int b = 0; b < 4; ++b) {
+                                        hsh ^= (t >> (8*b)) & 0xffu;
+                                        hsh *= 1099511628211ULL;
+                                    }
+                                }
+                            }
+                            slot_data["content_epoch"] = slot.content_epoch;
+                            slot_data["prefix_hash"]   = ladder.count(n_slot_tokens) ? ladder[n_slot_tokens] : "";
+
+                            json ckpts = json::array();
+                            for (const auto & cur : slot.prompt.checkpoints) {
+                                ckpts.push_back({
+                                    {"n_tokens",    cur.n_tokens},
+                                    {"pos_min",     cur.pos_min},
+                                    {"pos_max",     cur.pos_max},
+                                    {"pinned",      cur.pinned},
+                                    {"size_mib",    (double) cur.size() / (1024.0 * 1024.0)},
+                                    {"prefix_hash", ladder.count(cur.n_tokens) ? ladder[cur.n_tokens] : ""},
+                                });
+                            }
+                            slot_data["checkpoints"] = std::move(ckpts);
+                        }
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -2857,6 +3398,14 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    res->kv_stats                 = kv_stats;
+                    res->kv_cells_size            = kv_pool.n_size;
+                    res->kv_cells_used            = kv_pool.n_used;
+                    res->kv_cells_shared          = kv_pool.n_shared;
+                    res->kv_cells_logical         = kv_logical;
+                    res->n_slot_forks_total       = n_slot_forks_total;
+                    res->n_slot_fork_tokens_total = n_slot_fork_tokens_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2941,12 +3490,16 @@ private:
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
+                        slot->content_changed();
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->content_changed();
+                    // [KPF-11] provenance of the file's cells is unknown (it may come from a shifted slot)
+                    slot->kv_altered = true;
 
                     // nread is the end offset of the llama state payload within the file
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
@@ -3034,6 +3587,14 @@ private:
                     if (n_evicted < 0) {
                         send_error(task, "Expected Attention compression failed", ERROR_TYPE_SERVER);
                         break;
+                    }
+
+                    if (n_evicted > 0) {
+                        // [KPF-11] holes in the cells: this slot is no longer a valid fork source
+                        if (server_slot * sl = get_slot_by_id(id_slot)) {
+                            sl->kv_altered = true;
+                            sl->content_changed();
+                        }
                     }
 
                     const llama_pos new_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id_slot);
@@ -3452,7 +4013,9 @@ private:
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
-                slot.truncated = true;
+                slot.truncated  = true;
+                slot.kv_altered = true;
+                slot.content_changed();
             }
         });
 
@@ -3921,7 +4484,13 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        if (n_past < slot.prompt.n_tokens()) {
+                            slot.content_changed(); // [P2] truncated below what the slot held
+                        }
                         slot.prompt.tokens.keep_first(n_past);
+                        if (n_past == 0) {
+                            slot.kv_altered = false; // [KPF-11] the cells are rebuilt from position 0
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4021,6 +4590,13 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [KPF-15] explicit junction checkpoints: end a chunk exactly at each requested position
+                    const auto & ckpt_at = slot.task->params.checkpoint_at;
+                    const bool want_ckpt_at = do_checkpoint && !ckpt_at.empty();
+                    auto is_ckpt_at = [&](int64_t n) {
+                        return want_ckpt_at && std::binary_search(ckpt_at.begin(), ckpt_at.end(), (int32_t) n);
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_prompt_limit) {
                         // get next token to process
@@ -4045,6 +4621,11 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+
+                        // [KPF-15] the next chunk starts at a requested position, where the checkpoint is created
+                        if (is_ckpt_at(slot.prompt.n_tokens()) && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4125,6 +4706,12 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
+                    // [KPF-15] a requested junction is checkpointed regardless of spacing or placement policy
+                    const bool ckpt_pinned = is_ckpt_at(n_tokens_start) && n_tokens_start > 0;
+                    if (ckpt_pinned) {
+                        do_checkpoint = true;
+                    }
+
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -4136,6 +4723,7 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
+                            ckpt_pinned ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
@@ -4144,7 +4732,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, ckpt_pinned);
                     }
                 }
 
@@ -4499,6 +5087,10 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // [KPF-15] `checkpoint_at: [-1]` (or the prompt length): the state after the whole prompt exists
+                // only now, after its last chunk is decoded
+                maybe_create_end_checkpoint(slot);
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -4868,6 +5460,10 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+
+        /* slot_fork_min_tokens   */ impl->params_base.slot_fork_min_tokens,
+        /* slot_fork_mode         */ impl->slot_fork_mode == server_context_impl::SLOT_FORK_KV   ? "kv" :
+                                     impl->slot_fork_mode == server_context_impl::SLOT_FORK_CKPT ? "checkpoint" : "none",
     };
 }
 
@@ -4980,6 +5576,45 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // [P2] checkpoint_at {"message": k}, chat endpoints: rendered message prefixes, verified at token level
+            if (!task.params.checkpoint_at_msg.empty() && data.contains("checkpoint_at_prefix_text") && !task.tokens.has_mtmd) {
+                const int32_t n_tok = (int32_t) task.tokens.size();
+                for (const auto & pre : data.at("checkpoint_at_prefix_text")) {
+                    auto toks = tokenize_input_prompts(ctx_server.vocab, nullptr, pre, true, true);
+                    if (toks.size() != 1) {
+                        continue;
+                    }
+                    const int32_t n_pre = (int32_t) toks[0].size();
+                    if (n_pre > 0 && n_pre <= n_tok && (int32_t) task.tokens.get_common_prefix(toks[0]) == n_pre) {
+                        task.params.checkpoint_at.push_back(n_pre == n_tok ? -1 : n_pre);
+                    } else {
+                        SRV_WRN("checkpoint_at: a message prefix (%d tokens) does not end on a token boundary of the prompt, ignored\n", n_pre);
+                    }
+                }
+                auto & ca = task.params.checkpoint_at;
+                std::sort(ca.begin(), ca.end());
+                ca.erase(std::unique(ca.begin(), ca.end()), ca.end());
+            } else if (!task.params.checkpoint_at_msg.empty()) {
+                // other endpoints: the message spans found from the template's role delimiters
+                const auto & spans = task.params.message_spans.spans;
+                const int32_t n_spans = (int32_t) spans.size();
+                const int32_t n_tok   = (int32_t) task.tokens.size();
+                for (const auto & [k_req, at_end] : task.params.checkpoint_at_msg) {
+                    const int32_t k = k_req < 0 ? n_spans + k_req : k_req;
+                    if (k < 0 || k >= n_spans) {
+                        SRV_WRN("checkpoint_at: message %d out of range (%d spans), ignored\n", k_req, n_spans);
+                        continue;
+                    }
+                    const int32_t pos = at_end ? (int32_t) (spans[k].pos + spans[k].len) : (int32_t) spans[k].pos;
+                    if (pos > 0 && pos <= n_tok) {
+                        task.params.checkpoint_at.push_back(pos == n_tok ? -1 : pos);
+                    }
+                }
+                auto & ca = task.params.checkpoint_at;
+                std::sort(ca.begin(), ca.end());
+                ca.erase(std::unique(ca.begin(), ca.end()), ca.end());
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5295,6 +5930,40 @@ void server_routes::init_routes() {
             }}}
         };
 
+        // [KPF-16] only when the cross-slot prefix fork is enabled
+        if (res_task->kv_stats) {
+            all_metrics_def["counter"].push_back({
+                    {"name",  "slot_forks_total"},
+                    {"help",  "Number of cross-slot prefix forks."},
+                    {"value",  res_task->n_slot_forks_total}
+            });
+            all_metrics_def["counter"].push_back({
+                    {"name",  "slot_fork_tokens_total"},
+                    {"help",  "Prompt tokens taken from cross-slot prefix forks instead of being prefilled."},
+                    {"value",  res_task->n_slot_fork_tokens_total}
+            });
+            all_metrics_def["gauge"].push_back({
+                    {"name",  "kv_cells_size"},
+                    {"help",  "Attention KV cells in the pool."},
+                    {"value",  res_task->kv_cells_size}
+            });
+            all_metrics_def["gauge"].push_back({
+                    {"name",  "kv_cells_used"},
+                    {"help",  "Unique attention KV cells in use (shared cells counted once)."},
+                    {"value",  res_task->kv_cells_used}
+            });
+            all_metrics_def["gauge"].push_back({
+                    {"name",  "kv_cells_shared"},
+                    {"help",  "Attention KV cells referenced by two or more slots."},
+                    {"value",  res_task->kv_cells_shared}
+            });
+            all_metrics_def["gauge"].push_back({
+                    {"name",  "kv_cells_logical"},
+                    {"help",  "Sum over slots of the attention KV cells each references (what the pool would hold without sharing)."},
+                    {"value",  res_task->kv_cells_logical}
+            });
+        }
+
         std::stringstream prometheus;
 
         for (const auto & el : all_metrics_def.items()) {
@@ -5447,6 +6116,16 @@ void server_routes::init_routes() {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;
             }
+        }
+        // [KPF-11/P2] fork capability, only when configured (the default /props stays byte-identical).
+        // Live cell counts are not here: /props is served off the server thread (it works while sleeping),
+        // so it cannot read the KV cells; /slots kv_pool and /metrics llamacpp:kv_cells_* are exact at request.
+        if (meta->slot_fork_min_tokens > 0) {
+            props["slot_fork"] = {
+                {"min_tokens", meta->slot_fork_min_tokens},
+                {"mode",       meta->slot_fork_mode},
+                {"checkpoint_at", true},
+            };
         }
         res->ok(props);
         return res;

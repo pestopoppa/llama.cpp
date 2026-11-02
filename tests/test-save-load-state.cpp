@@ -3,7 +3,9 @@
 #include "log.h"
 #include "llama-cpp.h"
 
+#include <algorithm>
 #include <clocale>
+#include <cmath>
 #include <random>
 #include <vector>
 
@@ -347,6 +349,121 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
+// Test 6: restore recurrent checkpoint into a different live sequence while
+// the source advances.  A/A controls use the same token/chunk shape.  The
+// stale-state mutation must exceed the observed A/A floor; otherwise the
+// diagnostic is inconclusive, never a positive result.
+static bool test_partial_restore_busy_source_one(
+        struct llama_model * model, const struct common_params & params,
+        const llama_tokens & tokens, uint32_t n_rs_seq) {
+    if (tokens.size() < 6) {
+        LOG_ERR("Test 6 INVALID: need at least six prompt tokens\n");
+        return false;
+    }
+    auto p = common_context_params_to_llama(params);
+    p.n_ctx = 512;
+    p.n_seq_max = 3;
+    p.kv_unified = true;
+    p.n_rs_seq = n_rs_seq;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, p)};
+    auto ref = llama_context_ptr{llama_init_from_model(model, p)};
+    auto aa = llama_context_ptr{llama_init_from_model(model, p)};
+    if (!ctx || !ref || !aa) return false;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int end = std::min<int>(32, int(tokens.size()) - 2);
+    if (n_vocab <= 0 || end < 3) return false;
+
+    auto decode_one = [&](llama_context * c, llama_seq_id id, int pos) {
+        llama_batch_ptr batch(1, 0, 1);
+        common_batch_add(batch.get(), tokens[pos], pos, {id}, true);
+        return llama_decode(c, batch.get()) == 0;
+    };
+    auto logits = [&](llama_context * c) {
+        const float * ptr = llama_get_logits_ith(c, -1);
+        return ptr ? std::vector<float>(ptr, ptr + n_vocab) : std::vector<float>{};
+    };
+    auto max_diff = [&](const std::vector<float> & a, const std::vector<float> & b) {
+        if (a.size() != size_t(n_vocab) || b.size() != a.size()) return INFINITY;
+        float d = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return INFINITY;
+            d = std::max(d, std::fabs(a[i] - b[i]));
+        }
+        return d;
+    };
+    auto state = [&](llama_seq_id id, llama_state_seq_flags flags) {
+        const size_t n = llama_state_seq_get_size_ext(ctx.get(), id, flags);
+        std::vector<uint8_t> out(n);
+        if (!n || llama_state_seq_get_data_ext(ctx.get(), out.data(), n, id, flags) != n) out.clear();
+        return out;
+    };
+    for (int i = 0; i < end - 1; ++i) {
+        if (!decode_one(ctx.get(), 0, i) || !decode_one(ref.get(), 0, i) || !decode_one(aa.get(), 0, i)) return false;
+    }
+    // Deliberate stale-state mutation: checkpoint before the final prefix token.
+    const auto stale = state(0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (stale.empty()) return false;
+    if (!decode_one(ctx.get(), 0, end - 1) || !decode_one(ref.get(), 0, end - 1) ||
+        !decode_one(aa.get(), 0, end - 1)) return false;
+    const auto partial = state(0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (partial.empty()) return false;
+    if (!decode_one(ctx.get(), 0, end) || !decode_one(ref.get(), 0, end) ||
+        !decode_one(aa.get(), 0, end)) return false;
+    const auto source_before = state(0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (source_before.empty()) return false;
+    const auto lref = logits(ref.get());
+    const auto floor = max_diff(lref, logits(aa.get()));
+    if (!std::isfinite(floor)) return false;
+    auto mem = llama_get_memory(ctx.get());
+    auto restore = [&](llama_seq_id id, const std::vector<uint8_t> & bytes) {
+        if (!llama_memory_seq_cp_ext(mem, 0, id, 0, end, LLAMA_MEMORY_SEQ_CP_FLAGS_ATTN_ONLY)) return false;
+        return llama_state_seq_set_data_ext(ctx.get(), bytes.data(), bytes.size(), id,
+                                          LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == bytes.size();
+    };
+    if (!restore(1, partial)) return false;
+    if (llama_memory_seq_pos_max(mem, 0) != end || llama_memory_seq_pos_max(mem, 1) != end - 1 ||
+        state(0, LLAMA_STATE_SEQ_FLAGS_NONE) != source_before) return false;
+    if (!decode_one(ctx.get(), 1, end)) return false;
+    const float actual = max_diff(lref, logits(ctx.get()));
+    if (!std::isfinite(actual) || actual > floor || state(0, LLAMA_STATE_SEQ_FLAGS_NONE) != source_before) {
+        LOG_ERR("Test 6 FAIL: restored mismatch=%g control=%g\n", (double) actual, (double) floor);
+        return false;
+    }
+    // The same attention prefix but stale recurrent state must not look like the
+    // control; refusal is also an acceptable detection of this invalid state.
+    bool mutation_detected = !restore(2, stale);
+    if (!mutation_detected) {
+        mutation_detected = !decode_one(ctx.get(), 2, end);
+        if (!mutation_detected) {
+            const float changed = max_diff(lref, logits(ctx.get()));
+            mutation_detected = std::isfinite(changed) && changed > floor;
+        }
+    }
+    if (!mutation_detected || state(0, LLAMA_STATE_SEQ_FLAGS_NONE) != source_before) {
+        LOG_ERR("Test 6 INVALID: stale-state mutation not detected or source changed\n");
+        return false;
+    }
+    if (!decode_one(ctx.get(), 0, end + 1) || !decode_one(ref.get(), 0, end + 1) ||
+        !decode_one(aa.get(), 0, end + 1)) return false;
+    const auto lnext = logits(ref.get());
+    const auto next_floor = max_diff(lnext, logits(aa.get()));
+    const auto next_actual = max_diff(lnext, logits(ctx.get()));
+    if (!std::isfinite(next_actual) || !std::isfinite(next_floor) || next_actual > next_floor) return false;
+    LOG("Test 6 PASS n_rs_seq=%u restored=%g A/A=%g source=%g source_A/A=%g mutation=detected\n",
+        n_rs_seq, (double) actual, (double) floor, (double) next_actual, (double) next_floor);
+    return true;
+}
+
+static bool test_partial_restore_busy_source(
+        struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    if (!llama_model_is_hybrid(model)) {
+        LOG("Test 6 SKIP: hybrid model required\n");
+        return true;
+    }
+    return test_partial_restore_busy_source_one(model, params, tokens, 0) &&
+           test_partial_restore_busy_source_one(model, params, tokens, 8);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -431,6 +548,11 @@ int main(int argc, char ** argv) {
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return 1;
+    }
+
+    if (!test_partial_restore_busy_source(model, params, tokens)) {
+        LOG_ERR("Test 6: PARTIAL_ONLY busy-source restore failed\n");
         return 1;
     }
 

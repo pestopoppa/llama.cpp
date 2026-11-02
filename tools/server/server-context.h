@@ -51,6 +51,10 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // [KPF-11/P2] cross-slot prefix fork capability (static after load)
+    int32_t     slot_fork_min_tokens = 0;      // as configured (0 = off)
+    std::string slot_fork_mode       = "none"; // effective: none | kv | checkpoint
 };
 
 enum server_state {

@@ -1525,6 +1525,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slot-fork-min-tokens"}, "N",
+        string_format("[KPF-11] cross-slot prefix fork: a new task whose prompt shares at least N tokens with any other slot "
+            "(busy or idle) starts from a zero-copy fork of that slot's attention cells plus its recurrent/drafter state "
+            "restored from a checkpoint, and prefills only the suffix. Needs --kv-unified. 0 = off (default: %d)",
+            params.slot_fork_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("slot-fork-min-tokens must be non-negative");
+            }
+            params.slot_fork_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_FORK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
