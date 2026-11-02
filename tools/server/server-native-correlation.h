@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cctype>
+#include <cstddef>
 #include <map>
 #include <mutex>
 #include <string>
@@ -40,7 +41,7 @@ inline bool server_erase_has_native_correlation(const std::map<std::string, std:
 // IDs are never reused within a server incarnation; capacity is bounded.
 class server_native_correlation_registry {
 public:
-    explicit server_native_correlation_registry(size_t limit = 65536) : limit_(limit) {}
+    explicit server_native_correlation_registry(std::size_t limit = 65536) : limit_(limit) {}
     bool reserve(const std::string & value) {
         if (!server_valid_native_correlation(value)) return false;
         std::lock_guard<std::mutex> lock(mutex_);
@@ -48,7 +49,7 @@ public:
         return ids_.insert(value).second;
     }
 private:
-    const size_t limit_;
+    const std::size_t limit_;
     std::mutex mutex_;
     std::unordered_set<std::string> ids_;
 };
