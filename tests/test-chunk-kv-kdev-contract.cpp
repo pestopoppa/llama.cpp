@@ -1,5 +1,8 @@
 #include "../tools/server/chunk-kv-selector.h"
 #include "../tools/server/server-chunk-recompute.h"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <vector>
 
