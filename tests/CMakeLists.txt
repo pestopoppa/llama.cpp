@@ -469,3 +469,5 @@ if (TARGET gguf-model-data)
 endif()
 
 llama_build_and_test(test-kv-rows-plan.cpp)
+
+llama_build_and_test(test-kv-rows-reference.cpp ../src/llama-kv-rows-reference.cpp)
