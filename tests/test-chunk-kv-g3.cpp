@@ -65,6 +65,8 @@ struct g3_args {
     int32_t max_requests = 0;
     bool    self_test    = false;
     bool    modes_explicit = false;
+    int32_t outcome_tokens = 0;
+    std::string outcome_mode;
     int32_t kdev_layer   = -1;
     double  kdev_r       = -1;
 };
@@ -139,6 +141,12 @@ static bool split_args(int argc, char ** argv, g3_args & a, std::vector<char *> 
         else if (k == "--g3-n-cont")     { if (!need(v)) return false; a.n_cont = atoi(v.c_str()); }
         else if (k == "--g3-store-mib")  { if (!need(v)) return false; a.store_mib = atoll(v.c_str()); }
         else if (k == "--g3-max-requests") { if (!need(v)) return false; a.max_requests = atoi(v.c_str()); }
+        else if (k == "--g3-outcome-tokens") {
+            if (!need(v)) return false;
+            char * end = nullptr; const long x = std::strtol(v.c_str(), &end, 10);
+            if (!end || *end || end == v.c_str() || x < 1 || x > 4096) return false;
+            a.outcome_tokens = int32_t(x);
+        } else if (k == "--g3-outcome-mode") { if (!need(a.outcome_mode)) return false; }
         else if (k == "--g3-self-test")  { a.self_test = true; }
         else if (k == "--g3-kdev-layer") {
             if (!need(v)) return false;
@@ -272,6 +280,41 @@ static bool continuation(llama_context * ctx, tokens_t & cont, int32_t n_cont, i
     return true;
 }
 
+// Generate each task arm independently from its own prompt state. Teacher-forced
+// continuation rows remain the separate G3 distribution measurement.
+static bool write_outcome(FILE * out, const std::string & id, const char * arm,
+                          llama_context * ctx, llama_memory_t mem, const llama_vocab * vocab,
+                          llama_seq_id seq, int32_t prompt_len, const float * first_logits,
+                          int n_vocab, int32_t max_tokens) {
+    if (!llama_memory_seq_rm(mem, seq, prompt_len, -1)) return false;
+    tokens_t tokens;
+    llama_token next = argmax(first_logits, n_vocab);
+    bool complete = false;
+    llama_batch one = llama_batch_init(1, 0, 1);
+    for (int32_t k = 0; k < max_tokens; ++k) {
+        if (llama_vocab_is_eog(vocab, next)) { complete = true; break; }
+        tokens.push_back(next);
+        one.n_tokens = 1; one.token[0] = next; one.pos[0] = prompt_len + k;
+        one.n_seq_id[0] = 1; one.seq_id[0][0] = seq; one.logits[0] = 1;
+        const float * row = llama_decode(ctx, one) == 0 ? llama_get_logits_ith(ctx, 0) : nullptr;
+        if (!row) { llama_batch_free(one); return false; }
+        next = argmax(row, n_vocab);
+    }
+    llama_batch_free(one);
+    // A final EOG prediction at the exact bound is a completed response.
+    if (!complete && llama_vocab_is_eog(vocab, next)) complete = true;
+    try {
+        json result = {{"id", id}, {"arm", arm}, {"output_tokens", tokens},
+                       {"output_text", common_detokenize(vocab, tokens, false)},
+                       {"complete", complete}, {"finish_reason", complete ? "eog" : "length"}};
+        if (fprintf(out, "%s\n", result.dump().c_str()) < 0 || fflush(out) != 0) return false;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "outcome serialization failed for %s/%s: %s\n", id.c_str(), arm, e.what());
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -287,6 +330,15 @@ int main(int argc, char ** argv) {
     if (std::find(a.modes.begin(), a.modes.end(), server_chunk::SELECT_KDEV) != a.modes.end() &&
         (a.kdev_layer < 0 || a.kdev_r < 0)) {
         fprintf(stderr, "kdev requires explicit --g3-kdev-layer and --g3-kdev-r\n"); return 2;
+    }
+    if ((a.outcome_tokens > 0) != !a.outcome_mode.empty() ||
+        (a.outcome_tokens > 0 && (a.out.empty() ||
+         (a.outcome_mode != "kdev" && a.outcome_mode != "head" && a.outcome_mode != "all-inject") ||
+         std::count_if(a.modes.begin(), a.modes.end(), [&](server_chunk::select_mode m) {
+             return a.outcome_mode == server_chunk::select_mode_name(m);
+         }) != 1))) {
+        fprintf(stderr, "outcomes require --g3-out, --g3-outcome-tokens, and exactly one selected --g3-outcome-mode head, kdev or all-inject\n");
+        return 2;
     }
     if (a.self_test) {
         a.n_cont = std::min(a.n_cont, 8);
@@ -366,7 +418,7 @@ int main(int argc, char ** argv) {
     size_t max_len = 0;
     for (const auto & r : reqs) max_len = std::max(max_len, r.toks.size());
     uint32_t n_ctx_seq = 256;
-    while (n_ctx_seq < max_len + (size_t) a.n_cont + 8) n_ctx_seq *= 2;
+    while (n_ctx_seq < max_len + (size_t) std::max(a.n_cont, a.outcome_tokens) + 8) n_ctx_seq *= 2;
 
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max  = 3;
@@ -395,10 +447,12 @@ int main(int argc, char ** argv) {
 
     FILE * f_pos = nullptr;
     FILE * f_req = nullptr;
+    FILE * f_outcomes = nullptr;
     if (!a.out.empty()) {
         f_pos = fopen((a.out + "/positions.jsonl").c_str(), "w");
         f_req = fopen((a.out + "/requests.jsonl").c_str(), "w");
-        if (!f_pos || !f_req) {
+        if (a.outcome_tokens > 0) f_outcomes = fopen((a.out + "/outcomes.jsonl").c_str(), "w");
+        if (!f_pos || !f_req || (a.outcome_tokens > 0 && !f_outcomes)) {
             fprintf(stderr, "cannot write into %s (create it first)\n", a.out.c_str());
             return 2;
         }
@@ -428,6 +482,10 @@ int main(int argc, char ** argv) {
         if (!ok) {
             fprintf(stderr, "request %s: reference decode failed\n", r.id.c_str());
             return 3;
+        }
+        if (f_outcomes && !write_outcome(f_outcomes, r.id, "full", ctx, mem, vocab, s_ref, N,
+                ref_rows.data() + size_t(N - E - 1) * n_vocab, n_vocab, a.outcome_tokens)) {
+            fprintf(stderr, "request %s: full outcome decode failed\n", r.id.c_str()); return 3;
         }
         // Only kdev retains the full-reference K oracle; legacy modes keep their original lifecycle.
         if (std::find(a.modes.begin(), a.modes.end(), server_chunk::SELECT_KDEV) == a.modes.end())
@@ -502,6 +560,11 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "request %s mode %s: decode failed\n", r.id.c_str(), server_chunk::select_mode_name(mode));
                 return 3;
             }
+            if (f_outcomes && a.outcome_mode == server_chunk::select_mode_name(mode) &&
+                !write_outcome(f_outcomes, r.id, "reuse", ctx, mem, vocab, s_arm, N,
+                    rows.data() + size_t(N - E - 1) * n_vocab, n_vocab, a.outcome_tokens)) {
+                fprintf(stderr, "request %s: reuse outcome decode failed\n", r.id.c_str()); return 3;
+            }
             llama_memory_seq_rm(mem, s_arm, -1, -1);
 
             double kl_sum = 0.0;
@@ -567,6 +630,7 @@ int main(int argc, char ** argv) {
             {"window", a.window}, {"n_cont", a.n_cont}, {"n_batch", n_batch}, {"n_ubatch", (int) llama_n_ubatch(ctx)},
             {"n_threads", params.cpuparams.n_threads}, {"type_k", ggml_type_name(cparams.type_k)}, {"type_v", ggml_type_name(cparams.type_v)},
             {"selector", "head-window-v0 or kdev offline reference K, as named by each arm"},
+            {"outcome_tokens", a.outcome_tokens}, {"outcome_mode", a.outcome_mode},
             {"kdev_layer", a.kdev_layer}, {"kdev_target_r", a.kdev_r},
             {"kdev_scope", "full-graph reference K, offline quality only; no online speed claim"},
             {"scored_rows", "logits at every suffix position after the last chunk, plus after each of n_cont teacher-forced tokens of the reference greedy continuation"},
@@ -579,6 +643,7 @@ int main(int argc, char ** argv) {
     }
     if (f_pos) fclose(f_pos);
     if (f_req) fclose(f_req);
+    if (f_outcomes) fclose(f_outcomes);
 
     printf("sanity (all-inject vs reference): max KL=%.3e max NMSE=%.3e top1 misses=%d -> %s\n", sanity_kl_max, sanity_nmse_max,
             sanity_top1_miss, n_fail == 0 ? "bit-identical" : "DIFFER");
