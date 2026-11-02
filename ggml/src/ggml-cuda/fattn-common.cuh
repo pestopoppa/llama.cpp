@@ -27,6 +27,8 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
         const uint8_t * __restrict__ KV_live,
+        const int * __restrict__ KV_rows,
+        const int KV_rows_physical,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1364,6 +1366,9 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
+    const ggml_tensor * kv_rows = dst->src[5];
+    const int64_t n_kv_rows = kv_rows ? kv_rows->ne[0] : K->ne[1];
+
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
     const int id  = ggml_cuda_get_device();
@@ -1380,7 +1385,7 @@ void launch_fattn(
 
     // Scan the mask for KV blocks that are fully masked for a whole query tile (other sequences in a unified KV cache).
     int n_KV_live_rows = 0;
-    if (kv_skip_supported && ggml_cuda_fattn_mask_skip_enabled(Q, K, mask)) {
+    if (!kv_rows && kv_skip_supported && ggml_cuda_fattn_mask_skip_enabled(Q, K, mask)) {
         const int ntiles_x_live = (Q->ne[1] + ncols1 - 1) / ncols1;
         KV_live.alloc(size_t(ntiles_x_live)*Q->ne[3]*(K->ne[1]/FATTN_KQ_STRIDE));
         n_KV_live_rows = ggml_cuda_fattn_compute_KV_live<ncols1>(Q, K, mask, KV_live.ptr, main_stream);
@@ -1474,7 +1479,7 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     // Not needed with KV_live: the dead tail blocks are skipped like any other dead block.
-    if (!KV_live.ptr && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!kv_rows && !KV_live.ptr && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1497,7 +1502,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int ntiles_KV = (n_kv_rows + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1605,10 +1610,12 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         KV_live.ptr,
+        kv_rows ? (const int *) kv_rows->data : nullptr,
+        kv_rows ? (int) K->ne[1] : 0,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv_rows, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0

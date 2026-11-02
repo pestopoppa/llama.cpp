@@ -476,4 +476,6 @@ llama_build_and_test(test-kv-rows-reference.cpp ../src/llama-kv-rows-reference.c
 if (TARGET ggml-hip AND NOT GGML_BACKEND_DL)
     llama_build(test-kv-rows-backend.cpp ../src/llama-kv-rows-reference.cpp ../src/llama-kv-rows-backend.cpp)
     target_link_libraries(test-kv-rows-backend PRIVATE ggml-hip)
+    llama_build(test-kv-rows-vec-direct.cpp ../src/llama-kv-rows-backend.cpp)
+    target_link_libraries(test-kv-rows-vec-direct PRIVATE ggml-hip)
 endif()

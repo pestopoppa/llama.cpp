@@ -21,7 +21,8 @@ static void launch_fattn_vec(
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
-    const int ntiles_KV    = (K->ne[1] + nbatch_fa - 1) / nbatch_fa;
+    const int64_t n_kv_cols = dst->src[5] ? dst->src[5]->ne[0] : K->ne[1];
+    const int ntiles_KV    = (n_kv_cols + nbatch_fa - 1) / nbatch_fa;
 
     int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
     const int blocks_per_wave = nsm * max_blocks_per_sm;
@@ -42,7 +43,7 @@ static void launch_fattn_vec(
         }
     }
 
-    const int nbatch_fa_launch = !stream_k && parallel_blocks == 2 ? K->ne[1] : nbatch_fa;
+    const int nbatch_fa_launch = !stream_k && parallel_blocks == 2 ? n_kv_cols : nbatch_fa;
     launch_fattn<DV, ncols1, ncols2>(
         ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa_launch,
         need_f16_K, need_f16_V, stream_k, warp_size);
@@ -439,6 +440,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    // KPF-41 direct rows: narrowly guarded prototype for one-query gfx90a F16
+    // decode. All other shapes are refused to the caller's existing full-mask path.
+    if (const ggml_tensor * rows = dst->src[5]) {
+        float softcap = 0.0f;
+        memcpy(&softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const bool ok = cc == GGML_CUDA_CC_CDNA2 &&
+            Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            Q->ne[1] == 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+            (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) &&
+            K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0] && K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
+            K->ne[1] > 0 && K->ne[1] <= INT32_MAX && rows->type == GGML_TYPE_I32 &&
+            ggml_is_contiguous(rows) && rows->ne[0] > 0 && rows->ne[0] <= INT32_MAX &&
+            rows->ne[0] % FATTN_KQ_STRIDE == 0 && rows->ne[1] == 1 && rows->ne[2] == 1 && rows->ne[3] == 1 &&
+            mask && mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) &&
+            mask->ne[0] == rows->ne[0] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+            max_bias == 0.0f && softcap == 0.0f && dst->src[4] == nullptr;
+        return ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
     while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {

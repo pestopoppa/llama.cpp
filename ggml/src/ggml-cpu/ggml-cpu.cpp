@@ -444,6 +444,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    // A KPF-41 row-indexed FA is only executable on a backend that explicitly
+    // implements it; the ordinary CPU FA ignores src[5].
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5] != nullptr) return false;
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
