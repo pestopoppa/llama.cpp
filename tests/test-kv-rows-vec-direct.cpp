@@ -28,8 +28,8 @@ int main() {
     for (int i = 0; i < ROWS; ++i) { rd[i] = -1; md[i] = ggml_fp32_to_fp16(-INFINITY); }
     rd[0] = 301; rd[1] = 7; rd[2] = PHYS + 10; // invalid row must remain masked even if mask is finite
     md[0] = md[1] = md[2] = ggml_fp32_to_fp16(0);
-    auto * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0, 0);
-    out->src[5] = rows; // explicit experimental op; no production graph uses it
+    auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, 0.125f, 0, 0);
+    if (out->src[5] != rows || out->src[3] != mask) return 5;
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     auto * backend = ggml_backend_cuda_init(0);

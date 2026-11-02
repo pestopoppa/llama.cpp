@@ -5664,6 +5664,29 @@ struct ggml_tensor * ggml_flash_attn_ext(
 }
 
 
+struct ggml_tensor * ggml_flash_attn_ext_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_rows,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    // Current direct backend supports one query slice. Enforce this contract
+    // here until multi-slice kernels and scheduler support are available.
+    GGML_ASSERT(kv_rows && kv_rows->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_rows));
+    GGML_ASSERT(kv_rows->ne[0] > 0 && kv_rows->ne[1] == 1 && kv_rows->ne[2] == 1 && kv_rows->ne[3] == 1);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(mask && mask->ne[0] == kv_rows->ne[0]);
+    GGML_ASSERT(mask->ne[1] == q->ne[1] && mask->ne[2] == 1 && mask->ne[3] == 1);
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
+    result->src[5] = kv_rows;
+    return result;
+}
+
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

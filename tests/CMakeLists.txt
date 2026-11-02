@@ -536,6 +536,7 @@ endif()
 
 llama_build_and_test(test-kv-block-observer.cpp)
 llama_build_and_test(test-kv-rows-plan.cpp)
+llama_build_and_test(test-kv-rows-op.cpp)
 
 llama_build_and_test(test-kv-rows-reference.cpp ../src/llama-kv-rows-reference.cpp)
 

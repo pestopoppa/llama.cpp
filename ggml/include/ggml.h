@@ -2485,6 +2485,20 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Flash attention over physical K/V rows selected by an I32 row map.
+    // Row-aware backend support must be checked before scheduling this op.
+    // A negative index is padding and must have a masked (-inf) mask entry.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_rows,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
