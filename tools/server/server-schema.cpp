@@ -76,6 +76,32 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_json("kv_reorder"))
+        ->set_desc("Opt-in reorder planner: {\"segments\": [{\"offset\": <token pos>, \"n_tokens\": N}, ...]} marks order-insensitive segments of the prompt "
+                   "(tokens outside the segments never move). If the segments can be rebuilt in the order of a cached prompt so that the request becomes a longer "
+                   "exact-prefix hit, the server serves the reordered prompt. Never applied unless this field is sent. Optional: min_gain (tokens), budget_ms")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const json & v = data.at("kv_reorder");
+            if (!v.is_object()) {
+                throw std::invalid_argument("must be an object");
+            }
+            const json segs = json_value(v, "segments", json::array());
+            if (!segs.is_array() || segs.empty()) {
+                throw std::invalid_argument("'segments' must be a non-empty array");
+            }
+            std::vector<server_reorder::segment> out;
+            for (const auto & s : segs) {
+                if (!s.is_object() || !s.contains("offset") || !s.contains("n_tokens") ||
+                    !s.at("offset").is_number_integer() || !s.at("n_tokens").is_number_integer()) {
+                    throw std::invalid_argument("each segment needs integer 'offset' and 'n_tokens'");
+                }
+                out.push_back({ s.at("offset").get<int32_t>(), s.at("n_tokens").get<int32_t>() });
+            }
+            ctx.params.kv_reorder_segments  = std::move(out);
+            ctx.params.kv_reorder_min_gain  = std::max<int32_t>(0, json_value(v, "min_gain", 0));
+            ctx.params.kv_reorder_budget_ms = std::max<int32_t>(0, json_value(v, "budget_ms", 0));
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

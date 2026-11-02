@@ -11,6 +11,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-reorder.h"
 
 using json = nlohmann::ordered_json;
 
@@ -97,6 +98,17 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+
+    // opt-in reorder planner (chunk-KV reuse P1a): order-insensitive segments of the prompt, in token positions.
+    // empty = feature off for this request (default; the request is then handled exactly as before).
+    std::vector<server_reorder::segment> kv_reorder_segments;
+    int32_t kv_reorder_min_gain = 0;      // 0 = planner default
+    int32_t kv_reorder_budget_ms = 0;     // 0 = planner default
+    // planner outcome, filled in by the server when kv_reorder_segments is non-empty (null = not requested)
+    json    kv_reorder_report = nullptr;
+    // positions in the (possibly reordered) prompt where a copied piece starts: the prompt loop breaks there and
+    // creates a context checkpoint, so that a later reordered request can resume a hybrid prefix at a junction
+    std::vector<int32_t> kv_reorder_junctions;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -287,6 +299,9 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+
+    // Optional reorder-planner outcome - only included when the request asked for it (null otherwise)
+    json kv_reorder = nullptr;
 
     json to_json() const;
 };
