@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
+#include "cascade-attention-reference.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8874,6 +8875,95 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Optional P5 oracle check: compare the backend's dense FA output against an
+// independently evaluated trunk/private split merged by the test-only LSE
+// reference. This is not a cascade kernel or a serving/performance gate.
+struct test_cascade_reference_fa : public test_case {
+    static constexpr int64_t dim = 64;
+    static constexpr int64_t kv = 256;
+    static constexpr int64_t nq = 2;
+    const int split;
+    const int mask_case;
+    std::vector<float> expected;
+
+    test_cascade_reference_fa(int split, int mask_case) : split(split), mask_case(mask_case) {}
+    std::string op_desc(ggml_tensor *) override { return "CASCADE_REFERENCE_FA"; }
+    std::string vars() override { return VARS_TO_STR2(split, mask_case); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.003; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != expected.size()) return std::numeric_limits<double>::infinity();
+        double maximum = 0;
+        for (size_t i = 0; i < n; ++i) {
+            maximum = std::max(maximum, std::abs(double(a[i]) - expected[i]));
+            maximum = std::max(maximum, std::abs(double(b[i]) - expected[i]));
+        }
+        return maximum;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dim, nq, 1, 1); ggml_set_name(q, "cascade_q");
+        auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, dim, kv, 1, 1); ggml_set_name(k, "cascade_k");
+        auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, dim, kv, 1, 1); ggml_set_name(v, "cascade_v");
+        auto * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nq, 1, 1); ggml_set_name(m, "cascade_m");
+        auto * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f / std::sqrt(float(dim)), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<float> q(dim * nq), k(dim * kv), v(dim * kv), mask(kv * nq);
+        for (size_t i = 0; i < q.size(); ++i) q[i] = float(int(i % 17) - 8) / 16.0f;
+        for (size_t i = 0; i < k.size(); ++i) {
+            k[i] = float(int((i * 7) % 29) - 14) / 32.0f;
+            v[i] = float(int((i * 11) % 31) - 15) / 16.0f;
+        }
+        for (int64_t row = 0; row < nq; ++row) {
+            for (int64_t j = 0; j < kv; ++j) {
+                bool visible = true;
+                if (mask_case == 1) visible = row == 0 ? j >= split : j < split;
+                if (mask_case == 2) visible = ((j + 3 * row) % 5) != 0;
+                mask[row * kv + j] = visible ? 0.0f : -INFINITY;
+            }
+        }
+        std::vector<ggml_fp16_t> kh(k.size()), vh(v.size()), mh(mask.size());
+        ggml_fp32_to_fp16_row(k.data(), kh.data(), k.size());
+        ggml_fp32_to_fp16_row(v.data(), vh.data(), v.size());
+        ggml_fp32_to_fp16_row(mask.data(), mh.data(), mask.size());
+        expected.clear();
+        for (int64_t row = 0; row < nq; ++row) {
+            std::vector<double> scores(kv), values(dim * kv);
+            for (int64_t j = 0; j < kv; ++j) {
+                double score = 0;
+                for (int64_t d = 0; d < dim; ++d) {
+                    score += double(q[row * dim + d]) * ggml_fp16_to_fp32(kh[j * dim + d]);
+                    values[j * dim + d] = ggml_fp16_to_fp32(vh[j * dim + d]);
+                }
+                scores[j] = std::isfinite(mask[row * kv + j]) ? score / std::sqrt(double(dim)) : -INFINITY;
+            }
+            cascade_reference_partial trunk, suffix, merged;
+            const std::vector<double> left_scores(scores.begin(), scores.begin() + split);
+            const std::vector<double> right_scores(scores.begin() + split, scores.end());
+            const std::vector<double> left_values(values.begin(), values.begin() + split * dim);
+            const std::vector<double> right_values(values.begin() + split * dim, values.end());
+            if (!cascade_reference_partition(left_scores, left_values, dim, trunk) ||
+                !cascade_reference_partition(right_scores, right_values, dim, suffix) ||
+                !cascade_reference_merge(trunk, suffix, merged) || !merged.has_value) {
+                expected.clear(); return;
+            }
+            for (double x : merged.output) expected.push_back(float(x));
+        }
+        // Explicit mutation verifies that an incorrect oracle makes the test fail.
+        if (std::getenv("LLAMA_TEST_CASCADE_MUTATE")) expected[0] += 0.5f;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!std::strcmp(t->name, "cascade_q")) ggml_backend_tensor_set(t, q.data(), 0, q.size() * sizeof(float));
+            else if (!std::strcmp(t->name, "cascade_k")) ggml_backend_tensor_set(t, kh.data(), 0, kh.size() * sizeof(ggml_fp16_t));
+            else if (!std::strcmp(t->name, "cascade_v")) ggml_backend_tensor_set(t, vh.data(), 0, vh.size() * sizeof(ggml_fp16_t));
+            else if (!std::strcmp(t->name, "cascade_m")) ggml_backend_tensor_set(t, mh.data(), 0, mh.size() * sizeof(ggml_fp16_t));
+            else init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with the mask and K/V layout of a unified KV cache shared by several sequences
 // (--kv-unified): the cells of each sequence are contiguous runs of `run` cells, interleaved with the runs of
 // the other sequences, and the last `n_free` cells belong to no sequence (released cells). The query tokens
@@ -10549,6 +10639,12 @@ static void autokernel_add_served_shape_lowbit_cases(std::vector<std::unique_ptr
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
+    if (std::getenv("LLAMA_TEST_CASCADE_REFERENCE")) {
+        test_cases.emplace_back(new test_cascade_reference_fa(0, 0));
+        test_cases.emplace_back(new test_cascade_reference_fa(256, 0));
+        test_cases.emplace_back(new test_cascade_reference_fa(97, 1));
+        test_cases.emplace_back(new test_cascade_reference_fa(97, 2));
+    }
     std::default_random_engine rng(0);
 
     if (akx_guard_selftest()) {
