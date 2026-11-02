@@ -256,6 +256,9 @@ public:
 
     int64_t get_n_fused_decode() const { return n_fused_decode; }
 
+    // chunk-KV sparse recompute: let the next decode fill a position hole (see llama_batch_allocr::allow_pos_holes)
+    void set_allow_pos_holes(bool value);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

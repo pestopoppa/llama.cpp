@@ -463,6 +463,19 @@ public:
         return false;
     }
 
+    // record that the K stored in cell i was rotated for position (pos[i] - d) and must be re-rotated by d
+    // does NOT touch pos[i]; used by chunk-KV inject, which writes the cell directly at its final position
+    // sets "has_shift" to true
+    // note: call only if the cell is not empty
+    void mark_shift(uint32_t i, llama_pos d) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        shift[i] += d;
+
+        has_shift = true;
+    }
+
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty

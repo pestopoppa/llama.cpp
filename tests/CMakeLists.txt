@@ -189,6 +189,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-server-chunk-store.cpp)
+    target_include_directories(test-server-chunk-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-server-reorder.cpp)
+    target_include_directories(test-server-reorder PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-dsv41-engram-hash.cpp)
     llama_build_and_test(test-dsv41-dspark-rollback.cpp)
     llama_build_and_test(test-dsv41-dspark-mask.cpp)
@@ -297,6 +301,53 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-kv-seq-share-qwen35 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # chunk-KV reuse (P1): f32 K/V caches so the shift exactness gates are not confounded by re-quantisation
+    llama_build(test-chunk-kv.cpp)
+    target_include_directories(test-chunk-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    foreach(CKV_ARCH llama qwen3 qwen3vl qwen35)
+        llama_test(
+            test-chunk-kv
+            NAME test-chunk-kv-${CKV_ARCH}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${CKV_ARCH}-dense.gguf" -ctk f32 -ctv f32
+        )
+        set_tests_properties(test-chunk-kv-${CKV_ARCH} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+        if (CKV_ARCH STREQUAL "llama")
+            # random rope_freqs in the generated model; see test-chunk-kv.cpp
+            set_tests_properties(test-chunk-kv-${CKV_ARCH} PROPERTIES ENVIRONMENT "CKV_SKIP_K_GATE=1")
+        endif()
+    endforeach()
+
+    # chunk-KV reuse (P1, KPF-62.4): sparse recompute by explicit-position batches, gate G0 (qwen35 = refusal path)
+    llama_build(test-chunk-kv-recompute.cpp)
+    target_include_directories(test-chunk-kv-recompute PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)
+    foreach(CKV_ARCH llama qwen3 qwen3vl qwen35)
+        llama_test(
+            test-chunk-kv-recompute
+            NAME test-chunk-kv-recompute-${CKV_ARCH}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${CKV_ARCH}-dense.gguf" -ctk f32 -ctv f32
+        )
+        set_tests_properties(test-chunk-kv-recompute-${CKV_ARCH} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
+
+    # chunk-KV reuse (P1, KPF-62.6): G3 approximation-gate harness; the ctest runs only its built-in self-test
+    llama_build(test-chunk-kv-g3.cpp)
+    target_include_directories(test-chunk-kv-g3 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_test(
+        test-chunk-kv-g3
+        NAME test-chunk-kv-g3-selftest
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen3-dense.gguf" -ctk f32 -ctv f32 --g3-self-test
+    )
+    set_tests_properties(test-chunk-kv-g3-selftest PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 endif()
@@ -495,3 +546,9 @@ if (TARGET ggml-hip AND NOT GGML_BACKEND_DL)
     llama_build(test-kv-rows-vec-direct.cpp ../src/llama-kv-rows-backend.cpp)
     target_link_libraries(test-kv-rows-vec-direct PRIVATE ggml-hip)
 endif()
+
+llama_build_and_test(test-chunk-kv-selector.cpp)
+llama_build_and_test(test-chunk-kv-kdev-contract.cpp)
+target_include_directories(test-chunk-kv-kdev-contract PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)
+
+llama_build_and_test(test-server-prompt-fork.cpp)

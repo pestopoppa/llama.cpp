@@ -271,6 +271,14 @@ json result_timings::to_json() const {
         base["id_task"]       = id_task;
     }
 
+    if (!kv_reorder.is_null()) {
+        base["kv_reorder"] = kv_reorder;
+    }
+
+    if (!kv_chunks.is_null()) {
+        base["kv_chunks"] = kv_chunks;
+    }
+
     return base;
 }
 

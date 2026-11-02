@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -4233,6 +4234,205 @@ bool llama_fused_decode_env_enabled(void) {
     // GGML_FUSED_DECODE_ON opts in; unset, empty or "0" keeps the default graph path
     const char * on = getenv("GGML_FUSED_DECODE_ON");
     return on != NULL && on[0] != '\0' && strcmp(on, "0") != 0;
+}
+
+// chunk-KV reuse (experimental; see llama-ext.h)
+
+static constexpr uint32_t chunk_kv_magic = 0x31564b43; // "CKV1"
+
+static llama_kv_cache * chunk_kv_cache(const llama_context * ctx, std::string * why) {
+    if (ctx->get_cparams().dca_chunk_size > 0) {
+        if (why) *why = "dual chunk attention does not support K-shift";
+        return nullptr;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        if (why) {
+            *why = "memory is not a plain attention KV cache (hybrid/recurrent/iswa or none)";
+        }
+        return nullptr;
+    }
+    if (!kv->chunk_supported(why)) {
+        return nullptr;
+    }
+    return kv;
+}
+
+bool llama_chunk_kv_supported(const struct llama_context * ctx, char * why, size_t why_size) {
+    std::string w;
+    const bool ok = chunk_kv_cache(ctx, &w) != nullptr;
+    if (!ok && why && why_size > 0) {
+        snprintf(why, why_size, "%s", w.c_str());
+    }
+    return ok;
+}
+
+size_t llama_chunk_kv_export(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: chunk-KV export refused: %s\n", __func__, why.c_str());
+        return 0;
+    }
+
+    ctx->synchronize();
+
+    try {
+        if (dst == nullptr) {
+            llama_io_write_dummy io(false);
+            io.write(&chunk_kv_magic, sizeof(chunk_kv_magic));
+            return kv->chunk_export(io, seq_id, p0, p1) ? io.n_bytes() : 0;
+        }
+
+        size_t n = 0;
+        bool ok = false;
+        {
+            llama_io_write_host io(dst, size);
+            io.write(&chunk_kv_magic, sizeof(chunk_kv_magic));
+            ok = kv->chunk_export(io, seq_id, p0, p1);
+            n = io.n_bytes();
+        } // the destructor flushes the deferred tensor reads into dst
+        return ok ? n : 0;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: chunk-KV export failed: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_chunk_kv_inject(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_pos pos_delta) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: chunk-KV inject refused: %s\n", __func__, why.c_str());
+        return 0;
+    }
+
+    ctx->synchronize();
+
+    try {
+        size_t n = 0;
+        bool ok = false;
+        {
+            llama_io_read_host io(src, size);
+            uint32_t magic = 0;
+            io.read(&magic, sizeof(magic));
+            if (magic != chunk_kv_magic) {
+                throw std::runtime_error("wrong chunk magic");
+            }
+            ok = kv->chunk_inject(io, seq_id, pos_delta);
+            n = io.n_bytes();
+        } // the destructor flushes the deferred tensor writes into the cache
+        return ok ? n : 0;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: chunk-KV inject failed: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_chunk_kv_read_f32(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out, size_t * n_v_out) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        return 0;
+    }
+    ctx->synchronize();
+    ctx->memory_update(false);
+    if (kv->get_has_shift()) {
+        LLAMA_LOG_ERROR("%s: pending K-shift could not be applied\n", __func__);
+        return 0;
+    }
+
+    return kv->chunk_read_f32(seq_id, p0, p1, k_out, v_out, n_v_out);
+}
+
+size_t llama_chunk_kv_read_layer_k_f32(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        uint32_t layer, float * out, size_t capacity) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) return 0;
+    ctx->synchronize();
+    ctx->memory_update(false);
+    if (kv->get_has_shift()) return 0;
+    return kv->chunk_read_layer_k_f32(seq_id, p0, p1, layer, out, capacity);
+}
+
+bool llama_chunk_kv_apply_shift(struct llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->memory_update(false);
+}
+
+bool llama_chunk_kv_rope_selfcheck(struct llama_context * ctx, llama_pos delta, double * nmse_out) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: chunk-KV rope self-check skipped: %s\n", __func__, why.c_str());
+        return false;
+    }
+    ctx->synchronize();
+    return kv->chunk_rope_selfcheck(ctx, delta, nmse_out);
+}
+
+void llama_context::set_allow_pos_holes(bool value) {
+    balloc->allow_pos_holes = value;
+}
+
+int32_t llama_chunk_kv_decode_at(struct llama_context * ctx, struct llama_batch batch) {
+    std::string why;
+    auto * kv = chunk_kv_cache(ctx, &why);
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: chunk-KV sparse decode refused: %s\n", __func__, why.c_str());
+        return -1;
+    }
+    if (batch.n_tokens <= 0 || !batch.token || !batch.pos || !batch.seq_id || !batch.n_seq_id) {
+        LLAMA_LOG_ERROR("%s: needs a token batch with explicit pos and seq_id\n", __func__);
+        return -1;
+    }
+
+    if (batch.n_seq_id[0] != 1 || !batch.seq_id[0] || batch.pos[0] < 0 ||
+            int64_t(batch.pos[0]) + batch.n_tokens > std::numeric_limits<llama_pos>::max()) {
+        LLAMA_LOG_ERROR("%s: invalid initial sequence or position range\n", __func__);
+        return -1;
+    }
+    const llama_seq_id seq = batch.seq_id[0][0];
+    if (seq < 0 || (uint32_t) seq >= llama_n_seq_max(ctx)) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id %d\n", __func__, (int) seq);
+        return -1;
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || !batch.seq_id[i] || batch.seq_id[i][0] != seq) {
+            LLAMA_LOG_ERROR("%s: one sequence per batch, one sequence per token\n", __func__);
+            return -1;
+        }
+        if (batch.pos[i] != batch.pos[0] + i) {
+            LLAMA_LOG_ERROR("%s: positions must be consecutive (token %d has pos %d, first %d)\n", __func__, i,
+                    (int) batch.pos[i], (int) batch.pos[0]);
+            return -1;
+        }
+    }
+    if (batch.pos[0] < 0) {
+        LLAMA_LOG_ERROR("%s: negative position %d\n", __func__, (int) batch.pos[0]);
+        return -1;
+    }
+
+    ctx->synchronize();
+
+    // a position already present in the sequence would become a second cell with the same pos: refuse
+    if (!kv->chunk_range_free(seq, batch.pos[0], batch.pos[0] + batch.n_tokens)) {
+        LLAMA_LOG_ERROR("%s: positions [%d, %d) are not free in sequence %d (seq_rm them first)\n", __func__,
+                (int) batch.pos[0], (int) (batch.pos[0] + batch.n_tokens), (int) seq);
+        return -1;
+    }
+
+    ctx->set_allow_pos_holes(true);
+    int32_t ret = -1;
+    try {
+        ret = llama_decode(ctx, batch);
+    } catch (...) {
+        ctx->set_allow_pos_holes(false);
+        throw;
+    }
+    ctx->set_allow_pos_holes(false);
+    return ret;
 }
 
 // llama adapter API

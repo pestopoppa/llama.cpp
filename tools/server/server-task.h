@@ -11,6 +11,8 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-reorder.h"
+#include "server-chunk-recompute.h"
 
 using json = nlohmann::ordered_json;
 
@@ -102,6 +104,26 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+
+    // opt-in reorder planner (chunk-KV reuse P1a): order-insensitive segments of the prompt, in token positions.
+    // empty = feature off for this request (default; the request is then handled exactly as before).
+    std::vector<server_reorder::segment> kv_reorder_segments;
+    int32_t kv_reorder_min_gain = 0;      // 0 = planner default
+    int32_t kv_reorder_budget_ms = 0;     // 0 = planner default
+    // planner outcome, filled in by the server when kv_reorder_segments is non-empty (null = not requested)
+    json    kv_reorder_report = nullptr;
+    // positions in the (possibly reordered) prompt where a copied piece starts: the prompt loop breaks there and
+    // creates a context checkpoint, so that a later reordered request can resume a hybrid prefix at a junction
+    std::vector<int32_t> kv_reorder_junctions;
+
+    // chunk-KV reuse (P1, KPF-62.5): declared chunks of the prompt, in token positions. Empty = feature off for this
+    // request (default; the request is then handled exactly as before). Served only when the server runs with
+    // --chunk-store-mib > 0 on attention-only memory; otherwise the field is reported as not applied and ignored.
+    std::vector<server_chunk::span> kv_chunks;
+    std::vector<bool>               kv_chunks_pin;            // per chunk: never evict from the store
+    server_chunk::select_mode       kv_chunks_mode   = server_chunk::SELECT_HEAD; // recompute selection (none|head|all|all-inject)
+    int32_t                         kv_chunks_window = 64;    // head window W (P0 default)
+    // (the outcome is reported per slot under timings.kv_chunks)
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -300,6 +322,12 @@ struct result_timings {
     std::string fork_src_kind = "none"; // none | checkpoint | end | kv
     int32_t     id_slot       = -1;     // [P2] the slot that served the request
     int32_t     id_task       = -1;     // [P2] the task id /slots shows as id_task for that slot
+
+    // Optional reorder-planner outcome - only included when the request asked for it (null otherwise)
+    json kv_reorder = nullptr;
+
+    // Optional chunk-KV outcome - only included when the request sent kv_chunks (null otherwise)
+    json kv_chunks = nullptr;
 
     json to_json() const;
 };
@@ -634,9 +662,24 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // chunk-KV reuse: the memory from position approx_from on was built from reused chunks (an approximation of the
+    // full recompute). Such a state never seeds exact-prefix reuse: the next task's common prefix is clamped to
+    // approx_from, it is not shifted by --cache-reuse, and it is never saved to the prompt cache.
+    bool    approx      = false;
+    int32_t approx_from = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        approx      = false;
+        approx_from = -1;
+    }
+
+    bool can_seed_exact_fork() const { return !approx; }
+
+    void mark_exact_fork() {
+        approx = false;
+        approx_from = -1;
     }
 
     int n_tokens() const {
@@ -647,6 +690,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            approx,
+            approx_from,
         };
     }
 };
