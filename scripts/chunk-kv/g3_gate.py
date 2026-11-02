@@ -24,7 +24,15 @@ import json
 import math
 import os
 import re
+import random
 import sys
+
+try:
+    import g3_manifest
+except ModuleNotFoundError:
+    # Some callers load this script by file path rather than putting its directory on sys.path.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import g3_manifest
 import tempfile
 
 GATES = {
@@ -76,7 +84,8 @@ def check(name, value):
 
 def prereg_sha(thresholds_path):
     """sha256 recorded in P0_THRESHOLDS section 8, or None (TBD / absent)."""
-    text = open(thresholds_path, encoding="utf-8").read()
+    with open(thresholds_path, encoding="utf-8") as f:
+        text = f.read()
     m = re.search(r"^## 8\..*?$(.*?)(^## |\Z)", text, re.S | re.M)
     if not m:
         return None, None
@@ -137,7 +146,8 @@ def load_run(run_dir):
     meta = {}
     mp = os.path.join(run_dir, "meta.json")
     if os.path.exists(mp):
-        meta = json.load(open(mp, encoding="utf-8"))
+        with open(mp, encoding="utf-8") as f:
+            meta = json.load(f)
     return reqs, pos, meta
 
 
@@ -293,6 +303,75 @@ def render(res, label):
     return "\n".join(lines)
 
 
+def bound_cohort(manifest, reqs, pos, selector, naive):
+    """Bind every native arm to the frozen held-out cohort, not merely to a manifest hash."""
+    expected = {r["id"]: r for r in manifest["requests"] if r["split"] == "gate"}
+    for mode in (selector, naive, "all-inject"):
+        got = {rid for rid, arm in reqs if arm == mode}
+        if got != set(expected):
+            raise ValueError(f"{mode}: result ids do not equal frozen gate cohort")
+        for rid, declared in expected.items():
+            row = reqs[(rid, mode)]
+            if row.get("n_tokens") != declared["n_tokens"] or row.get("n_chunks") != declared["n_chunks"]:
+                raise ValueError(f"{rid}/{mode}: result shape differs from frozen cohort")
+            n = declared["n_tokens"] - declared["suffix_start"] + 64
+            if row.get("n_cont") != 64 or row.get("n_rows") != n:
+                raise ValueError(f"{rid}/{mode}: missing declared suffix/64 continuation rows")
+            actual = [(p.get("row"), p.get("pos")) for p in pos.get((rid, mode), [])]
+            if sorted(actual) != [(i, declared["suffix_start"] + i) for i in range(n)]:
+                raise ValueError(f"{rid}/{mode}: position coverage differs from frozen corpus")
+    if any(rid not in expected or mode not in (selector, naive, "all-inject") for rid, mode in pos):
+        raise ValueError("position rows contain undeclared request or mode")
+    return expected
+
+
+def paired_retention(path, tasks_path, expected):
+    """Score exact token matches against the frozen target, retaining every paired item."""
+    tasks = g3_manifest.records(tasks_path)
+    pairs = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError("task outcome is not an object")
+            key = (row.get("id"), row.get("arm"))
+            if key in pairs or key[0] not in expected or key[1] not in ("full", "reuse"):
+                raise ValueError("duplicate or unexpected task outcome")
+            tokens = row.get("output_tokens")
+            if not isinstance(tokens, list) or any(type(x) is not int or x < 0 for x in tokens):
+                raise ValueError("missing or invalid task output tokens")
+            if row.get("error") is not None or row.get("complete") is not True:
+                raise ValueError("task output is incomplete or failed")
+            pairs[key] = tokens
+    required = {(rid, arm) for rid in expected for arm in ("full", "reuse")}
+    if set(pairs) != required:
+        raise ValueError("paired task outcome coverage is incomplete")
+    ids = sorted(expected)
+    full = [int(pairs[(rid, "full")] == tasks[rid]["target_tokens"]) for rid in ids]
+    reuse = [int(pairs[(rid, "reuse")] == tasks[rid]["target_tokens"]) for rid in ids]
+    total = sum(full)
+    if not total:
+        raise ValueError("full-recompute score is zero; retention is undefined")
+    ratio = sum(reuse) / total
+    # Paired bootstrap is reported, not gated (P0 §4). Preserve undefined resamples.
+    rng = random.Random(62026)
+    estimates, undefined = [], 0
+    for _ in range(10000):
+        sample = [rng.randrange(len(ids)) for _ in ids]
+        a, b = sum(full[i] for i in sample), sum(reuse[i] for i in sample)
+        if a:
+            estimates.append(b / a)
+        else:
+            undefined += 1
+    estimates.sort()
+    return {"score_full": total / len(ids), "score_reuse": sum(reuse) / len(ids),
+            "retention": ratio, "n_tasks": len(ids), "bootstrap_seed": 62026,
+            "bootstrap_samples": 10000, "bootstrap_undefined": undefined,
+            "bootstrap_95": [nearest_rank(estimates, 2.5), nearest_rank(estimates, 97.5)] if estimates else None}
+
+
 def cmd_gate(args):
     label = "DEV (not a gate result)" if args.dev else "GATE"
     if not args.dev:
@@ -303,11 +382,26 @@ def cmd_gate(args):
         if rc != 0:
             return rc
     reqs, pos, meta = load_run(args.run)
-    retention = None
-    if args.retention:
-        rj = json.load(open(args.retention, encoding="utf-8"))
-        retention = rj["score_reuse"] / rj["score_full"] if rj.get("score_full") else None
+    retention, score = None, None
+    if not args.dev:
+        if not args.corpus or not args.tasks or not args.retention:
+            print("REFUSED: --corpus, --tasks and per-item --retention are required for GATE")
+            return 3
+        try:
+            manifest = g3_manifest.verify(args.manifest, args.corpus, args.tasks)
+            if meta.get("n_cont") != 64:
+                raise ValueError("native run did not declare 64 continuation positions")
+            expected = bound_cohort(manifest, reqs, pos, args.selector, args.naive)
+            score = paired_retention(args.retention, args.tasks, expected)
+            retention = score["retention"]
+        except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            print(f"REFUSED: invalid frozen cohort or paired outcomes: {exc}")
+            return 3
+    elif args.retention:
+        print("REFUSED: unbound aggregate task retention is not accepted; use a frozen GATE cohort")
+        return 3
     res = evaluate(reqs, pos, args.selector, args.naive, retention)
+    res["task_scores"] = score
     res["label"] = label
     res["meta"] = meta
     if args.manifest:
@@ -394,7 +488,9 @@ def main():
     s.add_argument("--manifest")
     s.add_argument("--selector", default="head")
     s.add_argument("--naive", default="none")
-    s.add_argument("--retention", help="JSON {score_full, score_reuse} from the B7-derived tasks")
+    s.add_argument("--corpus", help="frozen tokenized corpus JSONL matching the manifest")
+    s.add_argument("--tasks", help="frozen task target JSONL matching the manifest")
+    s.add_argument("--retention", help="paired per-item full/reuse output-token JSONL")
     s.add_argument("--dev", action="store_true")
     s.add_argument("--out", help="write OUT.json and OUT.md")
     sub.add_parser("selftest")
