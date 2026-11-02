@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-rows-plan.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -189,6 +190,9 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+
+    // Explicit graph input plan. Returns empty for unsupported/shared layouts.
+    llama_kv_rows_plan make_kv_rows_plan(const llama_ubatch & ubatch, uint32_t n_kv, bool backend_supported) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -400,6 +404,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // Must be refreshed for each ubatch even if same_graph_shape is true.
+    llama_kv_rows_plan make_kv_rows_plan(bool backend_supported) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

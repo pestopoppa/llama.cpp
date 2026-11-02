@@ -1267,6 +1267,13 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+llama_kv_rows_plan llama_kv_cache::make_kv_rows_plan(const llama_ubatch & ubatch, uint32_t n_kv,
+                                                       bool backend_supported) const {
+    // Until a backend and graph opt in, callers pass false and get the normal mask.
+    if (!backend_supported || n_stream != 1 || v_cells.size() != 1) return {};
+    return llama_kv_rows_make_plan(ubatch, v_cells[0], n_kv, backend_supported, n_stream);
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2841,6 +2848,13 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+llama_kv_rows_plan llama_kv_cache_context::make_kv_rows_plan(bool backend_supported) const {
+    // Never inspect an uninitialized/error context or construct a graph input
+    // unless the caller has independently established backend support.
+    if (!backend_supported || !kv || status != LLAMA_MEMORY_STATUS_SUCCESS || i_cur >= ubatches.size()) return {};
+    return kv->make_kv_rows_plan(ubatches[i_cur], n_kv, true);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
