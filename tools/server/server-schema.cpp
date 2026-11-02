@@ -102,6 +102,53 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.kv_reorder_budget_ms = std::max<int32_t>(0, json_value(v, "budget_ms", 0));
         }));
 
+    add((new field_json("kv_chunks"))
+        ->set_desc("Chunk-KV reuse (experimental, needs --chunk-store-mib > 0 and attention-only memory): "
+                   "[{\"offset\": <token pos>, \"n_tokens\": N, \"pin\": false}, ...] or {\"chunks\": [...], \"recompute\": \"head|none|all|all-inject\", \"window\": 64}. "
+                   "Each chunk's K/V comes from an isolated encode (cached by content, any offset), is shifted to its offset, and the selected tokens are "
+                   "recomputed (head = the first `window` tokens of every chunk; none = shift only; all = everything recomputed, store bypassed, identical "
+                   "to the request without this field). The result is an approximation of the full recompute; outcome under timings.kv_chunks. "
+                   "Never applied unless this field is sent.")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const json & v = data.at("kv_chunks");
+            json chunks;
+            std::string mode = "head";
+            int32_t window = 64;
+            if (v.is_array()) {
+                chunks = v;
+            } else if (v.is_object()) {
+                chunks = json_value(v, "chunks", json::array());
+                mode   = json_value(v, "recompute", std::string("head"));
+                window = json_value(v, "window", 64);
+            } else {
+                throw std::invalid_argument("must be an array of chunks or an object with 'chunks'");
+            }
+            if (!chunks.is_array() || chunks.empty()) {
+                throw std::invalid_argument("'chunks' must be a non-empty array");
+            }
+            server_chunk::select_mode sm = server_chunk::SELECT_HEAD;
+            if (!server_chunk::parse_select_mode(mode, sm)) {
+                throw std::invalid_argument("'recompute' must be one of head, none, all, all-inject");
+            }
+            if (window < 0) {
+                throw std::invalid_argument("'window' must be >= 0");
+            }
+            std::vector<server_chunk::span> out;
+            std::vector<bool> pin;
+            for (const auto & c : chunks) {
+                if (!c.is_object() || !c.contains("offset") || !c.contains("n_tokens") ||
+                    !c.at("offset").is_number_integer() || !c.at("n_tokens").is_number_integer()) {
+                    throw std::invalid_argument("each chunk needs integer 'offset' and 'n_tokens'");
+                }
+                out.push_back({ c.at("offset").get<int32_t>(), c.at("n_tokens").get<int32_t>() });
+                pin.push_back(json_value(c, "pin", false));
+            }
+            ctx.params.kv_chunks        = std::move(out);
+            ctx.params.kv_chunks_pin    = std::move(pin);
+            ctx.params.kv_chunks_mode   = sm;
+            ctx.params.kv_chunks_window = window;
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 
