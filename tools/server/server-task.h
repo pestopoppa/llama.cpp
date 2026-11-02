@@ -535,6 +535,9 @@ struct server_task_result_metrics : server_task_result {
 
     uint64_t n_tokens_max = 0;
 
+    bool kv_unique_cells_supported = false;
+    uint32_t kv_unique_cells_used = 0;
+
     uint64_t n_prompt_tokens_processed = 0;
     uint64_t t_prompt_processing       = 0;
 

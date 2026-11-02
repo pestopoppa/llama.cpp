@@ -132,6 +132,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_unique_kv_used_cells(uint32_t & used) const override;
 
     void clear(bool data) override;
 

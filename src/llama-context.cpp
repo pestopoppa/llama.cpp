@@ -4181,6 +4181,10 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     mem->clear(data);
 }
 
+bool llama_memory_get_unique_kv_used_cells(llama_memory_t mem, uint32_t * used) {
+    return mem && used && mem->get_unique_kv_used_cells(*used);
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,

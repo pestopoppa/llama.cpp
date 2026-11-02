@@ -100,6 +100,13 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // Only implementations that can identify the physical unified attention
+    // pool should override this. Unsupported is distinct from an empty pool.
+    virtual bool get_unique_kv_used_cells(uint32_t & used) const {
+        (void) used;
+        return false;
+    }
+
     //
     // ops
     //

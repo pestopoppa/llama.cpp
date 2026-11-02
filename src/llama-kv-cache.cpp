@@ -1209,6 +1209,14 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::get_unique_kv_used_cells(uint32_t & used) const {
+    if (n_stream != 1 || v_cells.size() != 1) {
+        return false;
+    }
+    used = v_cells[0].get_used();
+    return true;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

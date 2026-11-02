@@ -747,6 +747,12 @@ extern "C" {
             llama_memory_t mem,
                       bool data);
 
+    // Number of occupied physical attention KV cells in a single unified pool.
+    // Shared cells count once; recurrent state and other memory are excluded.
+    // Returns false for null, split or otherwise unsupported memory; `used` is
+    // written only on success. Call only when memory is not concurrently mutated.
+    LLAMA_API bool llama_memory_get_unique_kv_used_cells(llama_memory_t mem, uint32_t * used);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence

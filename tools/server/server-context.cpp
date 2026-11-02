@@ -2565,6 +2565,10 @@ private:
                     res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
 
                     res->n_tokens_max = metrics.n_tokens_max;
+                    // This task runs on the server's memory-owning loop, so
+                    // the sample is not racing llama_decode's cache updates.
+                    res->kv_unique_cells_supported = llama_memory_get_unique_kv_used_cells(
+                            llama_get_memory(ctx_tgt), &res->kv_unique_cells_used);
 
                     res->n_prompt_tokens_processed = metrics.n_prompt_tokens_processed;
                     res->t_prompt_processing       = metrics.t_prompt_processing;
@@ -4759,6 +4763,14 @@ void server_routes::init_routes() {
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
             }}}
         };
+
+        if (res_task->kv_unique_cells_supported) {
+            all_metrics_def["gauge"].push_back({
+                {"name", "kv_cache_used_cells"},
+                {"help", "Number of occupied unique KV cache cells."},
+                {"value", res_task->kv_unique_cells_used}
+            });
+        }
 
         std::stringstream prometheus;
 
