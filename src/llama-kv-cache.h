@@ -210,6 +210,9 @@ public:
     // every distinct rope configuration of the model. nmse_out = worst NMSE over configurations (f64 accumulation).
     bool chunk_rope_selfcheck(llama_context * lctx, llama_pos delta, double * nmse_out);
 
+    // true when seq_id holds no cell with pos in [p0, p1) (sparse recompute fills such a hole)
+    bool chunk_range_free(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     //
     // graph_build API
     //
