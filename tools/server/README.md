@@ -1123,6 +1123,18 @@ or different instance returns HTTP 400 without erasing. A successful conditional
 IDs from matching after a server restart; it is not an authentication token. Omitting both
 parameters retains the unconditional erase behavior and response shape.
 
+For a single-prompt, single-completion request, an owner may supply a fresh random 128-bit ID as
+32 lowercase hexadecimal characters in the `X-Llama-Native-Correlation-Id` header.
+`GET /slots?include_native_correlation=1` exposes `native_correlation_id` only for an active slot,
+along with its native `id_task` and `server_instance_id`; this is available during prefill, before
+the streamed response. Queued or completed requests may have no active slot. IDs cannot be reused
+within a server incarnation: duplicates and exhaustion of the bounded 65536-ID registry return
+HTTP 400. Ordinary requests and slots responses are unchanged. This is correlation, not
+authentication: callers must use fresh random IDs, require exactly one active match, and use the
+task and instance pair for conditional erase. A correlation ID alone never cancels a task.
+Supplying a native correlation ID to the erase endpoint is rejected; callers must resolve it
+through `/slots` and send the resulting task and instance pair.
+
 **Response format**
 
 ```json

@@ -2545,6 +2545,10 @@ private:
                         if (task.metrics_include_server_instance) {
                             slot_data["server_instance_id"] = server_instance_id;
                         }
+                        if (task.metrics_include_native_correlation && slot.is_processing() && slot.task &&
+                                !slot.task->native_correlation_id.empty()) {
+                            slot_data["native_correlation_id"] = slot.task->native_correlation_id;
+                        }
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -4406,6 +4410,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    std::string native_correlation_id;
+    if (server_parse_native_correlation(req.headers, native_correlation_id) == server_correlation_parse::invalid) {
+        res->error(format_error_response("Invalid native correlation ID", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     res->set_req(&req); // will also set spipe if needed
 
     int32_t sse_ping_interval = params.sse_ping_interval;
@@ -4444,6 +4454,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
         delimiters.tokenize(ctx_server.vocab);
 
+        if (!native_correlation_id.empty() && inputs.size() != 1) {
+            throw std::invalid_argument("Native correlation requires exactly one prompt");
+        }
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
@@ -4456,6 +4469,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->slot_n_ctx,
                     meta->logit_bias_eog,
                     data);
+
+            if (!native_correlation_id.empty() && task.params.n_cmpl != 1) {
+                throw std::invalid_argument("Native correlation requires one completion");
+            }
+            task.native_correlation_id = native_correlation_id;
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
@@ -4478,6 +4496,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        if (!native_correlation_id.empty() && !queue_tasks.reserve_native_correlation(native_correlation_id)) {
+            throw std::invalid_argument("Native correlation ID reused or capacity exhausted");
+        }
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -4808,7 +4829,9 @@ void server_routes::init_routes() {
         {
             server_task task(SERVER_TASK_TYPE_METRICS);
             task.id = res->rd.get_new_id();
-            task.metrics_include_server_instance = req.get_param("include_server_instance") == "1";
+            task.metrics_include_native_correlation = req.get_param("include_native_correlation") == "1";
+            task.metrics_include_server_instance = task.metrics_include_native_correlation ||
+                                                   req.get_param("include_server_instance") == "1";
             res->rd.post_task(std::move(task), true); // high-priority task
         }
 
@@ -5530,6 +5553,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const server_http_req & req, int id_slot) {
     auto res = create_response();
+    if (server_erase_has_native_correlation(req.headers, req.params)) {
+        res->error(format_error_response("A native correlation ID cannot authorize slot erase", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     int expected_task_id = -1;
     const auto expected = req.params.find("expected_task_id");
     const auto instance = req.params.find("expected_server_instance");

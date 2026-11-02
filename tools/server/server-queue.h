@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-task.h"
+#include "server-native-correlation.h"
 
 #include <condition_variable>
 #include <deque>
@@ -17,6 +18,7 @@ private:
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
+    server_native_correlation_registry native_correlations;
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -31,6 +33,9 @@ private:
     std::function<void(bool)>           callback_sleeping_state;
 
 public:
+    bool reserve_native_correlation(const std::string & value) {
+        return native_correlations.reserve(value);
+    }
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
 
