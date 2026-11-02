@@ -1,5 +1,8 @@
 #include "../tools/server/server-slot-erase.h"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <climits>
 
