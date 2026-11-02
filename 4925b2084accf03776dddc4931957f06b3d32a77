@@ -1,0 +1,17 @@
+Historical attribution correction (INF-65 CH-16 / INF-66 R18-C)
+
+This commit is the preserved tip of the retired loop champion branch,
+refs/tags/ak/pre-reconcile-loop-20260831. The 36 historical commit subjects
+on that lineage claim +171.7% compounded (+101.8% summed); these percentages
+must not be treated as independent marginal effects, added, or compounded.
+They reflect cumulative-attribution inflation.
+
+The measured block result was +8.524% tg128 for champion 5ad3e36d versus
+frozen v9 0db32c06, 264.918 to 287.499 tokens/s, 20 alternating pairs,
+on 2026-08-30. It is not a per-commit estimate or a measurement of this
+later tagged tip. See /mnt/raid0/llm/autokernel/loop-memory/
+champion-vs-production.json and epyc-root handoffs/active/
+autokernel-rebuild-program.md (R18-C and historical champion section).
+The loop's settled guidance is in epyc-inference-research commit
+47e9f1db12b3a649d1c7dbd2ae08e7ef9f85d349,
+scripts/kernel_rnd/autokernel/loop/program.md.
