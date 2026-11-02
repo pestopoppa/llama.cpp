@@ -26,6 +26,7 @@ import os
 import re
 import random
 import sys
+import types
 
 try:
     import g3_manifest
@@ -325,8 +326,24 @@ def bound_cohort(manifest, reqs, pos, selector, naive):
     return expected
 
 
-def paired_retention(path, tasks_path, expected):
-    """Score exact token matches against the frozen target, retaining every paired item."""
+def _load_pinned_scorer(path, expected_sha):
+    """Execute the exact digest-pinned project scorer bytes, never a path substitute."""
+    if not path:
+        raise ValueError("frozen text tasks require --scorer-module")
+    with open(path, "rb") as source:
+        data = source.read()
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise ValueError("scorer module digest mismatch")
+    module = types.ModuleType("_kpf62_pinned_debug_scorer")
+    module.__file__ = os.path.abspath(path)
+    exec(compile(data, module.__file__, "exec"), module.__dict__)
+    if not callable(getattr(module, "score_answer", None)):
+        raise ValueError("pinned scorer has no score_answer")
+    return module.score_answer
+
+
+def paired_retention(path, tasks_path, expected, scorer_module=None):
+    """Score paired raw outputs against each frozen task and pinned scorer."""
     tasks = g3_manifest.records(tasks_path)
     pairs = {}
     with open(path, encoding="utf-8") as f:
@@ -339,18 +356,44 @@ def paired_retention(path, tasks_path, expected):
             key = (row.get("id"), row.get("arm"))
             if key in pairs or key[0] not in expected or key[1] not in ("full", "reuse"):
                 raise ValueError("duplicate or unexpected task outcome")
-            tokens = row.get("output_tokens")
-            if not isinstance(tokens, list) or any(type(x) is not int or x < 0 for x in tokens):
-                raise ValueError("missing or invalid task output tokens")
+            task = tasks[key[0]]
+            if task.get("metric") == "exact_token_match":
+                output = row.get("output_tokens")
+                if not isinstance(output, list) or any(type(x) is not int or x < 0 for x in output):
+                    raise ValueError("missing or invalid task output tokens")
+            elif task.get("metric") == "orchestrator_text_v1":
+                output = row.get("output_text")
+                if not isinstance(output, str):
+                    raise ValueError("missing or invalid task output text")
+            else:
+                raise ValueError("unsupported task metric")
             if row.get("error") is not None or row.get("complete") is not True:
                 raise ValueError("task output is incomplete or failed")
-            pairs[key] = tokens
+            pairs[key] = output
     required = {(rid, arm) for rid in expected for arm in ("full", "reuse")}
     if set(pairs) != required:
         raise ValueError("paired task outcome coverage is incomplete")
     ids = sorted(expected)
-    full = [int(pairs[(rid, "full")] == tasks[rid]["target_tokens"]) for rid in ids]
-    reuse = [int(pairs[(rid, "reuse")] == tasks[rid]["target_tokens"]) for rid in ids]
+    text_hashes = {tasks[rid]["scorer_sha256"] for rid in ids
+                   if tasks[rid].get("metric") == "orchestrator_text_v1"}
+    if len(text_hashes) > 1:
+        raise ValueError("multiple scorer module digests in one cohort")
+    scorer = _load_pinned_scorer(scorer_module, next(iter(text_hashes))) if text_hashes else None
+    def score(rid, arm):
+        task = tasks[rid]
+        if task["metric"] == "exact_token_match":
+            return int(pairs[(rid, arm)] == task["target_tokens"])
+        if task.get("scoring_method") not in ("substring", "exact_match", "f1"):
+            raise ValueError("unsupported or non-deterministic scoring method")
+        try:
+            value = scorer(pairs[(rid, arm)], task["expected"], task["scoring_method"], task["scoring_config"])
+        except Exception as exc:
+            raise ValueError(f"{rid}/{arm}: canonical scorer failed") from exc
+        if type(value) is not bool:
+            raise ValueError("canonical scorer did not return a boolean")
+        return int(value)
+    full = [score(rid, "full") for rid in ids]
+    reuse = [score(rid, "reuse") for rid in ids]
     total = sum(full)
     if not total:
         raise ValueError("full-recompute score is zero; retention is undefined")
@@ -369,6 +412,9 @@ def paired_retention(path, tasks_path, expected):
     return {"score_full": total / len(ids), "score_reuse": sum(reuse) / len(ids),
             "retention": ratio, "n_tasks": len(ids), "bootstrap_seed": 62026,
             "bootstrap_samples": 10000, "bootstrap_undefined": undefined,
+            "scorer_sha256": next(iter(text_hashes)) if text_hashes else None,
+            "item_scores": [{"id": rid, "full": full[i], "reuse": reuse[i],
+                             "metric": tasks[rid]["metric"]} for i, rid in enumerate(ids)],
             "bootstrap_95": [nearest_rank(estimates, 2.5), nearest_rank(estimates, 97.5)] if estimates else None}
 
 
@@ -392,7 +438,7 @@ def cmd_gate(args):
             if meta.get("n_cont") != 64:
                 raise ValueError("native run did not declare 64 continuation positions")
             expected = bound_cohort(manifest, reqs, pos, args.selector, args.naive)
-            score = paired_retention(args.retention, args.tasks, expected)
+            score = paired_retention(args.retention, args.tasks, expected, getattr(args, "scorer_module", None))
             retention = score["retention"]
         except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
             print(f"REFUSED: invalid frozen cohort or paired outcomes: {exc}")
@@ -490,7 +536,8 @@ def main():
     s.add_argument("--naive", default="none")
     s.add_argument("--corpus", help="frozen tokenized corpus JSONL matching the manifest")
     s.add_argument("--tasks", help="frozen task target JSONL matching the manifest")
-    s.add_argument("--retention", help="paired per-item full/reuse output-token JSONL")
+    s.add_argument("--retention", help="paired per-item full/reuse raw output JSONL")
+    s.add_argument("--scorer-module", help="digest-pinned canonical orchestrator debug_scorer.py for frozen text tasks")
     s.add_argument("--dev", action="store_true")
     s.add_argument("--out", help="write OUT.json and OUT.md")
     sub.add_parser("selftest")

@@ -107,6 +107,36 @@ class FrozenGateTest(unittest.TestCase):
             self.op.write_text(json.dumps({'score_full': 1, 'score_reuse': 1}))
             self.assertEqual(gate.cmd_gate(args), 3)
 
+    def test_pinned_canonical_text_scorer_is_bound_per_item(self):
+        import hashlib
+        scorer = self.root / 'scorer.py'
+        scorer.write_text('def score_answer(answer, expected, scoring_method, scoring_config):\n'
+                          '    return expected.lower() in answer.lower()\n')
+        digest = hashlib.sha256(scorer.read_bytes()).hexdigest()
+        tasks = gm.records(self.tp)
+        for rid in self.ids:
+            tasks[rid] = {'id': rid, 'metric': 'orchestrator_text_v1', 'expected': 'Oxford',
+                          'scoring_method': 'substring', 'scoring_config': {}, 'scorer_sha256': digest}
+        self.tp.write_text(''.join(json.dumps(x) + '\n' for x in tasks.values()))
+        manifest = gm.make_manifest(self.cp, self.tp, 'role', 'fixture')
+        self.mp.write_text(json.dumps(manifest))
+        self.assertEqual(gm.verify(self.mp, self.cp, self.tp), manifest)
+        outcomes = [{'id': rid, 'arm': arm, 'output_text': 'Oxford University', 'complete': True}
+                    for rid in self.ids for arm in ('full', 'reuse')]
+        self.op.write_text(''.join(json.dumps(x) + '\n' for x in outcomes))
+        expected = {x['id']: x for x in manifest['requests']}
+        result = gate.paired_retention(self.op, self.tp, expected, str(scorer))
+        self.assertEqual(result['retention'], 1)
+        self.assertEqual(len(result['item_scores']), len(self.ids))
+        self.assertEqual(result['scorer_sha256'], digest)
+        scorer.write_text('def score_answer(*args): return True\n')
+        with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+            gate.paired_retention(self.op, self.tp, expected, str(scorer))
+        tasks[self.ids[0]]['scoring_method'] = 'llm_judge'
+        self.tp.write_text(''.join(json.dumps(x) + '\n' for x in tasks.values()))
+        with self.assertRaisesRegex(ValueError, 'unsupported'):
+            gm.make_manifest(self.cp, self.tp, 'role', 'fixture')
+
     def test_missing_task_wrong_metrics_or_changed_layout_refuse(self):
         rows = gm.records(self.tp)
         rows[self.ids[0]]['metric'] = 'unfixed_metric'

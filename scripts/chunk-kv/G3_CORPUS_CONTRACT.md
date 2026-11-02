@@ -36,3 +36,24 @@ change the pre-existing threshold. Missing, duplicated, failed, unknown or
 unmatched records refuse. A standalone aggregate `score_full`/`score_reuse` value
 is not evidence and is not accepted. Other request capture and model/DSO provenance
 remain the runner's responsibility; a score table alone is not a qualified run.
+
+## Optional pinned project text scorer
+
+For prospectively declared deterministic text tasks, the tasks JSONL may instead bind
+`metric: "orchestrator_text_v1"`, a nonempty `expected` string, explicit
+`scoring_method` (`substring`, `exact_match`, or `f1`), explicit `scoring_config`, and
+`scorer_sha256` of the exact orchestrator `scripts/benchmark/debug_scorer.py` bytes. The
+full tasks-file digest freezes all of these fields. Both outcome arms must carry original
+`output_text` strings and `complete: true`; errors, missing pairs, unsupported methods,
+multiple scorer digests, and an absent or changed scorer refuse. Pass the exact scorer
+file via `g3_gate.py gate --scorer-module PATH`; the gate verifies and executes those
+pinned bytes, returns per-item full/reuse scores, and computes the original retention
+ratio and paired CI without introducing a new threshold. Original generated output,
+token-to-text decoding and native run custody remain separately required.
+
+This implements an instrument interface, not corpus or scoring-policy admission. The
+project's current ZeroSCROLLS QA adapter selects substring; SQuALITY and open-ended
+L-Eval use `llm_judge`. This deterministic path deliberately refuses `llm_judge` and
+must not silently substitute a different score for those tasks. Freeze any task-specific
+methods and scorer identities under the existing G3 measurement process before running a
+decision-grade gate; the prospective mixed corpus is not thereby admitted as B7.

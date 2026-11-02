@@ -2,7 +2,8 @@
 """Freeze and verify tokenized G3 task corpora; no inference or result grading.
 
 Input JSONL corpus entries contain id, tokens, chunks [{offset,n_tokens}]. Task
-JSONL entries contain id, metric=exact_token_match, target_tokens. Both inputs
+JSONL entries specify either exact_token_match/target_tokens or an explicitly pinned
+orchestrator_text_v1 deterministic scorer, method, config and expected text. Both inputs
 must be independently sourced, not synthesized from model results. The output
 manifest binds exact bytes and predeclared SHA256(id) % 5 split. A gate cohort
 must satisfy P0's 200/50-per-bucket requirements; shared chunks must occur under
@@ -16,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 SCHEMA = 'epyc.kpf62.g3-manifest.v1'
@@ -81,8 +83,19 @@ def inspect(corpus_path, tasks_path):
             key = hashlib.sha256(body).hexdigest()
             chunk_occurrences.setdefault(key, set()).add((off, hashlib.sha256(predecessor).hexdigest()))
             previous_end = off + n
-        if task.get('metric') != 'exact_token_match' or not _tokens(task.get('target_tokens')):
-            raise ValueError(f'{rid}: unsupported metric or invalid target tokens')
+        metric = task.get('metric')
+        if metric == 'exact_token_match':
+            if not _tokens(task.get('target_tokens')):
+                raise ValueError(f'{rid}: unsupported metric or invalid target tokens')
+        elif metric == 'orchestrator_text_v1':
+            if (task.get('scoring_method') not in ('substring', 'exact_match', 'f1')
+                    or not isinstance(task.get('expected'), str) or not task['expected'].strip()
+                    or not isinstance(task.get('scoring_config'), dict)
+                    or not isinstance(task.get('scorer_sha256'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', task['scorer_sha256'])):
+                raise ValueError(f'{rid}: unsupported metric or incomplete pinned text scorer')
+        else:
+            raise ValueError(f'{rid}: unsupported metric')
         rows.append({'id': rid, 'split': split(rid), 'n_tokens': len(toks), 'n_chunks': len(chunks),
                      'suffix_start': previous_end, 'metric': task['metric']})
     if any(len(v) < 2 for v in chunk_occurrences.values()):
