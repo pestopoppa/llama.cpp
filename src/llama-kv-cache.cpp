@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-block-observer.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -8,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1865,6 +1868,37 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    // Observation only; the mask and allocation are never modified here.
+    const char * observer = std::getenv("LLAMA_KPF30_MIXED_BLOCKS");
+    if (observer && std::strcmp(observer, "1") == 0) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const auto seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const auto count = llama_kv_block_observe(size_t(n_kv), [&](size_t j) {
+                if (j >= cells.size()) return llama_kv_block_owner::unknown;
+                if (cells.is_empty(j)) return llama_kv_block_owner::empty;
+                const auto n = cells.seq_count(j);
+                if (n == 0) return llama_kv_block_owner::unknown;
+                if (n > 1) return llama_kv_block_owner::shared;
+                return cells.seq_has(j, seq_id) ? llama_kv_block_owner::current : llama_kv_block_owner::foreign;
+            }, [&](size_t j) {
+                const size_t idx = size_t(i)*size_t(n_kv) + j;
+                const float v = dst->type == GGML_TYPE_F16
+                    ? ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(dst->data)[idx])
+                    : static_cast<const float *>(dst->data)[idx];
+                if (std::isfinite(v)) return llama_kv_block_visibility::visible;
+                if (std::isinf(v) && v < 0) return llama_kv_block_visibility::masked;
+                return llama_kv_block_visibility::invalid;
+            });
+            LLAMA_LOG_INFO("KPF30 row=%u seq=%d n_tokens=%u n_seqs=%u swa=%d causal=%d n_kv=%" PRId64 " blocks=%" PRIu64
+                           " live=%" PRIu64 " mixed=%" PRIu64 " unknown=%" PRIu64
+                           " live_unknown=%" PRIu64 " invalid_mask=%" PRIu64 "\n",
+                           i, int(seq_id), n_tokens, ubatch->n_seqs_unq, int(swa_type), int(causal_attn),
+                           n_kv, count.blocks, count.live, count.mixed,
+                           count.unknown, count.live_unknown, count.invalid_mask);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
