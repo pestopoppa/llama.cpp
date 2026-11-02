@@ -552,3 +552,4 @@ llama_build_and_test(test-chunk-kv-kdev-contract.cpp)
 target_include_directories(test-chunk-kv-kdev-contract PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/server)
 
 llama_build_and_test(test-server-prompt-fork.cpp)
+target_link_libraries(test-server-prompt-fork PRIVATE mtmd)
