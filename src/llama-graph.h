@@ -351,6 +351,15 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // Single-query row attention. Inputs exist only for an eligible plan.
+    ggml_tensor * self_kv_rows = nullptr;
+    ggml_tensor * self_kv_mask_rows = nullptr;
+    bool row_plan_attempted = false;
+    uint32_t row_plan_n_kv = 0;
+    uint32_t row_plan_n_rows = 0;
+    void set_input_rows(const llama_kv_cache_context * kv);
+    bool can_reuse_rows(const llama_kv_cache_context * kv) const;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -1167,7 +1176,9 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_rows = nullptr,
+            ggml_tensor * row_mask = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

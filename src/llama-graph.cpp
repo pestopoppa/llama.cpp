@@ -16,7 +16,9 @@
 #include <cassert>
 #include <algorithm>
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
+#include <cstdlib>
 #ifdef GGML_CPU_PROF
 #include <cstdlib>
 #include <cstdio>
@@ -473,6 +475,27 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_attn_kv::set_input_rows(const llama_kv_cache_context * kv) {
+    if (!self_kv_rows || !self_kv_rows->buffer) return;
+    const auto plan = kv->make_kv_rows_plan(true);
+    GGML_ASSERT(plan.usable() && plan.n_slices == 1 && plan.n_kv == row_plan_n_kv &&
+                plan.padded_rows == row_plan_n_rows);
+    auto mask_rows = plan.rows;
+    for (auto & row : mask_rows) if (row < 0) row = 0;
+    ggml_backend_tensor_set(self_kv_rows, plan.rows.data(), 0, plan.rows.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(self_kv_mask_rows, mask_rows.data(), 0, mask_rows.size()*sizeof(int32_t));
+}
+
+bool llm_graph_input_attn_kv::can_reuse_rows(const llama_kv_cache_context * kv) const {
+    if (!row_plan_attempted) return true;
+    const auto plan = kv->make_kv_rows_plan(true);
+    if (!self_kv_rows) {
+        return !(plan.usable() && plan.n_slices == 1 && plan.padded_rows % 256 == 0);
+    }
+    return plan.usable() && plan.n_slices == 1 && plan.n_kv == row_plan_n_kv &&
+           plan.padded_rows == row_plan_n_rows;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -491,6 +514,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
+    set_input_rows(mctx);
     set_input_dca(mctx, ubatch);
 }
 
@@ -560,6 +584,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_rows(mctx);
 
     return res;
 }
@@ -1133,6 +1158,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    inp_attn->set_input_rows(mctx->get_attn());
     // Dual Chunk Attention inputs (no-op unless cparams.dca_chunk_size > 0)
     inp_attn->set_input_dca(mctx->get_attn(), ubatch);
 
@@ -1160,6 +1186,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= inp_attn->can_reuse_rows(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2791,7 +2818,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_rows,
+         ggml_tensor * row_mask) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2822,8 +2851,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cur = nullptr;
+        if (kv_rows && row_mask && !v_trans && !sinks && !v_mla &&
+            q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap) {
+            auto * candidate = ggml_flash_attn_ext_rows(ctx0, q, k, v, row_mask, kv_rows, kq_scale, 0.0f, 0.0f);
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto backend = ggml_backend_sched_get_backend(sched, i);
+                if (backend != backend_cpu && ggml_backend_supports_op(backend, candidate)) {
+                    LLAMA_LOG_DEBUG("kv_rows: layer %d, physical %" PRId64 ", selected %" PRId64 ", backend %s\n",
+                                    il, k->ne[1], kv_rows->ne[0], ggml_backend_name(backend));
+                    cur = candidate;
+                    break;
+                }
+            }
+        }
+        if (!cur) {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -3018,6 +3065,26 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        // Keep full-mask fallback. Rows are considered only for single-query
+        // unified-cache attention and accepted per layer by the actual backend.
+        const char * disable_rows = std::getenv("LLAMA_KV_ROWS_DISABLE");
+        if (cparams.flash_attn && cparams.offload_kqv && cparams.kv_unified &&
+            cparams.dca_chunk_size == 0 && ubatch.n_tokens == 1 &&
+            !(disable_rows && disable_rows[0] && disable_rows[0] != '0')) {
+            inp->row_plan_attempted = true;
+            const auto plan = mctx_cur->make_kv_rows_plan(true);
+            if (plan.usable() && plan.n_slices == 1 && plan.padded_rows % 256 == 0) {
+                inp->row_plan_n_kv = plan.n_kv;
+                inp->row_plan_n_rows = plan.padded_rows;
+                inp->self_kv_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, plan.padded_rows);
+                inp->self_kv_mask_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, plan.padded_rows);
+                ggml_set_input(inp->self_kv_rows);
+                ggml_set_input(inp->self_kv_mask_rows);
+                ggml_set_name(inp->self_kv_rows, "attn_inp_kv_rows");
+                ggml_set_name(inp->self_kv_mask_rows, "attn_inp_kv_mask_rows");
+            }
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3101,7 +3168,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * row_mask = nullptr;
+    if (inp->self_kv_rows && inp->self_kv_mask_rows) {
+        auto * mask_by_cell = ggml_reshape_2d(ctx0, kq_mask, 1, inp->row_plan_n_kv);
+        auto * gathered = ggml_get_rows(ctx0, mask_by_cell, inp->self_kv_mask_rows);
+        row_mask = ggml_reshape_2d(ctx0, ggml_cast(ctx0, gathered, GGML_TYPE_F16), inp->row_plan_n_rows, 1);
+    }
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+                                       inp->self_kv_rows, row_mask);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
