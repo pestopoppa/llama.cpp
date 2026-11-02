@@ -1114,6 +1114,15 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
 
+The optional query parameters `expected_task_id` and `expected_server_instance` make this a
+conditional erase and must be supplied together. Obtain both from an active slot using
+`GET /slots?include_server_instance=1`. The server erases only if the instance and active native
+task ID still match when the action reaches the server task loop; an idle slot, different task,
+or different instance returns HTTP 400 without erasing. A successful conditional erase includes
+`cancelled_task_id` and `server_instance_id` in the response. The instance ID prevents stale task
+IDs from matching after a server restart; it is not an authentication token. Omitting both
+parameters retains the unconditional erase behavior and response shape.
+
 **Response format**
 
 ```json

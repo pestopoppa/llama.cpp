@@ -1597,10 +1597,15 @@ json server_task_result_slot_save_load::to_json() {
 // server_task_result_slot_erase
 //
 json server_task_result_slot_erase::to_json() {
-    return json {
+    json result = {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
     };
+    if (cancelled_task_id >= 0) {
+        result["cancelled_task_id"] = cancelled_task_id;
+        result["server_instance_id"] = server_instance_id;
+    }
+    return result;
 }
 
 //

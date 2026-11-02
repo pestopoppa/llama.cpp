@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-slot-erase.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -917,6 +918,7 @@ struct server_context_impl {
     friend struct server_context;
 
 public:
+    const std::string server_instance_id = random_string() + random_string();
     // only use these pointers outside of this class:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
@@ -2540,6 +2542,9 @@ private:
 
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
+                        if (task.metrics_include_server_instance) {
+                            slot_data["server_instance_id"] = server_instance_id;
+                        }
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -2673,6 +2678,12 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    if (!server_slot_erase_matches(task.slot_action.expected_task_id,
+                            task.slot_action.expected_server_instance, server_instance_id,
+                            slot->is_processing(), bool(slot->task), slot->task ? slot->task->id : -1)) {
+                        send_error(task, "Slot is not processing the expected task", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     // Gate on slot content, consistent with save/restore.
                     if (!check_slot_no_media(*slot, task.id)) {
                         break;
@@ -2702,6 +2713,8 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    res->cancelled_task_id = task.slot_action.expected_task_id;
+                    res->server_instance_id = server_instance_id;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_COMPACT:
@@ -4795,6 +4808,7 @@ void server_routes::init_routes() {
         {
             server_task task(SERVER_TASK_TYPE_METRICS);
             task.id = res->rd.get_new_id();
+            task.metrics_include_server_instance = req.get_param("include_server_instance") == "1";
             res->rd.post_task(std::move(task), true); // high-priority task
         }
 
@@ -5516,11 +5530,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const server_http_req & req, int id_slot) {
     auto res = create_response();
+    int expected_task_id = -1;
+    const auto expected = req.params.find("expected_task_id");
+    const auto instance = req.params.find("expected_server_instance");
+    const bool has_expected = expected != req.params.end();
+    const bool has_instance = instance != req.params.end();
+    if (!server_parse_conditional_erase(has_expected, has_expected ? expected->second : "",
+                                       has_instance, has_instance ? instance->second : "", expected_task_id)) {
+        res->error(format_error_response("expected_task_id and expected_server_instance must be supplied together", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.expected_task_id = expected_task_id;
+        if (has_instance) {
+            task.slot_action.expected_server_instance = instance->second;
+        }
         rd.post_task(std::move(task));
     }
 

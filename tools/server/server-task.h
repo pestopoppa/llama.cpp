@@ -169,6 +169,8 @@ struct server_task {
     // SERVER_TASK_TYPE_SLOT_COMPACT
     struct slot_action {
         int id_slot;
+        int expected_task_id = -1;
+        std::string expected_server_instance;
         std::string filename;
         std::string filepath;
 
@@ -183,6 +185,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
+    bool metrics_include_server_instance = false;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -564,6 +567,8 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+    int cancelled_task_id = -1;
+    std::string server_instance_id;
 
     virtual json to_json() override;
 };
