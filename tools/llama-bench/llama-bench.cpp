@@ -358,6 +358,7 @@ struct cmd_params {
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                use_mmap;
+    std::vector<int>                 n_load_threads;
     std::vector<bool>                use_direct_io;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
@@ -409,6 +410,7 @@ static const cmd_params cmd_params_defaults = {
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* use_mmap             */ { true },
+    /* n_load_threads       */ { 0 },
     /* use_direct_io        */ { false },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
@@ -563,6 +565,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
+    printf("  -lt, --load-threads <n>                     threads reading the model file when mmap is off and weights go to host buffers\n");
+    printf("                                              (0 = auto, 1 = single-threaded; default: %s)\n", join(cmd_params_defaults.n_load_threads, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
     printf("  -embd, --embeddings <0|1>                   (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>            (default: 0)\n");
@@ -950,6 +954,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.use_mmap.insert(params.use_mmap.end(), p.begin(), p.end());
+            } else if (arg == "-lt" || arg == "--load-threads") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (int v : p) {
+                    if (v < 0) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.n_load_threads.insert(params.n_load_threads.end(), p.begin(), p.end());
             } else if (arg == "-dio" || arg == "--direct-io") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1264,6 +1284,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.use_mmap.empty()) {
         params.use_mmap = cmd_params_defaults.use_mmap;
     }
+    if (params.n_load_threads.empty()) {
+        params.n_load_threads = cmd_params_defaults.n_load_threads;
+    }
     if (params.use_direct_io.empty()) {
         params.use_direct_io = cmd_params_defaults.use_direct_io;
     }
@@ -1327,6 +1350,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    int                n_load_threads;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1339,6 +1363,7 @@ struct cmd_params_instance {
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.use_mmap      = use_mmap;
+        mparams.n_load_threads = n_load_threads;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
 
@@ -1386,6 +1411,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
+               n_load_threads == other.n_load_threads &&
                devices == other.devices &&
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
@@ -1433,6 +1459,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & ts : params.tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & mmp : params.use_mmap)
+    for (const auto & lt : params.n_load_threads)
     for (const auto & dio : params.use_direct_io)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
@@ -1481,6 +1508,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_load_threads = */ lt,
             };
             instances.push_back(instance);
         }
@@ -1518,6 +1546,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_load_threads = */ lt,
             };
             instances.push_back(instance);
         }
@@ -1555,6 +1584,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_load_threads = */ lt,
             };
             instances.push_back(instance);
         }
@@ -1591,6 +1621,7 @@ struct test {
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     use_mmap;
+    int                      n_load_threads;
     bool                     use_direct_io;
     bool                     embeddings;
     bool                     no_op_offload;
@@ -1644,6 +1675,7 @@ struct test {
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
         use_mmap       = inst.use_mmap;
+        n_load_threads = inst.n_load_threads;
         use_direct_io  = inst.use_direct_io;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
@@ -1706,7 +1738,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
+            "tensor_buft_overrides",            "use_mmap",      "n_load_threads", "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",       "autokernel_hardened",
             "autokernel_output_invariant",       "autokernel_hybrid_ab_complete",
@@ -1728,7 +1760,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "n_load_threads" ||
             field == "autokernel_input_working_set_bytes") {
             return INT;
         }
@@ -1809,6 +1841,7 @@ struct test {
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
                                             std::to_string(use_mmap),
+                                            std::to_string(n_load_threads),
                                             std::to_string(use_direct_io),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
@@ -2050,6 +2083,9 @@ struct markdown_printer : public printer {
         if (field == "use_mmap") {
             return "mmap";
         }
+        if (field == "n_load_threads") {
+            return "lt";
+        }
         if (field == "use_direct_io") {
             return "dio";
         }
@@ -2142,6 +2178,9 @@ struct markdown_printer : public printer {
         }
         if (params.use_mmap.size() > 1 || params.use_mmap != cmd_params_defaults.use_mmap) {
             fields.emplace_back("use_mmap");
+        }
+        if (params.n_load_threads.size() > 1 || params.n_load_threads != cmd_params_defaults.n_load_threads) {
+            fields.emplace_back("n_load_threads");
         }
         if (params.use_direct_io.size() > 1 || params.use_direct_io != cmd_params_defaults.use_direct_io) {
             fields.emplace_back("use_direct_io");
