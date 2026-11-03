@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
+#include "lsa-screen-reference.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -319,7 +321,59 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (cparams.dca_chunk_size > 0) {
+    const char * lsa_mode = std::getenv("LLAMA_LSA_SCREEN");
+    const bool lsa_target = lsa_mode && *lsa_mode && model.name == "Qwen3.8-27B" && n_layer == 64 && n_head == 24 && n_head_kv == 4 && n_embd_head == 256 && n_rot == 64;
+    if (lsa_target && ubatch.n_seqs_unq != 1 && il == 3) {
+        std::fprintf(stderr, "LSA screen: bypassing reference for multi-sequence graph (n_seqs=%u)\n", ubatch.n_seqs_unq);
+    }
+    if (lsa_target && ubatch.n_seqs_unq == 1) {
+        if (std::strcmp(lsa_mode, "all") && std::strcmp(lsa_mode, "pca") && std::strcmp(lsa_mode, "distilled") && std::strcmp(lsa_mode, "positional")) {
+            GGML_ABORT("LSA screen: mode must be all, pca, distilled or positional");
+        }
+        GGML_ASSERT(cparams.dca_chunk_size == 0 && ubatch.n_seqs_unq == 1 && n_layer == 64);
+        GGML_ASSERT(n_head == 24 && n_head_kv == 4 && n_embd_head == 256 && n_rot == 64);
+        GGML_ASSERT(il % 4 == 3);
+        // Match build_attn's physical KV layout, including quantized-cache rotations.
+        ggml_tensor * q_attn = Qcur;
+        ggml_tensor * k_store = Kcur;
+        ggml_tensor * v_store = Vcur;
+        if (inp->self_k_rot) {
+            q_attn = llama_mul_mat_hadamard(ctx0, q_attn, inp->self_k_rot);
+            k_store = llama_mul_mat_hadamard(ctx0, k_store, inp->self_k_rot);
+        }
+        if (inp->self_v_rot) {
+            v_store = llama_mul_mat_hadamard(ctx0, v_store, inp->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, q_attn);
+        ggml_build_forward_expand(gf, v_store);
+        ggml_build_forward_expand(gf, k_store);
+        const auto * cache = inp->mctx;
+        ggml_build_forward_expand(gf, cache->cpy_k(ctx0, k_store, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, cache->cpy_v(ctx0, v_store, inp->get_v_idxs(), il));
+        ggml_tensor * cached_k = cache->get_k(ctx0, il);
+        ggml_tensor * cached_v = cache->get_v(ctx0, il);
+        if (std::strcmp(lsa_mode, "all") && cached_k->type != GGML_TYPE_BF16 && cached_k->type != GGML_TYPE_Q8_0) {
+            GGML_ABORT("LSA screen: sparse reference requires BF16 or Q8_0 KV keys");
+        }
+        ggml_tensor * mask = inp->get_kq_mask();
+        ggml_tensor * mask_f32 = ggml_cast(ctx0, mask, GGML_TYPE_F32);
+        // The index maps were trained on logical, unroped Q/K free coordinates.
+        // RoPE changes only the prefix; inverse rotation must precede dropping it.
+        const bool projected = !std::strcmp(lsa_mode, "pca") || !std::strcmp(lsa_mode, "distilled");
+        ggml_tensor * q_f32 = ggml_cast(ctx0, projected ? Qraw : q_attn, GGML_TYPE_F32);
+        ggml_tensor * k_f32 = ggml_cast(ctx0, cached_k, GGML_TYPE_F32);
+        if (projected && inp->self_k_rot) {
+            k_f32 = llama_mul_mat_hadamard(ctx0, k_f32, inp->self_k_rot);
+        }
+        ggml_tensor * selected = ggml_map_custom3(ctx0, mask_f32, q_f32, k_f32,
+                                                   lsa_screen_mask, 1, reinterpret_cast<void *>(intptr_t(il)));
+        if (mask->type != GGML_TYPE_F32) selected = ggml_cast(ctx0, selected, mask->type);
+        cb(selected, "lsa_screen_mask", il);
+        cur = build_attn_mha(q_attn, cached_k, cached_v, nullptr, selected, nullptr, nullptr, kq_scale, il);
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+    } else if (cparams.dca_chunk_size > 0) {
         cur = build_attn_dca(inp,
                     nullptr, nullptr, nullptr,
                     Qraw, Kraw, Vcur, n_rot, sections, kq_scale, il);
