@@ -177,28 +177,50 @@ __global__ void project(tensor_view v, geometry g, const ggml_bf16_t * map,
     __shared__ float norm;
     const int width = g.head_dim - g.rope_dim;
     const int group = g.q_heads / g.kv_heads;
+    const int map_rows = g.kv_heads * width;
     float sum = 0.0f;
-    for (int kv = 0; kv < g.kv_heads; ++kv) {
-        for (int d = 0; d < width; ++d) {
-            float x = 0.0f;
+    // Match the pinned AVX512 BF16 dot: each 512-K block has a fresh FP32
+    // accumulator, and VDPBF16PS applies the high BF16 pair before the low.
+    for (int base = 0; base < map_rows; base += 512) {
+        float acc = 0.0f;
+        for (int k = base; k < min(base + 512, map_rows); k += 2) {
+            const int kv = k / width;
+            const int d = k % width;
             const int first = query ? kv * group : kv;
             const int end = query ? first + group : first + 1;
-            for (int h = first; h < end; ++h) { x += element(v, row, h, g.rope_dim + d); }
-            sum += rounded(x) * bf16_float(map[(kv * width + d) * index_dimension + j]);
+            float low = 0.0f;
+            float high = 0.0f;
+            for (int h = first; h < end; ++h) {
+                low = __ocml_add_rte_f32(low, element(v, row, h, g.rope_dim + d));
+                high = __ocml_add_rte_f32(high, element(v, row, h, g.rope_dim + d + 1));
+            }
+            const float x_high = rounded(high);
+            const float x_low = rounded(low);
+            const float w_high = bf16_float(map[(k + 1) * index_dimension + j]);
+            const float w_low = bf16_float(map[k * index_dimension + j]);
+            acc = __ocml_fma_rte_f32(x_high, w_high, acc);
+            acc = __ocml_fma_rte_f32(x_low, w_low, acc);
         }
+        sum = __ocml_add_rte_f32(sum, acc);
     }
     values[j] = rounded(sum);
     if (!isfinite(values[j])) { report(fault, bad_number); }
     __syncthreads();
     if (j == 0) {
-        float sq = 0.0f;
-        for (int d = 0; d < index_dimension; ++d) { sq += values[d] * values[d]; }
+        volatile float lanes[8] = {};
+        for (int d = 0; d < index_dimension; ++d) {
+            const float product = __ocml_mul_rte_f32(values[d], values[d]);
+            lanes[d % 8] = __ocml_add_rte_f32(lanes[d % 8], product);
+        }
+        float sq = lanes[0];
+        for (int lane = 1; lane < 8; ++lane) sq = __ocml_add_rte_f32(sq, lanes[lane]);
         if (!isfinite(sq)) { report(fault, bad_number); }
-        norm = fmaxf(sqrtf(sq), 1e-12f);
+        norm = fmaxf(__ocml_sqrt_rte_f32(sq), 1e-12f);
         if (!isfinite(norm)) { report(fault, bad_number); }
     }
     __syncthreads();
-    output[row * index_dimension + j] = query ? values[j] / norm : rounded(values[j] / norm);
+    const float normalized = __ocml_div_rte_f32(values[j], norm);
+    output[row * index_dimension + j] = query ? normalized : rounded(normalized);
 }
 
 // One cooperative CTA per immutable complete block. Shared state is under 40KiB
