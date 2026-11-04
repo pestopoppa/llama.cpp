@@ -109,6 +109,8 @@ llama_lsa_graph_state::llama_lsa_graph_state(const llama_model & model, const ll
         if (trace_file) {
             const char * trace_mode = std::getenv("LLAMA_LSA_NATIVE_TRACE_MODE");
             trace_light = trace_mode && std::strcmp(trace_mode, "light") == 0;
+            const char * phase_mode = std::getenv("LLAMA_LSA_NATIVE_PHASES");
+            trace_phases = trace_light && phase_mode && std::strcmp(phase_mode, "1") == 0;
             std::fprintf(trace_file, "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"admission_attempt\"}\n");
             std::fflush(trace_file);
         }
@@ -162,6 +164,7 @@ llama_lsa_graph_state::llama_lsa_graph_state(const llama_model & model, const ll
     options.max_new_tokens = int64_t(max_new_tokens);
     options.max_requests = 1;
     options.collect_stats = trace_file != nullptr && !trace_light;
+    options.collect_phase_times = trace_phases;
     options.max_host_bytes = size_t(max_host_bytes);
     options.max_device_bytes = size_t(max_device_bytes);
     options.selection.top_k = int(top_k);
@@ -362,6 +365,14 @@ bool llama_lsa_graph_state::execute(const ggml_tensor * op, void * stream, bool 
     frame.softcap = softcap;
     frame.stream = stream;
     auto result = selector->execute(frame);
+    if (trace_phases && result.sparse) {
+        std::fprintf(trace_file,
+            "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"phase_host\",\"timing_kind\":\"host_elapsed\",\"sequence\":%d,\"slot\":0,\"epoch\":%llu,\"first\":%lld,\"count\":%zu,\"layer\":%d,\"backend\":\"%s\",\"key_append_host_us\":%llu,\"query_select_host_us\":%llu,\"attention_host_us\":%llu}\n",
+            sequence, (unsigned long long) epoch, (long long) first, positions.size(), layer, device ? "hip" : "cpu",
+            (unsigned long long) result.key_append_host_us,
+            (unsigned long long) result.query_select_host_us,
+            (unsigned long long) result.attention_host_us);
+    }
     if (!result.sparse)
         return trace_failure(layer, "runtime_execute", llama_lsa::dense_reason_name(result.reason), result.detail);
     if (!selector->lease_valid(result)) return trace_failure(layer, "lease", "invalid_staging_lease");

@@ -22,6 +22,7 @@ struct runtime_options {
     size_t max_host_bytes = 0;   // admission for owned maps, CPU caches and scratch
     size_t max_device_bytes = 0; // aggregate across all live request/layer contexts
     bool collect_stats = false; // trace-only; HIP counters synchronize the stream
+    bool collect_phase_times = false; // host call intervals only; no new HIP synchronization
 };
 struct runtime_frame {
     uint64_t slot = 0, epoch = 0;
@@ -55,6 +56,9 @@ struct runtime_result {
     void * stream = nullptr;
     uint64_t key_rows = 0;   // physical selected K rows read across all query heads
     uint64_t value_rows = 0; // physical selected V rows read across all query heads
+    uint64_t key_append_host_us = 0;
+    uint64_t query_select_host_us = 0;
+    uint64_t attention_host_us = 0;
     std::string detail;
 };
 

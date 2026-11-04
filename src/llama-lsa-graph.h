@@ -52,6 +52,7 @@ private:
     std::map<int, failure_info> failures;
     FILE * trace_file = nullptr;
     bool trace_light = false;
+    bool trace_phases = false;
     std::vector<int32_t> positions;
     std::vector<int32_t> slots;
     uint64_t epoch = 0;

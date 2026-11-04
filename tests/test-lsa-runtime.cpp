@@ -47,6 +47,21 @@ int main() {
     hook_state h;r.set_cpu_attention_for_test(hook,&h);
     auto result=r.execute(x.frame(0,65));
     check(result.sparse && h.chunks==std::vector<int64_t>({32,32,1}),"real native attention executes bounded32-query chunks");
+    check(result.key_append_host_us==0 && result.query_select_host_us==0 && result.attention_host_us==0,
+          "host phase timers are disabled by default");
+    auto profiled_options=o;profiled_options.collect_phase_times=true;
+    runtime profiled(maps(),profiled_options);profiled.begin_request(1,1,runtime_backend::cpu);
+    auto profiled_result=profiled.execute(x.frame(0,65));
+    check(profiled_result.sparse && profiled_result.key_append_host_us>0 &&
+          profiled_result.query_select_host_us>0 && profiled_result.attention_host_us>0,
+          "opt-in host intervals cover key append, query selection and attention");
+    runtime profiled_failure(maps(),profiled_options);profiled_failure.begin_request(1,1,runtime_backend::cpu);
+    hook_state phase_fail;phase_fail.fail_call=2;profiled_failure.set_cpu_attention_for_test(hook,&phase_fail);
+    auto failed_phase=profiled_failure.execute(x.frame(0,65));
+    check(!failed_phase.sparse && !failed_phase.staged_output &&
+          failed_phase.key_append_host_us==0 && failed_phase.query_select_host_us==0 &&
+          failed_phase.attention_host_us==0,
+          "failed opt-in request exposes no partial phase or output lease");
     check(r.indexed_rows(1,3)==65,"all new logical keys append once across query chunks");
     std::vector<float> destination(65*24*256,-999);
     check(r.publish_cpu(result,destination.data(),destination.size()),"successful host lease publishes after complete execution");
@@ -85,6 +100,34 @@ int main() {
     check(late.indexed_rows(1,3)==-1 && !late.execute(x.frame(65,1)).sparse,"failure poisons appended layer and prevents double append/retry");
     check(late.begin_request(1,2,runtime_backend::cpu),"explicit newer epoch permits fresh retry");
     late.set_cpu_attention_for_test(nullptr,nullptr);check(late.execute(x.frame(0,2,1,2)).sparse,"fresh zero epoch recovers after failed transaction");
+    // A serving graph can evaluate one native layer before a later layer fails.
+    // Exercise the shared request and both layer indexes, then mirror the graph
+    // boundary's invalidate-on-any-native-failure rule.
+    runtime composed(maps(),o);check(composed.begin_request(1,1,runtime_backend::cpu),"composed request starts at epoch one");
+    hook_state later;later.fail_call=3;composed.set_cpu_attention_for_test(hook,&later);
+    auto first_layer=composed.execute(x.frame(0,2,1,1,3));
+    std::vector<float> first_output(2*24*256,-41);
+    check(first_layer.sparse && composed.publish_cpu(first_layer,first_output.data(),first_output.size()) &&
+          composed.indexed_rows(1,3)==2,"earlier native layer publishes complete output and owns its index");
+    auto later_layer=composed.execute(x.frame(0,65,1,1,7));
+    std::vector<float> later_output(65*24*256,-43);
+    check(later.chunks==std::vector<int64_t>({2,32,32}) && !later_layer.sparse &&
+          later_layer.reason==dense_reason::attention && !later_layer.staged_output,
+          "later native layer fails after one successful internal chunk without a staged lease");
+    check(!composed.publish_cpu(later_layer,later_output.data(),later_output.size()) &&
+          std::all_of(later_output.begin(),later_output.end(),[](float value){return value==-43;}) &&
+          !composed.publish_cpu(first_layer,first_output.data(),first_output.size()),
+          "failed layer publishes nothing; subsequent execute invalidates the earlier lease");
+    composed.invalidate(1,invalidation::shift);
+    check(composed.indexed_rows(1,3)==-1 && composed.indexed_rows(1,7)==-1 &&
+          !composed.execute(x.frame(2,1,1,1,3)).sparse,
+          "graph failure invalidation clears every layer and bars continuation in the old epoch");
+    check(composed.begin_request(1,2,runtime_backend::cpu),"fresh epoch reopens composed request");
+    composed.set_cpu_attention_for_test(nullptr,nullptr);
+    auto fresh3=composed.execute(x.frame(0,2,1,2,3));
+    auto fresh7=composed.execute(x.frame(0,2,1,2,7));
+    check(fresh3.sparse && fresh7.sparse && composed.indexed_rows(1,3)==2 &&
+          composed.indexed_rows(1,7)==2,"fresh epoch rebuilds both native layer histories from zero");
     auto changed=maps("maps-b");check(late.replace_maps(changed),"validated map replacement accepted");
     check(!late.execute(x.frame(2,1,1,2)).sparse,"map replacement invalidates existing request history");
     late.begin_request(1,3,runtime_backend::cpu);auto rebound=x.frame(0,1,1,3);
@@ -115,6 +158,13 @@ int main() {
     fixture ties(513);for(int i=0;i<513;++i){std::fill(ties.k.begin()+i*4*256,ties.k.begin()+(i+1)*4*256,0);const int pool=(i%512)/4;const int axis=pool>=124?pool-124:pool/2;ties.k[i*4*256+64+axis]=1;}
     runtime ambiguous(maps(),o);ambiguous.begin_request(1,1,runtime_backend::cpu);
     auto tie=ambiguous.execute(ties.frame(0,513));
-    check(!tie.sparse && tie.reason==dense_reason::ambiguous_selection && !tie.staged_output,"visible ambiguous Ward cluster returns original dense without publishing earlier chunks");
+    check(tie.sparse && tie.reason==dense_reason::none && ambiguous.indexed_rows(1,3)==513,
+          "author-rank tie resolution retains the visible 512-key cluster");
+    std::vector<float> tied_output(513*24*256,-44);
+    check(ambiguous.publish_cpu(tie,tied_output.data(),tied_output.size()),
+          "resolved tie publishes a complete CPU attention lease");
+    bool tied_oracle=true;
+    for(int i=0;i<513;++i) tied_oracle &= std::fabs(tied_output[i*24*256]-float(i)/2)<1e-6f;
+    check(tied_oracle,"all visible keys with zero physical QK return causal uniform-V mean through tied boundary");
     std::printf("RESULT runtime failures=%d\n",failures);return failures?1:0;
 }

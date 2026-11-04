@@ -1,11 +1,16 @@
 #include "llama-lsa-runtime-impl.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
 
 namespace llama_lsa {
+using phase_clock = std::chrono::steady_clock;
+static uint64_t phase_us(phase_clock::time_point begin) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(phase_clock::now() - begin).count());
+}
 bool runtime_add(size_t a,size_t b,size_t &o) { if(b>SIZE_MAX-a)return false;o=a+b;return true; }
 bool runtime_mul(size_t a,size_t b,size_t &o) { if(b && a>SIZE_MAX/b)return false;o=a*b;return true; }
 tensor_view runtime_slice(tensor_view v,int64_t first,int64_t count) {
@@ -157,14 +162,18 @@ runtime_result runtime::impl::execute_cpu(const runtime_frame&f,runtime_request&
     }
     if(!l.cpu.matches(r.epoch,m.identity) || l.cpu.size()!=f.first)return dense(dense_reason::missing_history,"append position/epoch mismatch");
     std::string error;std::vector<float> keys(size_t(n)*index_dimension);
+    const auto key_begin=options.collect_phase_times ? phase_clock::now() : phase_clock::time_point{};
     if(!project_keys(f.logical_k,m,keys.data(),&error))return dense(dense_reason::projection,error);
     if(!l.cpu.append(r.epoch,f.first,keys.data(),n,&error))return dense(dense_reason::projection,error);
+    const uint64_t key_host_us=options.collect_phase_times ? phase_us(key_begin) : 0;
     output.resize(size_t(n)*m.shape.q_heads*m.shape.head_dim);
     std::vector<float> queries(size_t(options.query_chunk)*index_dimension);
     std::vector<int32_t> indices(size_t(options.query_chunk)*capacity,-1),lengths(options.query_chunk),rows;
     attention_stats total_stats{};
+    uint64_t query_host_us=0, attention_host_us=0;
     for(int64_t start=0;start<n;start+=options.query_chunk){
         const int64_t count=std::min<int64_t>(options.query_chunk,n-start);
+        const auto query_begin=options.collect_phase_times ? phase_clock::now() : phase_clock::time_point{};
         if(!project_queries(runtime_slice(f.logical_q,start,count),m,queries.data(),&error))return dense(dense_reason::projection,error);
         std::fill(indices.begin(),indices.end(),-1);
         for(int64_t j=0;j<count;++j){
@@ -172,19 +181,25 @@ runtime_result runtime::impl::execute_cpu(const runtime_frame&f,runtime_request&
             if(rows.size()>size_t(capacity))return dense(dense_reason::capacity,"selection exceeds admitted capacity");
             lengths[j]=int32_t(rows.size());std::copy(rows.begin(),rows.end(),indices.begin()+j*capacity);
         }
+        if(options.collect_phase_times)query_host_us+=phase_us(query_begin);
         attention_args a;a.q=runtime_slice(f.physical_q,start,count);a.k=f.full_k;a.v=f.full_v;
         a.main={indices.data(),lengths.data(),capacity};a.positions=f.positions+start;a.scale=f.scale;a.softcap=f.softcap;
         a.output=output.data()+size_t(start)*m.shape.q_heads*m.shape.head_dim;
         attention_stats chunk_stats{};
         attention_stats * stats=options.collect_stats ? &chunk_stats : nullptr;
+        const auto attention_begin=options.collect_phase_times ? phase_clock::now() : phase_clock::time_point{};
         bool ok=attention ? attention(a,stats,&error,attention_userdata) : selected_attention_cpu(a,stats,&error);
         if(!ok)return dense(dense_reason::attention,error);
+        if(options.collect_phase_times)attention_host_us+=phase_us(attention_begin);
         total_stats.key_rows += chunk_stats.key_rows;
         total_stats.value_rows += chunk_stats.value_rows;
     }
     runtime_result result;result.sparse=true;result.reason=dense_reason::none;result.backend=runtime_backend::cpu;
     result.staged_output=output.data();result.rows=n;result.heads=m.shape.q_heads;result.dim=m.shape.head_dim;
     result.key_rows=total_stats.key_rows;result.value_rows=total_stats.value_rows;
+    result.key_append_host_us=key_host_us;
+    result.query_select_host_us=query_host_us;
+    result.attention_host_us=attention_host_us;
     result.generation=generation;result.owner=this;last=result;return result;
 }
 bool runtime::lease_valid(const runtime_result&r) const {

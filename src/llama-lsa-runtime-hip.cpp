@@ -1,8 +1,13 @@
 #include "llama-lsa-runtime-impl.h"
 #include <hip/hip_runtime_api.h>
 #include <algorithm>
+#include <chrono>
 
 namespace llama_lsa {
+using hip_phase_clock = std::chrono::steady_clock;
+static uint64_t hip_phase_us(hip_phase_clock::time_point begin) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(hip_phase_clock::now() - begin).count());
+}
 struct runtime_hip_scratch {
     int device = -1;
     hipStream_t stream = nullptr;
@@ -93,30 +98,40 @@ runtime_result runtime::impl::execute_hip(const runtime_frame&f,runtime_request&
         r.hip_scratch=std::move(s);r.scratch_admission=scratch_bytes;
     }
     auto &s=*r.hip_scratch;
+    const auto key_begin=options.collect_phase_times ? hip_phase_clock::now() : hip_phase_clock::time_point{};
     auto rc=hip_append(l.hip.get(),r.epoch,f.first,f.logical_k,&error);
     if(rc!=hip_result::success)return dense(classify(rc,dense_reason::projection),error);
     l.hip_rows+=f.logical_k.rows;
+    const uint64_t key_host_us=options.collect_phase_times ? hip_phase_us(key_begin) : 0;
     attention_stats total_stats{};
+    uint64_t query_host_us=0, attention_host_us=0;
     for(int64_t start=0;start<f.logical_q.rows;start+=options.query_chunk) {
         const int64_t count=std::min<int64_t>(options.query_chunk,f.logical_q.rows-start);
+        const auto query_begin=options.collect_phase_times ? hip_phase_clock::now() : hip_phase_clock::time_point{};
         if(hipMemcpyAsync(s.positions,f.positions+start,size_t(count)*sizeof(int32_t),hipMemcpyHostToDevice,s.stream)!=hipSuccess)
             return dense(dense_reason::device,"position upload failed");
         rc=hip_project_queries(l.hip.get(),runtime_slice(f.logical_q,start,count),s.queries,&error);
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::projection),error);
         rc=hip_select(l.hip.get(),r.epoch,s.queries,count,s.positions,options.selection,s.indices,s.lengths,capacity,&error);
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::ambiguous_selection),error);
+        if(options.collect_phase_times)query_host_us+=hip_phase_us(query_begin);
         attention_args a;a.q=runtime_slice(f.physical_q,start,count);a.k=f.full_k;a.v=f.full_v;
         a.main={s.indices,s.lengths,capacity};a.positions=s.positions;a.scale=f.scale;a.softcap=f.softcap;
         a.output=s.output+size_t(start)*m.shape.q_heads*m.shape.head_dim;
         attention_stats chunk_stats{};
+        const auto attention_begin=options.collect_phase_times ? hip_phase_clock::now() : hip_phase_clock::time_point{};
         rc=hip_selected_attention(l.hip.get(),a,options.collect_stats ? &chunk_stats : nullptr,&error);
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::attention),error);
+        if(options.collect_phase_times)attention_host_us+=hip_phase_us(attention_begin);
         total_stats.key_rows+=chunk_stats.key_rows;
         total_stats.value_rows+=chunk_stats.value_rows;
     }
     runtime_result result;result.sparse=true;result.reason=dense_reason::none;result.backend=runtime_backend::hip;
     result.staged_output=s.output;result.rows=f.logical_q.rows;result.heads=m.shape.q_heads;result.dim=m.shape.head_dim;
     result.key_rows=total_stats.key_rows;result.value_rows=total_stats.value_rows;
+    result.key_append_host_us=key_host_us;
+    result.query_select_host_us=query_host_us;
+    result.attention_host_us=attention_host_us;
     result.generation=generation;result.owner=this;result.device=device;result.stream=f.stream;last=result;return result;
 }
 } // namespace llama_lsa
