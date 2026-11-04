@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <utility>
 #include <vector>
 using namespace llama_lsa;
 static int failures=0;
@@ -74,6 +75,72 @@ int main() {
     check(!r.publish_cpu(result,destination.data(),destination.size()),"next execute invalidates prior output lease");
     runtime other(maps(),o);other.begin_request(1,1,runtime_backend::cpu);
     check(!other.publish_cpu(next,destination.data(),destination.size()),"different runtime cannot publish another instance's lease");
+
+    // Keep two requests live at the same positions and alternate their work.
+    // Each result must match an isolated runtime using that request's own KV.
+    fixture request_a(700), request_b(700);
+    for (int row = 0; row < 8; ++row) {
+        std::fill(request_b.k.begin()+row*4*256, request_b.k.begin()+(row+1)*4*256, float(row+3));
+        std::fill(request_b.v.begin()+row*4*256, request_b.v.begin()+(row+1)*4*256, float(100+row));
+    }
+    runtime interleaved(maps(),o);interleaved.begin_request(1,1,runtime_backend::cpu);
+    interleaved.begin_request(2,1,runtime_backend::cpu);
+    auto publish_rows = [&](runtime & owner, const runtime_result & lease, int rows) {
+        std::vector<float> output(size_t(rows)*24*256,-777);
+        const bool published=owner.publish_cpu(lease,output.data(),output.size());
+        return std::pair<bool,std::vector<float>>(published,std::move(output));
+    };
+    auto a_prefix=interleaved.execute(request_a.frame(0,2,1));
+    auto a_prefix_out=publish_rows(interleaved,a_prefix,2);
+    auto b_prefix=interleaved.execute(request_b.frame(0,2,2));
+    auto b_prefix_out=publish_rows(interleaved,b_prefix,2);
+    auto a_decode=interleaved.execute(request_a.frame(2,1,1));
+    auto a_decode_out=publish_rows(interleaved,a_decode,1);
+    runtime isolated_a(maps(),o);isolated_a.begin_request(1,1,runtime_backend::cpu);
+    auto isolated_a_prefix=isolated_a.execute(request_a.frame(0,2,1));
+    auto isolated_a_prefix_out=publish_rows(isolated_a,isolated_a_prefix,2);
+    auto isolated_a_decode=isolated_a.execute(request_a.frame(2,1,1));
+    auto isolated_a_decode_out=publish_rows(isolated_a,isolated_a_decode,1);
+    runtime isolated_b(maps(),o);isolated_b.begin_request(2,1,runtime_backend::cpu);
+    auto isolated_b_prefix=isolated_b.execute(request_b.frame(0,2,2));
+    auto isolated_b_prefix_out=publish_rows(isolated_b,isolated_b_prefix,2);
+    check(a_prefix.sparse && b_prefix.sparse && a_decode.sparse &&
+          isolated_a_prefix.sparse && isolated_a_decode.sparse && isolated_b_prefix.sparse &&
+          a_prefix_out.first && b_prefix_out.first && a_decode_out.first &&
+          isolated_a_prefix_out.first && isolated_a_decode_out.first && isolated_b_prefix_out.first &&
+          a_prefix_out.second==isolated_a_prefix_out.second &&
+          a_decode_out.second==isolated_a_decode_out.second &&
+          b_prefix_out.second==isolated_b_prefix_out.second,
+          "interleaved live requests match isolated A/B/A KV and output oracles");
+
+    // A rejected speculative suffix is removed from the selector history before
+    // different tokens are appended at the same positions. Compare replay with
+    // a fresh runtime that has seen only the retained prefix and replacement.
+    fixture replay_candidate(700), replay_oracle(700);
+    runtime replay(maps(),o);replay.begin_request(1,1,runtime_backend::cpu);
+    runtime fresh_replay(maps(),o);fresh_replay.begin_request(1,1,runtime_backend::cpu);
+    auto candidate_prefix=replay.execute(replay_candidate.frame(0,4));
+    auto oracle_prefix=fresh_replay.execute(replay_oracle.frame(0,4));
+    auto discarded=replay.execute(replay_candidate.frame(4,3));
+    const bool prefix_ok=candidate_prefix.sparse && oracle_prefix.sparse && discarded.sparse &&
+        replay.indexed_rows(1,3)==7 && replay.truncate(1,1,4) && replay.indexed_rows(1,3)==4;
+    auto replace_suffix=[](fixture & f) {
+        for(int row=4;row<7;++row) {
+            std::fill(f.q.begin()+row*24*256,f.q.begin()+(row+1)*24*256,float(row+9)/13.0f);
+            std::fill(f.k.begin()+row*4*256,f.k.begin()+(row+1)*4*256,float(row+11)/17.0f);
+            std::fill(f.v.begin()+row*4*256,f.v.begin()+(row+1)*4*256,float(200+row));
+        }
+    };
+    replace_suffix(replay_candidate);replace_suffix(replay_oracle);
+    auto replayed=replay.execute(replay_candidate.frame(4,3));
+    auto fresh_suffix=fresh_replay.execute(replay_oracle.frame(4,3));
+    auto replayed_out=publish_rows(replay,replayed,3);
+    auto fresh_out=publish_rows(fresh_replay,fresh_suffix,3);
+    check(prefix_ok && replayed.sparse && fresh_suffix.sparse &&
+          replay.indexed_rows(1,3)==7 && fresh_replay.indexed_rows(1,3)==7 &&
+          replayed_out.first && fresh_out.first && replayed_out.second==fresh_out.second,
+          "truncate then replayed speculative suffix matches fresh-runtime output oracle");
+
     check(r.begin_request(2,1,runtime_backend::cpu),"different slot has independent request ownership");
     std::vector<float> one(24*256,-42);
     check(!r.publish_cpu(next,one.data(),one.size()) && one[0]==-42,"cross-slot mutation invalidates old lease without destination writes");
