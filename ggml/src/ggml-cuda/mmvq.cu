@@ -2452,9 +2452,20 @@ void ggml_cuda_mul_mat_vec_q(
 
     bool reuse_src1_q8_1 = false;
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+    // GGML_CUDA_Q81_CACHE_WIDE=1 (default OFF): also share the q8_1 activation across MMVQ nodes for every quantized
+    // src0 type and for ne11 in [2, MMVQ_MAX_BATCH_SIZE] (np>1 decode, short verify batches). The q8_1 layout is
+    // independent of src0->type (quantize_row_q8_1_cuda ignores it) and the key already includes ne/nb, so a hit
+    // reads exactly what the skipped quantize would have written. Same in-graph no-overwrite assumption as the
+    // narrow default.
+    static const bool q81_cache_wide = [] {
+        const char * e = getenv("GGML_CUDA_Q81_CACHE_WIDE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool cache_type_ok = q81_cache_wide ? ggml_is_quantized(src0->type) :
+        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0);
+    const bool cache_shape_ok = q81_cache_wide ? (ne11 >= 1 && ne11 <= MMVQ_MAX_BATCH_SIZE) : ne11 == 1;
     const bool cache_eligible = ctx.curr_stream_no == 0 && ids == nullptr &&
-        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0) &&
-        ne11 == 1 && ne12 == 1 && ne13 == 1;
+        cache_type_ok && cache_shape_ok && ne12 == 1 && ne13 == 1;
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     unsigned long long capture_id = 0;
     if (cache_eligible) {
