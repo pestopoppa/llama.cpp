@@ -81,7 +81,9 @@ struct runtime_hip_scratch {
 };
 static bool capture_index_witness(const runtime_options & o,const map_bundle & maps,
                                   const runtime_frame & f,hip_context * context,
-                                  runtime_hip_scratch & s,int64_t start,int64_t row,int64_t capacity,
+                                  const float * device_queries,const int32_t * device_indices,
+                                  const int32_t * device_lengths,hipStream_t stream,
+                                  int64_t start,int64_t row,int64_t capacity,
                                   std::string & error) {
     constexpr int64_t nkeys=5132;
     // The pinned author oracle's default selector uses this exact tuple; the
@@ -96,19 +98,33 @@ static bool capture_index_witness(const runtime_options & o,const map_bundle & m
     std::vector<float> query(index_dimension),keys(size_t(nkeys)*index_dimension);
     std::vector<int32_t> indices(static_cast<size_t>(capacity));
     std::vector<int32_t> length(1);
-    hipError_t rc=hipMemcpyAsync(length.data(),s.lengths+row,sizeof(int32_t),hipMemcpyDeviceToHost,s.stream);
-    if(rc==hipSuccess)rc=hipMemcpyAsync(query.data(),s.queries+row*index_dimension,
-                                        query.size()*sizeof(float),hipMemcpyDeviceToHost,s.stream);
+    if(!device_queries || !device_indices || !device_lengths || !hip_index_keys(context)) {
+        error="witness device buffer missing";return false;
+    }
+    hipError_t rc=hipMemcpyAsync(length.data(),device_lengths+row,sizeof(int32_t),hipMemcpyDeviceToHost,stream);
+    if(rc==hipSuccess)rc=hipMemcpyAsync(query.data(),device_queries+row*index_dimension,
+                                        query.size()*sizeof(float),hipMemcpyDeviceToHost,stream);
     if(rc==hipSuccess)rc=hipMemcpyAsync(keys.data(),hip_index_keys(context),
-                                        keys.size()*sizeof(float),hipMemcpyDeviceToHost,s.stream);
-    if(rc==hipSuccess)rc=hipMemcpyAsync(indices.data(),s.indices+row*capacity,
-                                        indices.size()*sizeof(int32_t),hipMemcpyDeviceToHost,s.stream);
-    if(rc==hipSuccess)rc=hipStreamSynchronize(s.stream); // one extra sync, diagnostic only
+                                        keys.size()*sizeof(float),hipMemcpyDeviceToHost,stream);
+    if(rc==hipSuccess)rc=hipMemcpyAsync(indices.data(),device_indices+row*capacity,
+                                        indices.size()*sizeof(int32_t),hipMemcpyDeviceToHost,stream);
+    if(rc==hipSuccess)rc=hipStreamSynchronize(stream); // one extra sync, diagnostic only
     if(rc!=hipSuccess){error="witness HIP copy/sync failed";return false;}
     if(length[0]<0 || length[0]>capacity){error="witness selection length out of bounds";return false;}
     indices.resize(size_t(length[0]));
     for(int32_t i:indices)if(i<0 || i>=nkeys){error="witness selected index out of bounds";return false;}
     return write_witness_file(o,maps,f,length[0],capacity,query,keys,indices,error);
+}
+bool hip_capture_index_witness_for_test(const runtime_options & o,const map_bundle & maps,
+                                        const runtime_frame & f,hip_context * context,
+                                        const float * queries,const int32_t * indices,
+                                        const int32_t * lengths,void * stream,
+                                        int64_t capacity,std::string & error) {
+    if(f.logical_q.rows!=1 || !f.positions || f.positions[0]!=5131 || f.first!=5131) {
+        error="test witness frame mismatch";return false;
+    }
+    return capture_index_witness(o,maps,f,context,queries,indices,lengths,
+                                 reinterpret_cast<hipStream_t>(stream),0,0,capacity,error);
 }
 void runtime_destroy_hip(hip_context*c){hip_destroy(c);}
 void runtime_destroy_scratch(runtime_hip_scratch*s){delete s;}
@@ -205,7 +221,8 @@ runtime_result runtime::impl::execute_hip(const runtime_frame&f,runtime_request&
            f.first<=5131 && f.first+f.logical_q.rows>5131) {
             const int64_t row=5131-f.first-start;
             if(row>=0 && row<count &&
-               !capture_index_witness(options,maps,f,l.hip.get(),s,start,row,capacity,error))
+               !capture_index_witness(options,maps,f,l.hip.get(),s.queries,s.indices,s.lengths,
+                                      s.stream,start,row,capacity,error))
                 return dense(dense_reason::device,error);
         }
         if(options.collect_phase_times)query_host_us+=hip_phase_us(query_begin);

@@ -202,14 +202,19 @@ target and does not inspect model outputs.
 The `test-lsa-native-hip-live --run-index-witness-synthetic /absolute/new/file`
 mode is an explicit GPU-only prerequisite for a future model witness. It uses
 one synthetic causal query and 5132 keys, copies projected query/K and the
-ordered selected row from the same HIP context, verifies selected-attention
-output against the CPU implementation, and atomically publishes an `LSAWIT1`
-file. Its fixed `a`/`b`/`c` digests identify synthetic model/map/map-source
+ordered selected row from the same HIP context through the **same capture and
+publication helper** called by the runtime, verifies selected-attention output
+against the CPU implementation, and atomically publishes an `LSAWIT1` file.
+It invokes the helper again and requires a stable file hash on no-clobber failure.
+Its fixed `a`/`b`/`c` digests identify synthetic model/map/map-source
 placeholders only. Replay it with the comparator and the pinned author oracle
 using `--model-sha256` as 64 `a` characters, `--map-sha256` as 64 `b` characters,
 and `--map-source-sha256` as 64 `c` characters. Default test invocation still
 skips without touching HIP. An existing destination makes publication fail
 without replacement. This mode has not been built or run in this preparation.
+It does not exercise the graph's environment-variable admission path or prove
+that an actual model request is the approved development prompt; those remain
+separate live-graph and runner gates.
 
 `llama-lsa-runtime` is a separate target above `llama-lsa-native`; the native
 module never links back to it. New files are `llama-lsa-runtime.{h,cpp}`, the

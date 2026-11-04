@@ -51,4 +51,11 @@ bool runtime_add(size_t a, size_t b, size_t & out);
 bool runtime_mul(size_t a, size_t b, size_t & out);
 bool runtime_view(const tensor_view & view, int64_t rows, int heads, int dim, bool floating_only);
 tensor_view runtime_slice(tensor_view view, int64_t first, int64_t count);
+// Test-only narrow seam: the synthetic HIP unit passes its actual selector
+// buffers through the same capture/write helper used by execute_hip.
+bool hip_capture_index_witness_for_test(const runtime_options & options, const map_bundle & maps,
+                                        const runtime_frame & frame, hip_context * context,
+                                        const float * queries, const int32_t * indices,
+                                        const int32_t * lengths, void * stream,
+                                        int64_t capacity, std::string & error);
 } // namespace llama_lsa

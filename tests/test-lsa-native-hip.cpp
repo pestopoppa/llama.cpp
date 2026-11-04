@@ -1,21 +1,18 @@
 #include "llama-lsa-native-hip.h"
+#include "llama-lsa-runtime-impl.h"
 #include "ggml-quants.h"
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
-#include <array>
-#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <fstream>
-#include <fcntl.h>
 #include <limits>
 #include <string>
 #include <thread>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -423,17 +420,6 @@ void author_tied_fixture(const char * path) {
     hip_destroy(c);
 }
 
-bool witness_write_all(int fd, const void * data, size_t bytes) {
-    const char * p = static_cast<const char *>(data);
-    while (bytes) {
-        const ssize_t n = ::write(fd, p, bytes);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
-        p += n; bytes -= size_t(n);
-    }
-    return true;
-}
-
 // One bounded, model-free same-state selector witness. The three fixed digests
 // identify a synthetic fixture only; the receipt binds source/build separately.
 void index_witness_synthetic(const char * destination) {
@@ -462,19 +448,12 @@ void index_witness_synthetic(const char * destination) {
          "pinned author default selection budget");
     success(hip_select(c, 1, projected.data, 1, position.data, budget,
                        selected.data, length.data, capacity, &error), error);
-    // Copy exactly the projected query, *this context's* projected key cache,
-    // and its ordered selected row. No second projection or forward is used.
-    std::vector<float> query(64), keys(size_t(nk) * 64);
-    std::vector<int32_t> indices(capacity); int32_t nselected = -1;
-    checked(hipMemcpyAsync(query.data(), projected.data, query.size() * 4, hipMemcpyDeviceToHost, nullptr));
-    checked(hipMemcpyAsync(keys.data(), hip_index_keys(c), keys.size() * 4, hipMemcpyDeviceToHost, nullptr));
-    checked(hipMemcpyAsync(indices.data(), selected.data, indices.size() * 4, hipMemcpyDeviceToHost, nullptr));
-    checked(hipMemcpyAsync(&nselected, length.data, 4, hipMemcpyDeviceToHost, nullptr));
-    checked(hipStreamSynchronize(nullptr));
+    // Read the row for the independent CPU selected-attention output check.
+    // The payload itself is copied by the exact runtime capture helper below.
+    const int32_t nselected = length.get()[0];
     need(nselected >= 0 && nselected <= capacity, "synthetic selected length bound");
+    std::vector<int32_t> indices = selected.get();
     indices.resize(size_t(nselected));
-    for (float value : query) need(std::isfinite(value), "finite synthetic projected query");
-    for (float value : keys) need(std::isfinite(value), "finite synthetic projected keys");
     for (int32_t row : indices) need(row >= 0 && row < nk, "synthetic selected index bound");
 
     // Exact selected-attention output must also agree with the independent CPU
@@ -494,29 +473,25 @@ void index_witness_synthetic(const char * destination) {
     success(hip_selected_attention(c, gpu, nullptr, &error), error);
     close(output.get(), expected, 3e-5f, "same-state synthetic selected attention output");
 
-    std::string temp = std::string(destination) + ".tmp.XXXXXX";
-    std::vector<char> temp_path(temp.begin(), temp.end()); temp_path.push_back('\0');
-    const int fd = ::mkstemp(temp_path.data());
-    need(fd >= 0, "create synthetic witness temporary file");
-    const char magic[8] = {'L','S','A','W','I','T','1','\0'};
-    const std::array<uint32_t, 9> fields = {5132U, 4612U, uint32_t(nselected), 3U, 5131U,
-                                             4096U, 1024U, 512U, 4U};
-    const std::array<uint64_t, 2> request = {0U, 1U};
-    const std::string model(64, 'a'), map(64, 'b'), map_source(64, 'c');
-    bool ok = ::fchmod(fd, 0600) == 0 &&
-        witness_write_all(fd, magic, sizeof(magic)) &&
-        witness_write_all(fd, fields.data(), sizeof(fields)) &&
-        witness_write_all(fd, request.data(), sizeof(request)) &&
-        witness_write_all(fd, model.data(), 64) && witness_write_all(fd, map.data(), 64) &&
-        witness_write_all(fd, map_source.data(), 64) &&
-        witness_write_all(fd, query.data(), query.size() * sizeof(float)) &&
-        witness_write_all(fd, keys.data(), keys.size() * sizeof(float)) &&
-        witness_write_all(fd, indices.data(), indices.size() * sizeof(int32_t));
-    if (ok) ok = ::fsync(fd) == 0;
-    if (::close(fd) != 0) ok = false;
-    if (ok) ok = ::link(temp_path.data(), destination) == 0;
-    (void) ::unlink(temp_path.data());
-    need(ok, "atomic no-clobber synthetic witness publication");
+    map_bundle bundle;
+    bundle.shape = maps.shape; bundle.model_identity = "synthetic-only";
+    bundle.source_sha256 = std::string(64, 'c');
+    runtime_options options;
+    options.index_witness_path = destination;
+    options.witness_model_sha256 = std::string(64, 'a');
+    options.witness_map_sha256 = std::string(64, 'b');
+    runtime_frame frame;
+    frame.slot = 0; frame.epoch = 1; frame.layer = 3; frame.first = 5131;
+    frame.positions = &host_position; frame.logical_q.rows = 1;
+    need(hip_capture_index_witness_for_test(options, bundle, frame, c,
+                                            projected.data, selected.data, length.data,
+                                            nullptr, capacity, error), error.c_str());
+    std::string before, after;
+    need(sha256_file(destination, before), "hash published synthetic witness");
+    need(!hip_capture_index_witness_for_test(options, bundle, frame, c,
+                                             projected.data, selected.data, length.data,
+                                             nullptr, capacity, error), "existing witness path fails closed");
+    need(sha256_file(destination, after) && before == after, "existing witness never clobbered");
     hip_destroy(c);
 }
 } // namespace
