@@ -198,6 +198,11 @@ bool llama_lsa_graph_state::prepare(const llama_ubatch & ubatch, const llama_mem
         if (begun) invalidate();
         return false;
     };
+    // Decline hidden-state exports until native LSA compatibility is validated.
+    // This also excludes unrelated exporters; speculation without taps needs its own guard.
+    if (cparams.embeddings_nextn ||
+        std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; }))
+        return decline();
     if (!selector || !main_decoder || !adapters_compatible || !cparams.causal_attn || cparams.dca_chunk_size > 0 ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
         cparams.pipeline_parallel || ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 ||
