@@ -107,6 +107,8 @@ llama_lsa_graph_state::llama_lsa_graph_state(const llama_model & model, const ll
     if (trace_path && trace_path[0] == '/') {
         trace_file = std::fopen(trace_path, "a");
         if (trace_file) {
+            const char * trace_mode = std::getenv("LLAMA_LSA_NATIVE_TRACE_MODE");
+            trace_light = trace_mode && std::strcmp(trace_mode, "light") == 0;
             std::fprintf(trace_file, "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"admission_attempt\"}\n");
             std::fflush(trace_file);
         }
@@ -159,7 +161,7 @@ llama_lsa_graph_state::llama_lsa_graph_state(const llama_model & model, const ll
     options.max_keys = int64_t(max_keys);
     options.max_new_tokens = int64_t(max_new_tokens);
     options.max_requests = 1;
-    options.collect_stats = trace_file != nullptr;
+    options.collect_stats = trace_file != nullptr && !trace_light;
     options.max_host_bytes = size_t(max_host_bytes);
     options.max_device_bytes = size_t(max_device_bytes);
     options.selection.top_k = int(top_k);
@@ -264,13 +266,16 @@ void llama_lsa_graph_state::record_graph(ggml_cgraph * graph) {
         const uint64_t fallback = ggml_lsa_native_fallback_count(op);
         uint64_t dense_visible_rows = 0;
         for (int32_t pos : positions) dense_visible_rows += uint64_t(pos + 1) * 24;
+        const std::string key_rows = trace_light ? "null" : std::to_string(selected_key_rows[layer]);
+        const std::string value_rows = trace_light ? "null" : std::to_string(selected_value_rows[layer]);
         std::fprintf(trace_file,
-            "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"layer_complete\",\"sequence\":%d,\"slot\":0,\"epoch\":%llu,\"first\":%lld,\"count\":%zu,\"layer\":%d,\"backend\":\"%s\",\"native_success\":%d,\"original_flash_fallback_count\":%llu,\"selected_key_rows\":%llu,\"selected_value_rows\":%llu,\"dense_visible_rows\":%llu,\"model_sha256\":\"%s\",\"map_sha256\":\"%s\"",
+            "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"layer_complete\",\"sequence\":%d,\"slot\":0,\"epoch\":%llu,\"first\":%lld,\"count\":%zu,\"layer\":%d,\"backend\":\"%s\",\"native_success\":%d,\"original_flash_fallback_count\":%llu,\"selected_key_rows\":%s,\"selected_value_rows\":%s,\"dense_visible_rows\":%llu,\"model_sha256\":\"%s\",\"map_sha256\":\"%s\"",
             sequence, (unsigned long long) epoch, (long long) first, positions.size(), layer,
             used_device[layer] ? "hip" : "cpu", native_success[layer] ? 1 : 0,
             (unsigned long long) fallback,
-            (unsigned long long) selected_key_rows[layer], (unsigned long long) selected_value_rows[layer],
+            key_rows.c_str(), value_rows.c_str(),
             (unsigned long long) dense_visible_rows, model_digest.c_str(), map_digest.c_str());
+        if (trace_light) std::fputs(",\"stats_collected\":false", trace_file);
         const auto failure = failures.find(layer);
         if (failure != failures.end()) {
             std::fputs(",\"failure_stage\":", trace_file); trace_json_string(trace_file, failure->second.stage);

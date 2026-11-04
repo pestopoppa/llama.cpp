@@ -51,6 +51,7 @@ private:
     std::map<int, uint64_t> selected_value_rows;
     std::map<int, failure_info> failures;
     FILE * trace_file = nullptr;
+    bool trace_light = false;
     std::vector<int32_t> positions;
     std::vector<int32_t> slots;
     uint64_t epoch = 0;
