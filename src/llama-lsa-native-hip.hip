@@ -215,11 +215,11 @@ __global__ void project(tensor_view v, geometry g, const ggml_bf16_t * map,
         float sq = lanes[0];
         for (int lane = 1; lane < 8; ++lane) sq = __ocml_add_rte_f32(sq, lanes[lane]);
         if (!isfinite(sq)) { report(fault, bad_number); }
-        norm = fmaxf(__ocml_sqrt_rte_f32(sq), 1e-12f);
+        norm = fmaxf(__ocml_sqrt_f32(sq), 1e-12f);
         if (!isfinite(norm)) { report(fault, bad_number); }
     }
     __syncthreads();
-    const float normalized = __ocml_div_rte_f32(values[j], norm);
+    const float normalized = values[j] / norm;
     output[row * index_dimension + j] = query ? normalized : rounded(normalized);
 }
 
