@@ -3,15 +3,19 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <fstream>
+#include <fcntl.h>
 #include <limits>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -418,14 +422,112 @@ void author_tied_fixture(const char * path) {
     timestamp("author_tie_finish");
     hip_destroy(c);
 }
+
+bool witness_write_all(int fd, const void * data, size_t bytes) {
+    const char * p = static_cast<const char *>(data);
+    while (bytes) {
+        const ssize_t n = ::write(fd, p, bytes);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n; bytes -= size_t(n);
+    }
+    return true;
+}
+
+// One bounded, model-free same-state selector witness. The three fixed digests
+// identify a synthetic fixture only; the receipt binds source/build separately.
+void index_witness_synthetic(const char * destination) {
+    constexpr int64_t nk = 5132;
+    constexpr int64_t capacity = 4612;
+    need(destination && destination[0] == '/' && std::strlen(destination) <= 4096,
+         "absolute bounded synthetic witness path");
+    const projection_maps maps = maps_for(24, 4);
+    const auto host_q = samples(24 * 256, 20261104), host_k = samples(size_t(nk) * 4 * 256, 20261105);
+    const auto host_v = samples(host_k.size(), 20261106);
+    device_array<float> dq(host_q), dk(host_k), dv(host_v), projected(64), output(24 * 256);
+    device_array<int32_t> position(std::vector<int32_t>{5131}), selected(capacity), length(1);
+    hip_limits limits{nk, 1, capacity, 0};
+    hip_memory memory{}; std::string error;
+    success(hip_memory_requirements(maps.shape, limits, &memory, &error), error);
+    limits.max_device_bytes = memory.total_device_bytes;
+    hip_context * c = nullptr;
+    witness_gate();
+    success(hip_create(maps, limits, nullptr, &c, &error), error);
+    success(hip_reset(c, 1, maps.identity, &error), error);
+    success(hip_append(c, 1, 0, view(dk.data, GGML_TYPE_F32, nk, 4, 256), &error), error);
+    need(hip_size(c) == nk, "exact synthetic key history");
+    success(hip_project_queries(c, view(dq.data, GGML_TYPE_F32, 1, 24, 256), projected.data, &error), error);
+    const budgets budget{};
+    need(budget.top_k == 4096 && budget.top_p == 1024 && budget.window == 512 && budget.sink == 4,
+         "pinned author default selection budget");
+    success(hip_select(c, 1, projected.data, 1, position.data, budget,
+                       selected.data, length.data, capacity, &error), error);
+    // Copy exactly the projected query, *this context's* projected key cache,
+    // and its ordered selected row. No second projection or forward is used.
+    std::vector<float> query(64), keys(size_t(nk) * 64);
+    std::vector<int32_t> indices(capacity); int32_t nselected = -1;
+    checked(hipMemcpyAsync(query.data(), projected.data, query.size() * 4, hipMemcpyDeviceToHost, nullptr));
+    checked(hipMemcpyAsync(keys.data(), hip_index_keys(c), keys.size() * 4, hipMemcpyDeviceToHost, nullptr));
+    checked(hipMemcpyAsync(indices.data(), selected.data, indices.size() * 4, hipMemcpyDeviceToHost, nullptr));
+    checked(hipMemcpyAsync(&nselected, length.data, 4, hipMemcpyDeviceToHost, nullptr));
+    checked(hipStreamSynchronize(nullptr));
+    need(nselected >= 0 && nselected <= capacity, "synthetic selected length bound");
+    indices.resize(size_t(nselected));
+    for (float value : query) need(std::isfinite(value), "finite synthetic projected query");
+    for (float value : keys) need(std::isfinite(value), "finite synthetic projected keys");
+    for (int32_t row : indices) need(row >= 0 && row < nk, "synthetic selected index bound");
+
+    // Exact selected-attention output must also agree with the independent CPU
+    // implementation on the same physical Q/K/V and selected index order.
+    std::vector<float> expected(24 * 256);
+    attention_args cpu;
+    cpu.q = view(host_q.data(), GGML_TYPE_F32, 1, 24, 256);
+    cpu.k = view(host_k.data(), GGML_TYPE_F32, nk, 4, 256);
+    cpu.v = view(host_v.data(), GGML_TYPE_F32, nk, 4, 256);
+    cpu.main = {indices.data(), &nselected, capacity};
+    const int32_t host_position = 5131;
+    cpu.positions = &host_position; cpu.scale = 0.0625f; cpu.output = expected.data();
+    need(selected_attention_cpu(cpu, nullptr, &error), error.c_str());
+    attention_args gpu = cpu;
+    gpu.q.data = dq.data; gpu.k.data = dk.data; gpu.v.data = dv.data;
+    gpu.main = {selected.data, length.data, capacity}; gpu.positions = position.data; gpu.output = output.data;
+    success(hip_selected_attention(c, gpu, nullptr, &error), error);
+    close(output.get(), expected, 3e-5f, "same-state synthetic selected attention output");
+
+    std::string temp = std::string(destination) + ".tmp.XXXXXX";
+    std::vector<char> temp_path(temp.begin(), temp.end()); temp_path.push_back('\0');
+    const int fd = ::mkstemp(temp_path.data());
+    need(fd >= 0, "create synthetic witness temporary file");
+    const char magic[8] = {'L','S','A','W','I','T','1','\0'};
+    const std::array<uint32_t, 9> fields = {5132U, 4612U, uint32_t(nselected), 3U, 5131U,
+                                             4096U, 1024U, 512U, 4U};
+    const std::array<uint64_t, 2> request = {0U, 1U};
+    const std::string model(64, 'a'), map(64, 'b'), map_source(64, 'c');
+    bool ok = ::fchmod(fd, 0600) == 0 &&
+        witness_write_all(fd, magic, sizeof(magic)) &&
+        witness_write_all(fd, fields.data(), sizeof(fields)) &&
+        witness_write_all(fd, request.data(), sizeof(request)) &&
+        witness_write_all(fd, model.data(), 64) && witness_write_all(fd, map.data(), 64) &&
+        witness_write_all(fd, map_source.data(), 64) &&
+        witness_write_all(fd, query.data(), query.size() * sizeof(float)) &&
+        witness_write_all(fd, keys.data(), keys.size() * sizeof(float)) &&
+        witness_write_all(fd, indices.data(), indices.size() * sizeof(int32_t));
+    if (ok) ok = ::fsync(fd) == 0;
+    if (::close(fd) != 0) ok = false;
+    if (ok) ok = ::link(temp_path.data(), destination) == 0;
+    (void) ::unlink(temp_path.data());
+    need(ok, "atomic no-clobber synthetic witness publication");
+    hip_destroy(c);
+}
 } // namespace
 
 int main(int argc, char ** argv) {
+    const bool index_synthetic = argc == 3 && std::strcmp(argv[1], "--run-index-witness-synthetic") == 0;
     const bool author_tie = argc == 3 && std::strcmp(argv[1], "--run-hip-ward-fixture") == 0;
     const bool target_27b = argc == 2 && std::strcmp(argv[1], "--run-hip-27b") == 0;
     const bool numeric_only = argc == 2 && std::strcmp(argv[1], "--run-hip-numeric") == 0;
     const bool stats_only = argc == 2 && std::strcmp(argv[1], "--run-hip-stats") == 0;
-    if (!author_tie && (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !target_27b && !numeric_only && !stats_only))) {
+    if (!author_tie && !index_synthetic && (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !target_27b && !numeric_only && !stats_only))) {
         std::puts("SKIP: LSA HIP device parity requires explicit --run-hip and externally held resource claims");
         return 77;
     }
@@ -435,6 +537,11 @@ int main(int argc, char ** argv) {
     need(std::strstr(properties.gcnArchName, "gfx90a") != nullptr, "device0 is gfx90a");
     std::printf("device=0 arch=%s pid=%d\n", properties.gcnArchName, getpid());
     std::fflush(stdout);
+    if (index_synthetic) {
+        index_witness_synthetic(argv[2]);
+        std::puts("LSA HIP same-state 5132-key synthetic witness passed");
+        return 0;
+    }
     if (author_tie) {
         author_tied_fixture(argv[2]);
         timestamp("last_finish");

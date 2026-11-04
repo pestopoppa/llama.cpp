@@ -199,6 +199,18 @@ requires the author oracle's exact default budgets `(4096, 1024, 512, 4)` and
 fails closed on any other tuple. This capture has no held-out
 target and does not inspect model outputs.
 
+The `test-lsa-native-hip-live --run-index-witness-synthetic /absolute/new/file`
+mode is an explicit GPU-only prerequisite for a future model witness. It uses
+one synthetic causal query and 5132 keys, copies projected query/K and the
+ordered selected row from the same HIP context, verifies selected-attention
+output against the CPU implementation, and atomically publishes an `LSAWIT1`
+file. Its fixed `a`/`b`/`c` digests identify synthetic model/map/map-source
+placeholders only. Replay it with the comparator and the pinned author oracle
+using `--model-sha256` as 64 `a` characters, `--map-sha256` as 64 `b` characters,
+and `--map-source-sha256` as 64 `c` characters. Default test invocation still
+skips without touching HIP. An existing destination makes publication fail
+without replacement. This mode has not been built or run in this preparation.
+
 `llama-lsa-runtime` is a separate target above `llama-lsa-native`; the native
 module never links back to it. New files are `llama-lsa-runtime.{h,cpp}`, the
 private `llama-lsa-runtime-impl.h`, and optional `llama-lsa-runtime-hip.cpp`.

@@ -16,9 +16,9 @@ spec.loader.exec_module(replay)
 def payload(indices=(4, 2), length=None, budgets=(4096, 1024, 512, 4)):
     if length is None:
         length = len(indices)
-    digest = b"a" * 64
+    model, map_hash, map_source = (c * 64 for c in (b"a", b"b", b"c"))
     head = replay.HEADER.pack(b"LSAWIT1\0", 5132, 4612, length, 3, 5131,
-                              *budgets, 0, 7, digest, digest, digest)
+                              *budgets, 0, 7, model, map_hash, map_source)
     return head + struct.pack("<64f", *([0.0] * 64)) + struct.pack("<328448f", *([0.0] * 328448)) + struct.pack(f"<{len(indices)}i", *indices)
 
 
@@ -46,6 +46,7 @@ class WitnessTests(unittest.TestCase):
             witness = replay.read_witness(path)
             self.assertEqual(witness["indices"], [4, 2])
             self.assertEqual(witness["epoch"], 7)
+            self.assertEqual(witness["map_source_sha256"], "c" * 64)
             path.write_bytes(payload()[:-1])
             with self.assertRaisesRegex(ValueError, "payload length"):
                 replay.read_witness(path)
