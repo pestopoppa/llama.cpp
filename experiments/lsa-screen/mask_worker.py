@@ -1,5 +1,8 @@
 """Slow isolated reference mask worker. Protocol is private to the experimental graph."""
 import os
+import hashlib
+import gzip
+import json
 import math
 import struct
 import sys
@@ -12,6 +15,45 @@ from reference import load_maps, project, select
 ORACLE_TOP_K = 4096
 ORACLE_WINDOW = 512
 ORACLE_SINK = 4
+
+
+def verify_recall_binding(mode, map_path):
+    """Read only the approved development row and its pinned input/map files."""
+    if not os.environ.get('LLAMA_LSA_RECALL_OUT'):
+        return
+    expected_token = '9a6948657870e895f48aabc0f3acc15fdf273ccf66f72345f0a482191dc6a480'
+    expected_map = 'baaa28cb00b4378b3d33e02dc971e2781482d5c4d45e29e9140143bdf7832e65'
+    expected_manifest = 'e5fdb0ff8c64b7891c1ce6c861f099bff613962e1cb7fd24b5f3b66f2d9660dc'
+    if mode != 'pca' or os.environ.get('LLAMA_LSA_RECALL_ITEM') != 'dev-code-00' or \
+            os.environ.get('LLAMA_LSA_RECALL_SPLIT') != 'dev' or \
+            os.environ.get('LLAMA_LSA_RECALL_NOMINAL') != '32768' or \
+            os.environ.get('LLAMA_LSA_RECALL_POSITIONS') != '32767' or \
+            os.environ.get('LLAMA_LSA_RECALL_TOKEN_SHA256') != expected_token or \
+            os.environ.get('LLAMA_LSA_RECALL_MAP_SHA256') != expected_map:
+        raise ValueError('recall configuration is outside frozen development cell')
+    manifest_path = Path(os.environ['LLAMA_LSA_RECALL_MANIFEST'])
+    token_path = Path(os.environ['LLAMA_LSA_RECALL_TOKEN_FILE'])
+    if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected_manifest:
+        raise ValueError('recall cohort manifest digest mismatch')
+    manifest = json.loads(manifest_path.read_text())
+    rows = [r for r in manifest['rows'] if r['id'] == 'dev-code-00' and r['nominal'] == 32768]
+    if len(rows) != 1 or rows[0]['split'] != 'dev' or rows[0]['prompt_n'] != 32768 or \
+            rows[0]['token_ids_sha256'] != expected_token or \
+            token_path.name != Path(rows[0]['token_ids']).name or \
+            hashlib.sha256(gzip.decompress(token_path.read_bytes())).hexdigest() != expected_token:
+        raise ValueError('recall token file does not match frozen development row')
+    if hashlib.sha256(Path(map_path).read_bytes()).hexdigest() != expected_map:
+        raise ValueError('recall PCA map digest mismatch')
+
+
+def verify_recall_request(prompt_ids, token_path):
+    """The request runner must check its exact prompt before sending it."""
+    raw = gzip.decompress(Path(token_path).read_bytes())
+    if hashlib.sha256(raw).hexdigest() != '9a6948657870e895f48aabc0f3acc15fdf273ccf66f72345f0a482191dc6a480':
+        raise ValueError('recall request token source differs from frozen development tokens')
+    ids = json.loads(raw)
+    if not isinstance(prompt_ids, list) or prompt_ids != ids or len(ids) != 32768:
+        raise ValueError('recall request differs from frozen development tokens')
 
 
 def oracle_mass(q, k, position, scale, softcap):
@@ -113,10 +155,12 @@ def main():
     torch.set_num_threads(int(os.environ.get("LSA_THREADS", "1")))
     if sys.argv[1] != "--serve":
         source, dest, layer, mode, map_path = sys.argv[1:]
+        verify_recall_binding(mode, map_path)
         maps = load_maps(map_path, mode) if mode in ("pca", "distilled") else None
         Path(dest).write_bytes(compute(bytearray(Path(source).read_bytes()), layer, mode, maps, oracle_config(mode)))
         return
     mode, map_path = sys.argv[2:]
+    verify_recall_binding(mode, map_path)
     maps = load_maps(map_path, mode) if mode in ("pca", "distilled") else None
     oracle = oracle_config(mode)
     inp, out = sys.stdin.buffer, sys.stdout.buffer

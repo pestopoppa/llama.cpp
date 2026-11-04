@@ -325,6 +325,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     const char * lsa_mode = std::getenv("LLAMA_LSA_SCREEN");
     const bool lsa_target = lsa_mode && *lsa_mode && model.name == "Qwen3.8-27B" && n_layer == 64 && n_head == 24 && n_head_kv == 4 && n_embd_head == 256 && n_rot == 64;
+    if (std::getenv("LLAMA_LSA_RECALL_OUT") && !lsa_target) GGML_ABORT("LSA recall: unsupported model or disabled selector");
+    if (std::getenv("LLAMA_LSA_RECALL_OUT") && ubatch.n_seqs_unq != 1) GGML_ABORT("LSA recall: multi-sequence graph refused");
     if (lsa_target && ubatch.n_seqs_unq != 1 && il == 3) {
         std::fprintf(stderr, "LSA screen: bypassing reference for multi-sequence graph (n_seqs=%u)\n", ubatch.n_seqs_unq);
     }
@@ -377,12 +379,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         // RoPE changes only the prefix; inverse rotation must precede dropping it.
         const bool projected = !std::strcmp(lsa_mode, "pca") || !std::strcmp(lsa_mode, "distilled");
         ggml_tensor * q_f32 = ggml_cast(ctx0, projected ? Qraw : q_attn, GGML_TYPE_F32);
-        ggml_tensor * k_f32 = ggml_cast(ctx0, cached_k, GGML_TYPE_F32);
+        ggml_tensor * k_physical = ggml_cast(ctx0, cached_k, GGML_TYPE_F32);
+        ggml_tensor * k_f32 = k_physical;
         if (projected && inp->self_k_rot) {
             k_f32 = llama_mul_mat_hadamard(ctx0, k_f32, inp->self_k_rot);
         }
         ggml_tensor * selected = ggml_map_custom3(ctx0, mask_f32, q_f32, k_f32,
                                                    lsa_screen_mask, 1, reinterpret_cast<void *>(intptr_t(il)));
+        if (lsa_recall_enabled(kq_scale, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f)) {
+            if (hparams.f_max_alibi_bias != 0.0f) GGML_ABORT("LSA recall: attention bias unsupported");
+            // Selection uses logical Q/K for projected maps; recall uses physical Q/K.
+            ggml_tensor * q_physical = ggml_cast(ctx0, q_attn, GGML_TYPE_F32);
+            selected = ggml_map_custom3(ctx0, selected, q_physical, k_physical,
+                                        lsa_recall_measure, 1, reinterpret_cast<void *>(intptr_t(il)));
+        }
         if (mask->type != GGML_TYPE_F32) selected = ggml_cast(ctx0, selected, mask->type);
         cb(selected, "lsa_screen_mask", il);
         cur = build_attn_mha(q_attn, cached_k, cached_v, nullptr, selected, nullptr, nullptr, kq_scale, il);
