@@ -35,6 +35,12 @@ public:
 
 private:
     bool execute(const ggml_tensor * op, void * stream, bool device);
+    bool trace_failure(int layer, const char * stage, const char * reason, const std::string & detail = {});
+    struct failure_info {
+        std::string stage;
+        std::string reason;
+        std::string detail;
+    };
     llama_lsa::map_bundle maps;
     std::unique_ptr<llama_lsa::runtime> selector;
     std::string model_digest;
@@ -43,6 +49,7 @@ private:
     std::map<int, bool> used_device;
     std::map<int, uint64_t> selected_key_rows;
     std::map<int, uint64_t> selected_value_rows;
+    std::map<int, failure_info> failures;
     FILE * trace_file = nullptr;
     std::vector<int32_t> positions;
     std::vector<int32_t> slots;

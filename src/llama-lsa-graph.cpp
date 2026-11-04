@@ -79,6 +79,16 @@ llama_lsa::tensor_view physical_view(const ggml_tensor * tensor) {
     return { tensor->data, tensor->type, tensor->ne[1], int(tensor->ne[2]), int(tensor->ne[0]),
              tensor->nb[1], tensor->nb[2] };
 }
+
+void trace_json_string(FILE * file, const std::string & value) {
+    std::fputc('"', file);
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') { std::fputc('\\', file); std::fputc(ch, file); }
+        else if (ch < 0x20) { std::fprintf(file, "\\u%04x", unsigned(ch)); }
+        else { std::fputc(ch, file); }
+    }
+    std::fputc('"', file);
+}
 }
 
 bool llama_lsa_text_positions(const llama_ubatch & ubatch) {
@@ -222,6 +232,7 @@ bool llama_lsa_graph_state::prepare(const llama_ubatch & ubatch, const llama_mem
     used_device.clear();
     selected_key_rows.clear();
     selected_value_rows.clear();
+    if (trace_file) failures.clear();
     native_failed = false;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) positions[i] = int32_t(start + i);
     slots = std::move(next_slots);
@@ -254,16 +265,28 @@ void llama_lsa_graph_state::record_graph(ggml_cgraph * graph) {
         uint64_t dense_visible_rows = 0;
         for (int32_t pos : positions) dense_visible_rows += uint64_t(pos + 1) * 24;
         std::fprintf(trace_file,
-            "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"layer_complete\",\"sequence\":%d,\"slot\":0,\"epoch\":%llu,\"first\":%lld,\"count\":%zu,\"layer\":%d,\"backend\":\"%s\",\"native_success\":%d,\"original_flash_fallback_count\":%llu,\"selected_key_rows\":%llu,\"selected_value_rows\":%llu,\"dense_visible_rows\":%llu,\"model_sha256\":\"%s\",\"map_sha256\":\"%s\"}\n",
+            "{\"schema\":\"lsa-native-graph-v1\",\"event\":\"layer_complete\",\"sequence\":%d,\"slot\":0,\"epoch\":%llu,\"first\":%lld,\"count\":%zu,\"layer\":%d,\"backend\":\"%s\",\"native_success\":%d,\"original_flash_fallback_count\":%llu,\"selected_key_rows\":%llu,\"selected_value_rows\":%llu,\"dense_visible_rows\":%llu,\"model_sha256\":\"%s\",\"map_sha256\":\"%s\"",
             sequence, (unsigned long long) epoch, (long long) first, positions.size(), layer,
             used_device[layer] ? "hip" : "cpu", native_success[layer] ? 1 : 0,
             (unsigned long long) fallback,
             (unsigned long long) selected_key_rows[layer], (unsigned long long) selected_value_rows[layer],
             (unsigned long long) dense_visible_rows, model_digest.c_str(), map_digest.c_str());
+        const auto failure = failures.find(layer);
+        if (failure != failures.end()) {
+            std::fputs(",\"failure_stage\":", trace_file); trace_json_string(trace_file, failure->second.stage);
+            std::fputs(",\"failure_reason\":", trace_file); trace_json_string(trace_file, failure->second.reason);
+            std::fputs(",\"failure_detail\":", trace_file); trace_json_string(trace_file, failure->second.detail);
+        }
+        std::fputs("}\n", trace_file);
     }
     std::fflush(trace_file);
     }
     if (native_failed) invalidate();
+}
+
+bool llama_lsa_graph_state::trace_failure(int layer, const char * stage, const char * reason, const std::string & detail) {
+    if (trace_file) failures[layer] = {stage, reason, detail};
+    return false;
 }
 
 bool llama_lsa_graph_state::dispatch(void * userdata, const ggml_tensor * op, void * stream, bool device) noexcept {
@@ -274,34 +297,47 @@ bool llama_lsa_graph_state::dispatch(void * userdata, const ggml_tensor * op, vo
         if (!success) state->native_failed = true;
         return success;
     } catch (...) {
-        if (state) state->native_failed = true;
+        if (state) {
+            state->native_failed = true;
+            if (state->trace_file && op && op->op == GGML_OP_LSA_NATIVE) {
+                try {
+                    int32_t layer;
+                    std::memcpy(&layer, (const char *) op->op_params + 5*sizeof(int32_t), sizeof(layer));
+                    state->trace_failure(layer, "dispatch", "exception");
+                } catch (...) {}
+            }
+        }
         return false;
     }
 }
 
 bool llama_lsa_graph_state::execute(const ggml_tensor * op, void * stream, bool device) {
-    if (!active || native_failed || !selector || !op || op->op != GGML_OP_LSA_NATIVE) return false;
+    if (!op || op->op != GGML_OP_LSA_NATIVE) return false;
     int32_t layer;
     std::memcpy(&layer, (const char *) op->op_params + 5*sizeof(int32_t), sizeof(layer));
     used_device[layer] = device;
     native_success[layer] = false;
     selected_key_rows[layer] = 0;
     selected_value_rows[layer] = 0;
+    if (native_failed) return trace_failure(layer, "dispatch", "cascaded_after_first_failure");
+    if (!active || !selector) return trace_failure(layer, "dispatch", "inactive_or_unadmitted");
     auto it = maps.layers.find(layer);
     if (it == maps.layers.end() || !op->data || !op->src[0] || !op->src[1] || !op->src[2] ||
-        !op->src[4] || !op->src[5]) return false;
+        !op->src[4] || !op->src[5]) return trace_failure(layer, "graph_binding", "missing_map_or_tensor");
     float scale, max_bias, softcap;
     std::memcpy(&scale, op->op_params, sizeof(scale));
     std::memcpy(&max_bias, (const char *) op->op_params + 4, sizeof(max_bias));
     std::memcpy(&softcap, (const char *) op->op_params + 8, sizeof(softcap));
     if (max_bias != 0.0f || op->src[1]->type != GGML_TYPE_Q8_0 ||
-        op->src[2]->type != GGML_TYPE_Q8_0 || op->src[0]->type != GGML_TYPE_F32) return false;
+        op->src[2]->type != GGML_TYPE_Q8_0 || op->src[0]->type != GGML_TYPE_F32)
+        return trace_failure(layer, "flash_contract", "unsupported_flash_parameters_or_types");
     const auto backend = device ? llama_lsa::runtime_backend::hip : llama_lsa::runtime_backend::cpu;
 #ifndef GGML_USE_HIP
-    if (device) return false;
+    if (device) return trace_failure(layer, "backend", "hip_not_built");
 #endif
     if (!begun) {
-        if (first != 0 || !selector->begin_request(0, epoch, backend)) return false;
+        if (first != 0 || !selector->begin_request(0, epoch, backend))
+            return trace_failure(layer, "request", "begin_request_failed");
         begun = true;
     }
     llama_lsa::runtime_frame frame;
@@ -321,18 +357,23 @@ bool llama_lsa_graph_state::execute(const ggml_tensor * op, void * stream, bool 
     frame.softcap = softcap;
     frame.stream = stream;
     auto result = selector->execute(frame);
-    if (!result.sparse || !selector->lease_valid(result)) return false;
+    if (!result.sparse)
+        return trace_failure(layer, "runtime_execute", llama_lsa::dense_reason_name(result.reason), result.detail);
+    if (!selector->lease_valid(result)) return trace_failure(layer, "lease", "invalid_staging_lease");
     selected_key_rows[layer] = result.key_rows;
     selected_value_rows[layer] = result.value_rows;
     const size_t elements = size_t(result.rows) * size_t(result.heads) * size_t(result.dim);
-    if (elements != ggml_nelements(op)) return false;
+    if (elements != ggml_nelements(op)) return trace_failure(layer, "publication", "output_shape_mismatch");
     if (!device) {
         native_success[layer] = selector->publish_cpu(result, static_cast<float *>(op->data), elements);
+        if (!native_success[layer]) return trace_failure(layer, "publication", "cpu_publish_failed");
         return native_success[layer];
     }
 #ifdef GGML_USE_HIP
-    native_success[layer] = hipMemcpyAsync(op->data, result.staged_output, elements*sizeof(float),
-                                          hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream)) == hipSuccess;
+    const hipError_t copy = hipMemcpyAsync(op->data, result.staged_output, elements*sizeof(float),
+                                          hipMemcpyDeviceToDevice, static_cast<hipStream_t>(stream));
+    native_success[layer] = copy == hipSuccess;
+    if (!native_success[layer]) return trace_failure(layer, "publication", "hip_copy_failed", hipGetErrorString(copy));
     return native_success[layer];
 #else
     return false;
