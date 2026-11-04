@@ -107,6 +107,54 @@ static void cache_tests() {
     cache.reset(8, "maps-B");
     check(cache.size() == 0 && cache.buckets().empty() && !cache.matches(7, "maps-A") && cache.matches(8, "maps-B"), "slot reuse and map change clear all native cache state");
 
+
+    // LSA-SCREEN-1: selector-only dense control. top_k/top_p zero disable
+    // bucket contributions; window + sink must preserve the complete causal
+    // prefix through window capacity, then evict only the oldest nonsink row.
+    // Nonrepeating BF16-exact vectors make bucket tie refusal unlikely; if a
+    // tie is unresolved, select() intentionally declines to dense fallback.
+    constexpr int control_rows = 5120;
+    std::vector<float> control_keys((size_t) control_rows * index_dimension);
+    uint32_t state = 0x6d2b79f5u;
+    for (int row = 0; row < control_rows; ++row) {
+        for (int d = 0; d < index_dimension; ++d) {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+            const float x = ((int32_t) (state >> 8) / 8388608.0f);
+            control_keys[(size_t) row * index_dimension + d] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
+        }
+    }
+    index_cache control; control.reset(11, "window-control");
+    check(control.append(11, 0, control_keys.data(), control_rows), "window control builds full-history cache");
+    budgets all_keys; all_keys.top_k = 0; all_keys.top_p = 0; all_keys.window = 4608; all_keys.sink = 4;
+    float control_query[index_dimension] = {};
+    auto expect_support = [&](int32_t position, int32_t start, int32_t count, const char * name) {
+        std::vector<int32_t> selected;
+        bool exact = control.select(11, control_query, position, all_keys, selected);
+        std::vector<int32_t> expected;
+        for (int32_t i = start; i <= position; ++i) expected.push_back(i);
+        for (int32_t i = 0; i < std::min(all_keys.sink, start); ++i) expected.push_back(i);
+        exact &= (int32_t) selected.size() == count && selected == expected;
+        check(exact, name);
+    };
+    expect_support(4607, 0, 4608, "all-keys: top_k=top_p=0 returns every causal key at window capacity");
+    expect_support(4608, 1, 4609, "window boundary preserves causal suffix and sink exactly");
+    expect_support(4611, 4, 4612, "window plus four sinks reaches exact selector capacity");
+    expect_support(4612, 5, 4612, "over-capacity history evicts only oldest nonsink key");
+
+    // A separate full-history control raises both selector budgets above all
+    // visible history. At position 5119, ten complete clusters expose 640
+    // buckets; exact support is all 5,120 causal keys, beyond window+sink.
+    budgets full_history; full_history.top_k = control_rows; full_history.top_p = 640;
+    full_history.window = 4608; full_history.sink = 4;
+    std::vector<int32_t> full_rows;
+    bool full_ok = control.select(11, control_query, control_rows - 1, full_history, full_rows);
+    std::sort(full_rows.begin(), full_rows.end());
+    full_ok &= (int32_t) full_rows.size() == control_rows;
+    for (int32_t i = 0; full_ok && i < control_rows; ++i) full_ok &= full_rows[i] == i;
+    check(full_ok, "all-keys high-budget control selects exact full history beyond window capacity");
+    // The native API writes into std::vector and has no caller-specified output
+    // capacity, so a buffer-capacity failure case is not representable here.
+
     // Paired duplicates and BF16-near-ties exercise simultaneous mutual merges.
     // These are structural tests; author parity requires --reference-fixture.
     for (int profile = 0; profile < 3; ++profile) {
