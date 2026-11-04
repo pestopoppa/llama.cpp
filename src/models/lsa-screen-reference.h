@@ -21,7 +21,8 @@ public:
         const char * worker = std::getenv("LLAMA_LSA_WORKER");
         const char * python = std::getenv("LLAMA_LSA_PYTHON");
         const char * map = std::getenv("LLAMA_LSA_MAP");
-        if (!mode || !worker || !python || (std::strcmp(mode, "all") && std::strcmp(mode, "positional") && !map))
+        if (!mode || !worker || !python || (std::strcmp(mode, "all") && std::strcmp(mode, "positional") &&
+                                         std::strcmp(mode, "oracle_topk") && !map))
             GGML_ABORT("LSA screen: missing configuration");
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) GGML_ABORT("LSA screen: socketpair failed");

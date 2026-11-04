@@ -2,6 +2,8 @@
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache.h"
 #include "lsa-screen-reference.h"
+#include <cmath>
+#include <cstdlib>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -327,8 +329,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         std::fprintf(stderr, "LSA screen: bypassing reference for multi-sequence graph (n_seqs=%u)\n", ubatch.n_seqs_unq);
     }
     if (lsa_target && ubatch.n_seqs_unq == 1) {
-        if (std::strcmp(lsa_mode, "all") && std::strcmp(lsa_mode, "pca") && std::strcmp(lsa_mode, "distilled") && std::strcmp(lsa_mode, "positional")) {
-            GGML_ABORT("LSA screen: mode must be all, pca, distilled or positional");
+        if (std::strcmp(lsa_mode, "all") && std::strcmp(lsa_mode, "pca") && std::strcmp(lsa_mode, "distilled") &&
+            std::strcmp(lsa_mode, "positional") && std::strcmp(lsa_mode, "oracle_topk")) {
+            GGML_ABORT("LSA screen: unrecognized reference mode");
+        }
+        if (!std::strcmp(lsa_mode, "oracle_topk")) {
+            const char * scale_text = std::getenv("LLAMA_LSA_ORACLE_SCALE");
+            const char * cap_text = std::getenv("LLAMA_LSA_ORACLE_SOFTCAP");
+            char * scale_end = nullptr;
+            char * cap_end = nullptr;
+            const float scale = scale_text ? std::strtof(scale_text, &scale_end) : 0.0f;
+            const float cap = cap_text ? std::strtof(cap_text, &cap_end) : -1.0f;
+            const float expected_cap = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+            if (!scale_text || !cap_text || !scale_end || *scale_end || !cap_end || *cap_end ||
+                !std::isfinite(scale) || !std::isfinite(cap) || scale != kq_scale || cap != expected_cap) {
+                GGML_ABORT("LSA oracle: scale/softcap differ from model attention");
+            }
         }
         GGML_ASSERT(cparams.dca_chunk_size == 0 && ubatch.n_seqs_unq == 1 && n_layer == 64);
         GGML_ASSERT(n_head == 24 && n_head_kv == 4 && n_embd_head == 256 && n_rot == 64);
