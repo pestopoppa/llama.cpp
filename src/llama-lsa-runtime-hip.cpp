@@ -2,11 +2,67 @@
 #include <hip/hip_runtime_api.h>
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
 namespace llama_lsa {
 using hip_phase_clock = std::chrono::steady_clock;
 static uint64_t hip_phase_us(hip_phase_clock::time_point begin) {
     return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(hip_phase_clock::now() - begin).count());
+}
+// Diagnostic wire format: magic[8], nine little-endian u32 values (key count,
+// capacity, selected length, layer, position, top_k, top_p, window, sink),
+// slot/epoch as two little-endian u64, then model/map/map-source SHA256 as 64 ASCII
+// hex bytes each, then F32 query[64], F32 keys[key_count][64], I32 indices[length].
+// Native runs are Linux/x86-64 little-endian. The offline reader rejects all
+// other sizes and provenance; this record is not timing or prompt-identity proof.
+static bool hex_digest(const std::string & s) {
+    if (s.size()!=64) return false;
+    for (char c:s) if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) return false;
+    return true;
+}
+static bool write_all(int fd,const void * data,size_t bytes) {
+    const char * p=static_cast<const char*>(data);
+    while(bytes) {const ssize_t n=::write(fd,p,bytes);if(n<0&&errno==EINTR)continue;if(n<=0)return false;p+=n;bytes-=size_t(n);}
+    return true;
+}
+static bool write_witness_file(const runtime_options & o,const map_bundle & maps,
+                               const runtime_frame & f,int32_t length,int64_t capacity,
+                               const std::vector<float> & query,const std::vector<float> & keys,
+                               const std::vector<int32_t> & indices,std::string & error) {
+    if (o.index_witness_path.empty() || o.index_witness_path[0]!='/' ||
+        o.index_witness_path.size()>4096 || !hex_digest(o.witness_model_sha256) ||
+        !hex_digest(o.witness_map_sha256) || !hex_digest(maps.source_sha256)) {
+        error="invalid witness path or digest provenance";return false;
+    }
+    std::string temp=o.index_witness_path+".tmp.XXXXXX";
+    std::vector<char> path(temp.begin(),temp.end());path.push_back('\0');
+    const int fd=::mkstemp(path.data());
+    if(fd<0){error="cannot create witness temporary file";return false;}
+    bool permissions_ok=::fchmod(fd,0600)==0;
+    const char magic[8]={'L','S','A','W','I','T','1','\0'};
+    const std::array<uint32_t,9> fields={5132U,uint32_t(capacity),uint32_t(length),
+        uint32_t(f.layer),5131U,uint32_t(o.selection.top_k),uint32_t(o.selection.top_p),
+        uint32_t(o.selection.window),uint32_t(o.selection.sink)};
+    const std::array<uint64_t,2> request={f.slot,f.epoch};
+    bool ok=permissions_ok && write_all(fd,magic,sizeof(magic)) && write_all(fd,fields.data(),sizeof(fields)) &&
+        write_all(fd,request.data(),sizeof(request)) &&
+        write_all(fd,o.witness_model_sha256.data(),64) && write_all(fd,o.witness_map_sha256.data(),64) &&
+        write_all(fd,maps.source_sha256.data(),64) &&
+        write_all(fd,query.data(),query.size()*sizeof(float)) &&
+        write_all(fd,keys.data(),keys.size()*sizeof(float)) &&
+        write_all(fd,indices.data(),indices.size()*sizeof(int32_t));
+    if(ok)ok=::fsync(fd)==0;
+    if(::close(fd)!=0)ok=false;
+    if(ok)ok=::link(path.data(),o.index_witness_path.c_str())==0; // atomic no-clobber publication
+    (void)::unlink(path.data());
+    if(!ok){error="witness write/sync/publish failed or destination already exists";return false;}
+    return true;
 }
 struct runtime_hip_scratch {
     int device = -1;
@@ -23,6 +79,37 @@ struct runtime_hip_scratch {
         if(restore)(void)hipSetDevice(old);
     }
 };
+static bool capture_index_witness(const runtime_options & o,const map_bundle & maps,
+                                  const runtime_frame & f,hip_context * context,
+                                  runtime_hip_scratch & s,int64_t start,int64_t row,int64_t capacity,
+                                  std::string & error) {
+    constexpr int64_t nkeys=5132;
+    // The pinned author oracle's default selector uses this exact tuple; the
+    // replay calls its unchanged select(query, keys, positions) entry point.
+    if(o.selection.top_k!=4096 || o.selection.top_p!=1024 ||
+       o.selection.window!=512 || o.selection.sink!=4 ||
+       f.layer!=3 || start+row<0 || start+row>=f.logical_q.rows ||
+       f.positions[start+row]!=5131 || hip_size(context)<nkeys ||
+       capacity<=0 || capacity>4612 || row<0) {
+        error="witness target geometry or position mismatch";return false;
+    }
+    std::vector<float> query(index_dimension),keys(size_t(nkeys)*index_dimension);
+    std::vector<int32_t> indices(static_cast<size_t>(capacity));
+    std::vector<int32_t> length(1);
+    hipError_t rc=hipMemcpyAsync(length.data(),s.lengths+row,sizeof(int32_t),hipMemcpyDeviceToHost,s.stream);
+    if(rc==hipSuccess)rc=hipMemcpyAsync(query.data(),s.queries+row*index_dimension,
+                                        query.size()*sizeof(float),hipMemcpyDeviceToHost,s.stream);
+    if(rc==hipSuccess)rc=hipMemcpyAsync(keys.data(),hip_index_keys(context),
+                                        keys.size()*sizeof(float),hipMemcpyDeviceToHost,s.stream);
+    if(rc==hipSuccess)rc=hipMemcpyAsync(indices.data(),s.indices+row*capacity,
+                                        indices.size()*sizeof(int32_t),hipMemcpyDeviceToHost,s.stream);
+    if(rc==hipSuccess)rc=hipStreamSynchronize(s.stream); // one extra sync, diagnostic only
+    if(rc!=hipSuccess){error="witness HIP copy/sync failed";return false;}
+    if(length[0]<0 || length[0]>capacity){error="witness selection length out of bounds";return false;}
+    indices.resize(size_t(length[0]));
+    for(int32_t i:indices)if(i<0 || i>=nkeys){error="witness selected index out of bounds";return false;}
+    return write_witness_file(o,maps,f,length[0],capacity,query,keys,indices,error);
+}
 void runtime_destroy_hip(hip_context*c){hip_destroy(c);}
 void runtime_destroy_scratch(runtime_hip_scratch*s){delete s;}
 bool runtime::impl::hip_truncate_layer(runtime_layer&l,uint64_t epoch,int64_t count) {
@@ -114,6 +201,13 @@ runtime_result runtime::impl::execute_hip(const runtime_frame&f,runtime_request&
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::projection),error);
         rc=hip_select(l.hip.get(),r.epoch,s.queries,count,s.positions,options.selection,s.indices,s.lengths,capacity,&error);
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::ambiguous_selection),error);
+        if(!options.index_witness_path.empty() && f.layer==3 &&
+           f.first<=5131 && f.first+f.logical_q.rows>5131) {
+            const int64_t row=5131-f.first-start;
+            if(row>=0 && row<count &&
+               !capture_index_witness(options,maps,f,l.hip.get(),s,start,row,capacity,error))
+                return dense(dense_reason::device,error);
+        }
         if(options.collect_phase_times)query_host_us+=hip_phase_us(query_begin);
         attention_args a;a.q=runtime_slice(f.physical_q,start,count);a.k=f.full_k;a.v=f.full_v;
         a.main={s.indices,s.lengths,capacity};a.positions=s.positions;a.scale=f.scale;a.softcap=f.softcap;

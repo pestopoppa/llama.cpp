@@ -165,6 +165,14 @@ llama_lsa_graph_state::llama_lsa_graph_state(const llama_model & model, const ll
     options.max_requests = 1;
     options.collect_stats = trace_file != nullptr && !trace_light;
     options.collect_phase_times = trace_phases;
+    // A runner must independently pin and verify the exact development token IDs.
+    // This path is only a capture request, never proof of prompt identity.
+    if (const char * witness = std::getenv("LLAMA_LSA_INDEX_WITNESS")) {
+        if (witness[0] != '/' || std::strlen(witness) > 4096) return;
+        options.index_witness_path = witness;
+        options.witness_model_sha256 = model_digest;
+        options.witness_map_sha256 = map_digest;
+    }
     options.max_host_bytes = size_t(max_host_bytes);
     options.max_device_bytes = size_t(max_device_bytes);
     options.selection.top_k = int(top_k);

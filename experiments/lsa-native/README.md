@@ -168,6 +168,37 @@ the optional CMake build adds build/host validation only.
 
 ## Standalone runtime adapter
 
+### One-row HIP selected-index witness
+
+Set `LLAMA_LSA_INDEX_WITNESS` to a new absolute output path together with the
+existing pinned native manifest to request one diagnostic capture at global
+layer 3, causal query position 5131. The HIP runtime copies the selected row,
+projected query, and the first 5132 projected keys from the same live index
+cache immediately after selection. It admits at most 4612 selected slots and
+publishes a complete binary file atomically without replacing an existing
+path. Capture or publication failure takes the dense failure path. The extra
+HIP stream synchronization and host copies make this **diagnostic only**; no
+latency result from that run is valid. When the variable is unset, no capture
+copies, synchronization, or file operations occur.
+
+The file stores the manifest-verified model and map SHA256 digests, released
+`.pt` map-source SHA256, request slot/epoch, target layer/position, selection budgets, vectors,
+and ordered indices. Replay with
+`python3 experiments/lsa-native/replay_index_witness.py FILE --oracle AUTHOR_PY
+--model-sha256 HEX --map-sha256 HEX --map-source-sha256 HEX`. The reader requires
+the existing pinned author-oracle digest and reports both ordered and set
+parity, retaining both ordered index lists. Exit 0 means exact ordered parity;
+exit 2 means identical membership with different ordering and is **inconclusive**
+until tie behavior and attention-output impact are analyzed; exit 1 means a
+true membership mismatch. The future runner must independently bind the **exact rendered
+development token IDs**, candidate source commit/build identity, and expected
+hashes before accepting this
+file. Setting an environment variable or finding a witness file does not prove
+the request was the approved development prompt or source build. The capture
+requires the author oracle's exact default budgets `(4096, 1024, 512, 4)` and
+fails closed on any other tuple. This capture has no held-out
+target and does not inspect model outputs.
+
 `llama-lsa-runtime` is a separate target above `llama-lsa-native`; the native
 module never links back to it. New files are `llama-lsa-runtime.{h,cpp}`, the
 private `llama-lsa-runtime-impl.h`, and optional `llama-lsa-runtime-hip.cpp`.

@@ -23,6 +23,9 @@ struct runtime_options {
     size_t max_device_bytes = 0; // aggregate across all live request/layer contexts
     bool collect_stats = false; // trace-only; HIP counters synchronize the stream
     bool collect_phase_times = false; // host call intervals only; no new HIP synchronization
+    std::string index_witness_path; // opt-in HIP diagnostic; absolute output path, one layer-3/position-5131 record
+    std::string witness_model_sha256; // copied from the admitted, hashed graph manifest
+    std::string witness_map_sha256;
 };
 struct runtime_frame {
     uint64_t slot = 0, epoch = 0;
