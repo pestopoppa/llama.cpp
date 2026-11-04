@@ -45,6 +45,101 @@ namespace {
 constexpr int pools = cluster_size / 4;
 enum fault_code { no_fault, bad_position, bad_length, bad_index, bad_number, ward_failed, ambiguous_ward };
 
+// Fixed-128 device spelling of the pinned CPU std::sort (libstdc++ introsort).
+// Values remain in masked_cost; only their associated original indices move.
+__device__ bool rank_less(const float * masked_cost, int a, int b) {
+    return masked_cost[a] < masked_cost[b];
+}
+__device__ void rank_swap(int & a, int & b) { const int value = a; a = b; b = value; }
+__device__ void rank_heap_push(int * order, const float * cost, int hole, int top, int value) {
+    int parent = (hole - 1) / 2;
+    while (hole > top && rank_less(cost, order[parent], value)) {
+        order[hole] = order[parent]; hole = parent; parent = (hole - 1) / 2;
+    }
+    order[hole] = value;
+}
+__device__ void rank_heap_adjust(int * order, const float * cost, int hole, int length, int value) {
+    const int top = hole;
+    int child = hole;
+    while (child < (length - 1) / 2) {
+        child = 2 * (child + 1);
+        if (rank_less(cost, order[child], order[child - 1])) --child;
+        order[hole] = order[child]; hole = child;
+    }
+    if ((length & 1) == 0 && child == (length - 2) / 2) {
+        child = 2 * (child + 1);
+        order[hole] = order[child - 1]; hole = child - 1;
+    }
+    rank_heap_push(order, cost, hole, top, value);
+}
+__device__ void rank_heap_sort(int * order, const float * cost, int lo, int hi) {
+    int * data = order + lo;
+    const int length = hi - lo;
+    for (int parent = (length - 2) / 2; parent >= 0; --parent) {
+        const int value = data[parent];
+        rank_heap_adjust(data, cost, parent, length, value);
+    }
+    for (int end = length; end > 1; --end) {
+        const int value = data[end - 1];
+        data[end - 1] = data[0];
+        rank_heap_adjust(data, cost, 0, end - 1, value);
+    }
+}
+__device__ int rank_partition(int * order, const float * cost, int lo, int hi) {
+    const int a = lo + 1, b = lo + (hi - lo) / 2, c = hi - 1;
+    if (rank_less(cost, order[a], order[b])) {
+        if (rank_less(cost, order[b], order[c])) rank_swap(order[lo], order[b]);
+        else if (rank_less(cost, order[a], order[c])) rank_swap(order[lo], order[c]);
+        else rank_swap(order[lo], order[a]);
+    } else if (rank_less(cost, order[a], order[c])) rank_swap(order[lo], order[a]);
+    else if (rank_less(cost, order[b], order[c])) rank_swap(order[lo], order[c]);
+    else rank_swap(order[lo], order[b]);
+    int first = lo + 1, last = hi;
+    while (true) {
+        while (rank_less(cost, order[first], order[lo])) ++first;
+        --last;
+        while (rank_less(cost, order[lo], order[last])) --last;
+        if (first >= last) return first;
+        rank_swap(order[first], order[last]); ++first;
+    }
+}
+__device__ void rank_insert(int * order, const float * cost, int position) {
+    const int value = order[position];
+    int at = position;
+    do {
+        --at;
+        if (!rank_less(cost, value, order[at])) break;
+        order[at + 1] = order[at];
+    } while (at > 0);
+    order[at + 1] = value;
+}
+__device__ void rank_sort_128(int * order, const float * cost) {
+    int stack_lo[16], stack_hi[16], stack_depth[16], pending = 1;
+    stack_lo[0] = 0; stack_hi[0] = pools; stack_depth[0] = 14;
+    while (pending) {
+        --pending;
+        int lo = stack_lo[pending], hi = stack_hi[pending], depth = stack_depth[pending];
+        while (hi - lo > 16) {
+            if (depth == 0) { rank_heap_sort(order, cost, lo, hi); break; }
+            --depth;
+            const int cut = rank_partition(order, cost, lo, hi);
+            stack_lo[pending] = cut; stack_hi[pending] = hi; stack_depth[pending] = depth;
+            ++pending;
+            hi = cut;
+        }
+    }
+    // libstdc++ first sorts 16 with a guarded insertion, then inserts the rest
+    // against its smallest-element sentinel.
+    for (int i = 1; i < 16; ++i) {
+        if (rank_less(cost, order[i], order[0])) {
+            const int value = order[i];
+            for (int at = i; at > 0; --at) order[at] = order[at - 1];
+            order[0] = value;
+        } else rank_insert(order, cost, i);
+    }
+    for (int i = 16; i < pools; ++i) rank_insert(order, cost, i);
+}
+
 hip_result fail(hip_result result, std::string * error, const char * message) {
     if (error) { *error = message; }
     return result;
@@ -262,19 +357,16 @@ __global__ void build_buckets(const float * keys, int64_t first_cluster, bucket 
         costs[t] = cost; best[t] = partner;
         __syncthreads();
         if (t == 0) {
-            nmerge = 0;
-            // Stable insertion sort reproduces ascending kept-pool tie order.
+            // The pinned author ranks all 128 masked costs, including +inf
+            // non-mutual entries, using the CPU unstable argsort profile.
             for (int i = 0; i < pools; ++i) {
-                if (best[i] <= i || best[best[i]] != i) { continue; }
-                int at = nmerge;
-                while (at && costs[merge[at - 1]] > costs[i]) { merge[at] = merge[at - 1]; --at; }
-                merge[at] = i; ++nmerge;
+                if (best[i] <= i || best[best[i]] != i) costs[i] = INFINITY;
+                merge[i] = i;
             }
             const int cutoff = count - buckets_per_cluster;
-            // The author's argsort is not stable at a tied cutoff. Keep a
-            // diagnostic partition but refuse reads that can see this block.
-            if (nmerge > cutoff && costs[merge[cutoff - 1]] == costs[merge[cutoff]]) { ambiguous[cluster] = 1; }
-            nmerge = min(nmerge, cutoff);
+            rank_sort_128(merge, costs);
+            nmerge = 0;
+            while (nmerge < cutoff && isfinite(costs[merge[nmerge]])) ++nmerge;
             if (!nmerge) { report(fault, ward_failed); }
         }
         __syncthreads();

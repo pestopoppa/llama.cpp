@@ -133,10 +133,10 @@ static void cache_tests() {
         partition &= std::all_of(seen.begin(), seen.end(), [](int count) { return count == 1; });
         check(partition, "tie fixtures preserve a capped complete partition in member order");
         if (profile == 2) {
-            check(cache.ambiguous_tie_clusters() == 3, "equal-cost final-round cutoff flags all affected clusters");
-            check(cache.select(10, keys.data(), 511, {}, rows), "invisible ambiguous clusters permit causal window selection");
-            check(!cache.select(10, keys.data(), 512, {}, rows), "visible final-round tie ambiguity requests dense fallback");
-            check(cache.truncate(10, 511) && cache.ambiguous_tie_clusters() == 0, "rollback removes final-round ambiguity flags");
+            check(cache.ambiguous_tie_clusters() == 0, "pinned author full-rank tie ordering resolves all cutoffs");
+            check(cache.select(10, keys.data(), 511, {}, rows), "causal window selection before first completed cluster");
+            check(cache.select(10, keys.data(), 512, {}, rows), "visible tied cluster selects after author-rank resolution");
+            check(cache.truncate(10, 511) && cache.ambiguous_tie_clusters() == 0, "rollback clears tied clusters");
         }
     }
 }
@@ -168,10 +168,9 @@ static void reference_fixture(const char * path) {
         }
     }
     std::printf("AUTHOR_FIXTURE members_exact=%d centroids_tol=%d ambiguous_clusters=%zu\n", members_equal, centroids_equal, cache.ambiguous_tie_clusters());
-    if (!cache.ambiguous_tie_clusters()) {
-        check(members_equal, "unambiguous author fixture bucket members exact");
-        check(centroids_equal, "unambiguous author fixture centroid error <=3e-6");
-    }
+    check(cache.ambiguous_tie_clusters() == 0, "author fixture all tie cutoffs resolved");
+    check(members_equal, "author fixture bucket members exact, including ties");
+    check(centroids_equal, "author fixture centroid error <=3e-6");
     for (uint32_t i = 0; i < nq; ++i) {
         int32_t count;
         if (!read(&count, 4) || count < 0 || count > 4612) { check(false, "bounded author selected count"); return; }
@@ -179,8 +178,7 @@ static void reference_fixture(const char * path) {
         if (!read(expected.data(), count * sizeof(int32_t))) { check(false, "complete author selected rows"); return; }
         std::string error;
         const bool selected = cache.select(1, queries.data() + i * index_dimension, positions[i], {}, actual, &error);
-        if (selected) { check(actual == expected, "author fixture selected indices exact"); }
-        else { check(error.find("tie order ambiguous") != std::string::npos, "ambiguous author ordering triggers explicit dense fallback"); }
+        check(selected && actual == expected, "author fixture selected indices exact, including ties");
     }
     check(input.peek() == std::char_traits<char>::eof(), "author fixture has no trailing bytes");
 }
@@ -276,7 +274,7 @@ static void projection_fixture(const char * path) {
             }
             check(actual == expected, "coupled native projection Ward and selection author indices exact");
         }
-        else { check(error.find("tie order ambiguous") != std::string::npos, "coupled ambiguous author Ward order requests dense fallback"); }
+        else { check(false, "coupled author Ward selection must not decline a resolved tie"); }
     }
     check(input.peek() == std::char_traits<char>::eof(), "projection fixture has no trailing bytes");
 }

@@ -2,6 +2,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -219,17 +220,19 @@ bool cluster(const float * keys, int32_t offset, std::vector<bucket> & result, b
                 if (cost < best_cost[i]) { best_cost[i] = cost; best[i] = j; }
             }
         }
-        std::vector<int> merges;
+        // The pinned author calls argsort over all 128 masked costs, including
+        // non-mutual +inf entries. Its CPU unstable argsort uses std::sort;
+        // sorting only the mutual candidates changes ties at the final cutoff.
+        std::array<std::pair<float, int>, pools> ranked;
         for (int i = 0; i < pools; ++i) {
-            if (best[i] > i && best[best[i]] == i) { merges.push_back(i); }
+            ranked[i] = {best[i] > i && best[best[i]] == i ? best_cost[i] : INFINITY, i};
         }
-        std::stable_sort(merges.begin(), merges.end(), [&](int i, int j) { return best_cost[i] < best_cost[j]; });
+        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        std::vector<int> merges;
+        for (int rank = 0; rank < count - buckets_per_cluster && std::isfinite(ranked[rank].first); ++rank) {
+            merges.push_back(ranked[rank].second);
+        }
         if (merges.empty()) { return false; }
-        if ((int) merges.size() > count - buckets_per_cluster) {
-            const int cutoff = count - buckets_per_cluster;
-            ambiguous |= best_cost[merges[cutoff - 1]] == best_cost[merges[cutoff]];
-            merges.resize(cutoff);
-        }
         for (int i : merges) {
             const int j = best[i];
             for (int d = 0; d < index_dimension; ++d) { sums[i][d] += sums[j][d]; }

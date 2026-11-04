@@ -354,13 +354,78 @@ void optional_stats_fixture() {
     timestamp("stats_finish");
     hip_destroy(c);
 }
+
+void author_tied_fixture(const char * path) {
+    std::ifstream input(path, std::ios::binary);
+    auto read = [&](void * dst, size_t bytes) { return bool(input.read(static_cast<char *>(dst), bytes)); };
+    char magic[8]; uint32_t nk = 0, nq = 0;
+    need(read(magic, 8) && std::memcmp(magic, "LSAFIX1\0", 8) == 0 &&
+         read(&nk, 4) && read(&nq, 4) && nk == 513 && nq == 1, "bounded author tie fixture header");
+    std::vector<float> keys(size_t(nk) * index_dimension), query(index_dimension);
+    int32_t position = -1;
+    std::vector<int32_t> members(buckets_per_cluster * bucket_capacity);
+    std::vector<float> centroids(buckets_per_cluster * index_dimension);
+    need(read(keys.data(), keys.size() * sizeof(float)) && read(query.data(), query.size() * sizeof(float)) &&
+         read(&position, sizeof(position)) && read(members.data(), members.size() * sizeof(int32_t)) &&
+         read(centroids.data(), centroids.size() * sizeof(float)) && position == 512,
+         "complete bounded author tie fixture");
+    int32_t expected_count = -1;
+    need(read(&expected_count, 4) && expected_count >= 0 && expected_count <= 4612,
+         "bounded author tie selected count");
+    std::vector<int32_t> expected(expected_count);
+    need(read(expected.data(), expected.size() * sizeof(int32_t)) &&
+         input.peek() == std::char_traits<char>::eof(), "complete author tie selected rows");
+
+    projection_maps maps;
+    maps.shape = {24, 4, 256, 64}; maps.identity = "pinned-author-ward-tie";
+    maps.q.resize(maps.shape.map_rows() * index_dimension);
+    maps.k.resize(maps.q.size());
+    for (int d = 0; d < index_dimension; ++d) {
+        maps.q[d * index_dimension + d] = ggml_fp32_to_bf16(1.0f);
+        maps.k[d * index_dimension + d] = ggml_fp32_to_bf16(1.0f);
+    }
+    std::vector<float> physical_k(size_t(nk) * 4 * 256, 0.0f), physical_q(24 * 256, 0.0f);
+    for (uint32_t row = 0; row < nk; ++row)
+        for (int d = 0; d < index_dimension; ++d)
+            physical_k[(size_t(row) * 4 * 256) + 64 + d] = keys[size_t(row) * index_dimension + d];
+    for (int d = 0; d < index_dimension; ++d) physical_q[64 + d] = query[d];
+    device_array<float> dk(physical_k), dq(physical_q), projected(index_dimension);
+    device_array<int32_t> dp(std::vector<int32_t>{position}), selected(4612), lengths(1);
+    hip_context * c = nullptr;
+    std::string error;
+    success(hip_create(maps, {nk, 1, 4612}, nullptr, &c, &error), error);
+    witness_gate();
+    success(hip_reset(c, 1, maps.identity, &error), error);
+    timestamp("author_tie_launch");
+    success(hip_append(c, 1, 0, view(dk.data, GGML_TYPE_F32, nk, 4, 256), &error), error);
+    success(hip_project_queries(c, view(dq.data, GGML_TYPE_F32, 1, 24, 256), projected.data, &error), error);
+    std::vector<float> actual_keys(keys.size());
+    checked(hipMemcpy(actual_keys.data(), hip_index_keys(c), keys.size() * sizeof(float), hipMemcpyDeviceToHost));
+    need(actual_keys == keys, "author tie projected keys exact");
+    std::vector<bucket> actual_b(buckets_per_cluster);
+    checked(hipMemcpy(actual_b.data(), hip_index_buckets(c), actual_b.size() * sizeof(bucket), hipMemcpyDeviceToHost));
+    for (int b = 0; b < buckets_per_cluster; ++b) {
+        need(std::equal(actual_b[b].members, actual_b[b].members + bucket_capacity,
+                        members.data() + b * bucket_capacity), "author tie HIP bucket members exact");
+        close({actual_b[b].centroid, actual_b[b].centroid + index_dimension},
+              {centroids.data() + b * index_dimension, centroids.data() + (b + 1) * index_dimension},
+              3e-6f, "author tie HIP centroid tolerance");
+    }
+    success(hip_select(c, 1, projected.data, 1, dp.data, {}, selected.data, lengths.data, 4612, &error), error);
+    need(lengths.get()[0] == expected_count, "author tie HIP selected length");
+    const auto actual = selected.get();
+    need(std::equal(expected.begin(), expected.end(), actual.begin()), "author tie HIP ordered indices exact");
+    timestamp("author_tie_finish");
+    hip_destroy(c);
+}
 } // namespace
 
 int main(int argc, char ** argv) {
+    const bool author_tie = argc == 3 && std::strcmp(argv[1], "--run-hip-ward-fixture") == 0;
     const bool target_27b = argc == 2 && std::strcmp(argv[1], "--run-hip-27b") == 0;
     const bool numeric_only = argc == 2 && std::strcmp(argv[1], "--run-hip-numeric") == 0;
     const bool stats_only = argc == 2 && std::strcmp(argv[1], "--run-hip-stats") == 0;
-    if (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !target_27b && !numeric_only && !stats_only)) {
+    if (!author_tie && (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !target_27b && !numeric_only && !stats_only))) {
         std::puts("SKIP: LSA HIP device parity requires explicit --run-hip and externally held resource claims");
         return 77;
     }
@@ -370,6 +435,12 @@ int main(int argc, char ** argv) {
     need(std::strstr(properties.gcnArchName, "gfx90a") != nullptr, "device0 is gfx90a");
     std::printf("device=0 arch=%s pid=%d\n", properties.gcnArchName, getpid());
     std::fflush(stdout);
+    if (author_tie) {
+        author_tied_fixture(argv[2]);
+        timestamp("last_finish");
+        std::puts("LSA HIP pinned author Ward tie fixture passed");
+        return 0;
+    }
     if (stats_only) {
         optional_stats_fixture();
         std::puts("LSA HIP optional stats output/counter regression passed");
