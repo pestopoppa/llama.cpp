@@ -91,6 +91,9 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+#ifdef LLAMA_LSA_NATIVE
+class llama_lsa_graph_state;
+#endif
 
 // EXL3 weights (GGML_TYPE_EXL3_*): the per-tensor Hadamard vectors that ride on the matmul as
 // extra sources (EXL3-CPU-DESIGN.md). Filled by the model loader, keyed by the weight tensor.
@@ -801,10 +804,17 @@ struct llm_graph_params {
     llm_graph_result * res;
 
     const llama_exl3_aux_map * exl3_aux = nullptr;
+#ifdef LLAMA_LSA_NATIVE
+    llama_lsa_graph_state * lsa_state = nullptr;
+    bool lsa_active = false;
+#endif
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+#ifdef LLAMA_LSA_NATIVE
+        if (lsa_active || other.lsa_active) return false;
+#endif
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1020,6 +1030,10 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_exl3_aux_map     * exl3_aux = nullptr;
+#ifdef LLAMA_LSA_NATIVE
+    llama_lsa_graph_state * lsa_state = nullptr;
+    bool lsa_active = false;
+#endif
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1167,7 +1181,14 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il
+#ifdef LLAMA_LSA_NATIVE
+                  , ggml_tensor * logical_q = nullptr,
+                    ggml_tensor * logical_k = nullptr,
+                    ggml_tensor * positions = nullptr,
+                    ggml_tensor * slots = nullptr
+#endif
+                    ) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1199,7 +1220,14 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il
+#ifdef LLAMA_LSA_NATIVE
+                  , ggml_tensor * logical_q = nullptr,
+                    ggml_tensor * logical_k = nullptr,
+                    ggml_tensor * positions = nullptr,
+                    ggml_tensor * slots = nullptr
+#endif
+                    ) const;
 
     // Dual Chunk Attention over the KV cache (cparams.dca_chunk_size > 0). Takes the UNROPED
     // q/k: it ropes k at pos mod chunk_len (the value stored in the cache) and q three times

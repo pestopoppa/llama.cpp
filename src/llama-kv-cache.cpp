@@ -368,6 +368,9 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate);
+#endif
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -381,6 +384,9 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(seq_id >= 0 && p0 >= 0 && p1 < 0 ? lsa_mutation_kind::suffix_remove : lsa_mutation_kind::invalidate, seq_id, p0);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -449,6 +455,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate, seq_id_dst);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -541,6 +550,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -568,6 +580,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate, seq_id);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -621,6 +636,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate, seq_id);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1126,6 +1144,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+#ifdef LLAMA_LSA_NATIVE
+                lsa_note_mutation(lsa_mutation_kind::invalidate);
+#endif
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -1266,6 +1287,20 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 
     return v_cells[seq_to_stream[seq_id]];
 }
+
+#ifdef LLAMA_LSA_NATIVE
+bool llama_kv_cache::lsa_exact_prefix(llama_seq_id seq_id, int64_t count) const {
+    if (n_stream != 1 || seq_id < 0 || size_t(seq_id) >= seq_to_stream.size() ||
+        seq_to_stream[seq_id] != 0 || count < 0 || count > v_cells[0].size()) return false;
+    const auto & cells = v_cells[0];
+    if (cells.used_max_p1() != uint32_t(count)) return false;
+    for (int64_t i = 0; i < count; ++i) {
+        if (cells.is_empty(uint32_t(i)) || cells.pos_get(uint32_t(i)) != i ||
+            cells.seq_count(uint32_t(i)) != 1 || !cells.seq_has(uint32_t(i), seq_id)) return false;
+    }
+    return true;
+}
+#endif
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
@@ -2236,6 +2271,9 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
+#ifdef LLAMA_LSA_NATIVE
+    lsa_note_mutation(lsa_mutation_kind::invalidate, seq_id);
+#endif
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2890,6 +2928,20 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
 }
+
+#ifdef LLAMA_LSA_NATIVE
+bool llama_kv_cache_context::lsa_physical_slots(std::vector<int32_t> & output) const {
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.n_stream() != 1 || sinfo.strm[0] != 0 || sinfo.idxs[0].empty()) return false;
+    output.clear();
+    output.reserve(sinfo.idxs[0].size());
+    for (uint32_t index : sinfo.idxs[0]) {
+        if (index > INT32_MAX) return false;
+        output.push_back(int32_t(index));
+    }
+    return true;
+}
+#endif
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);

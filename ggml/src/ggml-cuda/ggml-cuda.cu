@@ -2392,6 +2392,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_LSA_NATIVE:
+            if (!ggml_lsa_native_try(dst, ctx.stream(), true)) {
+                ggml_lsa_native_record_fallback(dst);
+                ggml_tensor flash = *dst;
+                flash.op = GGML_OP_FLASH_ATTN_EXT;
+                flash.src[4] = nullptr;
+                ggml_cuda_flash_attn_ext(ctx, &flash);
+            }
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -2606,6 +2615,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_LSA_NATIVE) {
+            return false;
+        }
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
@@ -5256,6 +5269,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_LSA_NATIVE: {
+            ggml_tensor flash = *op;
+            flash.op = GGML_OP_FLASH_ATTN_EXT;
+            flash.src[4] = nullptr;
+            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, &flash);
+        }
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

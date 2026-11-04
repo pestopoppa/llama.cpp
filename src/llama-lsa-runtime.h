@@ -21,6 +21,7 @@ struct runtime_options {
     budgets selection;
     size_t max_host_bytes = 0;   // admission for owned maps, CPU caches and scratch
     size_t max_device_bytes = 0; // aggregate across all live request/layer contexts
+    bool collect_stats = false; // trace-only; HIP counters synchronize the stream
 };
 struct runtime_frame {
     uint64_t slot = 0, epoch = 0;
@@ -52,6 +53,8 @@ struct runtime_result {
     const void * owner = nullptr;
     int device = -1;
     void * stream = nullptr;
+    uint64_t key_rows = 0;   // physical selected K rows read across all query heads
+    uint64_t value_rows = 0; // physical selected V rows read across all query heads
     std::string detail;
 };
 

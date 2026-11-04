@@ -1,4 +1,7 @@
 #include "llama-context.h"
+#ifdef LLAMA_LSA_NATIVE
+#include "llama-lsa-graph.h"
+#endif
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -423,6 +426,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+#ifdef LLAMA_LSA_NATIVE
+        lsa_state = std::make_unique<llama_lsa_graph_state>(model, cparams);
+#endif
     }
 
     // init backends
@@ -509,6 +515,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef LLAMA_LSA_NATIVE
+    if (lsa_state && lsa_state->admitted() && sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    lsa_state.reset();
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1310,6 +1322,9 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return;
     }
+#ifdef LLAMA_LSA_NATIVE
+    if (lsa_state) lsa_state->invalidate();
+#endif
 
     loras.reset(new llama_adapter_loras());
 
@@ -1356,6 +1371,10 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+#ifdef LLAMA_LSA_NATIVE
+    lsa_cvec_seen = true;
+    if (lsa_state) lsa_state->invalidate();
+#endif
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
     sched_need_reserve = true;
@@ -1364,6 +1383,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+#ifdef LLAMA_LSA_NATIVE
+    if (lsa_state && lsa_state->admitted() && sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+#endif
     if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.token != nullptr && ubatch.n_tokens == 1) {
         fprintf(stderr, "process_ubatch: ubatch.token[0]=%d (0x%x) pos=%lld n_tokens=%lld\n",
                 ubatch.token[0], (unsigned) ubatch.token[0], (long long) ubatch.pos[0], (long long) ubatch.n_tokens);
@@ -1526,6 +1550,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+#ifdef LLAMA_LSA_NATIVE
+    if (lsa_state && lsa_state->using_graph()) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+#endif
     if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.n_tokens == 1) {
         const ggml_tensor * tk = res->get_inp_tokens();
         fprintf(stderr, "after compute:  inp_tokens %02x %02x %02x %02x\n",
@@ -1537,6 +1566,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+#ifdef LLAMA_LSA_NATIVE
+    if (lsa_state && lsa_state->using_graph()) {
+        lsa_state->record_graph(res->get_gf());
+    }
+#endif
 #ifdef GGML_CPU_PROF
     const int64_t t_graph = ggml_time_us();
     // DS41-C4: these three spans used to be printed per ubatch and never summed, so they could
@@ -2809,6 +2843,11 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.exl3_aux    =*/ &model.exl3_aux,
+#ifdef LLAMA_LSA_NATIVE
+        /*.lsa_state   =*/ lsa_state.get(),
+        /*.lsa_active  =*/ lsa_state && lsa_state->prepare(ubatch, mctx, cparams, gtype == LLM_GRAPH_TYPE_DEFAULT,
+                                                          loras->empty() && !lsa_cvec_seen),
+#endif
     };
 }
 

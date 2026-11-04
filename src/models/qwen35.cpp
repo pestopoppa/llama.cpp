@@ -326,7 +326,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il
+#ifdef LLAMA_LSA_NATIVE
+                    , Qraw, Kraw, inp_pos, inp->self_k_idxs
+#endif
+                    );
     }
     cb(cur, "attn_pregate", il);
 

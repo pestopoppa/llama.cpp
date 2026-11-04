@@ -137,6 +137,31 @@ endfunction()
 
 option(LLAMA_GLM_DSA_ORACLE_TESTS "llama: build GLM DSA oracle scaffold tests" OFF)
 
+if (LLAMA_LSA_NATIVE)
+    add_executable(test-lsa-graph-integration test-lsa-graph-integration.cpp)
+    target_include_directories(test-lsa-graph-integration PRIVATE ../src)
+    target_link_libraries(test-lsa-graph-integration PRIVATE llama ggml ggml-cpu)
+
+    # Link the established arithmetic and lifecycle fixtures against this
+    # candidate's libllama rather than the standalone experiment libraries.
+    add_executable(test-lsa-native-live test-lsa-native.cpp)
+    target_include_directories(test-lsa-native-live PRIVATE ../src)
+    target_link_libraries(test-lsa-native-live PRIVATE llama ggml ggml-cpu)
+    add_executable(test-lsa-runtime-live test-lsa-runtime.cpp)
+    target_include_directories(test-lsa-runtime-live PRIVATE ../src)
+    target_link_libraries(test-lsa-runtime-live PRIVATE llama ggml ggml-cpu)
+
+    if (GGML_HIP)
+        find_package(hip REQUIRED)
+        add_executable(test-lsa-native-hip-live test-lsa-native-hip.cpp)
+        target_include_directories(test-lsa-native-hip-live PRIVATE ../src ../ggml/src)
+        target_link_libraries(test-lsa-native-hip-live PRIVATE llama ggml ggml-cpu hip::host)
+        add_executable(test-lsa-runtime-hip-live test-lsa-runtime-hip.cpp)
+        target_include_directories(test-lsa-runtime-hip-live PRIVATE ../src ../ggml/src)
+        target_link_libraries(test-lsa-runtime-hip-live PRIVATE llama ggml ggml-cpu hip::host)
+    endif()
+endif()
+
 if (LLAMA_GLM_DSA_ORACLE_TESTS)
     add_executable(test-glm-dsa-top-k-mask test-glm-dsa-top-k-mask.cpp)
     if (LLAMA_TESTS_INSTALL)

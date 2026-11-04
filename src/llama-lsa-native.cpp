@@ -106,6 +106,40 @@ void score_avx512(const float * query, const bucket * buckets, size_t count, flo
 }
 #endif
 
+// Experimental pinned PyTorch CPU profile, requires no contraction.
+float pinned_norm64(const float * x) {
+    volatile float lanes[8] = {};
+    for (int i = 0; i < index_dimension; ++i) {
+        volatile float product = x[i] * x[i];
+        lanes[i % 8] = lanes[i % 8] + product;
+    }
+    volatile float total = lanes[0];
+    for (int i = 1; i < 8; ++i) { total = total + lanes[i]; }
+    return std::sqrt(total);
+}
+
+#if LLAMA_LSA_AVX512
+__attribute__((target("avx512f,avx512bw,avx512bf16")))
+static void dpbf16_dot64(const uint16_t *x, const uint16_t *w, int n, float *out) {
+    __m512 sums[4] = {_mm512_setzero_ps(),_mm512_setzero_ps(),_mm512_setzero_ps(),_mm512_setzero_ps()};
+    for (int base=0; base<n; base+=512) {
+    __m512 acc[4] = {_mm512_setzero_ps(),_mm512_setzero_ps(),_mm512_setzero_ps(),_mm512_setzero_ps()};
+    alignas(64) uint16_t packed[32];
+    for (int k=base;k<std::min(base + 512, n);k+=2) {
+        uint32_t pair; std::memcpy(&pair,x+k,4);
+        auto a = (__m512bh) _mm512_set1_epi32(static_cast<int>(pair));
+        for (int block=0;block<4;++block) {
+            for (int j=0;j<16;++j) { packed[2*j]=w[k*64+block*16+j]; packed[2*j+1]=w[(k+1)*64+block*16+j]; }
+            auto b = (__m512bh) _mm512_load_si512(packed);
+            acc[block] = _mm512_dpbf16_ps(acc[block],a,b);
+        }
+    }
+    for(int i=0;i<4;++i) sums[i] = _mm512_add_ps(sums[i],acc[i]);
+    }
+    for(int i=0;i<4;++i) _mm512_storeu_ps(out+i*16,sums[i]);
+}
+#endif
+
 bool project(const tensor_view & view, const projection_maps & maps, bool query, float * output, std::string * error) {
     if (!maps.valid() || !valid_view(view) || view.dim != maps.shape.head_dim ||
         view.heads != (query ? maps.shape.q_heads : maps.shape.kv_heads) ||
@@ -115,6 +149,15 @@ bool project(const tensor_view & view, const projection_maps & maps, bool query,
     const int group = maps.shape.q_heads / maps.shape.kv_heads;
     std::vector<float> input(n), row(view.dim);
     const auto & map = query ? maps.q : maps.k;
+#if LLAMA_LSA_AVX512
+    if (!cpu_projection_profile_available(maps.shape)) {
+        return fail(error, "pinned CPU BF16 profile unavailable");
+    }
+    std::vector<uint16_t> bf_map(n * index_dimension);
+    std::memcpy(bf_map.data(), map.data(), bf_map.size() * sizeof(uint16_t));
+#else
+    return fail(error, "pinned CPU BF16 profile unavailable");
+#endif
     for (int64_t token = 0; token < view.rows; ++token) {
         std::fill(input.begin(), input.end(), 0.0f);
         for (int head = 0; head < view.heads; ++head) {
@@ -129,12 +172,18 @@ bool project(const tensor_view & view, const projection_maps & maps, bool query,
         for (float & x : input) { x = rounded(x); }
         float * out = output + token * index_dimension;
 #if LLAMA_LSA_AVX512
-        if (cpu_has_avx512()) { project_avx512(input.data(), map.data(), n, out); } else
+        {
+            std::vector<uint16_t> bf_input(n);
+            for (int d = 0; d < n; ++d) {
+                const auto val = ggml_fp32_to_bf16(input[d]);
+                std::memcpy(&bf_input[d], &val, sizeof(uint16_t));
+            }
+            dpbf16_dot64(bf_input.data(), bf_map.data(), n, out);
+        }
 #endif
-        { project_scalar(input.data(), map.data(), n, out); }
         // torch BF16 matmul rounds the result before FP32 normalization.
         for (int d = 0; d < index_dimension; ++d) { out[d] = rounded(out[d]); }
-        const float norm = std::max(std::sqrt(dot(out, out, index_dimension)), 1e-12f);
+        const float norm = std::max(pinned_norm64(out), 1e-12f);
         for (int d = 0; d < index_dimension; ++d) { out[d] = query ? out[d] / norm : rounded(out[d] / norm); }
     }
     return true;
@@ -244,6 +293,17 @@ bool projection_maps::valid() const {
 bool budgets::valid() const { return top_k >= 0 && top_p >= 0 && window >= cluster_size && sink >= 0; }
 
 bucket::bucket() { std::fill(members, members + bucket_capacity, -1); }
+
+const char * cpu_projection_profile() { return "torch-2.13-cpu-bf16-k512-norm8"; }
+bool cpu_projection_profile_available(const geometry & shape) {
+#if LLAMA_LSA_AVX512
+    __builtin_cpu_init();
+    return shape.valid() && (shape.map_rows() % 2) == 0 && cpu_has_avx512() && __builtin_cpu_supports("avx512bf16");
+#else
+    (void) shape;
+    return false;
+#endif
+}
 
 bool cpu_has_avx512() {
 #if LLAMA_LSA_AVX512

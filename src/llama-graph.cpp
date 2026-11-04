@@ -1,4 +1,7 @@
 #include "llama-graph.h"
+#ifdef LLAMA_LSA_NATIVE
+#include "llama-lsa-graph.h"
+#endif
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1653,6 +1656,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     exl3_aux         (params.exl3_aux),
+#ifdef LLAMA_LSA_NATIVE
+    lsa_state        (params.lsa_state),
+    lsa_active       (params.lsa_active),
+#endif
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2791,7 +2798,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il
+#ifdef LLAMA_LSA_NATIVE
+               , ggml_tensor * logical_q,
+                 ggml_tensor * logical_k,
+                 ggml_tensor * positions,
+                 ggml_tensor * slots
+#endif
+                 ) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2824,10 +2838,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+#ifdef LLAMA_LSA_NATIVE
+        if (lsa_active && lsa_state && logical_q && logical_k && positions && slots && lsa_state->layer_enabled(il)) {
+            cur = ggml_lsa_native(ctx0, cur, logical_q, logical_k, positions, slots,
+                                  il, llama_lsa_graph_state::dispatch, lsa_state);
+        }
+#endif
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         // A unified KV cache puts the tokens of all sequences of the ubatch into one stream. Tell the backend how many
         // sequences share the query rows, so that it can iterate the KV cells of each sequence separately. The hint is
@@ -3065,7 +3085,14 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il
+#ifdef LLAMA_LSA_NATIVE
+          , ggml_tensor * logical_q,
+            ggml_tensor * logical_k,
+            ggml_tensor * positions,
+            ggml_tensor * slots
+#endif
+            ) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -3101,7 +3128,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il
+#ifdef LLAMA_LSA_NATIVE
+                                      , logical_q, logical_k, positions, slots
+#endif
+                                      );
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

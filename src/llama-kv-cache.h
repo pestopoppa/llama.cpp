@@ -173,6 +173,18 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+#ifdef LLAMA_LSA_NATIVE
+    enum class lsa_mutation_kind { none, suffix_remove, invalidate };
+    struct lsa_mutation {
+        uint64_t generation = 0;
+        lsa_mutation_kind kind = lsa_mutation_kind::none;
+        llama_seq_id seq_id = -1;
+        llama_pos from = -1;
+    };
+    lsa_mutation lsa_last_mutation() const { return lsa_change; }
+    bool lsa_exact_prefix(llama_seq_id seq_id, int64_t count) const;
+#endif
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -254,6 +266,15 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+#ifdef LLAMA_LSA_NATIVE
+    void lsa_note_mutation(lsa_mutation_kind kind, llama_seq_id seq_id = -1, llama_pos from = -1) {
+        ++lsa_change.generation;
+        lsa_change.kind = kind;
+        lsa_change.seq_id = seq_id;
+        lsa_change.from = from;
+    }
+    lsa_mutation lsa_change;
+#endif
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -445,6 +466,12 @@ public:
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const {
         return kv->get_cells(seq_id);
     }
+
+#ifdef LLAMA_LSA_NATIVE
+    llama_kv_cache::lsa_mutation lsa_last_mutation() const { return kv->lsa_last_mutation(); }
+    bool lsa_exact_prefix(llama_seq_id seq_id, int64_t count) const { return kv->lsa_exact_prefix(seq_id, count); }
+    bool lsa_physical_slots(std::vector<int32_t> & output) const;
+#endif
 
 private:
     llama_memory_status status;

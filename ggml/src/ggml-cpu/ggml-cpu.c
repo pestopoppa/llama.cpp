@@ -2539,6 +2539,27 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_LSA_NATIVE:
+            {
+                GGML_ASSERT(params->wdata && params->wsize >= CACHE_LINE_SIZE);
+                int * use_sparse = (int *) params->wdata;
+                if (params->ith == 0) {
+                    *use_sparse = ggml_lsa_native_try(tensor, NULL, false) ? 1 : 0;
+                    if (!*use_sparse) {
+                        ggml_lsa_native_record_fallback(tensor);
+                    }
+                }
+                ggml_barrier(params->threadpool);
+                if (!*use_sparse) {
+                    struct ggml_tensor flash = *tensor;
+                    flash.op = GGML_OP_FLASH_ATTN_EXT;
+                    flash.src[4] = NULL;
+                    struct ggml_compute_params flash_params = *params;
+                    flash_params.wdata = (char *) params->wdata + CACHE_LINE_SIZE;
+                    flash_params.wsize -= CACHE_LINE_SIZE;
+                    ggml_compute_forward_flash_attn_ext(&flash_params, &flash);
+                }
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -3122,6 +3143,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_LSA_NATIVE:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
@@ -3682,6 +3707,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
+                case GGML_OP_LSA_NATIVE:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];
@@ -3697,6 +3723,9 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                        if (node->op == GGML_OP_LSA_NATIVE) {
+                            cur += CACHE_LINE_SIZE;
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

@@ -56,6 +56,41 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_LSA_NATIVE)
+    target_sources(llama PRIVATE
+        llama-lsa-native.cpp
+        llama-lsa-map.cpp
+        llama-lsa-digest.cpp
+        llama-lsa-graph.cpp
+        llama-lsa-runtime.cpp)
+    target_link_libraries(llama PRIVATE ggml-cpu)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+    target_link_libraries(llama PRIVATE OpenSSL::Crypto)
+    # Internal model/context headers contain gated fields; every consumer of
+    # libllama must see the same class layout in this experimental build.
+    target_compile_definitions(llama PUBLIC LLAMA_LSA_NATIVE)
+    if (GGML_HIP)
+        # ggml enables HIP inside its own subdirectory. The libllama HIP
+        # translation unit needs the language and imported host target here.
+        if (AMDGPU_TARGETS AND NOT GPU_TARGETS)
+            set(GPU_TARGETS ${AMDGPU_TARGETS})
+        endif()
+        if (GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
+            set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+        endif()
+        enable_language(HIP)
+        find_package(hip REQUIRED)
+        set_source_files_properties(llama-lsa-native-hip.hip PROPERTIES LANGUAGE HIP)
+        target_sources(llama PRIVATE llama-lsa-native-hip.hip llama-lsa-runtime-hip.cpp)
+        if (CMAKE_HIP_ARCHITECTURES)
+            set_property(TARGET llama PROPERTY HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
+        endif()
+        target_compile_definitions(llama PRIVATE GGML_USE_HIP LLAMA_LSA_RUNTIME_HIP)
+        target_include_directories(llama PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+        target_link_libraries(llama PRIVATE hip::host)
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

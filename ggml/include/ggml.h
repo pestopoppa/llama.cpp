@@ -627,6 +627,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_LSA_NATIVE,
+
         GGML_OP_COUNT,
     };
 
@@ -2484,6 +2486,29 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // Return true only after the complete output has been written or queued on stream.
+    // Returning false delegates to the original flash-attention backend.
+    typedef bool (*ggml_lsa_native_fn)(
+            void *                userdata,
+            const struct ggml_tensor * op,
+            void *                stream,
+            bool                  device);
+
+    GGML_API struct ggml_tensor * ggml_lsa_native(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * flash,
+            struct ggml_tensor  * logical_q,
+            struct ggml_tensor  * logical_k,
+            struct ggml_tensor  * positions,
+            struct ggml_tensor  * slots,
+            int32_t               layer,
+            ggml_lsa_native_fn    callback,
+            void *                userdata);
+
+    GGML_API bool ggml_lsa_native_try(const struct ggml_tensor * op, void * stream, bool device);
+    GGML_API void ggml_lsa_native_record_fallback(struct ggml_tensor * op);
+    GGML_API uint64_t ggml_lsa_native_fallback_count(const struct ggml_tensor * op);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

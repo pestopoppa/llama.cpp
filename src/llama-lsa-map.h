@@ -17,4 +17,5 @@ bool load_map_bundle(const std::string & path, const std::string & model_identit
                      const std::string & expected_source_sha256, map_bundle & output,
                      std::string * error = nullptr);
 std::string map_sha256(const void * data, size_t size);
+bool sha256_file(const std::string & path, std::string & digest);
 }

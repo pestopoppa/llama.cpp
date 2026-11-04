@@ -357,9 +357,10 @@ void optional_stats_fixture() {
 } // namespace
 
 int main(int argc, char ** argv) {
+    const bool target_27b = argc == 2 && std::strcmp(argv[1], "--run-hip-27b") == 0;
     const bool numeric_only = argc == 2 && std::strcmp(argv[1], "--run-hip-numeric") == 0;
     const bool stats_only = argc == 2 && std::strcmp(argv[1], "--run-hip-stats") == 0;
-    if (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !numeric_only && !stats_only)) {
+    if (argc != 2 || (std::strcmp(argv[1], "--run-hip") != 0 && !target_27b && !numeric_only && !stats_only)) {
         std::puts("SKIP: LSA HIP device parity requires explicit --run-hip and externally held resource claims");
         return 77;
     }
@@ -380,11 +381,12 @@ int main(int argc, char ** argv) {
         return 0;
     }
     geometry_fixture(24, 4);
-    geometry_fixture(16, 2);
+    if (!target_27b) geometry_fixture(16, 2);
     stable_tie_fixture();
     numeric_failure_fixture();
     optional_stats_fixture();
     timestamp("last_finish");
-    std::puts("LSA HIP device parity passed (projection, Ward, selection, selected-only F32/BF16/Q8 attention)");
+    std::puts(target_27b ? "LSA HIP 27B-shape synthetic passed" :
+        "LSA HIP device parity passed (projection, Ward, selection, selected-only F32/BF16/Q8 attention)");
     return 0;
 }

@@ -44,6 +44,11 @@ struct projection_maps {
     bool valid() const;
 };
 
+// CPU profile modeled on torch 2.13 CPU BF16: K-block 512 and FP32 norm
+// reduced in 8 lanes. This identifier makes no HIP or other-version claim.
+const char * cpu_projection_profile();
+bool cpu_projection_profile_available(const geometry & shape);
+
 // Inputs MUST be normalized logical Q/K before RoPE and KV quantization rotations.
 // Each output row has 64 FP32 elements; key values are rounded to BF16.
 bool project_queries(const tensor_view & logical_q, const projection_maps & maps,

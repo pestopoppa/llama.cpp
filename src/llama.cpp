@@ -405,6 +405,12 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
+#ifdef LLAMA_LSA_NATIVE
+    if (model && metadata == nullptr && file == nullptr && !path_model.empty() && splits.size() <= 1) {
+        model->lsa_source_path = path_model;
+    }
+#endif
+
     return model;
 }
 

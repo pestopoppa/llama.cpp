@@ -96,6 +96,7 @@ runtime_result runtime::impl::execute_hip(const runtime_frame&f,runtime_request&
     auto rc=hip_append(l.hip.get(),r.epoch,f.first,f.logical_k,&error);
     if(rc!=hip_result::success)return dense(classify(rc,dense_reason::projection),error);
     l.hip_rows+=f.logical_k.rows;
+    attention_stats total_stats{};
     for(int64_t start=0;start<f.logical_q.rows;start+=options.query_chunk) {
         const int64_t count=std::min<int64_t>(options.query_chunk,f.logical_q.rows-start);
         if(hipMemcpyAsync(s.positions,f.positions+start,size_t(count)*sizeof(int32_t),hipMemcpyHostToDevice,s.stream)!=hipSuccess)
@@ -107,11 +108,15 @@ runtime_result runtime::impl::execute_hip(const runtime_frame&f,runtime_request&
         attention_args a;a.q=runtime_slice(f.physical_q,start,count);a.k=f.full_k;a.v=f.full_v;
         a.main={s.indices,s.lengths,capacity};a.positions=s.positions;a.scale=f.scale;a.softcap=f.softcap;
         a.output=s.output+size_t(start)*m.shape.q_heads*m.shape.head_dim;
-        rc=hip_selected_attention(l.hip.get(),a,nullptr,&error);
+        attention_stats chunk_stats{};
+        rc=hip_selected_attention(l.hip.get(),a,options.collect_stats ? &chunk_stats : nullptr,&error);
         if(rc!=hip_result::success)return dense(classify(rc,dense_reason::attention),error);
+        total_stats.key_rows+=chunk_stats.key_rows;
+        total_stats.value_rows+=chunk_stats.value_rows;
     }
     runtime_result result;result.sparse=true;result.reason=dense_reason::none;result.backend=runtime_backend::hip;
     result.staged_output=s.output;result.rows=f.logical_q.rows;result.heads=m.shape.q_heads;result.dim=m.shape.head_dim;
+    result.key_rows=total_stats.key_rows;result.value_rows=total_stats.value_rows;
     result.generation=generation;result.owner=this;result.device=device;result.stream=f.stream;last=result;return result;
 }
 } // namespace llama_lsa

@@ -590,6 +590,9 @@ struct llama_model {
     llama_exl3_aux_map exl3_aux;
 
     std::string name = "n/a";
+#ifdef LLAMA_LSA_NATIVE
+    std::string lsa_source_path;
+#endif
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

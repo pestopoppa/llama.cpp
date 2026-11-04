@@ -1258,9 +1258,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "LSA_NATIVE",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1376,9 +1377,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "lsa_native(q,k,v)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5661,6 +5663,62 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[3] = mask;
 
     return result;
+}
+
+struct ggml_tensor * ggml_lsa_native(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * flash,
+        struct ggml_tensor  * logical_q,
+        struct ggml_tensor  * logical_k,
+        struct ggml_tensor  * positions,
+        struct ggml_tensor  * slots,
+        int32_t               layer,
+        ggml_lsa_native_fn    callback,
+        void *                userdata) {
+    static_assert(24 + sizeof(callback) + sizeof(userdata) <= 48,
+            "LSA callback binding overlaps fallback counter");
+    static_assert(48 + sizeof(uint64_t) <= GGML_MAX_OP_PARAMS,
+            "LSA fallback counter exceeds ggml op parameters");
+    GGML_ASSERT(flash && flash->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(logical_q && logical_k && positions && slots);
+    GGML_ASSERT(flash->src[4] == NULL);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, flash->type, GGML_MAX_DIMS, flash->ne);
+    result->op = GGML_OP_LSA_NATIVE;
+    memcpy(result->op_params, flash->op_params, 5*sizeof(int32_t));
+    ggml_set_op_params_i32(result, 5, layer);
+    memcpy((char *) result->op_params + 24, &callback, sizeof(callback));
+    memcpy((char *) result->op_params + 24 + sizeof(callback), &userdata, sizeof(userdata));
+    const uint64_t zero = 0;
+    memcpy((char *) result->op_params + 48, &zero, sizeof(zero));
+    for (int i = 0; i < 4; ++i) {
+        result->src[i] = flash->src[i];
+    }
+    result->src[4] = logical_q;
+    result->src[5] = logical_k;
+    result->src[6] = positions;
+    result->src[7] = slots;
+    return result;
+}
+
+bool ggml_lsa_native_try(const struct ggml_tensor * op, void * stream, bool device) {
+    GGML_ASSERT(op && op->op == GGML_OP_LSA_NATIVE);
+    ggml_lsa_native_fn callback = NULL;
+    void * userdata = NULL;
+    memcpy(&callback, (const char *) op->op_params + 24, sizeof(callback));
+    memcpy(&userdata, (const char *) op->op_params + 24 + sizeof(callback), sizeof(userdata));
+    return callback && callback(userdata, op, stream, device);
+}
+
+uint64_t ggml_lsa_native_fallback_count(const struct ggml_tensor * op) {
+    GGML_ASSERT(op && op->op == GGML_OP_LSA_NATIVE);
+    uint64_t count;
+    memcpy(&count, (const char *) op->op_params + 48, sizeof(count));
+    return count;
+}
+
+void ggml_lsa_native_record_fallback(struct ggml_tensor * op) {
+    const uint64_t count = ggml_lsa_native_fallback_count(op) + 1;
+    memcpy((char *) op->op_params + 48, &count, sizeof(count));
 }
 
 

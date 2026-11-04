@@ -16,6 +16,9 @@
 
 struct llama_model;
 class llama_batch_allocr;
+#ifdef LLAMA_LSA_NATIVE
+class llama_lsa_graph_state;
+#endif
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -290,6 +293,10 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+#ifdef LLAMA_LSA_NATIVE
+    std::unique_ptr<llama_lsa_graph_state> lsa_state;
+    bool lsa_cvec_seen = false;
+#endif
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

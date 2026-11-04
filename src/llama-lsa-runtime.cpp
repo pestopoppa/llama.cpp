@@ -136,6 +136,8 @@ runtime_result runtime::execute(const runtime_frame &f) {
        !runtime_view(f.full_k,f.full_k.rows,s.kv_heads,s.head_dim,false) ||
        !runtime_view(f.full_v,f.full_v.rows,s.kv_heads,s.head_dim,false) ||
        !std::isfinite(f.scale) || !std::isfinite(f.softcap) || f.softcap<0)return p->dense(dense_reason::unsupported_layout);
+    if(r.backend==runtime_backend::cpu && !cpu_projection_profile_available(s))
+        return p->dense(dense_reason::projection,"pinned CPU projection profile unavailable; use dense path");
     try {
         auto &l=r.layers[f.layer];if(l.poisoned)return p->dense(dense_reason::missing_history);
         auto result=r.backend==runtime_backend::cpu ? p->execute_cpu(f,r,l,mi->second) : p->execute_hip(f,r,l,mi->second);
@@ -160,6 +162,7 @@ runtime_result runtime::impl::execute_cpu(const runtime_frame&f,runtime_request&
     output.resize(size_t(n)*m.shape.q_heads*m.shape.head_dim);
     std::vector<float> queries(size_t(options.query_chunk)*index_dimension);
     std::vector<int32_t> indices(size_t(options.query_chunk)*capacity,-1),lengths(options.query_chunk),rows;
+    attention_stats total_stats{};
     for(int64_t start=0;start<n;start+=options.query_chunk){
         const int64_t count=std::min<int64_t>(options.query_chunk,n-start);
         if(!project_queries(runtime_slice(f.logical_q,start,count),m,queries.data(),&error))return dense(dense_reason::projection,error);
@@ -172,11 +175,16 @@ runtime_result runtime::impl::execute_cpu(const runtime_frame&f,runtime_request&
         attention_args a;a.q=runtime_slice(f.physical_q,start,count);a.k=f.full_k;a.v=f.full_v;
         a.main={indices.data(),lengths.data(),capacity};a.positions=f.positions+start;a.scale=f.scale;a.softcap=f.softcap;
         a.output=output.data()+size_t(start)*m.shape.q_heads*m.shape.head_dim;
-        bool ok=attention ? attention(a,nullptr,&error,attention_userdata) : selected_attention_cpu(a,nullptr,&error);
+        attention_stats chunk_stats{};
+        attention_stats * stats=options.collect_stats ? &chunk_stats : nullptr;
+        bool ok=attention ? attention(a,stats,&error,attention_userdata) : selected_attention_cpu(a,stats,&error);
         if(!ok)return dense(dense_reason::attention,error);
+        total_stats.key_rows += chunk_stats.key_rows;
+        total_stats.value_rows += chunk_stats.value_rows;
     }
     runtime_result result;result.sparse=true;result.reason=dense_reason::none;result.backend=runtime_backend::cpu;
     result.staged_output=output.data();result.rows=n;result.heads=m.shape.q_heads;result.dim=m.shape.head_dim;
+    result.key_rows=total_stats.key_rows;result.value_rows=total_stats.value_rows;
     result.generation=generation;result.owner=this;last=result;return result;
 }
 bool runtime::lease_valid(const runtime_result&r) const {
