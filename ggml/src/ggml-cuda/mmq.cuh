@@ -1278,6 +1278,9 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // AK-ASM-H8: column-tile (J) selection hint for MUL_MAT_ID. 0 = select J from ncols_max (upstream behaviour).
+    // The grid still spans ncols_max, so correctness never depends on the hint; tiles past an expert's bound exit early.
+    int64_t ncols_tile_hint = 0;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1388,7 +1391,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        const int64_t ncols_sel = args.ncols_tile_hint > 0 ? args.ncols_tile_hint : args.ncols_max;
+        const int ntiles_x = (ncols_sel + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
@@ -1490,6 +1494,11 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * gate = nullptr, ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU);
+
+// AK-ASM-H8: whether MUL_MAT_ID(gate) + MUL_MAT_ID(up) + GLU may run as one MMQ-id call (shared expert sort +
+// shared src1 quantization, gate/up GEMMs, in-place GLU epilogue pass). up/gate/glu are the graph nodes.
+bool ggml_cuda_should_fuse_mmq_id_glu(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, int cc);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
