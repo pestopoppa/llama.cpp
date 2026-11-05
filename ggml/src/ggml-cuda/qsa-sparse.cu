@@ -37,6 +37,13 @@ static int qsa_max_tokens() {
     return v;
 }
 
+// fuse only when n_kv >= ratio * width. Gate r4 (MI210): at n_kv/width = 4 (8k ctx) the fused path lost at
+// n_tokens 1 and 16 (0.78-0.94x) and won 1.0-1.4x elsewhere; at 16 (32k ctx) it won 2.2-4.6x in every cell.
+static int qsa_min_kv_ratio() {
+    static const int v = qsa_env_int("GGML_CUDA_QSA_SPARSE_MIN_KV_RATIO", 8);
+    return v;
+}
+
 static bool qsa_debug() {
     static const bool v = qsa_env_int("GGML_CUDA_QSA_SPARSE_DEBUG", 0) != 0;
     return v;
@@ -139,6 +146,7 @@ struct qsa_params {
     float2     * part_ml;// [n_split][rows]
 
     int     width;
+    int     n_kv;
     int     n_tps;
     int     n_head;
     int     n_head_kv;
@@ -279,7 +287,7 @@ static __global__ void __launch_bounds__(D, 2) k_qsa_sparse_attn(const qsa_param
             int j = -1;
             if (c < c_end) {
                 j = trow[c];
-                const float m = __half2float(mrow[j]);
+                const float m = (j >= 0 && j < p.n_kv) ? __half2float(mrow[j]) : -INFINITY;
                 if (m == -INFINITY) {
                     j = -1; // masked by the base KQ mask: no K read needed
                 } else {
@@ -468,8 +476,22 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (!qsa_match_mask(dst, m)) {
         return false;
     }
-    const ggml_tensor * tk   = m.top_k;
-    const ggml_tensor * mask = m.mask;
+    // the data come from the FA node's own extra sources (set by the model graph): only they are guaranteed
+    // to be alive (allocator) and resident on this backend (scheduler copies) when the FA runs. The mask chain
+    // tensors may already have been overwritten. The chain must name the same tensors (by shape/type/view_src).
+    const ggml_tensor * tk   = dst->src[5];
+    const ggml_tensor * mask = dst->src[6];
+    if (!tk || !mask) {
+        qsa_reject(dst, "FA carries no src[5]/src[6] (top_k, base mask) edge"); return false;
+    }
+    if (!ggml_are_same_shape(tk, m.top_k) || tk->type != m.top_k->type || !ggml_are_same_shape(mask, m.mask) || mask->type != m.mask->type) {
+        qsa_reject(dst, "src[5]/src[6] do not match the mask chain"); return false;
+    }
+    for (int i = 7; i < GGML_MAX_SRC; ++i) {
+        if (dst->src[i]) {
+            qsa_reject(dst, "unexpected extra FA source"); return false;
+        }
+    }
 
     const int64_t D         = q->ne[0];
     const int64_t n_tps     = q->ne[1];
@@ -518,6 +540,9 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (width >= n_kv) {
         qsa_reject(dst, "width >= n_kv (dense is better)"); return false;
     }
+    if ((int64_t) qsa_min_kv_ratio()*width > n_kv) {
+        qsa_reject(dst, "n_kv < GGML_CUDA_QSA_SPARSE_MIN_KV_RATIO * width"); return false;
+    }
     const int max_tok = qsa_max_tokens();
     if (max_tok > 0 && n_tps*n_stream > max_tok) {
         qsa_reject(dst, "GGML_CUDA_QSA_SPARSE_MAX_TOKENS"); return false;
@@ -531,6 +556,7 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     p.top_k    = (const char *) tk->data;
     p.dst      = (float *) dst->data;
     p.width    = (int) width;
+    p.n_kv     = (int) n_kv;
     p.n_tps    = (int) n_tps;
     p.n_head   = (int) n_head;
     p.n_head_kv = (int) n_head_kv;

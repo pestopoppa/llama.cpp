@@ -8899,9 +8899,14 @@ struct test_qsa_sparse_attn : public test_case {
     const int64_t   width;    // top-k width (indexer_top_k + ratio - 1)
     const int64_t   ns;       // streams
     const ggml_type type_KV;
+    const bool      real_layout; // K/V are views of a larger cache (kv_size > n_kv cells per stream), as get_k/get_v give
 
     std::string vars() override {
-        return "qsa=1," + VARS_TO_STR8(hs, nh, nh_kv, kv, nb, width, ns, type_KV);
+        std::string r = "qsa=1," + VARS_TO_STR8(hs, nh, nh_kv, kv, nb, width, ns, type_KV);
+        if (real_layout) {
+            r += ",real_layout=1";
+        }
+        return r;
     }
 
     // compare only the FA output: top_k returns its set in backend-specific order (unordered radix select on HIP),
@@ -8919,8 +8924,8 @@ struct test_qsa_sparse_attn : public test_case {
     }
 
     test_qsa_sparse_attn(int64_t hs = 256, int64_t nh = 24, int64_t nh_kv = 2, int64_t kv = 1024, int64_t nb = 4,
-                         int64_t width = 259, int64_t ns = 1, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), width(width), ns(ns), type_KV(type_KV) {}
+                         int64_t width = 259, int64_t ns = 1, ggml_type type_KV = GGML_TYPE_F16, bool real_layout = false)
+        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), width(width), ns(ns), type_KV(type_KV), real_layout(real_layout) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // q [hs, nh, nb, ns] -> permute as build_attn_mha does
@@ -8929,10 +8934,16 @@ struct test_qsa_sparse_attn : public test_case {
         q = ggml_permute(ctx, q, 0, 2, 1, 3);
 
         // K/V caches: get_k gives [hs, nh_kv, kv, ns] views; build_attn_mha permutes them
-        ggml_tensor * kc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        // real_layout: the cache holds kv_size > n_kv cells per stream and get_k views the first n_kv of each stream
+        const int64_t kv_size = real_layout ? kv + 512 : kv;
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv_size, ns);
         ggml_set_name(kc, "kc");
-        ggml_tensor * vc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        ggml_tensor * vc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv_size, ns);
         ggml_set_name(vc, "vc");
+        if (real_layout) {
+            kc = ggml_view_4d(ctx, kc, hs, nh_kv, kv, ns, kc->nb[1], kc->nb[2], kc->nb[3], 0);
+            vc = ggml_view_4d(ctx, vc, hs, nh_kv, kv, ns, vc->nb[1], vc->nb[2], vc->nb[3], 0);
+        }
         ggml_tensor * k = ggml_permute(ctx, kc, 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(ctx, vc, 0, 2, 1, 3);
 
@@ -8943,7 +8954,7 @@ struct test_qsa_sparse_attn : public test_case {
         ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, score, width));
         top_k = ggml_reshape_4d(ctx, top_k, width, nb, 1, ns);
 
-        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns); // build_attn_qsa requires mask rows == n_tokens (set_rows shape asserts)
         ggml_set_name(kq_mask, "m");
 
         // --- build_attn_qsa mask composition (verbatim)
@@ -8958,6 +8969,9 @@ struct test_qsa_sparse_attn : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, kq_mask_top_k, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        // the edge qwen4exp build_attn_qsa adds (src[5] = top-k indices, src[6] = base mask)
+        out->src[5] = top_k_3d;
+        out->src[6] = kq_mask;
         ggml_set_name(out, "out");
         return out;
     }
@@ -12555,6 +12569,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_qsa_sparse_attn(256, 16, 2, 2048, 8, 300, 1, type_KV)); // G=8
         test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 8192, 1, 2051, 1, type_KV));
+        for (int64_t nb : {1, 5, 64}) {
+            test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 4096, nb, 2051, 1, type_KV, true));
+            test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 4096, nb, 2051, 2, type_KV, true));
+        }
     }
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
