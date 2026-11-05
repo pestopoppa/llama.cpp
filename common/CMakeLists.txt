@@ -141,6 +141,26 @@ if (LLAMA_LLGUIDANCE)
     set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
     set(LLGUIDANCE_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
+    # LLAMA_LLGUIDANCE_SOURCE_DIR: a pinned, pre-vendored llguidance v1.0.1 tree
+    # (crates vendored, .cargo/config.toml redirecting crates-io). When set, the build
+    # copies it and runs cargo --offline --locked: no network, no rustup, reproducible.
+    set(LLAMA_LLGUIDANCE_SOURCE_DIR "" CACHE PATH "pinned vendored llguidance source (offline build)")
+    if (LLAMA_LLGUIDANCE_SOURCE_DIR)
+        if (NOT EXISTS ${LLAMA_LLGUIDANCE_SOURCE_DIR}/Cargo.lock OR NOT EXISTS ${LLAMA_LLGUIDANCE_SOURCE_DIR}/.cargo/config.toml)
+            message(FATAL_ERROR "LLAMA_LLGUIDANCE_SOURCE_DIR must hold Cargo.lock and a vendoring .cargo/config.toml")
+        endif()
+        ExternalProject_Add(llguidance_ext
+            DOWNLOAD_COMMAND ${CMAKE_COMMAND} -E copy_directory ${LLAMA_LLGUIDANCE_SOURCE_DIR} ${LLGUIDANCE_SRC}
+            PREFIX ${CMAKE_BINARY_DIR}/llguidance
+            SOURCE_DIR ${LLGUIDANCE_SRC}
+            BUILD_IN_SOURCE TRUE
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND cargo build --release --offline --locked --package llguidance
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME} ${LLGUIDANCE_PATH}/llguidance.h
+            UPDATE_COMMAND ""
+        )
+    else()
     ExternalProject_Add(llguidance_ext
         GIT_REPOSITORY https://github.com/guidance-ai/llguidance
         # v1.0.1:
@@ -154,6 +174,7 @@ if (LLAMA_LLGUIDANCE)
         BUILD_BYPRODUCTS ${LLGUIDANCE_PATH}/${LLGUIDANCE_LIB_NAME} ${LLGUIDANCE_PATH}/llguidance.h
         UPDATE_COMMAND ""
     )
+    endif()
     target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_LLGUIDANCE)
 
     add_library(llguidance STATIC IMPORTED)
