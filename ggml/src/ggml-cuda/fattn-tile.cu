@@ -35,6 +35,10 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             ggml_cuda_flash_attn_ext_tile_case<128, 128>(ctx, dst);
         } break;
         case 192: {
+            if (V->ne[0] == 192) { // C6-HIP-FA-F16-HS
+                ggml_cuda_flash_attn_ext_tile_case<192, 192>(ctx, dst);
+                break;
+            }
             GGML_ASSERT(V->ne[0] == 128);
             ggml_cuda_flash_attn_ext_tile_case<192, 128>(ctx, dst);
         } break;

@@ -69,6 +69,10 @@ for head_size_kq in HEAD_SIZES_KQ:
     with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
         f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v))
 
+# C6-HIP-FA-F16-HS: extra tile-only (DKQ, DV) pair without an MMA/vec kernel.
+with open("fattn-tile-instance-dkq192-dv192.cu", "w") as f:
+    f.write(SOURCE_FATTN_TILE.format(head_size_kq=192, head_size_v=192))
+
 for type_k in TYPES_KV:
     for type_v in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:

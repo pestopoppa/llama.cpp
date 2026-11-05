@@ -85,6 +85,18 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  64,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  4, 128, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  8, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  4, 128, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  8, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 16, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 32, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
     return 0;
 }
 
@@ -154,6 +166,18 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  32,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  2,  64, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  4, 128, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  8, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  2, 128, 3,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  4, 128, 3,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  8, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 16, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 32, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
     return 0;
 }
 
@@ -232,6 +256,16 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 512, 1, 128,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  4, 128, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  8, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  2, 256, 2, 128,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  4, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  8, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 16, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 32, 256, 2,  32,  64) // C6-HIP-FA-F16-HS
     return 0;
 }
 
@@ -310,6 +344,16 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 4,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 2, 128,  64)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  2,  64, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  4, 128, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256,  8, 256, 2,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 4,  64,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  2,  64, 8,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  4, 128, 6,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192,  8, 128, 6,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 16, 256, 5,  32,  64) // C6-HIP-FA-F16-HS
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(192, 192, 32, 256, 3,  64,  64) // C6-HIP-FA-F16-HS
     return 0;
 }
 
@@ -1288,7 +1332,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             return;
         }
 #endif // GGML_USE_HIP
-        GGML_ABORT("flash-attn tile (320/256): expected GQA ratio multiple of 32");
+        // C6-HIP-FA-F16-HS: no GQA grouping possible (gqa=1, no mask, ALiBi, unpadded KV): generic path below.
     }
 
     if constexpr (DKQ == 576) {
@@ -1312,10 +1356,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV,  8, use_logit_softcap>(ctx, dst);
             return;
         }
-        GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
+        // C6-HIP-FA-F16-HS: fall through to the generic ncols2 <= 8 path below.
     }
 
-    if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+    // C6-HIP-FA-F16-HS: the generic path now covers every head size (192, 320, 512 and 576 included), so
+    // non-GQA-optimizable shapes run on the tile kernel instead of falling back to the CPU.
+    {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;
@@ -1331,10 +1377,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             return;
         }
 
-        if constexpr (DV <= 256) {
-            launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
-            return;
-        }
+        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+        return;
     }
     GGML_ABORT("fatal error");
 }
@@ -1369,6 +1413,7 @@ extern DECL_FATTN_TILE_CASE( 96,  96);
 extern DECL_FATTN_TILE_CASE(112, 112);
 extern DECL_FATTN_TILE_CASE(128, 128);
 extern DECL_FATTN_TILE_CASE(192, 128);
+extern DECL_FATTN_TILE_CASE(192, 192);
 extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(320, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);

@@ -519,6 +519,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    bool force_tile = false; // C6-HIP-FA-F16-HS
+
     switch (K->ne[0]) {
         case  40:
         case  64:
@@ -532,23 +536,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+        // C6-HIP-FA-F16-HS: the MMA kernels for 192/320/512/576 need a fixed GQA grouping. Shapes where it
+        // cannot apply (gqa=1, no mask, ALiBi, unpadded KV, non-dividing ratio, 192/192) run on the
+        // generic tile kernel (ncols2 = 1/2/4/8 path) for an f16 KV cache instead of returning NONE.
         case 192:
-            if (V->ne[0] != 128 || !gqa_opt_applies) {
+            if (V->ne[0] == 192) {
+                force_tile = true; // tile-only instance; no softcap variant compiled for DV=192
+                if (logit_softcap != 0.0f) {
+                    return BEST_FATTN_KERNEL_NONE;
+                }
+                break;
+            }
+            if (V->ne[0] != 128) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 8 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            if (GGML_CUDA_CC_IS_AMD(cc) && Q->ne[1] * int64_t(gqa_ratio_eff) > 256) {
-                return BEST_FATTN_KERNEL_NONE;
+            if (!gqa_opt_applies || gqa_ratio % 8 != 0 ||
+                (GGML_CUDA_CC_IS_AMD(cc) && Q->ne[1] * int64_t(gqa_ratio_eff) > 256)) {
+                force_tile = true;
             }
             break;
         case 320:
-            if (V->ne[0] != 256 || !gqa_opt_applies) {
+            if (V->ne[0] != 256) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 32 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+            if (!gqa_opt_applies || gqa_ratio % 32 != 0) {
+                force_tile = true;
             }
             break;
         case 512:
@@ -556,7 +568,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                force_tile = true;
             }
             break;
         case 576:
@@ -564,7 +576,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                force_tile = true;
             }
             break;
         default:
@@ -583,6 +595,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (force_tile) {
+        // C6-HIP-FA-F16-HS: scope is the f16 KV cache only.
+        if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
