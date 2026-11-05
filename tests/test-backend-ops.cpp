@@ -11111,10 +11111,10 @@ static void akh1_add_q8_skinny_eval_cases(std::vector<std::unique_ptr<test_case>
         }
     }
     for (int64_t n = 2; n <= 17; ++n) {  // every template instance, plus the 4/17 edges that must fall back
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 2112, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 2304, {1, 1}, {1, 1}));
     }
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 129, 7, 96, {1, 1}, {1, 1}));  // ne00 % 64 != 0
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 8, 64, {1, 1}, {1, 1}));  // ksplit == 1
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 129, 7, 2112, {1, 1}, {1, 1}));  // ne00 % 256 != 0 -> fallback
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, 8, 256, {1, 1}, {1, 1}));  // ksplit == 1, row tail
 }
 
 static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
