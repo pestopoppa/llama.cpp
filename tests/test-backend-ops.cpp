@@ -8885,6 +8885,93 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// AK-ASM-H12: the Q38FN (qwen4exp) QSA attention composition, exactly as src/models/qwen4exp.cpp
+// build_qsa_top_k (tail) + build_attn_qsa + build_attn_mha build it: indexer scores -> top_k -> -inf
+// mask with the top-k cells unmasked (fill/set_rows/add) -> masked dense FLASH_ATTN_EXT. The CPU
+// reference runs that dense composition; ggml-cuda matches the mask chain at the FA node and runs the
+// fused sparse gather + GQA attention kernel (qsa-sparse.cu) unless GGML_CUDA_QSA_SPARSE=0.
+struct test_qsa_sparse_attn : public test_case {
+    const int64_t   hs;       // head size (K = V)
+    const int64_t   nh;       // q heads
+    const int64_t   nh_kv;    // kv heads
+    const int64_t   kv;       // n_kv cells
+    const int64_t   nb;       // query tokens per stream
+    const int64_t   width;    // top-k width (indexer_top_k + ratio - 1)
+    const int64_t   ns;       // streams
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return "qsa=1," + VARS_TO_STR8(hs, nh, nh_kv, kv, nb, width, ns, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // the dense composition's matmul cost (what the fused kernel avoids)
+        return 2 * nh * nb * (hs + hs) * kv * ns;
+    }
+
+    test_qsa_sparse_attn(int64_t hs = 256, int64_t nh = 24, int64_t nh_kv = 2, int64_t kv = 1024, int64_t nb = 4,
+                         int64_t width = 259, int64_t ns = 1, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), width(width), ns(ns), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q [hs, nh, nb, ns] -> permute as build_attn_mha does
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nh, nb, ns);
+        ggml_set_name(q, "q");
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+
+        // K/V caches: get_k gives [hs, nh_kv, kv, ns] views; build_attn_mha permutes them
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        ggml_set_name(kc, "kc");
+        ggml_tensor * vc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        ggml_set_name(vc, "vc");
+        ggml_tensor * k = ggml_permute(ctx, kc, 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, vc, 0, 2, 1, 3);
+
+        // indexer token scores (already expanded per cell and biased)
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kv, nb, ns);
+        ggml_set_name(score, "score");
+
+        ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, score, width));
+        top_k = ggml_reshape_4d(ctx, top_k, width, nb, 1, ns);
+
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(kq_mask, "m");
+
+        // --- build_attn_qsa mask composition (verbatim)
+        ggml_tensor * kq_mask_all = ggml_fill(ctx, kq_mask, -INFINITY);
+        kq_mask_all = ggml_view_4d(ctx, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx, zeros, 0.0f);
+        ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx, kq_mask_all, zeros, top_k_3d);
+        kq_mask_top_k = ggml_view_4d(ctx, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+        kq_mask_top_k = ggml_add(ctx, kq_mask_top_k, kq_mask);
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, kq_mask_top_k, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (t->op == GGML_OP_NONE && t->type != GGML_TYPE_I32 && strcmp(t->name, "score") == 0) {
+                // distinct scores: the top-k set must not depend on tie-breaking
+                init_tensor_uniform(t, -100.0f, 100.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // G10 (INF-48): a test_flash_attn_ext that carries a stable id in its case name (",g10=NN" appended to vars()), so the imported
 // upstream cases can be selected in isolation with `-p 'g10='` (or one at a time with `-p 'g10=07$'`) and parsed per case.
 // Behaviour is otherwise identical to test_flash_attn_ext (prec is always GGML_PREC_F32, as in every imported upstream case).
@@ -12453,6 +12540,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // AK-ASM-H12: QSA-shaped wide top-k (radix select on HIP) and the fused QSA sparse attention composition
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 4, 1, 1}, 2051));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 2, 1, 2}, 2051));
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 33}) {
+            test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 1024, nb,  259, 1, type_KV));
+            test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 4096, nb, 2051, 1, type_KV));
+            test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 4096, nb, 2051, 2, type_KV));
+        }
+        test_cases.emplace_back(new test_qsa_sparse_attn(256, 16, 2, 2048, 8, 300, 1, type_KV)); // G=8
+        test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 8192, 1, 2051, 1, type_KV));
+    }
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -12915,6 +13014,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // AK-ASM-H12: Q38FN QSA layer attention at ctx 8k/32k (heads 24/2, hd256, width = top_k 2048 + ratio 4 - 1).
+    // A/B: GGML_CUDA_QSA_SPARSE=1 (fused sparse) vs =0 (dense masked FA); both arms include the top-k + mask chain.
+    for (int64_t kv : {8192, 32768}) {
+        for (int64_t nb : {1, 4, 16, 512}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, kv, nb, 2051, 1, type_KV));
+            }
+        }
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {kv, 512, 1, 1}, 2051));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {kv, 1, 1, 1}, 2051));
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;

@@ -24,6 +24,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/qsa-sparse.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2391,7 +2392,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+            // AK-ASM-H12: QSA top-k masked FA -> fused sparse gather + attention (GGML_CUDA_QSA_SPARSE=0 disables)
+            if (!ggml_cuda_qsa_sparse_try(ctx, dst)) {
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5219,7 +5223,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
-            return op->src[0]->ne[0] <= 1024;
+            // AK-ASM-H12: wide TOP_K rows use the radix select (top-k.cu)
+            return op->src[0]->ne[0] <= 1024 ||
+                (op->op == GGML_OP_TOP_K && ggml_cuda_top_k_radix_enabled() && ggml_is_contiguous(op->src[0]));
 #else
             return true;
 #endif
