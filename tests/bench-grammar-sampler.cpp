@@ -26,6 +26,7 @@
 //        [--logits-model FULL_GGUF --threads 24 --temp 0.8]   (adds profile "real")
 #include "llama.h"
 #include "json-schema-to-grammar.h"
+#include "sampling.h"   // SPEC-GRAM.3: llama_sampler_init_llg (LLAMA_LLGUIDANCE=ON builds only)
 
 #include <nlohmann/json.hpp>
 
@@ -57,6 +58,7 @@ struct bench_args {
     std::string schema_file;
     std::string out = "bench-grammar-sampler.jsonl";
     std::string kinds = "toolcall-eager,toolcall-lazy,schema-eager";
+    std::string llg_lark;   // SPEC-GRAM.3: lark grammar (same language as --grammar-file) for kind toolcall-eager-llg
     std::string profiles = "peaked,random";
     std::string batches = "1,5";
     double step_ms = 0.0;       // decode step of the model on its serving device (ms/token), for the share; 0 = report absolute ms only
@@ -119,6 +121,15 @@ static llama_sampler * make_chain(uint32_t seed, float temp) {
 }
 
 static llama_sampler * make_grammar(const llama_vocab * vocab, const std::string & gbnf, const char * root, bool lazy) {
+    if (gbnf.rfind("%llguidance", 0) == 0) {   // SPEC-GRAM.3 arm: llguidance matcher, mask computed per state (no reject path of its own)
+#ifdef LLAMA_USE_LLGUIDANCE
+        (void) root; (void) lazy;
+        return llama_sampler_init_llg(vocab, "lark", gbnf.c_str());
+#else
+        fprintf(stderr, "this build has no llguidance (LLAMA_LLGUIDANCE=OFF)\n");
+        exit(3);
+#endif
+    }
     if (!lazy) {
         return llama_sampler_init_grammar(vocab, gbnf.c_str(), root);
     }
@@ -331,6 +342,7 @@ int main(int argc, char ** argv) {
         else if (k == "--logits-model") { a.logits_model = next(); }
         else if (k == "--threads")      { a.threads = atoi(next().c_str()); }
         else if (k == "--temp")         { a.temp = (float) atof(next().c_str()); }
+        else if (k == "--llg-lark")     { a.llg_lark = next(); }
         else { fprintf(stderr, "unknown arg %s\n", k.c_str()); return 2; }
     }
     if (a.model.empty() || a.grammar_file.empty()) {
@@ -466,7 +478,10 @@ int main(int argc, char ** argv) {
         const bool lazy = kind == "toolcall-lazy";
         const bool schema = kind == "schema-eager";
         if (schema && gbnf_schema.empty()) { printf("skip %s: no --schema-file\n", kind.c_str()); continue; }
-        const std::string & gbnf = schema ? gbnf_schema : gbnf_tool;
+        const bool llg = kind == "toolcall-eager-llg";
+        if (llg && a.llg_lark.empty()) { printf("skip %s: no --llg-lark\n", kind.c_str()); continue; }
+        const std::string lark_tool = llg ? read_file(a.llg_lark) : std::string();
+        const std::string & gbnf = schema ? gbnf_schema : (llg ? lark_tool : gbnf_tool);
         const char * root = lazy ? "tool-call" : "root";
         std::vector<std::vector<llama_token>> scripts;
         for (const auto & s : (schema ? schema_scripts : (lazy ? lazy_scripts : tool_scripts))) {
@@ -477,6 +492,44 @@ int main(int argc, char ** argv) {
             const bool real = prof == "real";
             if (real && !real_logits.count(kind)) { printf("skip %s|real: no --logits-model\n", kind.c_str()); continue; }
             const auto * rl = real ? &real_logits.at(kind) : nullptr;
+            if (llg && real && !done.count(a.label + "|" + kind + "|" + prof + "|parity")) {
+                // SPEC-GRAM.3 parity: at every scripted position, the allowed-token SET of the stock grammar and of llguidance over the
+                // full vocab on the real logits, and the greedy (argmax) constrained token of each. Untimed.
+                long n_pos = 0, n_mask_diff = 0, n_greedy_diff = 0, n_tok_diff = 0, n_llg_dead = 0;
+                for (size_t si = 0; si < scripts.size(); ++si) {
+                    llama_sampler * gs = make_grammar(vocab, gbnf_tool, "root", false);
+                    llama_sampler * gl = make_grammar(vocab, lark_tool, "root", false);
+                    if (!gs || !gl) { fprintf(stderr, "parity: grammar init failed\n"); return 3; }
+                    std::vector<llama_token_data> xs((size_t) c.n_vocab), xl((size_t) c.n_vocab);
+                    for (size_t k = 0; k < scripts[si].size(); ++k) {
+                        const float * lg = (*rl)[si][k].data();
+                        for (int32_t t = 0; t < c.n_vocab; ++t) { xs[(size_t) t] = { t, lg[t], 0.0f }; xl[(size_t) t] = { t, lg[t], 0.0f }; }
+                        llama_token_data_array ps = { xs.data(), xs.size(), -1, false }, pl = { xl.data(), xl.size(), -1, false };
+                        llama_sampler_apply(gs, &ps); llama_sampler_apply(gl, &pl);
+                        long nd = 0, n_allowed_l = 0; int as = -1, al = -1;
+                        for (int32_t t = 0; t < c.n_vocab; ++t) {
+                            const bool os = xs[(size_t) t].logit != -INFINITY, ol = xl[(size_t) t].logit != -INFINITY;
+                            nd += os != ol; n_allowed_l += ol;
+                            if (os && (as < 0 || xs[(size_t) t].logit > xs[(size_t) as].logit)) { as = t; }
+                            if (ol && (al < 0 || xl[(size_t) t].logit > xl[(size_t) al].logit)) { al = t; }
+                        }
+                        if (n_allowed_l == c.n_vocab) { n_llg_dead++; }
+                        n_pos++; n_tok_diff += nd; n_mask_diff += nd > 0; n_greedy_diff += as != al;
+                        if (nd > 0 && n_mask_diff <= 5) { printf("parity: script %zu pos %zu mask differs on %ld tokens (greedy stock %d llg %d)\n", si, k, nd, as, al); }
+                        llama_sampler_accept(gs, scripts[si][k]); llama_sampler_accept(gl, scripts[si][k]);
+                    }
+                    llama_sampler_free(gs); llama_sampler_free(gl);
+                }
+                json pj;
+                pj["key"] = a.label + "|" + kind + "|" + prof + "|parity"; pj["label"] = a.label; pj["kind"] = kind; pj["profile"] = prof;
+                pj["record"] = "parity"; pj["positions"] = n_pos; pj["mask_diff_positions"] = n_mask_diff; pj["mask_diff_tokens"] = n_tok_diff;
+                pj["greedy_diff_positions"] = n_greedy_diff; pj["llg_all_allowed_positions"] = n_llg_dead; pj["temp"] = a.temp;
+                pj["parity_pass"] = n_pos > 0 && n_greedy_diff == 0;
+                std::ofstream(a.out, std::ios::app) << pj.dump() << "\n";
+                printf("parity %s: positions %ld mask-diff %ld (tokens %ld) greedy-diff %ld all-allowed %ld\n", pj["key"].get<std::string>().c_str(),
+                       n_pos, n_mask_diff, n_tok_diff, n_greedy_diff, n_llg_dead);
+                fflush(stdout);
+            }
             for (const std::string & bs : split(a.batches, ',')) {
                 const int batch = atoi(bs.c_str());
                 const std::string key = a.label + "|" + kind + "|" + prof + "|B" + bs;
