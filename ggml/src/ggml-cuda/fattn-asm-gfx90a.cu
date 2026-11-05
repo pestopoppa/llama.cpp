@@ -20,6 +20,16 @@
 //   GGML_HIP_FA_ASM=0              disable the fast path at run time (default: enabled when compiled in)
 //   GGML_HIP_FA_ASM_MIN_BATCH=n    smallest query-row count that takes the fast path (default 64, minimum 1)
 //   GGML_HIP_FA_ASM_LOG=1          log every fast-path decision (default: one line at first use, one per new reject)
+//
+// AK-CK-HD256 (GGML_HIP_CK_FMHA_HD256): head_dim 256 takes a CK-tile fmha forward kernel instead
+// (ggml/src/ggml-hip/ck-fmha-gfx90a/, composable_kernel rocm-6.2.4 headers, fp16, qr pipeline, compiled into this
+// library by ROCm 6.2 hipcc). Same gates as above (mask classification, threshold, env), with these differences:
+//   - K and V must be f16 and are read in place (no conversion, no copy); only the first L cells are attended.
+//   - Q (f32|f16) -> f16 BSHD scratch (RNE; the existing f16 FA kernels make the same rounding), O f16 -> dst f32.
+//     fp16 instead of bf16: 3 more mantissa bits on Q/P/O, and K/V need no conversion. The instance accumulates S and
+//     O in fp32; P (softmax probabilities in [0, 1]) is rounded to fp16 for the second GEMM, as in the C6 kernels.
+//   - GQA ratios {1, 2, 4, 6, 8, 12} (Qwen3.8-27B 24/4, Qwen3.6-35B-A3B 16/2, Q38FN 24/2).
+//   GGML_HIP_FA_CK_HD256=0         disable only the hd256 CK path at run time (default: enabled when compiled in)
 
 #include "fattn-asm-gfx90a.cuh"
 
@@ -31,6 +41,10 @@
 #include <cstring>
 #include <mutex>
 #include <type_traits>
+
+#ifdef GGML_HIP_CK_FMHA_HD256
+#include "../ggml-hip/ck-fmha-gfx90a/ck_fmha_hd256.h"
+#endif
 
 extern "C" {
 extern const unsigned char ggml_hip_fa_asm_fwd_hd128_bf16_rtne[];
@@ -44,6 +58,7 @@ extern const char          ggml_hip_fa_asm_fwd_hd128_bf16_causal_rtne_sha256[];
 namespace {
 
 constexpr int     FA_ASM_D      = 128;  // the only head size these kernels implement
+constexpr int     FA_CK_D       = 256;  // AK-CK-HD256: the CK-tile instances' head size
 constexpr int     FA_ASM_TS_QO  = 256;  // fmha_fwd.csv ts_qo for hd128 bf16 (query rows per tile)
 constexpr int     FA_ASM_BLOCK  = 512;  // mha_fwd.cu: bdx = 512
 constexpr size_t  FA_ASM_KARGS  = 512;  // .kernarg_segment_size of both code objects
@@ -77,6 +92,15 @@ bool fa_asm_log_all() {
 // rate), and every call also converts the first L cells of K and V to bf16 (a fixed cost that decode cannot
 // amortize). Decode (1 row) and MTP verify (2-5 rows) therefore stay on the existing kernels. The crossover must
 // be measured (test-backend-ops perf at n_q 16..256); GGML_HIP_FA_ASM_MIN_BATCH=1 forces the path for tests.
+bool fa_ck_hd256_enabled() {
+#ifdef GGML_HIP_CK_FMHA_HD256
+    static const bool enabled = fa_asm_env_flag("GGML_HIP_FA_CK_HD256", true);
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 int64_t fa_asm_min_batch() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_HIP_FA_ASM_MIN_BATCH");
@@ -86,7 +110,8 @@ int64_t fa_asm_min_batch() {
     return v;
 }
 
-std::atomic<uint64_t> g_fa_asm_n_calls{0};
+std::atomic<uint64_t> g_fa_asm_n_calls{0}; // every fast-path call (asm hd128 + CK hd256)
+std::atomic<uint64_t> g_fa_ck_n_calls{0};  // AK-CK-HD256 calls only
 
 struct fa_asm_module {
     std::once_flag once;
@@ -160,10 +185,21 @@ bool fa_asm_shape_ok(int device, const ggml_tensor * dst, const char ** why) {
     FA_ASM_REQUIRE(fa_asm_enabled(), "disabled (GGML_HIP_FA_ASM=0)");
     FA_ASM_REQUIRE(fa_asm_device_ok(device), "device is not gfx90a");
     FA_ASM_REQUIRE(Q && K && V, "missing source");
-    FA_ASM_REQUIRE(Q->ne[0] == FA_ASM_D && K->ne[0] == FA_ASM_D && V->ne[0] == FA_ASM_D && dst->ne[0] == FA_ASM_D, "head dim != 128");
+    const int64_t D = Q->ne[0];
+    FA_ASM_REQUIRE(K->ne[0] == D && V->ne[0] == D && dst->ne[0] == D, "head dims differ (K/V/dst vs Q)");
+    FA_ASM_REQUIRE(D == FA_ASM_D || (D == FA_CK_D && fa_ck_hd256_enabled()),
+                   "head dim not 128 (asm) or 256 (CK, compiled in and GGML_HIP_FA_CK_HD256 != 0)");
     FA_ASM_REQUIRE(dst->type == GGML_TYPE_F32, "dst is not f32");
     FA_ASM_REQUIRE(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16, "Q type");
-    FA_ASM_REQUIRE(fa_asm_kv_type_ok(K->type) && K->type == V->type, "K/V type");
+    if (D == FA_CK_D) {
+        // the CK instances read K and V in place as fp16 with 16-byte vector loads along D
+        FA_ASM_REQUIRE(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16, "hd256: K/V not f16");
+        FA_ASM_REQUIRE((uintptr_t) K->data % 16 == 0 && (uintptr_t) V->data % 16 == 0 &&
+                       K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0,
+                       "hd256: K/V not 16-byte aligned");
+    } else {
+        FA_ASM_REQUIRE(fa_asm_kv_type_ok(K->type) && K->type == V->type, "K/V type");
+    }
     FA_ASM_REQUIRE(Q->nb[0] == ggml_type_size(Q->type) && K->nb[0] == ggml_type_size(K->type) &&
                    V->nb[0] == ggml_type_size(V->type), "non-unit innermost stride");
     FA_ASM_REQUIRE(ggml_is_contiguous(dst), "dst not contiguous");
@@ -173,7 +209,12 @@ bool fa_asm_shape_ok(int device, const ggml_tensor * dst, const char ** why) {
     {
         const int64_t gqa = Q->ne[2] / K->ne[2];
         // ratios the AK-ASM-H5 correctness run and the fa_asm_gfx90a test set cover; widen only with test cases
-        FA_ASM_REQUIRE(gqa == 1 || gqa == 2 || gqa == 4 || gqa == 8, "GQA ratio not in {1,2,4,8}");
+        if (D == FA_CK_D) {
+            FA_ASM_REQUIRE(gqa == 1 || gqa == 2 || gqa == 4 || gqa == 6 || gqa == 8 || gqa == 12,
+                           "hd256: GQA ratio not in {1,2,4,6,8,12}");
+        } else {
+            FA_ASM_REQUIRE(gqa == 1 || gqa == 2 || gqa == 4 || gqa == 8, "GQA ratio not in {1,2,4,8}");
+        }
     }
     FA_ASM_REQUIRE(Q->ne[1] >= fa_asm_min_batch(), "fewer query rows than GGML_HIP_FA_ASM_MIN_BATCH");
     FA_ASM_REQUIRE(sink == nullptr, "attention sinks");
@@ -191,10 +232,14 @@ bool fa_asm_shape_ok(int device, const ggml_tensor * dst, const char ** why) {
         FA_ASM_REQUIRE(mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1], "mask smaller than n_kv x n_q");
     }
 
-    // the kernel addresses with 32-bit byte strides and buffer offsets: stay well inside 2^31
-    const uint64_t q_bytes  = (uint64_t) Q->ne[1] * Q->ne[2] * FA_ASM_D * 2;
-    const uint64_t kv_bytes = (uint64_t) K->ne[1] * K->ne[2] * FA_ASM_D * 2;
-    FA_ASM_REQUIRE(q_bytes < (1ull << 31) && kv_bytes < (1ull << 31), "tensor too large for 32-bit kernel offsets");
+    // the asm kernel addresses with 32-bit byte strides and buffer offsets: stay well inside 2^31. The CK instances use
+    // 32-bit element offsets (ck_tile::index_t) over K/V read in place with the cache's own strides.
+    const uint64_t q_bytes  = (uint64_t) Q->ne[1] * Q->ne[2] * D * 2;
+    const uint64_t kv_bytes = D == FA_CK_D ? (uint64_t) K->ne[1] * std::max<uint64_t>(K->nb[1], K->ne[2] * K->nb[2])
+                                           : (uint64_t) K->ne[1] * K->ne[2] * D * 2;
+    const uint64_t v_bytes  = D == FA_CK_D ? (uint64_t) V->ne[1] * std::max<uint64_t>(V->nb[1], V->ne[2] * V->nb[2]) : 0;
+    FA_ASM_REQUIRE(q_bytes < (1ull << 31) && kv_bytes < (1ull << 31) && v_bytes < (1ull << 31),
+                   "tensor too large for 32-bit kernel offsets");
 #undef FA_ASM_REQUIRE
 
     *why = nullptr;
@@ -365,6 +410,32 @@ static __global__ void fa_asm_o_to_f32(const uint16_t * __restrict__ src, const 
     }
 }
 
+// AK-CK-HD256: Q [D=256, n_rows, n_heads] (byte strides nb1, nb2; f32 or f16) -> f16 [n_rows][n_heads][256] (RNE)
+template <typename src_t>
+static __global__ void fa_ck_q_to_f16_bshd(const char * __restrict__ src, const int64_t nb1, const int64_t nb2,
+                                           const int n_heads, const int64_t n, half * __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int     d = i % FA_CK_D;
+    const int     h = (i / FA_CK_D) % n_heads;
+    const int64_t s = i / ((int64_t) FA_CK_D * n_heads);
+    const src_t * p = (const src_t *) (src + s*nb1 + h*nb2);
+    if constexpr (std::is_same_v<src_t, float>) {
+        dst[i] = __float2half_rn(p[d]);
+    } else {
+        dst[i] = p[d];
+    }
+}
+
+static __global__ void fa_ck_o_f16_to_f32(const half * __restrict__ src, const int64_t n, float * __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __half2float(src[i]);
+    }
+}
+
 constexpr int FA_ASM_CVT_BLOCK = 256;
 
 int64_t fa_asm_cvt_blocks(const int64_t n) {
@@ -467,6 +538,89 @@ bool ggml_cuda_fattn_asm_gfx90a_usable(int device) {
     return fa_asm_load(device);
 }
 
+bool ggml_cuda_fattn_ck_hd256_usable(int device) {
+    return fa_asm_enabled() && fa_ck_hd256_enabled() && fa_asm_device_ok(device);
+}
+
+uint64_t ggml_cuda_fattn_ck_hd256_n_calls() {
+    return g_fa_ck_n_calls.load(std::memory_order_relaxed);
+}
+
+#ifdef GGML_HIP_CK_FMHA_HD256
+// AK-CK-HD256: Q -> f16 scratch, CK-tile fmha fwd (K/V in place), O f16 -> dst f32. Called after the mask verdict.
+static bool fa_ck_hd256_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool causal, const int64_t L) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const int64_t n_q  = Q->ne[1];
+    const int64_t H    = Q->ne[2];
+    const int64_t H_kv = K->ne[2];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<half> q_f16(pool, (size_t) n_q * H * FA_CK_D);
+    ggml_cuda_pool_alloc<half> o_f16(pool, (size_t) n_q * H * FA_CK_D);
+
+    {
+        const int64_t n    = n_q * H * FA_CK_D;
+        const dim3    grid((unsigned) fa_asm_cvt_blocks(n));
+        const char *  src  = (const char *) Q->data;
+        if (Q->type == GGML_TYPE_F32) {
+            fa_ck_q_to_f16_bshd<float><<<grid, FA_ASM_CVT_BLOCK, 0, stream>>>(src, Q->nb[1], Q->nb[2], (int) H, n, q_f16.ptr);
+        } else {
+            fa_ck_q_to_f16_bshd<half><<<grid, FA_ASM_CVT_BLOCK, 0, stream>>>(src, Q->nb[1], Q->nb[2], (int) H, n, q_f16.ptr);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    ggml_ck_fmha_hd256_args a;
+    a.q              = q_f16.ptr;
+    a.k              = K->data;
+    a.v              = V->data;
+    a.o              = o_f16.ptr;
+    a.seqlen_q       = (int) n_q;
+    a.seqlen_k       = (int) L;
+    a.nhead_q        = (int) H;
+    a.nhead_k        = (int) H_kv;
+    a.stride_q       = (int) (H * FA_CK_D);       // Q scratch BSHD
+    a.nhead_stride_q = FA_CK_D;
+    a.stride_k       = (int) (K->nb[1] / sizeof(half));
+    a.nhead_stride_k = (int) (K->nb[2] / sizeof(half));
+    a.stride_v       = (int) (V->nb[1] / sizeof(half));
+    a.nhead_stride_v = (int) (V->nb[2] / sizeof(half));
+    a.stride_o       = (int) (H * FA_CK_D);       // O scratch BSHD == dst element order [D, H, n_q]
+    a.nhead_stride_o = FA_CK_D;
+    a.scale          = scale;
+    a.causal         = causal ? 1 : 0;
+
+    const hipError_t err = ggml_ck_fmha_fwd_hd256_f16(a, stream);
+    if (err != hipSuccess) {
+        // only the Q scratch has been written: fall back
+        GGML_LOG_WARN("ggml_cuda_fa_ck: CK fmha fwd hd256 launch failed: %s\n", hipGetErrorString(err));
+        (void) hipGetLastError();
+        fa_asm_log_reject("CK hd256 launch failed", dst);
+        return false;
+    }
+
+    const int64_t n_out = n_q * H * FA_CK_D;
+    fa_ck_o_f16_to_f32<<<(unsigned) fa_asm_cvt_blocks(n_out), FA_ASM_CVT_BLOCK, 0, stream>>>(o_f16.ptr, n_out, (float *) dst->data);
+    CUDA_CHECK(cudaGetLastError());
+
+    g_fa_asm_n_calls.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = g_fa_ck_n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || fa_asm_log_all()) {
+        GGML_LOG_INFO("ggml_cuda_fa_ck: gfx90a CK-tile hd256 fp16 path ran (call %llu) node=%s %s n_q=%lld H=%lld H_kv=%lld n_kv=%lld L=%lld [%s]\n",
+                      (unsigned long long) n, dst->name, causal ? "causal" : "full", (long long) n_q, (long long) H,
+                      (long long) H_kv, (long long) K->ne[1], (long long) L, ggml_ck_fmha_fwd_hd256_f16_name(a.causal));
+    }
+    return true;
+}
+#endif // GGML_HIP_CK_FMHA_HD256
+
 bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int device = ctx.device;
 
@@ -489,7 +643,8 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
         }
     }
 
-    if (!fa_asm_load(device)) {
+    const bool is_hd256 = dst->src[0]->ne[0] == FA_CK_D;
+    if (!is_hd256 && !fa_asm_load(device)) {
         fa_asm_log_reject("code objects failed to load", dst);
         return false;
     }
@@ -514,6 +669,14 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
         return false;
     }
     const bool causal = kind == FA_ASM_MASK_CAUSAL;
+
+    if (is_hd256) {
+#ifdef GGML_HIP_CK_FMHA_HD256
+        return fa_ck_hd256_run(ctx, dst, causal, L);
+#else
+        GGML_ABORT("unreachable: hd256 admitted without GGML_HIP_CK_FMHA_HD256"); // fa_ck_hd256_enabled() is false
+#endif
+    }
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));

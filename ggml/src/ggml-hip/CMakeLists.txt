@@ -52,6 +52,13 @@ if ("${CMAKE_HIP_ARCHITECTURES};${GPU_TARGETS};${AMDGPU_TARGETS}" MATCHES "gfx90
 endif()
 option(GGML_HIP_FA_ASM_GFX90A "ggml: gfx90a AITER FA-v3 hd128 bf16 asm fast path for FLASH_ATTN_EXT" ${GGML_HIP_FA_ASM_GFX90A_DEFAULT})
 
+# AK-CK-HD256: head_dim 256 FLASH_ATTN_EXT on gfx90a through CK-tile fmha forward instances (ck-fmha-gfx90a/), compiled
+# from the composable_kernel headers in GGML_HIP_CK_FMHA_DIR (a checkout of tag rocm-6.2.4, commit pinned below: the
+# CK trunk needs gfx950 builtins ROCm 6.2's clang does not have). Rides on GGML_HIP_FA_ASM_GFX90A (same dispatcher).
+option(GGML_HIP_CK_FMHA_HD256 "ggml: gfx90a CK-tile fmha fwd hd256 fp16 path for FLASH_ATTN_EXT (needs GGML_HIP_CK_FMHA_DIR)" OFF)
+set(GGML_HIP_CK_FMHA_DIR "" CACHE PATH "ggml: composable_kernel source checkout (tag rocm-6.2.4) for GGML_HIP_CK_FMHA_HD256")
+set(GGML_HIP_CK_FMHA_COMMIT "6d90a7cf2eb64f6c956460ea94341e32ab4de7a5" CACHE STRING "ggml: required git HEAD of GGML_HIP_CK_FMHA_DIR (empty = do not check)")
+
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
@@ -162,6 +169,40 @@ if (GGML_HIP_FA_ASM_GFX90A)
     target_sources(ggml-hip PRIVATE ${GGML_HIP_FA_ASM_GEN})
     add_compile_definitions(GGML_HIP_FA_ASM_GFX90A)
     message(STATUS "GGML_HIP_FA_ASM_GFX90A: gfx90a FA-v3 hd128 bf16 asm fast path embedded")
+endif()
+
+if (GGML_HIP_CK_FMHA_HD256)
+    if (NOT GGML_HIP_FA_ASM_GFX90A)
+        message(FATAL_ERROR "GGML_HIP_CK_FMHA_HD256 requires GGML_HIP_FA_ASM_GFX90A (it shares its dispatcher)")
+    endif()
+    set(GGML_HIP_CK_FMHA_FWD_HPP ${GGML_HIP_CK_FMHA_DIR}/example/ck_tile/01_fmha/fmha_fwd.hpp)
+    if (NOT EXISTS ${GGML_HIP_CK_FMHA_DIR}/include/ck_tile/ops/fmha.hpp OR NOT EXISTS ${GGML_HIP_CK_FMHA_FWD_HPP})
+        message(FATAL_ERROR "GGML_HIP_CK_FMHA_HD256: GGML_HIP_CK_FMHA_DIR='${GGML_HIP_CK_FMHA_DIR}' is not a composable_kernel checkout")
+    endif()
+    if (GGML_HIP_CK_FMHA_COMMIT)
+        find_package(Git REQUIRED)
+        execute_process(COMMAND ${GIT_EXECUTABLE} -C ${GGML_HIP_CK_FMHA_DIR} rev-parse HEAD
+                        OUTPUT_VARIABLE GGML_HIP_CK_FMHA_HEAD OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE GGML_HIP_CK_FMHA_RC)
+        execute_process(COMMAND ${GIT_EXECUTABLE} -C ${GGML_HIP_CK_FMHA_DIR} status --porcelain --untracked-files=no
+                        OUTPUT_VARIABLE GGML_HIP_CK_FMHA_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if (NOT GGML_HIP_CK_FMHA_RC EQUAL 0 OR NOT GGML_HIP_CK_FMHA_HEAD STREQUAL GGML_HIP_CK_FMHA_COMMIT OR GGML_HIP_CK_FMHA_DIRTY)
+            message(FATAL_ERROR "GGML_HIP_CK_FMHA_HD256: ${GGML_HIP_CK_FMHA_DIR} HEAD '${GGML_HIP_CK_FMHA_HEAD}' (dirty: '${GGML_HIP_CK_FMHA_DIRTY}') != clean ${GGML_HIP_CK_FMHA_COMMIT}")
+        endif()
+    endif()
+    set(GGML_HIP_CK_FMHA_SRC ${CMAKE_CURRENT_SOURCE_DIR}/ck-fmha-gfx90a/ck_fmha_fwd_hd256_f16.cpp)
+    target_sources(ggml-hip PRIVATE ${GGML_HIP_CK_FMHA_SRC})
+    if (CXX_IS_HIPCC)
+        set_source_files_properties(${GGML_HIP_CK_FMHA_SRC} PROPERTIES LANGUAGE CXX)
+    else()
+        set_source_files_properties(${GGML_HIP_CK_FMHA_SRC} PROPERTIES LANGUAGE HIP)
+    endif()
+    # CK headers only for this TU (they clash with ggml's half/bf16 helpers); flags as CK's 01_fmha example
+    # (FAST_EXP2 is also what the aiter build that produced the AK-CK-HD256 evidence used)
+    set_source_files_properties(${GGML_HIP_CK_FMHA_SRC} PROPERTIES
+        INCLUDE_DIRECTORIES "${GGML_HIP_CK_FMHA_DIR}/include;${GGML_HIP_CK_FMHA_DIR}/example/ck_tile/01_fmha"
+        COMPILE_OPTIONS "-DCK_TILE_FMHA_FWD_FAST_EXP2=1;-fgpu-flush-denormals-to-zero;-mllvm;-enable-post-misched=0;-Wno-undefined-func-template;-Wno-float-equal")
+    add_compile_definitions(GGML_HIP_CK_FMHA_HD256)
+    message(STATUS "GGML_HIP_CK_FMHA_HD256: gfx90a CK-tile fmha fwd hd256 fp16 path (CK ${GGML_HIP_CK_FMHA_HEAD} at ${GGML_HIP_CK_FMHA_DIR})")
 endif()
 
 if (NOT GGML_HIP_MMQ_MFMA)

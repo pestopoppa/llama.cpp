@@ -5479,6 +5479,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_fa_asm_usable") == 0) {
         return (void *)ggml_cuda_fattn_asm_gfx90a_usable;
     }
+    // AK-CK-HD256 (the hd256 CK path; always exported with the asm path, usable() is false when not compiled in)
+    if (strcmp(name, "ggml_backend_cuda_fa_ck_hd256_usable") == 0) {
+        return (void *)ggml_cuda_fattn_ck_hd256_usable;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_ck_hd256_n_calls") == 0) {
+        return (void *)ggml_cuda_fattn_ck_hd256_n_calls;
+    }
 #endif
     return nullptr;
 }

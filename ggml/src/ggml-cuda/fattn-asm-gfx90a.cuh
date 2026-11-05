@@ -26,6 +26,10 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
 uint64_t ggml_cuda_fattn_asm_gfx90a_n_calls();      // FA ops the asm kernel computed since process start
 int64_t  ggml_cuda_fattn_asm_gfx90a_min_batch();    // query-row threshold in effect (GGML_HIP_FA_ASM_MIN_BATCH)
 bool     ggml_cuda_fattn_asm_gfx90a_usable(int device); // enabled, gfx90a, and both code objects loaded
+// AK-CK-HD256 witnesses: the hd256 CK path is compiled in, enabled (GGML_HIP_FA_ASM, GGML_HIP_FA_CK_HD256) and the
+// device is gfx90a; and the number of FA ops it computed (also counted in ggml_cuda_fattn_asm_gfx90a_n_calls).
+bool     ggml_cuda_fattn_ck_hd256_usable(int device);
+uint64_t ggml_cuda_fattn_ck_hd256_n_calls();
 #else
 static inline bool ggml_cuda_fattn_asm_gfx90a_may_apply(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device); GGML_UNUSED(dst);
