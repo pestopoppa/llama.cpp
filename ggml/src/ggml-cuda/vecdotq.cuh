@@ -501,6 +501,12 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 #define VDR_Q4_K_Q8_1_MMVQ 2
 #define VDR_Q4_K_Q8_1_MMQ  8
 
+// C6-Q4-MMVQ-FIX isum: for MMVQ q4_K consumers, quantize_q8_1 stores the exact integer sum of the block's 32
+// quantized values (|sum| <= 4064) as raw int16 bits in ds.y instead of the half-rounded float sum.
+static __device__ __forceinline__ int q8_1_q4k_isum(const half2 & ds8) {
+    return int(__half_as_short(__high2half(ds8)));
+}
+
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
@@ -520,14 +526,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const float d8 = __low2float(ds8);
 
         sumf_d += d8 * (dot0 * sc[i]);
-        // Min correction from the same quantized activations used by dot0 (not the q8_1 sum of the
-        // original floats). u holds this lane's ints {q8_offset, q8_offset+4} of block i; the four lanes
-        // sharing the block cover all QI8_1 ints, so each adds its partial integer sum and the caller's
-        // cross-lane reduction completes it, without reloading the block.
-        const int sum_q8 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
-        sumf_m += (d8 * float(sum_q8)) * m[i];
+        if (sum_lane) {
+            // Min correction from the same quantized activations used by dot0: the exact integer sum of the
+            // block's q8 values, stored by quantize_q8_1 for q4_K consumers (C6-Q4-MMVQ-FIX isum).
+            sumf_m += (d8 * float(q8_1_q4k_isum(ds8))) * m[i];
+        }
     }
-    (void) sum_lane;
 
     const float2 dm4f = __half22float2(dm4);
 

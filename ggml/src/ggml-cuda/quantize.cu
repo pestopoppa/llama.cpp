@@ -18,6 +18,13 @@ static __device__ __forceinline__ float quantize_q8_1_shuffle_xor_gfx90a(float x
 }
 #endif // defined(__gfx90a__)
 
+// C6-Q4-MMVQ-FIX isum: with q4k_isum, ds.y carries the exact integer sum of the block's quantized values as raw
+// int16 bits (|sum| <= 32*127) instead of the half-rounded float sum; read by q8_1_q4k_isum (vecdotq.cuh).
+static __device__ __forceinline__ half2 q8_1_make_ds_isum(const float d, const float qsum) {
+    return make_half2(__float2half(d), __short_as_half(short(qsum)));
+}
+
+template <bool q4k_isum>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -61,13 +68,23 @@ static __global__ void quantize_q8_1(
 
     y[ib].qs[iqs] = q;
 
+    if constexpr (q4k_isum) {
+        // float sum of int8 values is exact (|sum| <= 4064 < 2^24)
+        sum = warp_reduce_sum<QK8_1>(float(q));
+    }
+
     if (iqs > 0) {
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    if constexpr (q4k_isum) {
+        y[ib].ds = q8_1_make_ds_isum(d, sum);
+    } else {
+        y[ib].ds = make_half2(d, sum);
+    }
 }
 
+template <bool q4k_isum>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1_1d(
         const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t ne0) {
@@ -115,6 +132,23 @@ static __global__ void quantize_q8_1_1d(
         "v_add_f32_dpp %1, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0"
         : "+v"(amax), "+v"(sum));
     __builtin_amdgcn_wave_barrier();
+    if constexpr (q4k_isum) {
+        // Quantized-sum reduction before the out-of-range exit, with the same swizzle/DPP pattern as above
+        // (float adds of int8 values are exact). Replaces the float sum, which this layout does not store.
+        const float d_q = amax / 127.0f;
+        float qs_sum = amax == 0.0f ? 0.0f : float(int8_t(roundf(xi / d_q)));
+        qs_sum += quantize_q8_1_shuffle_xor_gfx90a<16>(qs_sum);
+        qs_sum += quantize_q8_1_shuffle_xor_gfx90a<8>(qs_sum);
+        qs_sum += quantize_q8_1_shuffle_xor_gfx90a<4>(qs_sum);
+        asm volatile(
+            "s_nop 1\n\t"
+            "v_add_f32_dpp %0, %0, %0 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:0\n\t"
+            "s_nop 1\n\t"
+            "v_add_f32_dpp %0, %0, %0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:0"
+            : "+v"(qs_sum));
+        __builtin_amdgcn_wave_barrier();
+        sum = qs_sum;
+    }
     if (i0 >= ne0) {
         return;
     }
@@ -128,11 +162,21 @@ static __global__ void quantize_q8_1_1d(
 
     y[ib].qs[iqs] = q;
 
+#if !defined(__gfx90a__)
+    if constexpr (q4k_isum) {
+        sum = warp_reduce_sum<QK8_1>(float(q)); // exact: int8 values, |sum| <= 4064
+    }
+#endif // !defined(__gfx90a__)
+
     if (iqs > 0) {
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    if constexpr (q4k_isum) {
+        y[ib].ds = q8_1_make_ds_isum(d, sum);
+    } else {
+        y[ib].ds = make_half2(d, sum);
+    }
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -523,13 +567,22 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(block_size_x, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+    // q4_K MMVQ consumers read the exact quantized block sum from ds.y (C6-Q4-MMVQ-FIX isum).
+    const bool q4k_isum = type_src0 == GGML_TYPE_Q4_K;
     if (is_1d) {
-        ggml_cuda_kernel_launch(quantize_q8_1_1d, launch_params, x, vy, ne00, ne0);
+        if (q4k_isum) {
+            ggml_cuda_kernel_launch(quantize_q8_1_1d<true>, launch_params, x, vy, ne00, ne0);
+        } else {
+            ggml_cuda_kernel_launch(quantize_q8_1_1d<false>, launch_params, x, vy, ne00, ne0);
+        }
     } else {
         const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
-        ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+        if (q4k_isum) {
+            ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+        } else {
+            ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+        }
     }
-    GGML_UNUSED(type_src0);
 }
 
 void quantize_mmq_q8_1_cuda(

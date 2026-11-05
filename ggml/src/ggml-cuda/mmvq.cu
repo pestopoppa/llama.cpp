@@ -261,6 +261,7 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
 #endif
     const uint8_t * m      = sc      + 2;
     const uint8_t * m_gate = sc_gate + 2;
+    const bool sum_lane = iqs % QI8_1 == 0;
 
 #if defined(__gfx90a__)
     using floatx2_t = __attribute__((ext_vector_type(2))) float;
@@ -281,8 +282,8 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
         const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
         const int u0 = q8[0];
         const int u1 = q8[4];
-        // C6-Q4-MMVQ-FIX: min correction from this lane's quantized partial sum (see vec_dot_q4_K_q8_1_b4).
-        const float s8 = d8 * float(ggml_cuda_dp4a(0x01010101, u1, ggml_cuda_dp4a(0x01010101, u0, 0)));
+        // C6-Q4-MMVQ-FIX isum: min correction from the block's stored exact quantized sum (sum lane only).
+        const float s8 = sum_lane ? d8 * float(q8_1_q4k_isum(ds8)) : 0.0f;
 
         const int dot0 = ggml_cuda_dp4a((v0 >> (4*i)) & 0x0F0F0F0F, u0, 0);
         const int dot1 = ggml_cuda_dp4a((v1 >> (4*i)) & 0x0F0F0F0F, u1, 0);
@@ -397,6 +398,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_b4(
         const q4_K_b4_weight & weight, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
     const int q8_offset = (iqs/2)%4;
+    const bool sum_lane = iqs % QI8_1 == 0;
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 
@@ -406,14 +408,13 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_b4(
         const int * q8 = (const int *) bq8i->qs + q8_offset;
         const int dot = ggml_cuda_dp4a(
             weight.q[2*i + 1], q8[4], ggml_cuda_dp4a(weight.q[2*i + 0], q8[0], 0));
-        // Min correction from the same quantized activations and half-rounded scale as the dot.
-        // The four lanes sharing this q8_1 block (q8_offset 0..3) each hold ints {q8_offset, q8_offset+4},
-        // so together they cover all QI8_1 ints: each lane adds its partial integer sum from the values it
-        // already loaded and the existing cross-lane reduction completes it. No extra activation loads.
-        const int sum_q8 = ggml_cuda_dp4a(0x01010101, q8[4], ggml_cuda_dp4a(0x01010101, q8[0], 0));
         const half2 ds8 = bq8i->ds;
         sumf_d += __low2float(ds8) * (dot * weight.sc[i]);
-        sumf_m += (__low2float(ds8) * float(sum_q8)) * weight.m[i];
+        if (sum_lane) {
+            // Min correction from the same quantized activations and half-rounded scale as the dot:
+            // the block's exact integer q8 sum, stored by quantize_q8_1 (C6-Q4-MMVQ-FIX isum).
+            sumf_m += (__low2float(ds8) * float(q8_1_q4k_isum(ds8))) * weight.m[i];
+        }
     }
 
     return weight.dm.x*sumf_d - weight.dm.y*sumf_m;
@@ -2314,6 +2315,7 @@ struct mmvq_q8_1_graph_arena {
 struct mmvq_q8_1_graph_cache_entry {
     const ggml_tensor * src1 = nullptr;
     ggml_type type = GGML_TYPE_COUNT;
+    bool q4k_isum = false; // ds.y holds the int16 quantized sum (q4_K consumers) instead of the float sum
     int64_t ne[GGML_MAX_DIMS] = {};
     size_t nb[GGML_MAX_DIMS] = {};
     int64_t ne10_padded = 0;
@@ -2356,8 +2358,8 @@ void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx) {
 
 static bool mmvq_q8_1_graph_cache_matches(
         const mmvq_q8_1_graph_cache_entry & entry, const ggml_tensor * src1,
-        const int64_t ne10_padded, const size_t q8_1_size) {
-    if (entry.src1 != src1 || entry.type != src1->type ||
+        const int64_t ne10_padded, const size_t q8_1_size, const bool q4k_isum) {
+    if (entry.src1 != src1 || entry.type != src1->type || entry.q4k_isum != q4k_isum ||
         entry.ne10_padded != ne10_padded || entry.q8_1_size != q8_1_size) {
         return false;
     }
@@ -2479,7 +2481,7 @@ void ggml_cuda_mul_mat_vec_q(
         }
 
         for (const mmvq_q8_1_graph_cache_entry & entry : cache.entries) {
-            if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, src1_q8_1_size)) {
+            if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, src1_q8_1_size, src0->type == GGML_TYPE_Q4_K)) {
                 src1_q8_1 = entry.q8_1;
                 reuse_src1_q8_1 = true;
                 break;
@@ -2491,6 +2493,7 @@ void ggml_cuda_mul_mat_vec_q(
             mmvq_q8_1_graph_cache_entry & entry = cache.entries.back();
             entry.src1 = src1;
             entry.type = src1->type;
+            entry.q4k_isum = src0->type == GGML_TYPE_Q4_K;
             for (int i = 0; i < GGML_MAX_DIMS; ++i) {
                 entry.ne[i] = src1->ne[i];
                 entry.nb[i] = src1->nb[i];
