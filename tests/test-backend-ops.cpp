@@ -11094,6 +11094,23 @@ static bool test_backend_ops_extra_case_set(const char * name) {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // AK-ASM-H8: Qwen3.6-35B-A3B (256 experts, top-8, 2048 -> 512 -> 2048) and Q38FN / Qwen3.8-Flash-Next
+    // (512 experts, top-10, 2560 -> 640 -> 2560) expert GEMMs. gate/up broadcast b (b=true), down per-slot b.
+    // MUL_MAT_VEC_FUSION(use_id) rows exercise the fused gate+up+GLU path (MMVQ-id at small M, MMQ-id H8 at large M).
+    {
+        struct h8_shape { int n_mats; int n_used; int64_t d_model; int64_t d_ff; };
+        for (const h8_shape & sh : { h8_shape{256, 8, 2048, 512}, h8_shape{512, 10, 2560, 640} }) {
+            for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+                for (int bs : {1, 8, 512, 2048}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, sh.d_ff, sh.d_model,
+                        /*use_id=*/true, sh.n_mats, sh.n_used, /*b=*/true, /*with_bias=*/false, /*with_gate=*/true));
+                }
+            }
+        }
+    }
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     std::default_random_engine rng(0);
 
@@ -13058,6 +13075,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+
+    // AK-ASM-H8: Qwen3.6-35B-A3B (256 experts, top-8, 2048 -> 512 -> 2048) and Q38FN / Qwen3.8-Flash-Next
+    // (512 experts, top-10, 2560 -> 640 -> 2560) expert GEMMs. gate/up broadcast b (b=true), down per-slot b.
+    // MUL_MAT_VEC_FUSION(use_id) rows exercise the fused gate+up+GLU path (MMVQ-id at small M, MMQ-id H8 at large M).
+    {
+        struct h8_shape { int n_mats; int n_used; int64_t d_model; int64_t d_ff; };
+        for (const h8_shape & sh : { h8_shape{256, 8, 2048, 512}, h8_shape{512, 10, 2560, 640} }) {
+            for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+                for (int bs : {1, 8, 512, 2048}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, sh.d_ff, sh.d_model,
+                        /*use_id=*/true, sh.n_mats, sh.n_used, /*b=*/true, /*with_bias=*/false, /*with_gate=*/true));
+                }
             }
         }
     }
