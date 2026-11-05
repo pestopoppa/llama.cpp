@@ -3837,6 +3837,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+
+            // AK-ASM-H8: MMQ-id regime (prefill / verify batches) - shared sort + quantize, in-place GLU
+            if (op == GGML_OP_MUL_MAT_ID && glu->src[0] == gate && glu->src[1] == up &&
+                    ggml_cuda_should_fuse_mmq_id_glu(up, gate, glu, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_log_mul_mat_route("MMQ_MMID_GLU_H8", src0, src1, glu, ggml_cuda_info().devices[cuda_ctx->device].cc, src1->ne[2]);
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, gate->src[0], ggml_get_glu_op(glu));
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
         }
     }
 
