@@ -136,6 +136,14 @@ option(GGML_CPU_PROF               "ggml: compile the per-node CPU profiler (INF
 # and hook it into the CPU FLASH_ATTN_EXT op. OFF by default: an OFF build is byte-identical to
 # the champion. Experimental only until the CPU correctness gates in AKX-ALL-LB4 pass.
 option(GGML_IQK_FLASH_ATTENTION    "ggml: compile the iqk CPU flash-attention kernel (experimental)" OFF)
+# Option R (cpu-int8-prefill-port-20261105): route Q8_0 MUL_MAT / MUL_MAT_ID with at least
+# GGML_IQK_Q8_0_PREFILL_MIN_ROWS logical rows (prefill only) to the iqk Q8_0 -> Q8_0_R8 GEMM.
+# Compiled default, no new runtime knob (ONE-champion rule); still behind the existing GGML_IQK=1
+# family gate. Decode / spec-verify batches below the threshold keep the champion's path.
+# OFF reproduces the C6 champion's Q8_0 dispatch exactly (its graph plans differ from C6 only
+# while the legacy GGML_IQK_Q8_0=1 env route is on: the work-buffer fix then sizes for it).
+option(GGML_IQK_Q8_0_PREFILL       "ggml: route Q8_0 MUL_MAT/MUL_MAT_ID with >= GGML_IQK_Q8_0_PREFILL_MIN_ROWS logical rows to the iqk Q8_0_R8 GEMM" ON)
+set(GGML_IQK_Q8_0_PREFILL_MIN_ROWS "32" CACHE STRING "ggml: logical-row threshold for GGML_IQK_Q8_0_PREFILL")
 
 # build
 option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)

@@ -159,6 +159,17 @@ extern "C" {
     typedef bool     (*ggml_backend_cpu_get_iqk_fa_t)(void);
     typedef uint64_t (*ggml_backend_cpu_iqk_fa_n_calls_t)(void);
 
+    // iqk Q8_0 GEMM route (option R; test witnesses only, nothing is switched through them).
+    // Resolve through ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "<name>");
+    // a NULL result means the build has no iqk GEMM at all:
+    //   "ggml_backend_cpu_iqk_q8_0_n_calls"          -> ggml_backend_cpu_iqk_q8_0_n_calls_t (Q8_0
+    //       MUL_MAT / MUL_MAT_ID ops the iqk route computed since process start; never counts a
+    //       fallback to the native path)
+    //   "ggml_backend_cpu_iqk_q8_0_prefill_min_rows" -> ggml_backend_cpu_iqk_q8_0_prefill_min_rows_t
+    //       (compiled GGML_IQK_Q8_0_PREFILL_MIN_ROWS; 0 = built with GGML_IQK_Q8_0_PREFILL=OFF)
+    typedef uint64_t (*ggml_backend_cpu_iqk_q8_0_n_calls_t)(void);
+    typedef int64_t  (*ggml_backend_cpu_iqk_q8_0_prefill_min_rows_t)(void);
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     // Run fn(ith, nth, user_data) on a team of n_threads CPU threads and return when all have

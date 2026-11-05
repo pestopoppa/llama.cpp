@@ -2555,6 +2555,11 @@ struct test_case {
     virtual std::vector<ggml_tensor *> autokernel_final_state_outputs() { return {}; }
     virtual bool use_weight_context() { return false; }
 
+    // Path witness (MODE_TEST only): witness_begin() runs just before the backend1-vs-reference
+    // comparison, witness_check() right after it; a non-empty reason fails the case. Default: none.
+    virtual void witness_begin(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    virtual std::string witness_check(ggml_backend_t backend) { GGML_UNUSED(backend); return ""; }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -2979,6 +2984,7 @@ struct test_case {
         size_t transforms_completed = 0;
         autokernel_stateful_compare_result state_result;
         std::array<uint64_t, 4> input_hashes {};
+        witness_begin(backend1);
         for (size_t transform_index = 0; transform_index < transform_count; ++transform_index) {
             const input_variant_spec & transform = input_variants[transform_index];
             ud.transform = transform.id;
@@ -3049,10 +3055,17 @@ struct test_case {
             printf("%s ", guard_reason.c_str());
             ud.ok = false;
         }
+        const std::string witness_reason = witness_check(backend1);
+        if (!witness_reason.empty()) {
+            printf("%s ", witness_reason.c_str());
+            ud.ok = false;
+        }
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         if (!guard_reason.empty()) {
             error_msg = guard_reason;
+        } else if (!witness_reason.empty()) {
+            error_msg = witness_reason;
         }
         std::string value_receipt;
         if (autokernel_value_transforms) {
@@ -6293,6 +6306,117 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// [option R, cpu-int8-prefill-port-20261105] iqk Q8_0 prefill route witness.
+// A Q8_0 x F32 MUL_MAT / MUL_MAT_ID case that, besides the usual NMSE comparison against the CPU
+// reference (use_ref: the iqk hooks are skipped there), proves WHICH path the tested CPU backend
+// took, through the backend's "ggml_backend_cpu_iqk_q8_0_n_calls" counter (thread 0, once per op,
+// only after the hook committed, so a silent fallback never counts):
+//   - GGML_IQK=1 and rows >= the compiled GGML_IQK_Q8_0_PREFILL_MIN_ROWS: the counter MUST advance
+//     (vacuity guard: an NMSE pass alone would also pass on the native path). The K=9728 dense
+//     and the 512-token MoE cases are the planner-fix witnesses: without the ggml_graph_plan fix
+//     their Q8_0-sized work buffer is too small for the iqk activations and the hook falls back.
+//   - rows below the threshold (decode 1, verify 5, 31), or GGML_IQK unset, or a build with
+//     GGML_IQK_Q8_0_PREFILL=OFF: the counter MUST NOT advance (champion path untouched), unless
+//     the legacy GGML_IQK_Q8_0 env route is switched on, which may widen it.
+// The counter is process-wide, so the witness is only armed when the test cases run one at a
+// time (-j 1, the default); with parallel workers only the NMSE comparison applies. A build
+// without the iqk GEMM (NULL proc address) or a non-CPU tested backend disarms it as well.
+static bool g_iqk_q8_0_witness_exclusive = false;
+
+static bool iqk_q8_0_witness_env_flag(const char * name) {
+    const char * s = std::getenv(name);
+    return s != nullptr && std::atoi(s) != 0;   // same parse as iqk_dispatch.cpp
+}
+
+struct iqk_q8_0_witness {
+    int64_t  logical_rows      = 0;
+    bool     armed             = false;
+    int64_t  compiled_min_rows = 0;
+    uint64_t calls_before      = 0;
+    ggml_backend_cpu_iqk_q8_0_n_calls_t n_calls = nullptr;
+
+    void begin(ggml_backend_t backend) {
+        armed = false;
+        if (!g_iqk_q8_0_witness_exclusive || !ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (ggml_backend_cpu_iqk_q8_0_n_calls_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_iqk_q8_0_n_calls");
+        auto min_rows = (ggml_backend_cpu_iqk_q8_0_prefill_min_rows_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_iqk_q8_0_prefill_min_rows");
+        if (n_calls == nullptr || min_rows == nullptr) {
+            return;
+        }
+        compiled_min_rows = min_rows();
+        calls_before      = n_calls();
+        armed             = true;
+    }
+
+    std::string check() {
+        if (!armed) {
+            fprintf(stderr, "IQK_Q8_0_WITNESS rows=%" PRId64 " armed=0\n", logical_rows);
+            return "";
+        }
+        const uint64_t advanced = n_calls() - calls_before;
+        const bool iqk_on  = iqk_q8_0_witness_env_flag("GGML_IQK");
+        const bool legacy  = iqk_q8_0_witness_env_flag("GGML_IQK_Q8_0");
+        const bool prefill = compiled_min_rows > 0 && logical_rows >= compiled_min_rows;
+        const bool must_run  = iqk_on && prefill;
+        const bool must_skip = !iqk_on || (!prefill && !legacy);
+        std::string reason;
+        if (must_run && advanced == 0) {
+            reason = "IQK_Q8_0_WITNESS: iqk Q8_0 route did not run (silent fallback?)";
+        } else if (must_skip && advanced != 0) {
+            reason = "IQK_Q8_0_WITNESS: iqk Q8_0 route ran where the champion path must";
+        }
+        fprintf(stderr, "IQK_Q8_0_WITNESS rows=%" PRId64 " armed=1 compiled_min_rows=%" PRId64
+                " GGML_IQK=%d GGML_IQK_Q8_0=%d expect=%s calls_advanced=%" PRIu64 " verdict=%s\n",
+                logical_rows, compiled_min_rows, iqk_on ? 1 : 0, legacy ? 1 : 0,
+                must_run ? "iqk" : (must_skip ? "native" : "either"), advanced,
+                reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
+struct test_mul_mat_iqk_q8_0 : public test_mul_mat {
+    iqk_q8_0_witness witness;
+
+    test_mul_mat_iqk_q8_0(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {
+        witness.logical_rows = n;
+    }
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",witness=iqk_q8_0";
+    }
+
+    void witness_begin(ggml_backend_t backend) override { witness.begin(backend); }
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return witness.check();
+    }
+};
+
+struct test_mul_mat_id_iqk_q8_0 : public test_mul_mat_id {
+    iqk_q8_0_witness witness;
+
+    test_mul_mat_id_iqk_q8_0(int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_mats, n_used, false, m, n, k) {
+        witness.logical_rows = n;   // tokens = ids->ne[1], the hook's logical row count
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",witness=iqk_q8_0";
+    }
+
+    void witness_begin(ggml_backend_t backend) override { witness.begin(backend); }
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return witness.check();
     }
 };
 
@@ -12866,6 +12990,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
     }
 
+    // [option R] opt-in set "iqk_q8_0_prefill" (kept out of the default corpus): Q8_0 x F32 at the
+    // served model shapes, NMSE 5e-4 against the CPU reference, plus the iqk path witness
+    // (test_mul_mat_iqk_q8_0 above). Run as production does (GGML_IQK=1), one case at a time:
+    //   GGML_IQK=1 TEST_BACKEND_OPS_EXTRA_CASES=iqk_q8_0_prefill test-backend-ops test -b CPU -o MUL_MAT
+    //   GGML_IQK=1 TEST_BACKEND_OPS_EXTRA_CASES=iqk_q8_0_prefill test-backend-ops test -b CPU -o MUL_MAT_ID
+    // Row counts straddle the compiled threshold (32): 1 (decode) and 5 (MTP verify) and 31 must stay
+    // on the champion path, 32/33/64/512 must take the iqk route.
+    if (test_backend_ops_extra_case_set("iqk_q8_0_prefill")) {
+        // Qwen3-4B (hidden 2560, ffn 9728, 32 q / 8 kv heads x 128): q, k|v, o, gate|up, down.
+        // (2560, 9728) is ffn_down: its K=9728 activation is the planner-fix witness.
+        const std::array<std::pair<int64_t, int64_t>, 5> qwen3_4b_mk = {{
+            {4096, 2560}, {1024, 2560}, {2560, 4096}, {9728, 2560}, {2560, 9728},
+        }};
+        for (const auto & [m, k] : qwen3_4b_mk) {
+            for (int64_t n : {1, 5, 31, 32, 33, 64, 512}) {
+                test_cases.emplace_back(new test_mul_mat_iqk_q8_0(m, n, k));
+            }
+        }
+        // Qwen3.8-Flash-Next dense Q8_0 projections: attn_qkv, attn_gate, ssm_out | attn_output, attn_q.
+        const std::array<std::pair<int64_t, int64_t>, 4> flash_next_mk = {{
+            {10240, 2560}, {6144, 2560}, {2560, 6144}, {12288, 2560},
+        }};
+        for (const auto & [m, k] : flash_next_mk) {
+            for (int64_t n : {31, 32, 512}) {
+                test_cases.emplace_back(new test_mul_mat_iqk_q8_0(m, n, k));
+            }
+        }
+        // Qwen3.8-Flash-Next MoE: 512 experts, top-10, expert FFN 640. ffn_down_exps (K=640 -> 2560)
+        // is the Q8_0 MUL_MAT_ID in the served model; the up/gate orientation (K=2560 -> 640) covers
+        // the larger-K activation carve. Logical rows = tokens; 512 tokens is the MoE planner witness.
+        // Each case holds 0.9 GB of Q8_0 expert weights per backend.
+        for (int64_t n : {1, 31, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_iqk_q8_0(512, 10, /*m=*/2560, n, /*k=*/640));
+        }
+        for (int64_t n : {31, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_iqk_q8_0(512, 10, /*m=*/640, n, /*k=*/2560));
+        }
+    }
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -13373,6 +13536,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     filter_test_cases(test_cases, params_filter);
 
     if (mode == MODE_TEST) {
+        // option R witness: the iqk Q8_0 call counter is process-wide, so it can only be read
+        // per case when the cases run one at a time
+        g_iqk_q8_0_witness_exclusive = parallel_workers <= 1;
+
         ggml_backend_ptr backend_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
         if (backend_cpu == NULL) {
             test_operation_info info("", "", "CPU");

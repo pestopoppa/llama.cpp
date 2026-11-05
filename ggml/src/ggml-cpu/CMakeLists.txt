@@ -69,6 +69,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # iqk port: kernels compiled in; runtime gate is env GGML_IQK (see iqk_dispatch.cpp)
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_IQK_MULMAT)
 
+    # Option R: Q8_0 prefill (>= GGML_IQK_Q8_0_PREFILL_MIN_ROWS logical rows) on the iqk Q8_0_R8
+    # GEMM by default. Undefined (option OFF) = the C6 champion's Q8_0 dispatch exactly.
+    if (GGML_IQK_Q8_0_PREFILL)
+        if (NOT GGML_IQK_Q8_0_PREFILL_MIN_ROWS MATCHES "^[1-9][0-9]*$")
+            message(FATAL_ERROR "GGML_IQK_Q8_0_PREFILL_MIN_ROWS must be a positive integer, got '${GGML_IQK_Q8_0_PREFILL_MIN_ROWS}'")
+        endif()
+        message(STATUS "ggml-cpu: iqk Q8_0 prefill route ENABLED (GGML_IQK_Q8_0_PREFILL, min rows ${GGML_IQK_Q8_0_PREFILL_MIN_ROWS})")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IQK_Q8_0_PREFILL_MIN_ROWS=${GGML_IQK_Q8_0_PREFILL_MIN_ROWS})
+    endif()
+
     # INF-77 DS41-C4: per-node CPU profiler (INF-70).  Runtime gate is env GGML_CPU_PROF;
     # this only decides whether the code exists in libggml-cpu at all.
     if (GGML_CPU_PROF)
