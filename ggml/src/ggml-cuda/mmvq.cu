@@ -397,7 +397,6 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_b4(
         const q4_K_b4_weight & weight, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
     const int q8_offset = (iqs/2)%4;
-    const bool sum_lane = iqs % QI8_1 == 0;
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 
@@ -407,17 +406,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_b4(
         const int * q8 = (const int *) bq8i->qs + q8_offset;
         const int dot = ggml_cuda_dp4a(
             weight.q[2*i + 1], q8[4], ggml_cuda_dp4a(weight.q[2*i + 0], q8[0], 0));
+        // Min correction from the same quantized activations and half-rounded scale as the dot.
+        // The four lanes sharing this q8_1 block (q8_offset 0..3) each hold ints {q8_offset, q8_offset+4},
+        // so together they cover all QI8_1 ints: each lane adds its partial integer sum from the values it
+        // already loaded and the existing cross-lane reduction completes it. No extra activation loads.
+        const int sum_q8 = ggml_cuda_dp4a(0x01010101, q8[4], ggml_cuda_dp4a(0x01010101, q8[0], 0));
         const half2 ds8 = bq8i->ds;
         sumf_d += __low2float(ds8) * (dot * weight.sc[i]);
-        if (sum_lane) {
-            // Use the same quantized activations and half-rounded scale as the dot.
-            int sum_q8 = 0;
-#pragma unroll
-            for (int k = 0; k < QI8_1; ++k) {
-                sum_q8 = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8i->qs, k), sum_q8);
-            }
-            sumf_m += (__low2float(ds8) * float(sum_q8)) * weight.m[i];
-        }
+        sumf_m += (__low2float(ds8) * float(sum_q8)) * weight.m[i];
     }
 
     return weight.dm.x*sumf_d - weight.dm.y*sumf_m;
