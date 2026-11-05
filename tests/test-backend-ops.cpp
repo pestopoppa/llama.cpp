@@ -8904,6 +8904,10 @@ struct test_qsa_sparse_attn : public test_case {
         return "qsa=1," + VARS_TO_STR8(hs, nh, nh_kv, kv, nb, width, ns, type_KV);
     }
 
+    // compare only the FA output: top_k returns its set in backend-specific order (unordered radix select on HIP),
+    // and the -inf mask intermediates (FILL/SET_ROWS/ADD) have no finite NMSE. The output depends only on the set.
+    bool run_whole_graph() override { return true; }
+
     double max_nmse_err() override {
         return 5e-4;
     }
