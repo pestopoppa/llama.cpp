@@ -84,6 +84,58 @@ inline bool iqk_q8_0_eligible(int64_t logical_rows) {
     return iqk_q8_0_enabled() && logical_rows >= iqk_q8_0_min_rows();
 }
 
+// Option R (cpu-int8-prefill-port-20261105): Q8_0 prefill on the iqk route by default.
+// A compiled threshold, not a runtime knob (ONE-champion rule): a Q8_0 MUL_MAT / MUL_MAT_ID whose
+// LOGICAL row count (ne11 dense, ids->ne[1] MoE: tokens, never the broadcast/top-k expansion) is at
+// least GGML_IQK_Q8_0_PREFILL_MIN_ROWS takes the iqk Q8_0 -> Q8_0_R8 GEMM (is_dequant_better()
+// repacks Q8_0 at Ny >= 32). Below the threshold nothing changes: decode and spec-verify batches
+// keep the champion's path byte for byte. The legacy env knobs are kept and OR-ed in:
+// GGML_IQK_Q8_0=1 [GGML_IQK_Q8_0_MIN_ROWS=n] still widens the route below the threshold (and still
+// gates the CH-19 fused MoE up+gate path), but it can no longer NARROW it: GGML_IQK_Q8_0=0 (or
+// unset) does not take Q8_0 prefill off the iqk route in an ON build. The A/B controls that remain
+// are GGML_IQK=0 (the whole iqk family off, as before) and a -DGGML_IQK_Q8_0_PREFILL=OFF build,
+// where the macro is undefined, this is constant-false and dispatch + graph plans are C6's.
+#ifdef GGML_IQK_Q8_0_PREFILL_MIN_ROWS
+constexpr int64_t k_q8_0_prefill_min_rows = GGML_IQK_Q8_0_PREFILL_MIN_ROWS;
+static_assert(k_q8_0_prefill_min_rows >= 1, "GGML_IQK_Q8_0_PREFILL_MIN_ROWS must be >= 1");
+#define IQK_Q8_0_STR_(x) #x
+#define IQK_Q8_0_STR(x)  IQK_Q8_0_STR_(x)
+// Build-content witness: this literal exists in libggml-cpu only in a GGML_IQK_Q8_0_PREFILL=ON build.
+constexpr const char * k_q8_0_prefill_tag = "iqk_q8_0_prefill GGML_IQK_Q8_0_PREFILL_MIN_ROWS=" IQK_Q8_0_STR(GGML_IQK_Q8_0_PREFILL_MIN_ROWS);
+#else
+constexpr int64_t k_q8_0_prefill_min_rows = 0;   // OFF build: C6 behaviour exactly
+#endif
+inline bool iqk_q8_0_prefill(int64_t logical_rows) {
+    return k_q8_0_prefill_min_rows > 0 && logical_rows >= k_q8_0_prefill_min_rows;
+}
+inline bool iqk_q8_0_route(int64_t logical_rows) {
+    return iqk_q8_0_prefill(logical_rows) || iqk_q8_0_eligible(logical_rows);
+}
+static_assert(!(k_q8_0_prefill_min_rows > 0) || k_q8_0_prefill_min_rows > 1,
+              "a Q8_0 prefill threshold of 1 would move decode onto the iqk route");
+
+// Test witness (no behaviour): Q8_0 MUL_MAT / MUL_MAT_ID ops the iqk route computed since process
+// start, counted once per op by thread 0 after the hook committed (so a silent fallback, e.g. a
+// short work buffer, never counts). Read through the CPU backend's get_proc_address
+// ("ggml_backend_cpu_iqk_q8_0_n_calls").
+std::atomic<uint64_t> iqk_q8_0_n_calls{0};
+
+inline void iqk_q8_0_count(int ith, int weight_type, int64_t logical_rows) {
+    if (ith != 0 || weight_type != GGML_TYPE_Q8_0) {
+        return;
+    }
+    iqk_q8_0_n_calls.fetch_add(1, std::memory_order_relaxed);
+#ifdef GGML_IQK_Q8_0_PREFILL_MIN_ROWS
+    static std::atomic<bool> logged{false};
+    if (iqk_q8_0_prefill(logical_rows) && !logged.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "[iqk] ACTIVE: Q8_0 prefill route (%s, first rows=%lld)\n",
+                k_q8_0_prefill_tag, (long long) logical_rows);
+    }
+#else
+    (void) logical_rows;
+#endif
+}
+
 // INF-70 SYNC-15: GGML_QSPLIT / GGML_QSPLIT_MIN — the activation-quantization split.
 //
 // D1's batch-1 fast path has EVERY thread quantize the WHOLE activation row into its own
@@ -263,7 +315,8 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
     // ne11 is the row count of each logical matrix (the token axis for model
     // projections). ne12/ne13 are broadcast/head batches and must not turn a
     // one-token MLA projection into an apparent large prefill batch.
-    if (src0->type == GGML_TYPE_Q8_0 && !iqk_q8_0_eligible(ne11)) return false;
+    // Option R: compiled prefill threshold OR the legacy env route (both on ne11).
+    if (src0->type == GGML_TYPE_Q8_0 && !iqk_q8_0_route(ne11)) return false;
     const int activation_type = iqk_activation_type((int) src0->type);
     if (activation_type == GGML_TYPE_Q8_K ? ne00 % QK_K != 0 : ne00 % 32 != 0) return false;
 
@@ -386,6 +439,7 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
             fprintf(stderr, "[iqk] ACTIVE: ik_llama GEMM kernels engaged (first mul_mat type=%d activation=%d ne00=%lld)\n",
                     (int) src0->type, activation_type, (long long) ne00);
         }
+        iqk_q8_0_count(ith, (int) src0->type, ne11);
     }
     return ok;
 }
@@ -414,7 +468,8 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     if (!iqk_typeA_supported(tA)) return false;
     if (!iqk_shape_supported(tA, src0->ne[1])) return false;
     if (!iqk_mmid_shape_supported(tA, ids->ne[1])) return false;
-    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_eligible(ids->ne[1])) return false;
+    // Option R: logical rows = tokens (ids->ne[1]), excluding the top-k expansion.
+    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_route(ids->ne[1])) return false;
 
     const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
@@ -573,6 +628,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                         tA, activation_type, n_as);
             }
         }
+        iqk_q8_0_count(ith, tA, ids->ne[1]);
         return true;
     }
 
@@ -726,6 +782,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                     tA, activation_type, n_as);
         }
     }
+    iqk_q8_0_count(ith, tA, ids->ne[1]);
     return true;
 }
 
@@ -844,7 +901,43 @@ extern "C" bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * para
     return true;
 }
 
+// Option R test witnesses (CPU backend get_proc_address). No behaviour depends on them.
+extern "C" uint64_t ggml_cpu_iqk_q8_0_n_calls(void) {
+    return iqk_q8_0_n_calls.load(std::memory_order_relaxed);
+}
+
+extern "C" int64_t ggml_cpu_iqk_q8_0_prefill_min_rows(void) {
+    return k_q8_0_prefill_min_rows;
+}
+
+// Planner side of option R (see ggml_graph_plan): the smallest logical row count at which
+// iqk_q8_0_route() can be true while the family gate is on, INT64_MAX if never. Same predicates
+// as the hooks, so the plan grows exactly where the route can engage: with GGML_IQK unset, or at
+// row counts below the threshold, every plan stays the C6 plan.
+extern "C" int64_t ggml_iqk_q8_0_route_min_rows(void) {
+    if (!iqk_enabled()) {
+        return INT64_MAX;
+    }
+    int64_t m = k_q8_0_prefill_min_rows > 0 ? k_q8_0_prefill_min_rows : INT64_MAX;
+    if (iqk_q8_0_enabled() && iqk_q8_0_min_rows() < m) {
+        m = iqk_q8_0_min_rows();
+    }
+    return m;
+}
+
 #else  // iqk not implemented / disabled — no-op hook
+
+extern "C" int64_t ggml_iqk_q8_0_route_min_rows(void) {
+    return INT64_MAX;
+}
+
+extern "C" uint64_t ggml_cpu_iqk_q8_0_n_calls(void) {
+    return 0;
+}
+
+extern "C" int64_t ggml_cpu_iqk_q8_0_prefill_min_rows(void) {
+    return 0;
+}
 
 extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     (void) params; (void) dst;

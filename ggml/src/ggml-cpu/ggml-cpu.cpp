@@ -793,6 +793,17 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_fused_moe_upgate") == 0) {
         return (void *)ggml_backend_cpu_set_fused_moe_upgate;
     }
+#if defined(GGML_USE_IQK_MULMAT)
+    // Option R test witnesses (NULL = the build has no iqk GEMM at all)
+    if (strcmp(name, "ggml_backend_cpu_iqk_q8_0_n_calls") == 0) {
+        ggml_backend_cpu_iqk_q8_0_n_calls_t fct = ggml_cpu_iqk_q8_0_n_calls;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_cpu_iqk_q8_0_prefill_min_rows") == 0) {
+        ggml_backend_cpu_iqk_q8_0_prefill_min_rows_t fct = ggml_cpu_iqk_q8_0_prefill_min_rows;
+        return (void *)fct;
+    }
+#endif
 #ifdef GGML_IQK_FLASH_ATTENTION
     // AKX-ALL-LB4.5: iqk flash-attention runtime switch (NULL = the build has no iqk FA kernel)
     if (strcmp(name, "ggml_backend_cpu_set_iqk_fa") == 0) {

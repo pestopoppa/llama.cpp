@@ -3581,6 +3581,22 @@ struct ggml_cplan ggml_graph_plan(
                                 cur *= n_tasks;
                             }
                         }
+#if defined(GGML_USE_IQK_MULMAT)
+                        // Option R planner fix: the iqk Q8_0 route quantizes src1 to Q8_2_X4
+                        // (36 B / 32), not Q8_0 (34 B / 32), and silently fell back to the native
+                        // path when wsize was short (ggml_iqk_try_mul_mat: wsize < ne13*nbw3).
+                        // Enlarge only where the route can engage (same logical-row predicate,
+                        // ne11): plans below the threshold, or with GGML_IQK unset, stay the C6
+                        // plans byte for byte. Applied after the D1 n_tasks multiply, so a
+                        // single-row plan is never shrunk. Scratch size only, no numerics.
+                        if (node->src[0]->type == GGML_TYPE_Q8_0 && node->src[1]->type == GGML_TYPE_F32 &&
+                                node->src[1]->ne[0] % 32 == 0 &&
+                                node->src[1]->ne[1] >= ggml_iqk_q8_0_route_min_rows()) {
+                            const size_t iqk_act = (size_t) (node->src[1]->ne[0]/32) * 36 *
+                                (size_t) (node->src[1]->ne[1]*node->src[1]->ne[2]*node->src[1]->ne[3]);
+                            cur = MAX(cur, iqk_act);
+                        }
+#endif
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     if (ggml_type_is_exl3(node->src[0]->type)) {
@@ -3609,6 +3625,22 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+#if defined(GGML_USE_IQK_MULMAT)
+                        // Option R planner fix: ggml_iqk_try_mul_mat_id carves a Q8_K-sized
+                        // activation region (36.5 B / 32) + row counts + row map from wdata and
+                        // fell back when that exceeded the Q8_0-sized (34 B / 32) reservation.
+                        // Reserve the hook's exact carve (iqk_dispatch.cpp, "Carve wdata"), only
+                        // where the route can engage (logical rows = tokens = ids->ne[1]).
+                        if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 &&
+                                ids->ne[1] >= ggml_iqk_q8_0_route_min_rows()) {
+                            const size_t q8k_act = ggml_type_size(GGML_TYPE_Q8_K) * (size_t) ggml_nelements(src1) /
+                                                   (size_t) ggml_blck_size(GGML_TYPE_Q8_K);
+                            const size_t iqk_carve = GGML_PAD(q8k_act, sizeof(int64_t)) +
+                                GGML_PAD((size_t) n_as * sizeof(int64_t), sizeof(int64_t)) +
+                                (size_t) n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping);
+                            cur = MAX(cur, iqk_carve);
+                        }
+#endif
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

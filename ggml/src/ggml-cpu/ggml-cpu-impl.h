@@ -547,6 +547,16 @@ bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct g
 // CH-19 Q8_0 single-token up+gate fusion; false preserves the unfused path.
 bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * params,
         struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu);
+// Option R: smallest logical row count at which a Q8_0 MUL_MAT / MUL_MAT_ID can take the iqk
+// route in this process (compiled prefill threshold, legacy GGML_IQK_Q8_0 env route, GGML_IQK
+// gate), or INT64_MAX when it never can. ggml_graph_plan sizes the Q8_0 work buffer for the iqk
+// activation format exactly when this says the route can engage.
+int64_t ggml_iqk_q8_0_route_min_rows(void);
+// Option R test witnesses, exported through the CPU backend's get_proc_address (ggml-cpu.h):
+// Q8_0 ops the iqk route computed since process start, and the compiled prefill threshold
+// (0 = GGML_IQK_Q8_0_PREFILL=OFF).
+uint64_t ggml_cpu_iqk_q8_0_n_calls(void);
+int64_t  ggml_cpu_iqk_q8_0_prefill_min_rows(void);
 
 #endif
 // Additional activation workspace for the optional Q8_0 fusion; zero if no matching graph.
