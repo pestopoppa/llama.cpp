@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/q8-pipe.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -726,6 +727,8 @@ void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx);
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    ggml_cuda_q8_1_slot_release(this);
 
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
     ggml_cuda_mmvq_q8_1_graph_cache_clear(this);
@@ -1918,6 +1921,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_log_mul_mat_route("MMVQ", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_q8_pipe_mul_mat(ctx, src0, src1, dst)) { // AK-ASM-H4 (gfx90a, GGML_HIP_Q8_PIPE=0 disables)
+        ggml_cuda_log_mul_mat_route("Q8PIPE", src0, src1, dst, cc, ne11);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -3942,6 +3949,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        // AK-ASM-H6: also emit the q8_1 copy for the next MMVQ/H4 consumer (GGML_HIP_RMS_Q8=0 disables)
+        if (ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, cgraph, i)) {
+            return 1;
+        }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -4074,6 +4085,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            ggml_cuda_q8_1_slot_reset(*cuda_ctx);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4116,7 +4128,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_q8_1_slot_observe(*cuda_ctx, node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                for (int k = 1; k <= nodes_to_skip; ++k) {
+                    ggml_cuda_q8_1_slot_observe(*cuda_ctx, cgraph->nodes[i + k]);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG

@@ -6041,6 +6041,62 @@ struct test_rwkv_wkv7 : public test_case {
 };
 
 // GGML_OP_MUL_MAT
+// AK-ASM-H6: rms_norm -> mul(weight) -> one or two quantized matmuls (exercises the fused rms_norm + q8_1 path and
+// the q8_1 slot reuse by MMVQ / the H4 pipelined Q8_0 GEMM).
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type_w;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const bool two_consumers;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, k, m, n, two_consumers);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k * (two_consumers ? 2 : 1);
+    }
+
+    test_rms_norm_mul_mat(ggml_type type_w = GGML_TYPE_Q8_0, int64_t k = 5120, int64_t m = 6144, int64_t n = 512,
+            bool two_consumers = true)
+        : type_w(type_w), k(k), m(m), n(n), two_consumers(two_consumers) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * g  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type_w, k, m);
+        ggml_set_name(a, "a");
+        ggml_set_name(c, "c");
+        ggml_set_name(g, "g");
+        ggml_set_name(w1, "w1");
+
+        a = ggml_add(ctx, a, c); // keep an op between the inputs and rms_norm
+        ggml_tensor * h   = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), g);
+        ggml_tensor * out = ggml_mul_mat(ctx, w1, h);
+        if (two_consumers) {
+            ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type_w, k, m);
+            ggml_set_name(w2, "w2");
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, w2, h));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -12906,6 +12962,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
 
+    // AK-ASM-H4/H6: production shapes of Qwen3.8-27B (hidden 5120, ffn 17408, gated-delta/attn projections) and
+    // Qwen3.6-35B-A3B (hidden 2048) Q8_0 dense matmuls, (k, m) = (ne00, ne01).
+    {
+        const std::array<int64_t, 2> q8_shapes[] = {
+            {5120, 6144}, {5120, 1024}, {6144, 5120}, {5120, 12288}, {5120, 10240}, {17408, 5120}, {5120, 17408}, {5120, 48},
+            {2048, 4096}, {2048, 512}, {4096, 2048}, {2048, 8192}, {512, 2048}, {2048, 32},
+        };
+        for (const auto & km : q8_shapes) {
+            for (int64_t n : {129, 512}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km[1], n, km[0], {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t n : {200, 300, 1000}) { // ragged N and M tails
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+        for (int64_t n : {1, 3, 8, 129, 512}) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0, 5120, 6144, n, true));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0, 2048, 4096, n, true));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q6_K, 5120, 1024, n, false));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 5120, 1024, n, false)); // isum consumer: no slot reuse
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13260,6 +13339,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // AK-ASM-H4/H6: production shapes of Qwen3.8-27B (hidden 5120, ffn 17408, gated-delta/attn projections) and
+    // Qwen3.6-35B-A3B (hidden 2048) Q8_0 dense matmuls, (k, m) = (ne00, ne01).
+    {
+        const std::array<int64_t, 2> q8_shapes[] = {
+            {5120, 6144}, {5120, 1024}, {6144, 5120}, {5120, 12288}, {5120, 10240}, {17408, 5120}, {5120, 17408}, {5120, 48},
+            {2048, 4096}, {2048, 512}, {4096, 2048}, {2048, 8192}, {512, 2048}, {2048, 32},
+        };
+        for (const auto & km : q8_shapes) {
+            for (int64_t n : {512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km[1], n, km[0], {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t n : {1, 512, 2048}) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0, 5120, 6144, n, true));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0, 2048, 4096, n, true));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q6_K, 5120, 1024, n, false));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 5120, 1024, n, false)); // isum consumer: no slot reuse
         }
     }
 
