@@ -79,36 +79,49 @@ struct qsa_match {
     const ggml_tensor * mask;  // F16 [n_kv, >=n_tps, 1, n_stream or 1]
 };
 
-// FA mask = ADD(VIEW(SET_ROWS(VIEW(FILL(-inf)), FILL(0), VIEW(top_k))), kq_mask), possibly behind a cast/cont
+// why the last FA node was not fused (GGML_CUDA_QSA_SPARSE_DEBUG=1 prints it)
+static void qsa_reject(const ggml_tensor * fa, const char * why) {
+    if (qsa_debug()) {
+        static int n_logged = 0;
+        if (n_logged++ < 16) {
+            GGML_LOG_INFO("ggml_cuda_qsa_sparse: no match at %s: %s\n", fa->name, why);
+        }
+    }
+}
+
+// FA mask = ADD(VIEW(SET_ROWS(dst=VIEW(FILL(-inf)), values=FILL(0), idx=VIEW(top_k))), kq_mask), possibly behind a cast/cont.
+// ggml_set_rows(a, b, c) stores src[0] = b (values), src[1] = c (indices), src[2] = a (destination).
 static bool qsa_match_mask(const ggml_tensor * fa, qsa_match & m) {
     const ggml_tensor * mask = fa->src[3];
     if (!mask) {
-        return false;
+        qsa_reject(fa, "no mask"); return false;
     }
     const ggml_tensor * add = qsa_strip_views_cpy(mask);
     if (!add || add->op != GGML_OP_ADD) {
-        return false;
+        qsa_reject(fa, "mask is not an ADD"); return false;
     }
+    const char * why = "no SET_ROWS operand";
     for (int side = 0; side < 2; ++side) {
         const ggml_tensor * sr   = qsa_strip_views(add->src[side]);
         const ggml_tensor * base = add->src[1 - side];
         if (!sr || sr->op != GGML_OP_SET_ROWS || !base) {
             continue;
         }
-        if (!qsa_is_fill(qsa_strip_views(sr->src[0]), -INFINITY)) {
-            continue;
+        if (!qsa_is_fill(qsa_strip_views(sr->src[2]), -INFINITY)) {
+            why = "SET_ROWS destination is not FILL(-inf)"; continue;
         }
-        if (!qsa_is_fill(qsa_strip_views(sr->src[1]), 0.0f)) {
-            continue;
+        if (!qsa_is_fill(qsa_strip_views(sr->src[0]), 0.0f)) {
+            why = "SET_ROWS values are not FILL(0)"; continue;
         }
         // rows of size 1: [1, n_kv, n_batch, n_stream]
         if (sr->ne[0] != 1) {
-            continue;
+            why = "SET_ROWS rows are not of size 1"; continue;
         }
-        m.top_k = sr->src[2];
+        m.top_k = sr->src[1];
         m.mask  = base;
         return true;
     }
+    qsa_reject(fa, why);
     return false;
 }
 
@@ -426,7 +439,7 @@ static bool qsa_dispatch_g(ggml_backend_cuda_context & ctx, const qsa_params & p
         case  8: qsa_launch<D,  8, type>(ctx, p, n_chunks); return true;
         case 12: qsa_launch<D, 12, type>(ctx, p, n_chunks); return true;
         case 16: qsa_launch<D, 16, type>(ctx, p, n_chunks); return true;
-        default: return false;
+        default: return false; // caller reports the reject
     }
 }
 
@@ -466,48 +479,48 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int64_t n_head_kv = k->ne[2];
 
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
-        return false;
+        qsa_reject(dst, "q/dst type or dst layout"); return false;
     }
     if (k->type != v->type || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0)) {
-        return false;
+        qsa_reject(dst, "K/V type"); return false;
     }
     if (D != 256 || k->ne[0] != D || v->ne[0] != D || v->ne[1] != n_kv || v->ne[2] != n_head_kv) {
-        return false;
+        qsa_reject(dst, "head size / K-V shape"); return false;
     }
     if (k->ne[3] != n_stream || v->ne[3] != n_stream || n_head % n_head_kv != 0) {
-        return false;
+        qsa_reject(dst, "stream / head split"); return false;
     }
     if (q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
-        return false;
+        qsa_reject(dst, "row strides"); return false;
     }
     if (k->type == GGML_TYPE_F16) {
         // 16-byte K row loads
         if (((uintptr_t) k->data % 16) != 0 || k->nb[1] % 16 != 0 || k->nb[2] % 16 != 0 || k->nb[3] % 16 != 0) {
-            return false;
+            qsa_reject(dst, "F16 K alignment"); return false;
         }
     }
     if (tk->type != GGML_TYPE_I32 || tk->nb[0] != sizeof(int32_t) || tk->ne[1] != n_tps || tk->ne[2] != n_stream || tk->ne[3] != 1) {
-        return false;
+        qsa_reject(dst, "top_k shape/type"); return false;
     }
     if (mask->type != GGML_TYPE_F16 || mask->nb[0] != sizeof(half) || mask->ne[0] != n_kv || mask->ne[1] < n_tps ||
             mask->ne[2] != 1 || n_stream % mask->ne[3] != 0) {
-        return false;
+        qsa_reject(dst, "base mask shape/type"); return false;
     }
     if (!qsa_on_device(tk) || !qsa_on_device(mask)) {
-        return false;
+        qsa_reject(dst, "top_k or mask not in device memory"); return false;
     }
 
     const int64_t width = tk->ne[0];
     if (width < 1 || width > INT32_MAX/2) {
-        return false;
+        qsa_reject(dst, "width out of range"); return false;
     }
     // nothing to skip: every cell is selected, the dense FA is the better kernel
     if (width >= n_kv) {
-        return false;
+        qsa_reject(dst, "width >= n_kv (dense is better)"); return false;
     }
     const int max_tok = qsa_max_tokens();
     if (max_tok > 0 && n_tps*n_stream > max_tok) {
-        return false;
+        qsa_reject(dst, "GGML_CUDA_QSA_SPARSE_MAX_TOKENS"); return false;
     }
 
     qsa_params p = {};
@@ -534,6 +547,9 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int n_chunks = (int) ((width + D - 1)/D);
 
     bool ok;
+    if (G != 1 && G != 2 && G != 4 && G != 8 && G != 12 && G != 16) {
+        qsa_reject(dst, "unsupported GQA group size"); return false;
+    }
     if (k->type == GGML_TYPE_F16) {
         ok = qsa_dispatch_g<256, GGML_TYPE_F16>(ctx, p, G, n_chunks);
     } else {
