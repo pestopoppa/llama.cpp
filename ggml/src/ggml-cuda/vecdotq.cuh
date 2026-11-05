@@ -520,17 +520,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const float d8 = __low2float(ds8);
 
         sumf_d += d8 * (dot0 * sc[i]);
-        if (sum_lane) {
-            // Match the min correction to the quantized activation values
-            // used by dot0, rather than the q8_1 sum of original floats.
-            int sum_q8 = 0;
-#pragma unroll
-            for (int k = 0; k < QI8_1; ++k) {
-                sum_q8 = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8_1[i].qs, k), sum_q8);
-            }
-            sumf_m += (d8 * float(sum_q8)) * m[i];
-        }
+        // Min correction from the same quantized activations used by dot0 (not the q8_1 sum of the
+        // original floats). u holds this lane's ints {q8_offset, q8_offset+4} of block i; the four lanes
+        // sharing the block cover all QI8_1 ints, so each adds its partial integer sum and the caller's
+        // cross-lane reduction completes it, without reloading the block.
+        const int sum_q8 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
+        sumf_m += (d8 * float(sum_q8)) * m[i];
     }
+    (void) sum_lane;
 
     const float2 dm4f = __half22float2(dm4);
 

@@ -261,7 +261,6 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
 #endif
     const uint8_t * m      = sc      + 2;
     const uint8_t * m_gate = sc_gate + 2;
-    const bool sum_lane = iqs % QI8_1 == 0;
 
 #if defined(__gfx90a__)
     using floatx2_t = __attribute__((ext_vector_type(2))) float;
@@ -279,10 +278,11 @@ static __device__ __forceinline__ float2 vec_dot_q4_K_q8_1_dual(
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
         const half2 ds8 = bq8i->ds;
         const float d8 = __low2float(ds8);
-        const float s8 = sum_lane ? __high2float(ds8) : 0.0f;
         const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
         const int u0 = q8[0];
         const int u1 = q8[4];
+        // C6-Q4-MMVQ-FIX: min correction from this lane's quantized partial sum (see vec_dot_q4_K_q8_1_b4).
+        const float s8 = d8 * float(ggml_cuda_dp4a(0x01010101, u1, ggml_cuda_dp4a(0x01010101, u0, 0)));
 
         const int dot0 = ggml_cuda_dp4a((v0 >> (4*i)) & 0x0F0F0F0F, u0, 0);
         const int dot1 = ggml_cuda_dp4a((v1 >> (4*i)) & 0x0F0F0F0F, u1, 0);
