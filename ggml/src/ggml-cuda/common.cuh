@@ -1405,10 +1405,27 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// AK-ASM-H5-PORT (fattn-asm-gfx90a.cu): result of the device-side KQ-mask classification, reused by every
+// FLASH_ATTN_EXT node of the same graph compute that reads the same mask tensor (one stream sync per mask).
+struct ggml_cuda_fattn_asm_mask_cache {
+    uint64_t     epoch  = 0;        // ggml_backend_cuda_context::graph_compute_epoch at classification time
+    const void * tensor = nullptr;  // the mask ggml_tensor object
+    const void * data   = nullptr;
+    int64_t      n_q    = 0;
+    int64_t      n_kv   = 0;
+    int          kind   = 0;        // 0 = unsupported, 1 = full (no causal), 2 = bottom-right causal
+    int64_t      len    = 0;        // effective KV length L (the -INF tail beyond it is KV padding)
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // incremented at every graph compute; scopes ggml_cuda_fattn_asm_mask_cache (graph inputs, such as the KQ
+    // mask, only change between graph computes)
+    uint64_t graph_compute_epoch = 0;
+    ggml_cuda_fattn_asm_mask_cache fattn_asm_mask_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
