@@ -11104,8 +11104,23 @@ static const std::array<int64_t, 2> akh1_q38_27b_shapes[] = {
     {17408, 5120},  // ffn_gate / ffn_up
 };
 
+// Qwen3.6-35B-A3B Q8_0 dense (non-expert) weight shapes, from /mnt/raid0/llm/models/Qwen3.6-35B-A3B-MTP-Q8_0.gguf.
+static const std::array<int64_t, 2> akh1_q36_a3b_shapes[] = {
+    { 4096, 2048},  // attn_gate
+    {  512, 2048},  // attn_k / attn_v / ffn_gate_shexp / ffn_up_shexp
+    { 2048, 4096},  // attn_output / ssm_out / nextn.eh_proj
+    { 8192, 2048},  // attn_q / attn_qkv
+    { 2048,  512},  // ffn_down_shexp
+    {   32, 2048},  // ssm_alpha / ssm_beta
+};
+
 static void akh1_add_q8_skinny_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
     for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (const auto & sh : akh1_q36_a3b_shapes) {
         for (int64_t n : {5, 8, 16}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
         }
@@ -11123,8 +11138,14 @@ static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
         }
     }
-    for (int64_t n : {5, 8, 16}) {  // output.weight
+    for (const auto & sh : akh1_q36_a3b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {5, 8, 16}) {  // output.weight (27B, A3B)
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, n, 2048, {1, 1}, {1, 1}));
     }
 }
 
