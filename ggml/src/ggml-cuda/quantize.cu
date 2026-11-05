@@ -395,7 +395,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool q4k_quantized_sum = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -460,6 +460,19 @@ static __global__ void quantize_mmq_q8_1(
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
+
+    if constexpr (q4k_quantized_sum) {
+        static_assert(ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4 && !scatter,
+                      "q4_K quantized sum is scoped to direct DS4 MMQ");
+        int qsum = int(q.x) + int(q.y) + int(q.z) + int(q.w);
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            qsum += __shfl_xor_sync(0xFFFFFFFF, qsum, offset, WARP_SIZE);
+        }
+        // The MMQ dot uses the half-rounded q8 scale, so its offset must
+        // use that same scale and the same quantized activation values.
+        sum = __half2float(__float2half(d)) * float(qsum);
+    }
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -536,8 +549,13 @@ void quantize_mmq_q8_1_cuda(
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            if (type_src0 == GGML_TYPE_Q4_K && ids == nullptr) {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            } else {
+                quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
+                    <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            }
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>

@@ -521,8 +521,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
 
         sumf_d += d8 * (dot0 * sc[i]);
         if (sum_lane) {
-            const float s8 = __high2float(ds8);
-            sumf_m += s8 * m[i]; // sum of q8_1 block * q4_K min val
+            // Match the min correction to the quantized activation values
+            // used by dot0, rather than the q8_1 sum of original floats.
+            int sum_q8 = 0;
+#pragma unroll
+            for (int k = 0; k < QI8_1; ++k) {
+                sum_q8 = ggml_cuda_dp4a(0x01010101, get_int_b4(bq8_1[i].qs, k), sum_q8);
+            }
+            sumf_m += (d8 * float(sum_q8)) * m[i];
         }
     }
 
@@ -721,7 +727,20 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
         u[2*i+1] = get_int_b4(bq8_1->qs, iqs + i + QI4_0);
     }
 
-    return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
+    // Center the four-bit weights in integer space.  ds8.y is the rounded
+    // sum of the original activations, not the sum of their q8 integers; using
+    // it for the -8 correction adds a second quantization discrepancy.
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
+        const uint32_t lo = uint32_t(v[i]) & 0x0f0f0f0fU;
+        const uint32_t hi = (uint32_t(v[i]) >> 4) & 0x0f0f0f0fU;
+        const uint32_t slo = (lo & 0x07070707U) | (((~lo) & 0x08080808U) * 31U);
+        const uint32_t shi = (hi & 0x07070707U) | (((~hi) & 0x08080808U) * 31U);
+        sumi = ggml_cuda_dp4a(static_cast<int>(slo), u[2*i+0], sumi);
+        sumi = ggml_cuda_dp4a(static_cast<int>(shi), u[2*i+1], sumi);
+    }
+    return float(bq4_0->d) * float(sumi) * __half22float2(bq8_1->ds).x;
 }
 
 
