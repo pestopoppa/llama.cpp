@@ -186,9 +186,6 @@ target_include_directories(test-mmap-evict PRIVATE ${PROJECT_SOURCE_DIR}/src)
 # SPEC-GRAM.1 grammar cost microbenchmark (measurement tool, not a test; experimental)
 llama_build(bench-grammar-sampler.cpp)
 
-# SPEC-GRAM.1 grammar cost microbenchmark (measurement tool, not a test; experimental)
-llama_build(bench-grammar-sampler.cpp)
-
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
