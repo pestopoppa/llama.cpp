@@ -182,6 +182,11 @@ llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build_and_test(test-mmap-evict.cpp LABEL "main")
 target_include_directories(test-mmap-evict PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (BUILD_SHARED_LIBS AND NOT WIN32)
+    # Meta host-view regression (9422960da); compiles the Meta source in, so shared ggml only
+    llama_build_and_test(test-backend-meta-host-view.cpp LABEL "main")
+    target_include_directories(test-backend-meta-host-view PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
 
 # SPEC-GRAM.1 grammar cost microbenchmark (measurement tool, not a test; experimental)
 llama_build(bench-grammar-sampler.cpp)
