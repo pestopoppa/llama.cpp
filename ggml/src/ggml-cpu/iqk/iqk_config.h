@@ -17,6 +17,11 @@
 #ifndef GGML_TYPE_Q8_2_X4
 #define GGML_TYPE_Q8_2_X4 99
 #endif
+// C6-IQKQ8PF-FP16S: Q8_2_X4 layout (36 B / 32) with an FP16 d and Q8_0-identical codes (quantize_row_q8_0),
+// s = int16 block sum. Activation for Q8_0 weights on the iqk route (AVX512 VNNI kernels only).
+#ifndef GGML_TYPE_Q8_2_X4_H
+#define GGML_TYPE_Q8_2_X4_H 97
+#endif
 
 #if defined IQK_IMPLEMENT
 #undef IQK_IMPLEMENT

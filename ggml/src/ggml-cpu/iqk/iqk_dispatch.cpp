@@ -105,6 +105,12 @@ constexpr const char * k_q8_0_prefill_tag = "iqk_q8_0_prefill GGML_IQK_Q8_0_PREF
 #else
 constexpr int64_t k_q8_0_prefill_min_rows = 0;   // OFF build: C6 behaviour exactly
 #endif
+// C6-IQKQ8PF-FP16S build-content witness: which activation format the Q8_0 route quantizes to.
+#ifdef HAVE_FANCY_SIMD
+constexpr const char * k_q8_0_act_tag = "iqk_q8_0_act=Q8_2_X4_H fp16-scale q8_0-rounding";
+#else
+constexpr const char * k_q8_0_act_tag = "iqk_q8_0_act=Q8_2_X4 bf16-scale";
+#endif
 inline bool iqk_q8_0_prefill(int64_t logical_rows) {
     return k_q8_0_prefill_min_rows > 0 && logical_rows >= k_q8_0_prefill_min_rows;
 }
@@ -128,8 +134,8 @@ inline void iqk_q8_0_count(int ith, int weight_type, int64_t logical_rows) {
 #ifdef GGML_IQK_Q8_0_PREFILL_MIN_ROWS
     static std::atomic<bool> logged{false};
     if (iqk_q8_0_prefill(logical_rows) && !logged.exchange(true, std::memory_order_relaxed)) {
-        fprintf(stderr, "[iqk] ACTIVE: Q8_0 prefill route (%s, first rows=%lld)\n",
-                k_q8_0_prefill_tag, (long long) logical_rows);
+        fprintf(stderr, "[iqk] ACTIVE: Q8_0 prefill route (%s, %s, first rows=%lld)\n",
+                k_q8_0_prefill_tag, k_q8_0_act_tag, (long long) logical_rows);
     }
 #else
     (void) logical_rows;
@@ -273,8 +279,42 @@ static_assert(!iqk_mmid_shape_supported(GGML_TYPE_IQ3_XXS, 15));
 static_assert(!iqk_mmid_shape_supported(GGML_TYPE_IQ3_XXS, 16));
 static_assert(iqk_mmid_shape_supported(GGML_TYPE_IQ3_S, 16));
 
+// C6-IQKQ8PF-FP16S: Q8_0 weights take Q8_2_X4_H activations (fp16 d, codes from ggml's own quantize_row_q8_0 =
+// bit-identical to the native Q8_0 path's src1 quantization), so the iqk route no longer adds the bf16-scale
+// rounding excess (NWT gate c6-iqkq8pf-nwt-gate-20261105: +0.2% PPL on Qwen3.6-35B-A3B with bf16 scales).
+// Kernels exist for AVX512-VNNI (HAVE_FANCY_SIMD) only; elsewhere Q8_0 keeps Q8_2_X4.
 inline int iqk_activation_type(int weight_type) {
+#ifdef HAVE_FANCY_SIMD
+    if (weight_type == GGML_TYPE_Q8_0) return GGML_TYPE_Q8_2_X4_H;
+#endif
     return iqk_weight_uses_q8_k(weight_type) ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_2_X4;
+}
+
+// Q8_2_X4 layout with Q8_0 numerics: per 4 blocks d[0..3] = fp16 d, d[4..7] = int16 sum of the block's codes;
+// tail blocks (k/32 not a multiple of 4) as single block_q8_2 {d (fp16), s, qs}. k % 32 == 0.
+void quantize_row_q8_2_x4_h(const float * x, void * vy, int64_t k) {
+    const int64_t nb = k / QK8_0, nb4 = nb / 4;
+    block_q8_2_x4 * y4 = (block_q8_2_x4 *) vy;
+    block_q8_2    * y  = (block_q8_2 *) vy;
+    block_q8_0 tmp[4];
+    for (int64_t i4 = 0; i4 < nb4; ++i4) {
+        quantize_row_q8_0(x + 4*QK8_0*i4, tmp, 4*QK8_0);
+        for (int j = 0; j < 4; ++j) {
+            int isum = 0;
+            for (int l = 0; l < QK8_0; ++l) isum += tmp[j].qs[l];
+            y4[i4].d[j]   = tmp[j].d;
+            y4[i4].d[j+4] = (uint16_t) (int16_t) isum;
+            memcpy(y4[i4].qs + QK8_0*j, tmp[j].qs, QK8_0);
+        }
+    }
+    for (int64_t i = 4*nb4; i < nb; ++i) {
+        quantize_row_q8_0(x + QK8_0*i, tmp, QK8_0);
+        int isum = 0;
+        for (int l = 0; l < QK8_0; ++l) isum += tmp[0].qs[l];
+        y[i].d = tmp[0].d;
+        y[i].s = (int16_t) isum;
+        memcpy(y[i].qs, tmp[0].qs, QK8_0);
+    }
 }
 
 inline size_t iqk_activation_row_size(int activation_type, int64_t n) {
@@ -286,6 +326,8 @@ inline size_t iqk_activation_row_size(int activation_type, int64_t n) {
 inline void iqk_quantize_activation(int activation_type, const float * src, void * dst, int64_t n) {
     if (activation_type == GGML_TYPE_Q8_K) {
         quantize_row_q8_K(src, dst, n);
+    } else if (activation_type == GGML_TYPE_Q8_2_X4_H) {
+        quantize_row_q8_2_x4_h(src, dst, n);
     } else {
         quantize_row_q8_2_x4(src, dst, n);
     }

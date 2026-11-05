@@ -87,6 +87,18 @@ inline __m256 convert_scales(const uint16_t * scales) {
     return _mm256_set_m128(_mm_mul_ps(aux_d, aux_m), aux_d);
 }
 
+// C6-IQKQ8PF-FP16S: Q8_2_X4 layout whose d slot holds an FP16 (not BF16) scale: activations quantized with
+// ggml's own quantize_row_q8_0 (bit-identical codes and scale to the native Q8_0 path), s = int16 block sum.
+inline __m256 convert_scales_h(const uint16_t * scales) {
+    auto aux_d = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)scales));
+    auto aux_m = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(scales+4))));
+    return _mm256_set_m128(_mm_mul_ps(aux_d, aux_m), aux_d);
+}
+
+template <bool fp16_scale> inline __m256 convert_scales_T(const uint16_t * scales) {
+    if constexpr (fp16_scale) return convert_scales_h(scales); else return convert_scales(scales);
+}
+
 inline __m128 convert_scales_s(const uint16_t * scales) {
     return _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)scales)), 16));
 }
@@ -226,6 +238,27 @@ struct ScaleHelperQ8_2 {
     }
     template <typename Q> static inline std::pair<float, float> prepare1(const Q * y) {
         float   d = GGML_BF16_TO_FP32(ggml_bf16_t{y->d});
+        int16_t m = *(const int16_t *)&y->s;
+        return std::make_pair(d, d*m);
+    }
+    static inline std::pair<float, float> prepare1(const std::pair<float, float>& dm, const block_q8_2 * y) {
+        auto d = prepare1(y);
+        return std::make_pair(dm.first*d.first, dm.second*d.second);
+    }
+};
+
+struct ScaleHelperQ8_2H {   // C6-IQKQ8PF-FP16S: fp16 d variant of ScaleHelperQ8_2
+    template <typename Q>
+    inline __m256 prepare4(const Q * y) {
+        const block_q8_2_x4 * y4 = (const block_q8_2_x4 *)y;
+        return convert_scales_h((const uint16_t *)y4->d);
+    }
+    template <typename Q>
+    inline __m256 prepare4(__m256 other_scales, const Q * y) {
+        return _mm256_mul_ps(other_scales, prepare4<Q>(y));
+    }
+    template <typename Q> static inline std::pair<float, float> prepare1(const Q * y) {
+        float   d = GGML_FP16_TO_FP32(y->d);
         int16_t m = *(const int16_t *)&y->s;
         return std::make_pair(d, d*m);
     }
@@ -498,20 +531,28 @@ void mul_mat_qX_1_q8_1_T(int n, const void * vx, size_t bx, const DataInfo& info
     }
 }
 
-template <typename Unpacker, int nrc_y>
-void mul_mat_qX_1_q8_2_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+template <typename Unpacker, typename ScaleHelper, int nrc_y>
+void mul_mat_qX_1_q8_2_impl(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n%Unpacker::block_size() == 0);
     Q8<nrc_y, block_q8_2> q8(info);
     int nb = n/Unpacker::block_size();
     if (nb%4 == 0) {
-        mul_mat_qX_q8_Helper<Unpacker, AccumType1<nrc_y, true>, ScaleHelperQ8_2, block_q8_2, nrc_y>(
+        mul_mat_qX_q8_Helper<Unpacker, AccumType1<nrc_y, true>, ScaleHelper, block_q8_2, nrc_y>(
                 nb, vx, bx, info, q8.y, nrc_x
         );
     } else {
-        mul_mat_qX_q8_Helper<Unpacker, AccumType1<nrc_y, false>, ScaleHelperQ8_2, block_q8_2, nrc_y>(
+        mul_mat_qX_q8_Helper<Unpacker, AccumType1<nrc_y, false>, ScaleHelper, block_q8_2, nrc_y>(
                 nb, vx, bx, info, q8.y, nrc_x
         );
     }
+}
+template <typename Unpacker, int nrc_y>
+void mul_mat_qX_1_q8_2_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    mul_mat_qX_1_q8_2_impl<Unpacker, ScaleHelperQ8_2, nrc_y>(n, vx, bx, info, nrc_x);
+}
+template <typename Unpacker, int nrc_y>
+void mul_mat_qX_1_q8_2H_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    mul_mat_qX_1_q8_2_impl<Unpacker, ScaleHelperQ8_2H, nrc_y>(n, vx, bx, info, nrc_x);
 }
 
 template <typename Unpacker, int nrc_y, int nrc_x>
@@ -1576,7 +1617,7 @@ inline __m256i q8_0_r8_dot_product(const uint8_t * x, const int8_t * y, __m256i 
     }
     return qx_r8_q8_dot_product(qx, y);
 }
-template <int nrc_y>
+template <int nrc_y, bool fp16_scale = false>
 static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     GGML_ASSERT(nrc_x%16 == 0);
     Q8<nrc_y, block_q8_2_x4> q8(info);
@@ -1588,7 +1629,7 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
         for (int ix = 0; ix < nrc_x; ix += 8) {
             const block_q8_0_r8 * iq8 = (const block_q8_0_r8 *)((const char *)vx + ix*bx);
             for (int ib4 = 0; ib4 < nb/4; ++ib4) {
-                _mm256_storeu_ps(d8, convert_scales((const uint16_t *)q8.y[0][ib4].d));
+                _mm256_storeu_ps(d8, convert_scales_T<fp16_scale>((const uint16_t *)q8.y[0][ib4].d));
                 for (int k = 0; k < 4; ++k) {
                     auto scales = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)iq8[4*ib4+k].d));
                     auto sumi = q8_0_r8_dot_product((const uint8_t *)iq8[4*ib4+k].qs, q8.y[0][ib4].qs+32*k, qx);
@@ -1602,7 +1643,7 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
                 for (int ib = 4*(nb/4); ib < nb; ++ib) {
                     auto scales = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)iq8[ib].d));
                     auto sumi = q8_0_r8_dot_product((const uint8_t *)iq8[ib].qs, qy[ib].qs, qx);
-                    auto [d8, m8] = ScaleHelperQ8_2::prepare1(qy + ib);
+                    auto [d8, m8] = std::conditional_t<fp16_scale, ScaleHelperQ8_2H, ScaleHelperQ8_2>::prepare1(qy + ib);
                     auto d4d8 = _mm256_mul_ps(scales, _mm256_set1_ps(d8));
                     acc[0] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), acc[0]);
                     acc[1] = _mm256_fmadd_ps(scales, _mm256_set1_ps(m8), acc[1]);
@@ -1620,7 +1661,7 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
             const block_q8_0_r8 * q8h = (const block_q8_0_r8 *)((const char *)vx + (ix+8)*bx);
             for (int ib4 = 0; ib4 < nb/4; ++ib4) {
                 for (int iy = 0; iy < nrc_y; ++iy) {
-                    _mm256_storeu_ps(d8+8*iy, convert_scales((const uint16_t *)q8.y[iy][ib4].d));
+                    _mm256_storeu_ps(d8+8*iy, convert_scales_T<fp16_scale>((const uint16_t *)q8.y[iy][ib4].d));
                 }
                 for (int k = 0; k < 4; ++k) {
                     auto scales1  = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)q8l[4*ib4+k].d));
@@ -1651,7 +1692,7 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
                 for (int iy = 0; iy < nrc_y; ++iy) {
                     auto qy = (const block_q8_2 *)q8.y[iy];
                     auto sumi = qx_r8_q8_dot_product(qx, qy[ib].qs);
-                    auto [d8, m8] = ScaleHelperQ8_2::prepare1(qy + ib);
+                    auto [d8, m8] = std::conditional_t<fp16_scale, ScaleHelperQ8_2H, ScaleHelperQ8_2>::prepare1(qy + ib);
                     auto dy = _mm512_set1_ps(d8);
                     acc[2*iy+0] = _mm512_fmadd_ps(_mm512_mul_ps(scales, dy), _mm512_cvtepi32_ps(sumi), acc[2*iy+0]);
                     acc[2*iy+1] = _mm512_fmadd_ps(scales, _mm512_set1_ps(m8), acc[2*iy+1]);
@@ -1664,6 +1705,11 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
             }
         }
     }
+}
+// C6-IQKQ8PF-FP16S: Q8_0_R8 x Q8_2_X4 with fp16 activation scales (activations from quantize_row_q8_0).
+template <int nrc_y>
+static void mul_mat_q8_0_r8_q8_2H(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    mul_mat_q8_0_r8_q8_2<nrc_y, true>(n, vx, bx, info, nrc_x);
 }
 #else
 template <int nrc_y>
@@ -2084,6 +2130,22 @@ bool iqk_convert_legacy_quants_q8_r8(int type, int n, const void * vx, size_t bx
 bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
 
     if (ne00%QK8_0 != 0) return false;
+
+#ifdef HAVE_FANCY_SIMD
+    // C6-IQKQ8PF-FP16S: Q8_0 weights with Q8_0-rounded (fp16-scale) activations. Only Q8_0 and its Q8_0_R8 repack.
+    if (typeB == GGML_TYPE_Q8_2_X4_H) {
+        func16 = nullptr;
+        if (typeA == GGML_TYPE_Q8_0) {
+            IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_1_q8_2H_T, Q8_0_1_Unpacker, kernels)
+            return true;
+        }
+        if (typeA == GGML_TYPE_Q8_0_R8) {
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_0_r8_q8_2H, kernels)
+            return true;
+        }
+        return false;
+    }
+#endif
 
     auto expected_typeB = GGML_TYPE_Q8_2_X4;
 
