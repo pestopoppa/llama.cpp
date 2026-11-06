@@ -9009,6 +9009,80 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// AK-ASM-H10: multi-token verify attention exactly as llama builds it for a DFlash/MTP verify step: q [hs, nh, nb, ns] and
+// the K/V caches [hs, nh_kv, kv, ns] permuted to [hs, n, h, s] (non-contiguous K/V views, as get_k/get_v give), causal
+// f16 mask [kv, nb, 1, ns]: query i sits at position n_used - nb + i and sees cells j <= its position; cells
+// j >= n_used (cache not yet filled) are -inf. ggml-cuda runs the GQA-packed kernel (fattn-gqa-verify.cu) for
+// hs 256, nb 2..16 unless GGML_CUDA_FA_GQA_VERIFY=0.
+struct test_fa_gqa_verify : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;
+    const int64_t   nh_kv;
+    const int64_t   kv;     // n_kv cells (multiple of 256)
+    const int64_t   nb;     // query tokens per stream
+    const int64_t   ns;     // streams
+    const ggml_type type_KV;
+    const int64_t   tail;   // unfilled cells at the end of the window (masked -inf)
+
+    std::string vars() override {
+        return "gqav=1," + VARS_TO_STR8(hs, nh, nh_kv, kv, nb, ns, type_KV, tail);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh * nb * (hs + hs) * kv * ns;
+    }
+
+    test_fa_gqa_verify(int64_t hs = 256, int64_t nh = 24, int64_t nh_kv = 4, int64_t kv = 1024, int64_t nb = 5,
+                       int64_t ns = 1, ggml_type type_KV = GGML_TYPE_Q8_0, int64_t tail = 0)
+        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), ns(ns), type_KV(type_KV), tail(tail) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nh, nb, ns);
+        ggml_set_name(q, "q");
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        ggml_set_name(kc, "kc");
+        ggml_tensor * vc = ggml_new_tensor_4d(ctx, type_KV, hs, nh_kv, kv, ns);
+        ggml_set_name(vc, "vc");
+        ggml_tensor * k = ggml_permute(ctx, kc, 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, vc, 0, 2, 1, 3);
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                const int64_t n_used = kv - tail;
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t i = 0; i < nb; ++i) {
+                        const int64_t pos = n_used - nb + i;
+                        for (int64_t j = 0; j < kv; ++j) {
+                            data[(s*nb + i)*kv + j] = ggml_fp32_to_fp16(j <= pos ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // G10 (INF-48): a test_flash_attn_ext that carries a stable id in its case name (",g10=NN" appended to vars()), so the imported
 // upstream cases can be selected in isolation with `-p 'g10='` (or one at a time with `-p 'g10=07$'`) and parsed per case.
 // Behaviour is otherwise identical to test_flash_attn_ext (prec is always GGML_PREC_F32, as in every imported upstream case).
@@ -12577,6 +12651,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // AK-ASM-H10: GQA-packed verify attention (27B 24/4, A3B 16/2, Q38FN 24/2), hd256, f16 and q8_0 KV, causal mask
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (auto hh : std::vector<std::array<int64_t, 2>>{{24, 4}, {16, 2}, {24, 2}}) {
+            for (int64_t nb : {1, 2, 5, 8, 16}) {
+                test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], 1024, nb, 1, type_KV, 0));
+                test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], 4096, nb, 1, type_KV, 300));
+            }
+            test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], 2048, 5, 2, type_KV, 77));
+        }
+        // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
+    }
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -13078,6 +13164,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
+    // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
+    for (int64_t kv : {8192, 32768, 81920}) {
+        for (auto hh : std::vector<std::array<int64_t, 2>>{{24, 4}, {16, 2}, {24, 2}}) {
+            for (int64_t nb : {1, 2, 5, 8, 16}) {
+                for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], kv, nb, 1, type_KV, 0));
+                }
+            }
+        }
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
