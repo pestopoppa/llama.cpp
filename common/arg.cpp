@@ -1577,6 +1577,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFILL_BUDGET_TARGET_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefill-budget-align"}, "N",
+        string_format("adaptive prefill budget: round the iteration's batch rows (decode rows + prompt tokens) down to a "
+            "multiple of N; the iteration cost is a staircase in the batch rows (KVU-16g-3: ~60 ms steps every 32 rows "
+            "on MI210, -ub 512), so an aligned chunk is the cheapest point of its step and the controller does not "
+            "limit-cycle across a step edge (default: %d, 0 = off)", params.prefill_budget_align),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prefill-budget-align must be non-negative");
+            }
+            params.prefill_budget_align = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_BUDGET_ALIGN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-budget-tail-k"}, "K",
+        string_format("adaptive prefill budget: aim at --prefill-budget-target-ms minus K times the RMS of the measured "
+            "one-step prediction error, so the iteration-time tail (not the mean) is held near the target "
+            "(default: %.2f, 0 = mean controller)", (double) params.prefill_budget_tail_k),
+        [](common_params & params, const std::string & value) {
+            const float k = std::stof(value);
+            if (!(k >= 0.0f)) {
+                throw std::invalid_argument("prefill-budget-tail-k must be non-negative");
+            }
+            params.prefill_budget_tail_k = k;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_BUDGET_TAIL_K").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--prefill-order"}, "{slot,srpf}",
         "order in which the server fills each iteration's batch with pending prompts: 'slot' walks the slots by "
         "index (a short prompt in a higher slot waits behind a long prefill in a lower one); 'srpf' takes the "

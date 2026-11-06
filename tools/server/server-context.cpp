@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-prefill-budget.h"
 #include "server-prefill-order.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -1392,6 +1393,12 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        pb_ctl           = {};
+        pb_ctl.cap       = params_base.prefill_budget_decoding;
+        pb_ctl.target_ms = params_base.prefill_budget_target_ms;
+        pb_ctl.align     = params_base.prefill_budget_align;
+        pb_ctl.tail_k    = params_base.prefill_budget_tail_k;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -4003,8 +4010,6 @@ private:
     // a neighbour's prompt; the chunk's cost grows with the occupied KV cells, so a full n_batch chunk can
     // stall every decoding slot for seconds per step. the budget caps the prompt tokens per iteration in
     // that case only; with no slot generating, prompts still fill n_batch.
-    static constexpr int32_t PREFILL_BUDGET_MIN = 64;
-
     struct prefill_budget_iter {
         int32_t n_decode_rows = 0; // batch rows from generating slots (sampled + drafted tokens)
         int32_t n_generating  = 0; // slots in SLOT_STATE_GENERATING
@@ -4013,28 +4018,12 @@ private:
         int32_t budget        = 0; // prompt-token budget applied this iteration (0 = none, n_batch)
     } pb_iter;
 
-    double   pb_ms_per_tok = 0.0; // smoothed iteration ms per prompt token (adaptive budget)
+    server_prefill_budget_ctl pb_ctl; // adaptive budget controller (server-prefill-budget.h)
     uint64_t pb_n_iter     = 0;   // iterations that carried prompt tokens
 
     // the prompt-token budget for this iteration, or 0 when it does not apply
     int32_t prefill_budget_get(int32_t n_batch) const {
-        if (pb_iter.n_generating == 0) {
-            return 0;
-        }
-
-        int32_t budget = n_batch;
-
-        if (params_base.prefill_budget_decoding > 0) {
-            budget = std::min(budget, params_base.prefill_budget_decoding);
-        }
-
-        if (params_base.prefill_budget_target_ms > 0 && pb_ms_per_tok > 0.0) {
-            const double n = (double) params_base.prefill_budget_target_ms / pb_ms_per_tok;
-            const int32_t adaptive = (int32_t) std::min<double>(n, (double) n_batch);
-            budget = std::min(budget, std::max(PREFILL_BUDGET_MIN, adaptive));
-        }
-
-        return budget < n_batch ? budget : 0;
+        return pb_ctl.get(n_batch, pb_iter.n_decode_rows, pb_iter.n_generating);
     }
 
     // per-iteration metrics, and the cost estimate for the adaptive budget
@@ -4049,14 +4038,9 @@ private:
 
         const double t_ms = t_iter_us / 1e3;
 
-        // ms per prompt token, measured over the whole iteration: it includes the decode rows, so it
-        // overestimates the marginal cost; the resulting multiplicative update n' = n * target / t
-        // converges on iterations of about the target time as long as the target exceeds the decode-only
-        // step time
-        if (it.n_prompt >= PREFILL_BUDGET_MIN) {
-            const double c = t_ms / it.n_prompt;
-            pb_ms_per_tok = pb_ms_per_tok > 0.0 ? 0.5 * pb_ms_per_tok + 0.5 * c : c;
-        }
+        // ms per prompt token, measured over the whole iteration (it includes the decode rows), plus the
+        // RMS of its one-step prediction residual for the tail margin (KVU-16g-3, server-prefill-budget.h)
+        pb_ctl.observe(t_ms, it.n_prompt, it.n_decode_rows);
 
         // KV depth: positions held, summed over every slot (idle slots included). pos_max + 1, not
         // pos_max - pos_min + 1: hybrid (recurrent) and SWA memories report a pos_min near pos_max, while the
@@ -4070,9 +4054,9 @@ private:
         }
 
         SRV_INF("prefill-budget: iter %" PRIu64 ": decode_rows = %d (slots %d), prompt = %d (slots %d), budget = %d, "
-                "t_iter = %.1f ms, kv_pos = %" PRId64 ", ms/tok = %.3f\n",
+                "t_iter = %.1f ms, kv_pos = %" PRId64 ", ms/tok = %.3f, t_eff = %.1f ms\n",
                 pb_n_iter, it.n_decode_rows, it.n_generating, it.n_prompt, it.n_prefilling, it.budget,
-                t_ms, n_kv_pos, pb_ms_per_tok);
+                t_ms, n_kv_pos, pb_ctl.ms_per_tok, pb_ctl.target_eff());
     }
 
 // #define DEBUG_TIMINGS
