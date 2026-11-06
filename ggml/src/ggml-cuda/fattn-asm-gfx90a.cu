@@ -235,9 +235,14 @@ bool fa_asm_shape_ok(int device, const ggml_tensor * dst, const char ** why) {
     // the asm kernel addresses with 32-bit byte strides and buffer offsets: stay well inside 2^31. The CK instances use
     // 32-bit element offsets (ck_tile::index_t) over K/V read in place with the cache's own strides.
     const uint64_t q_bytes  = (uint64_t) Q->ne[1] * Q->ne[2] * D * 2;
-    const uint64_t kv_bytes = D == FA_CK_D ? (uint64_t) K->ne[1] * std::max<uint64_t>(K->nb[1], K->ne[2] * K->nb[2])
-                                           : (uint64_t) K->ne[1] * K->ne[2] * D * 2;
-    const uint64_t v_bytes  = D == FA_CK_D ? (uint64_t) V->ne[1] * std::max<uint64_t>(V->nb[1], V->ne[2] * V->nb[2]) : 0;
+    // CK: the byte extent actually addressed, (ne1-1)*nb1 + (ne2-1)*nb2 + one row. (The previous
+    // ne1 * max(nb1, ne2*nb2) counted n_kv twice for a head-major [D, n_kv, H_kv] layout - nb2 = n_kv*nb1 - and
+    // rejected every such case above ~2^31/(n_kv*H_kv*512): e.g. the test-file / default-permute 24/4 S=8192 cell.)
+    const auto extent = [D](const ggml_tensor * t) {
+        return (uint64_t) (t->ne[1] - 1) * t->nb[1] + (uint64_t) (t->ne[2] - 1) * t->nb[2] + (uint64_t) D * t->nb[0];
+    };
+    const uint64_t kv_bytes = D == FA_CK_D ? extent(K) : (uint64_t) K->ne[1] * K->ne[2] * D * 2;
+    const uint64_t v_bytes  = D == FA_CK_D ? extent(V) : 0;
     FA_ASM_REQUIRE(q_bytes < (1ull << 31) && kv_bytes < (1ull << 31) && v_bytes < (1ull << 31),
                    "tensor too large for 32-bit kernel offsets");
 #undef FA_ASM_REQUIRE
