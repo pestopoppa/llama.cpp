@@ -11886,7 +11886,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
                 for (int bs : {1, 8, 512, 2048}) {
                     test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
-                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
+                    // down has k = d_ff (640 on Q38FN): IQ4_XS needs k % 256 == 0, so use IQ4_NL (block 32, the GSQ down type)
+                    const ggml_type type_down = sh.d_ff % ggml_blck_size(type_a) == 0 ? type_a : GGML_TYPE_IQ4_NL;
+                    test_cases.emplace_back(new test_mul_mat_id(type_down, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, sh.d_ff, sh.d_model,
                         /*use_id=*/true, sh.n_mats, sh.n_used, /*b=*/true, /*with_bias=*/false, /*with_gate=*/true));
                 }
@@ -14103,7 +14105,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
                 for (int bs : {1, 8, 512, 2048}) {
                     test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
-                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
+                    // down has k = d_ff (640 on Q38FN): IQ4_XS needs k % 256 == 0, so use IQ4_NL (block 32, the GSQ down type)
+                    const ggml_type type_down = sh.d_ff % ggml_blck_size(type_a) == 0 ? type_a : GGML_TYPE_IQ4_NL;
+                    test_cases.emplace_back(new test_mul_mat_id(type_down, GGML_TYPE_F32, sh.n_mats, sh.n_used, false, sh.d_model, bs, sh.d_ff));
                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, sh.d_ff, sh.d_model,
                         /*use_id=*/true, sh.n_mats, sh.n_used, /*b=*/true, /*with_bias=*/false, /*with_gate=*/true));
                 }
