@@ -35,6 +35,7 @@
 #define GV_MAX_ROWS (16 * GV_MAX_TILES)
 #define GV_MAX_WAVES GV_MAX_TILES
 #define GV_MIN_WAVES 4
+#define GV_PIPE_MAX_WAVES 8   // pipelined variant: <= 8 tiles (gqa*n_q <= 128), 256-VGPR budget
 
 static int gv_env_int(const char * name, int def) {
     const char * s = getenv(name);
@@ -56,6 +57,12 @@ static int gv_splits_env() {
     return v;
 }
 
+// GGML_CUDA_FA_GQA_VERIFY_PIPE=1: register-prefetch pipelined K/V load (default OFF until the GPU gate times it)
+static bool gv_pipe() {
+    static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_PIPE", 0) != 0;
+    return v;
+}
+
 static bool gv_debug() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_DEBUG", 0) != 0;
     return v;
@@ -69,10 +76,87 @@ static size_t gv_smem_bytes(const int nwaves) {
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 typedef _Float16 gv_halfx4 __attribute__((ext_vector_type(4)));
 typedef float    gv_floatx4 __attribute__((ext_vector_type(4)));
+
+// steps 3+4 of one 32-key chunk (sK / sVt / smask filled, block-synchronized); contains one __syncthreads()
+static __device__ __forceinline__ void gv_compute_chunk(
+        const bool tile_active, const _Float16 * sK, const _Float16 * sVt, _Float16 * sP, const float * smask,
+        const gv_halfx4 (&qa)[GV_D / 16], gv_floatx4 (&o)[GV_D / 16], float (&m_run)[4], float (&l_run)[4],
+        const bool (&row_ok)[4], const int (&row_q)[4], const float scale, const int li, const int kq) {
+    // 3. S = Q K^T, online softmax, P -> sP
+    float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (tile_active) {
+        gv_floatx4 S[GV_KC / 16];
+#pragma unroll
+        for (int nb = 0; nb < GV_KC / 16; ++nb) {
+            S[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int s = 0; s < GV_D / 16; ++s) {
+                const gv_halfx4 kb = *(const gv_halfx4 *) (sK + (nb * 16 + li) * GV_KSTR + 16 * s + 4 * kq);
+                S[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S[nb], 0, 0, 0);
+            }
+        }
+
+        float rmax[4];
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            rmax[v] = -FLT_MAX / 2.0f;
+#pragma unroll
+            for (int nb = 0; nb < GV_KC / 16; ++nb) {
+                const float mv = row_ok[v] ? smask[row_q[v] * GV_KC + nb * 16 + li] : -INFINITY;
+                S[nb][v] = S[nb][v] * scale + mv;
+                rmax[v] = fmaxf(rmax[v], S[nb][v]);
+            }
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                rmax[v] = fmaxf(rmax[v], __shfl_xor(rmax[v], off, 64));
+            }
+        }
+
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const float m_new = fmaxf(m_run[v], rmax[v]);
+            alpha[v] = __expf(m_run[v] - m_new);
+            float rsum = 0.0f;
+#pragma unroll
+            for (int nb = 0; nb < GV_KC / 16; ++nb) {
+                const float p = __expf(S[nb][v] - m_new);
+                rsum += p;
+                sP[(4 * kq + v) * GV_PSTR + nb * 16 + li] = (_Float16) p;
+            }
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                rsum += __shfl_xor(rsum, off, 64);
+            }
+            l_run[v] = l_run[v] * alpha[v] + rsum;
+            m_run[v] = m_new;
+        }
+    }
+    __syncthreads();
+
+    // 4. O = O*alpha + P V
+    if (tile_active) {
+#pragma unroll
+        for (int nb = 0; nb < GV_D / 16; ++nb) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                o[nb][v] *= alpha[v];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < GV_KC / 16; ++t) {
+            const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * GV_PSTR + 16 * t + 4 * kq);
+#pragma unroll
+            for (int nb = 0; nb < GV_D / 16; ++nb) {
+                const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * GV_VTSTR + 16 * t + 4 * kq);
+                o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
+            }
+        }
+    }
+}
 #endif
 
-template <bool KV_Q8>
-static __global__ void __launch_bounds__(64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
+template <bool KV_Q8, bool PIPE>
+static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
         const float scale, const int n_q, const int gqa, const int n_head_kv, const int n_seq,
@@ -151,6 +235,117 @@ static __global__ void __launch_bounds__(64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
     const int c_begin = split * chunks_per_split;
     const int c_end   = min(c_begin + chunks_per_split, n_chunks);
 
+    if constexpr (PIPE) {
+        // Software pipeline: the raw global data of chunk c+1 (mask halves, q8_0 blocks or f16 16-byte rows) is loaded into
+        // registers while chunk c is computed, then dequantized/stored to LDS after the end-of-chunk barrier.
+        // nthreads in [256, 512]: q8_0 = 1 block of K + 1 of V per thread, f16 = up to 4 x 16 B of K and of V, mask = up to 2.
+        constexpr int NK = KV_Q8 ? 1 : (GV_KC * (GV_D / 8) + 255) / 256;
+        uint16_t rk[KV_Q8 ? 1 + QK8_0 / 2 : 1];
+        uint16_t rv[KV_Q8 ? 1 + QK8_0 / 2 : 1];
+        uint32_t fk[4 * NK]; // plain words: an array of HIP_vector_type uint4 is not promoted to registers (scratch)
+        uint32_t fv[4 * NK];
+        uint16_t rm[2];
+
+        auto load_raw = [&](const int c) __attribute__((always_inline)) {
+            const int kbase = c * GV_KC;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int i = tid + s * nthreads;
+                rm[s] = i < n_q * GV_KC ?
+                    *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half)) : (uint16_t) 0xFC00;
+            }
+            if constexpr (KV_Q8) {
+                if (tid < GV_KC * (GV_D / QK8_0)) {
+                    const int b = tid / GV_KC, key = tid % GV_KC;
+                    const uint16_t * pk = (const uint16_t *) (Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0));
+                    const uint16_t * pv = (const uint16_t *) (Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0));
+#pragma unroll
+                    for (int t = 0; t < 1 + QK8_0 / 2; ++t) {
+                        rk[t] = pk[t];
+                        rv[t] = pv[t];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int s = 0; s < NK; ++s) {
+                    const int i = tid + s * nthreads;
+                    if (i < GV_KC * (GV_D / 8)) {
+                        const int cc = i / GV_KC, key = i % GV_KC;
+                        const uint4 tk = *(const uint4 *) (Kb + (int64_t) (kbase + key) * nb11 + cc * 16);
+                        const uint4 tv = *(const uint4 *) (Vb + (int64_t) (kbase + key) * nb21 + cc * 16);
+                        fk[4 * s + 0] = tk.x; fk[4 * s + 1] = tk.y; fk[4 * s + 2] = tk.z; fk[4 * s + 3] = tk.w;
+                        fv[4 * s + 0] = tv.x; fv[4 * s + 1] = tv.y; fv[4 * s + 2] = tv.z; fv[4 * s + 3] = tv.w;
+                    }
+                }
+            }
+        };
+
+        auto store_raw = [&]() __attribute__((always_inline)) -> int {
+            int any = 0;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int i = tid + s * nthreads;
+                if (i < n_q * GV_KC) {
+                    const float mv = __half2float(__ushort_as_half(rm[s]));
+                    smask[i] = mv;
+                    any |= mv != -INFINITY;
+                }
+            }
+            if constexpr (KV_Q8) {
+                if (tid < GV_KC * (GV_D / QK8_0)) {
+                    const int b = tid / GV_KC, key = tid % GV_KC;
+                    const float dk = __half2float(__ushort_as_half(rk[0]));
+                    const float dv = __half2float(__ushort_as_half(rv[0]));
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        _Float16 tmp[8];
+#pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            const uint16_t u = rk[1 + 4 * g + t];
+                            tmp[2 * t + 0] = (_Float16) (dk * (float) (int8_t) (u & 0xFF));
+                            tmp[2 * t + 1] = (_Float16) (dk * (float) (int8_t) (u >> 8));
+                        }
+                        *(uint4 *) (sK + key * GV_KSTR + b * QK8_0 + 8 * g) = *(const uint4 *) tmp;
+                    }
+#pragma unroll
+                    for (int t = 0; t < QK8_0 / 2; ++t) {
+                        const uint16_t u = rv[1 + t];
+                        sVt[(b * QK8_0 + 2 * t + 0) * GV_VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
+                        sVt[(b * QK8_0 + 2 * t + 1) * GV_VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int s = 0; s < NK; ++s) {
+                    const int i = tid + s * nthreads;
+                    if (i < GV_KC * (GV_D / 8)) {
+                        const int cc = i / GV_KC, key = i % GV_KC;
+                        *(uint4 *) (sK + key * GV_KSTR + cc * 8) = make_uint4(fk[4 * s + 0], fk[4 * s + 1], fk[4 * s + 2], fk[4 * s + 3]);
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            const uint16_t hb = (uint16_t) (fv[4 * s + t / 2] >> (16 * (t % 2)));
+                            *(uint16_t *) (sVt + (cc * 8 + t) * GV_VTSTR + key) = hb;
+                        }
+                    }
+                }
+            }
+            return any;
+        };
+
+        if (c_begin < c_end) {
+            load_raw(c_begin);
+        }
+        for (int c = c_begin; c < c_end; ++c) {
+            const int live = __syncthreads_or(store_raw());
+            if (c + 1 < c_end) {
+                load_raw(c + 1); // in flight during the MFMA work below
+            }
+            if (live) {
+                gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+            }
+            __syncthreads();
+        }
+    } else
     for (int c = c_begin; c < c_end; ++c) {
         const int kbase = c * GV_KC;
 
@@ -216,76 +411,7 @@ static __global__ void __launch_bounds__(64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         }
         __syncthreads();
 
-        // 3. S = Q K^T, online softmax, P -> sP
-        float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        if (tile_active) {
-            gv_floatx4 S[GV_KC / 16];
-#pragma unroll
-            for (int nb = 0; nb < GV_KC / 16; ++nb) {
-                S[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-                for (int s = 0; s < GV_D / 16; ++s) {
-                    const gv_halfx4 kb = *(const gv_halfx4 *) (sK + (nb * 16 + li) * GV_KSTR + 16 * s + 4 * kq);
-                    S[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S[nb], 0, 0, 0);
-                }
-            }
-
-            float rmax[4];
-#pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                rmax[v] = -FLT_MAX / 2.0f;
-#pragma unroll
-                for (int nb = 0; nb < GV_KC / 16; ++nb) {
-                    const float mv = row_ok[v] ? smask[row_q[v] * GV_KC + nb * 16 + li] : -INFINITY;
-                    S[nb][v] = S[nb][v] * scale + mv;
-                    rmax[v] = fmaxf(rmax[v], S[nb][v]);
-                }
-#pragma unroll
-                for (int off = 1; off < 16; off <<= 1) {
-                    rmax[v] = fmaxf(rmax[v], __shfl_xor(rmax[v], off, 64));
-                }
-            }
-
-#pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                const float m_new = fmaxf(m_run[v], rmax[v]);
-                alpha[v] = __expf(m_run[v] - m_new);
-                float rsum = 0.0f;
-#pragma unroll
-                for (int nb = 0; nb < GV_KC / 16; ++nb) {
-                    const float p = __expf(S[nb][v] - m_new);
-                    rsum += p;
-                    sP[(4 * kq + v) * GV_PSTR + nb * 16 + li] = (_Float16) p;
-                }
-#pragma unroll
-                for (int off = 1; off < 16; off <<= 1) {
-                    rsum += __shfl_xor(rsum, off, 64);
-                }
-                l_run[v] = l_run[v] * alpha[v] + rsum;
-                m_run[v] = m_new;
-            }
-        }
-        __syncthreads();
-
-        // 4. O = O*alpha + P V
-        if (tile_active) {
-#pragma unroll
-            for (int nb = 0; nb < GV_D / 16; ++nb) {
-#pragma unroll
-                for (int v = 0; v < 4; ++v) {
-                    o[nb][v] *= alpha[v];
-                }
-            }
-#pragma unroll
-            for (int t = 0; t < GV_KC / 16; ++t) {
-                const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * GV_PSTR + 16 * t + 4 * kq);
-#pragma unroll
-                for (int nb = 0; nb < GV_D / 16; ++nb) {
-                    const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * GV_VTSTR + 16 * t + 4 * kq);
-                    o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
-                }
-            }
-        }
+        gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
         __syncthreads();
     }
 
@@ -442,6 +568,7 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int ntiles    = (R + 15) / 16;
     const int nwaves    = std::max(ntiles, GV_MIN_WAVES);
     GGML_ASSERT(ntiles <= GV_MAX_TILES);
+    const bool pipe     = gv_pipe() && ntiles <= GV_PIPE_MAX_WAVES;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -469,18 +596,35 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const size_t smem = gv_smem_bytes(nwaves);
 
     const int ne33 = (int) mask->ne[3];
-    if (K->type == GGML_TYPE_Q8_0) {
-        gv_fattn_kernel<true><<<grid, block, smem, stream>>>(
+    const bool q8 = K->type == GGML_TYPE_Q8_0;
+    if (pipe) {
+        if (q8) {
+            gv_fattn_kernel<true, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
+        } else {
+            gv_fattn_kernel<false, true><<<grid, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
+            mask->nb[1], mask->nb[3], ne33);
+        }
     } else {
-        gv_fattn_kernel<false><<<grid, block, smem, stream>>>(
+        if (q8) {
+            gv_fattn_kernel<true, false><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
+        } else {
+            gv_fattn_kernel<false, false><<<grid, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
+            mask->nb[1], mask->nb[3], ne33);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -493,8 +637,12 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     if (n_calls++ == 0) {
         GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: GQA-packed verify attention ran (call 1)\n");
     }
+    static int n_pipe_calls = 0;
+    if (pipe && n_pipe_calls++ == 0) {
+        GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
+    }
     if (gv_debug() && n_calls <= 8) {
-        GGML_LOG_INFO("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu\n",
-            __func__, dst->name, n_q, gqa, n_head_kv, n_kv, n_seq, ggml_type_name(K->type), n_splits, nwaves, smem);
+        GGML_LOG_INFO("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
+            __func__, dst->name, n_q, gqa, n_head_kv, n_kv, n_seq, ggml_type_name(K->type), n_splits, nwaves, smem, (int) pipe);
     }
 }
