@@ -8136,6 +8136,23 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// AK-ASM-H11: the router graph under own op labels, so the asm cases and the residency hold are selected with -o and
+// never change the TOPK_MOE corpus (an env-token selection ran zero cases in a launcher smoke).
+struct test_topk_moe_asm : public test_topk_moe {
+    using test_topk_moe::test_topk_moe;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_ASM"; }
+    // perf: one graph per timed run (n_runs = target_size / op_size + 1 = 1), so us/run is the whole router graph time
+    // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+};
+struct test_topk_moe_hold : public test_topk_moe {
+    using test_topk_moe::test_topk_moe;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_HOLD"; }
+    // perf: one graph per timed run (n_runs = target_size / op_size + 1 = 1), so us/run is the whole router graph time
+    // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -13424,6 +13441,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // AK-ASM-H11 (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_gfx90a): every (n_expert, k) with a gfx90a topksoftmax
+    // code object, at 1 row (decode: ids written in place) and several rows (ids via scratch + strided copy, incl. a
+    // partial last 4-row workgroup), with and without norm, plus Q38FN's (512, 10), which has no asm kernel and must
+    // stay on the existing kernel.
+    // r2: always registered under the label TOPK_MOE_ASM
+    for (bool with_norm : { false, true }) {
+        for (auto ek : std::vector<std::pair<int64_t, int>>{ {128, 4}, {128, 6}, {128, 8}, {256, 6}, {256, 8}, {384, 8}, {640, 8}, {512, 10} }) {
+            for (int64_t n_tok : { 1, 3, 22, 513 }) {
+                test_cases.emplace_back(new test_topk_moe_asm({ek.first, n_tok, 1, 1}, ek.second, with_norm, false, GATING_FUNC_SOFTMAX, 0.0f));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -13925,6 +13955,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // AK-ASM-H11 (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_gfx90a): MoE router (softmax -> top-k -> norm) at
+    // Qwen3.6-35B-A3B (256 experts, top-8; gfx90a asm fast path) and Q38FN (512 experts, top-10; no asm kernel, the
+    // existing topk-moe kernel) sizes: decode, MTP verify, prefill.
+    {   // r2: always registered under the label TOPK_MOE_ASM
+        for (int64_t n_tok : { 1, 4, 16, 512, 2048 }) {
+            test_cases.emplace_back(new test_topk_moe_asm({256, n_tok, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+            test_cases.emplace_back(new test_topk_moe_asm({512, n_tok, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+        }
+    }
+    // AK-ASM-H11 residency hold (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_hold): 50 copies of a 131072-row A3B
+    // router case (128 MiB logits), each timed >= 1 s, so one process stays VRAM-resident for ~1 min (gate smoke).
+    {   // r2: always registered under the label TOPK_MOE_HOLD
+        for (int i = 0; i < 50; ++i) {
+            test_cases.emplace_back(new test_topk_moe_hold({256, 131072, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+        }
+    }
     return test_cases;
 }
 
