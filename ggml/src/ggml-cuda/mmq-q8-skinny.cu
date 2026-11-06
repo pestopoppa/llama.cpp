@@ -22,7 +22,7 @@
 //    srcB fragments from global/L2, issued before the next item's DMA so the in-order vmcnt wait leaves that DMA in flight.
 //  Env: GGML_HIP_Q8_SKINNY=0 disables (falls back to MMVQ/MMQ exactly as C6), GGML_HIP_Q8_SKINNY_MIN (default 5),
 //       GGML_HIP_Q8_SKINNY_MAX (default 16, cap 16), GGML_HIP_Q8_SKINNY_WAVES (persistent wave count, default
-//       CUs x occupancy).
+//       CUs x occupancy), GGML_HIP_Q8_SKINNY_MAX_BYTES (shape gate, default 6 MiB of Q8_0 weight; 0 = no limit).
 #include "mmq-q8-skinny.cuh"
 
 #include <atomic>
@@ -41,8 +41,15 @@ static int q8sk_env_int(const char * name, int def) {
 }
 
 struct q8sk_cfg {
-    bool enabled; int mmin; int mmax; int waves;
+    bool enabled; int mmin; int mmax; int waves; int64_t max_bytes;
 };
+
+// Shape gate (derived post hoc from gate r5, 2026-11-05, MI210, 39 cells x M 5/8/16): the fast path beat C6 on every
+// weight <= 5.6 MB (1024x5120 1.20x, 512x2048 2.0x, 2048x512 1.3x, 32x2048 4.5x) and lost or tied from 8.9 MB up
+// (2048x4096 1.00x, 4096x2048 0.95x, 8192x2048 0.80x, the large 27B shapes 0.75-0.81x, where C6 MMVQ/MMQ sits near the
+// plain-load ceiling). Default: take the fast path only when the Q8_0 weight is <= 6 MiB. Override with
+// GGML_HIP_Q8_SKINNY_MAX_BYTES (bytes; 0 = no limit).
+#define Q8SK_DEFAULT_MAX_BYTES (6ll << 20)
 
 static const q8sk_cfg & q8sk_get_cfg() {
     static const q8sk_cfg cfg = [] {
@@ -51,6 +58,8 @@ static const q8sk_cfg & q8sk_get_cfg() {
         c.mmin    = std::max(2, q8sk_env_int("GGML_HIP_Q8_SKINNY_MIN", 5));
         c.mmax    = std::min(Q8SK_MAXM, q8sk_env_int("GGML_HIP_Q8_SKINNY_MAX", Q8SK_MAXM));
         c.waves   = std::max(0, q8sk_env_int("GGML_HIP_Q8_SKINNY_WAVES", 0));
+        const char * mb = getenv("GGML_HIP_Q8_SKINNY_MAX_BYTES");
+        c.max_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : Q8SK_DEFAULT_MAX_BYTES;
         return c;
     }();
     return cfg;
@@ -69,7 +78,8 @@ bool ggml_cuda_q8_skinny_eligible(const ggml_tensor * src0, const ggml_tensor * 
         (int64_t) 16 * src0->nb[1] < INT32_MAX &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
         dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0 &&
-        src0->ne[1] <= INT32_MAX / Q8SK_MAXM;
+        src0->ne[1] <= INT32_MAX / Q8SK_MAXM &&
+        (cfg.max_bytes == 0 || (int64_t) ggml_nbytes(src0) <= cfg.max_bytes);
 #else
     GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(cc);
     return false;
