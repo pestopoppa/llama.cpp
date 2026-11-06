@@ -1870,6 +1870,43 @@ void llama_kv_cache::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * u
     }
 }
 
+void llama_kv_cache::set_input_lsa_h12(ggml_tensor * kpos, ggml_tensor * kbias, ggml_tensor * qwin, const llama_ubatch * ubatch,
+        int32_t window, int32_t sink, float empty_pos, float sink_bonus) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(kpos->buffer) && ggml_backend_buffer_is_host(kbias->buffer) && ggml_backend_buffer_is_host(qwin->buffer));
+    GGML_ASSERT(kpos->type == GGML_TYPE_F32 && kbias->type == GGML_TYPE_F32 && qwin->type == GGML_TYPE_F32);
+
+    const int64_t n_kv     = kpos->ne[0];
+    const int64_t n_stream = kpos->ne[2];
+    const int64_t n_tps    = qwin->ne[1];
+
+    GGML_ASSERT((int64_t) ubatch->n_tokens == n_tps*n_stream);
+    GGML_ASSERT(qwin->ne[2] == n_stream && kbias->ne[0] == n_kv && kbias->ne[2] == n_stream);
+
+    float * kp = (float *) kpos->data;
+    float * kb = (float *) kbias->data;
+    float * qw = (float *) qwin->data;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        // the ubatch's stream s holds tokens [s*n_tps, (s+1)*n_tps) of one sequence set (as in the KQ mask)
+        const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                kp[s*n_kv + j] = empty_pos;
+                kb[s*n_kv + j] = 0.0f;
+                continue;
+            }
+            const llama_pos p0 = cells.pos_get(j);
+            kp[s*n_kv + j] = (float) p0;
+            kb[s*n_kv + j] = p0 < sink ? sink_bonus : 0.0f;
+        }
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            qw[s*n_tps + ii] = (float) window - (float) ubatch->pos[s*n_tps + ii];
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3421,6 +3458,11 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const {
     kv->set_input_dca_sel(dst, ubatch, chunk_len);
+}
+
+void llama_kv_cache_context::set_input_lsa_h12(ggml_tensor * kpos, ggml_tensor * kbias, ggml_tensor * qwin, const llama_ubatch * ubatch,
+        int32_t window, int32_t sink, float empty_pos, float sink_bonus) const {
+    kv->set_input_lsa_h12(kpos, kbias, qwin, ubatch, window, sink, empty_pos, sink_bonus);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

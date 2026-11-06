@@ -1,5 +1,44 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
+#include "llama-lsa-h12.h"
+
+// LSA-H12-INDEXER host inputs, shared by the global attention layers of one graph
+class llm_graph_input_lsa_h12 : public llm_graph_input_i {
+public:
+    llm_graph_input_lsa_h12(const llama_memory_hybrid_context * mctx, int32_t window, int32_t sink) :
+        mctx(mctx), window(window), sink(sink) {}
+    virtual ~llm_graph_input_lsa_h12() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        if (kpos->buffer && kbias->buffer && qwin->buffer) {
+            mctx->get_attn()->set_input_lsa_h12(kpos, kbias, qwin, ubatch, window, sink,
+                    llama_lsa_h12::empty_pos, llama_lsa_h12::sink_bonus);
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+        const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+
+        bool res = true;
+        res &= n_stream > 0 && params.ubatch.n_tokens % n_stream == 0;
+        res &= kpos->ne[0] == (int64_t) mctx->get_attn()->get_n_kv();
+        res &= kpos->ne[2] == n_stream;
+        res &= n_stream > 0 && qwin->ne[1] == (int64_t) params.ubatch.n_tokens/n_stream;
+        return res;
+    }
+
+    ggml_tensor * kpos  = nullptr; // F32 [n_kv, 1, n_stream]
+    ggml_tensor * kbias = nullptr; // F32 [n_kv, 1, n_stream]
+    ggml_tensor * qwin  = nullptr; // F32 [1, n_tps, n_stream]
+
+    const llama_memory_hybrid_context * mctx;
+    const int32_t window;
+    const int32_t sink;
+};
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -147,6 +186,19 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(inpL, "model.input_embed", -1);
 
     auto * inp = build_inp_mem_hybrid();
+
+    // LSA-H12-INDEXER: off unless LLAMA_LSA_H12=1 (then the graph is exactly C7's)
+    if (llama_lsa_h12::get_config().enabled) {
+        std::map<int, ggml_backend_buffer_type_t> layer_buft;
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hparams.is_recr(il) && model.layers[il].wq && model.layers[il].wq->buffer) {
+                layer_buft[il] = ggml_backend_buffer_get_type(model.layers[il].wq->buffer);
+            }
+        }
+        int il0 = layer_buft.empty() ? 0 : layer_buft.begin()->first;
+        lsa_maps = llama_lsa_h12::get_device_maps(&model, model.name, (int) hparams.n_head(il0), (int) hparams.n_head_kv(il0),
+                (int) hparams.n_embd_head_k(il0), (int) hparams.n_rot(il0), layer_buft);
+    }
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -323,6 +375,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         cur = build_attn_dca(inp,
                     nullptr, nullptr, nullptr,
                     Qraw, Kraw, Vcur, n_rot, sections, kq_scale, il);
+    } else if (lsa_h12_active(inp, il)) {
+        cur = build_attn_lsa_h12(inp, Qraw, Qcur, Kcur, Vcur, kq_scale, il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
@@ -338,6 +392,134 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
+
+    return cur;
+}
+
+bool llama_model_qwen35::graph::lsa_h12_active(llm_graph_input_attn_kv * inp, int il) {
+    if (lsa_maps == nullptr || !cparams.flash_attn || cparams.dca_chunk_size > 0 || !cparams.causal_attn) {
+        return false;
+    }
+    if (lsa_maps->layers.find(il) == lsa_maps->layers.end() || inp->self_k_rot || inp->self_v_rot) {
+        return false;
+    }
+    const auto & cfg = llama_lsa_h12::get_config();
+    const auto * mctx_cur = inp->mctx;
+    const int64_t n_kv = mctx_cur->get_n_kv();
+    // same rule as ggml-cuda qsa-sparse: below it the fused path would not fire, so keep the dense graph
+    if (n_kv < (int64_t) cfg.min_kv_ratio*cfg.width()) {
+        return false;
+    }
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    if (k->type != GGML_TYPE_F16 || k->ne[0] != 256) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("llama_lsa_h12: K cache %s / head %lld not supported (needs f16, hd 256): dense attention\n",
+                    ggml_type_name(k->type), (long long) k->ne[0]);
+        }
+        return false;
+    }
+    return true;
+}
+
+// build_attn (store K/V) + PCA scorer + qwen4exp build_attn_qsa mask composition and src[5]/src[6] edge
+ggml_tensor * llama_model_qwen35::graph::build_attn_lsa_h12(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_raw,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    const auto & cfg = llama_lsa_h12::get_config();
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to KV cache first: the scorer reads the current ubatch's keys from the cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * k       = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v       = mctx_cur->get_v(ctx0, il);
+
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_stream = k->ne[3];
+    GGML_ASSERT(n_tokens % n_stream == 0);
+    const int64_t n_tps    = n_tokens/n_stream;
+
+    if (lsa_inp == nullptr) {
+        auto li = std::make_unique<llm_graph_input_lsa_h12>(
+                static_cast<const llama_memory_hybrid_context *>(mctx), cfg.window, cfg.sink);
+        li->kpos  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, 1, n_stream);
+        li->kbias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, 1, n_stream);
+        li->qwin  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_tps, n_stream);
+        ggml_set_input(li->kpos);
+        ggml_set_input(li->kbias);
+        ggml_set_input(li->qwin);
+        ggml_set_name(li->kpos,  "lsa_h12_inp_kpos");
+        ggml_set_name(li->kbias, "lsa_h12_inp_kbias");
+        ggml_set_name(li->qwin,  "lsa_h12_inp_qwin");
+        lsa_inp = li.get();
+        res->add_input(std::move(li));
+    }
+
+    const auto & lm = lsa_maps->layers.at(il);
+
+    ggml_tensor * score = llama_lsa_h12::build_scores(ctx0, q_raw, k, lm.first, lm.second, kq_mask,
+            lsa_inp->kpos, lsa_inp->kbias, lsa_inp->qwin);
+    cb(score, "lsa_h12_score", il);
+
+    const int64_t width = std::min<int64_t>(n_kv, cfg.width());
+
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, width));
+    top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
+    cb(top_k, "lsa_h12_top_k", il);
+
+    // --- qwen4exp build_attn_qsa mask composition (verbatim), matched by ggml-cuda qsa-sparse
+    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+
+    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+
+    ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+
+    // AK-ASM-H12 edge: top-k indices (src[5]) and the base mask (src[6]) on the FA node
+    {
+        ggml_tensor * fa = cur;
+        while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT &&
+               (fa->op == GGML_OP_PERMUTE || fa->op == GGML_OP_RESHAPE || fa->op == GGML_OP_VIEW || fa->op == GGML_OP_CONT)) {
+            fa = fa->src[0];
+        }
+        GGML_ASSERT(fa && fa->op == GGML_OP_FLASH_ATTN_EXT && fa->src[5] == nullptr && fa->src[6] == nullptr);
+        fa->src[5] = top_k_3d;
+        fa->src[6] = kq_mask;
+    }
+    cb(cur, "kqv_out", il);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LLAMA_LOG_WARN("llama_lsa_h12: LSA-H12-INDEXER graph active: layer %d n_kv %lld width %lld n_tps %lld n_stream %lld\n",
+                il, (long long) n_kv, (long long) width, (long long) n_tps, (long long) n_stream);
+    }
 
     return cur;
 }

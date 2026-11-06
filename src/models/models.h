@@ -2170,6 +2170,9 @@ struct llama_model_qwen3next : public llama_model_base {
 };
 
 
+namespace llama_lsa_h12 { struct device_maps; }
+class llm_graph_input_lsa_h12;
+
 struct llama_model_qwen35 : public llama_model_base {
     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2204,6 +2207,21 @@ struct llama_model_qwen35 : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        // LSA-H12-INDEXER (LLAMA_LSA_H12=1): PCA-map key scorer -> top_k -> H12 fused sparse FA
+        bool lsa_h12_active(llm_graph_input_attn_kv * inp, int il);
+
+        ggml_tensor * build_attn_lsa_h12(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_raw,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
+
+        const llama_lsa_h12::device_maps * lsa_maps = nullptr;
+        llm_graph_input_lsa_h12          * lsa_inp  = nullptr;
 
         const llama_model & model;
     };

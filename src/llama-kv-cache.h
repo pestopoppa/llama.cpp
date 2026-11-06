@@ -288,6 +288,10 @@ public:
     // (chunk = pos / chunk_len). Cells the KQ mask drops get 0 in all three slices.
     void set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
+    // LSA-H12-INDEXER: cell positions / sink bias [n_kv, 1, n_stream] and query window offsets [1, n_tps, n_stream]
+    void set_input_lsa_h12(ggml_tensor * kpos, ggml_tensor * kbias, ggml_tensor * qwin, const llama_ubatch * ubatch,
+            int32_t window, int32_t sink, float empty_pos, float sink_bonus) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -486,6 +490,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
+    void set_input_lsa_h12   (ggml_tensor * kpos, ggml_tensor * kbias, ggml_tensor * qwin, const llama_ubatch * ubatch,
+            int32_t window, int32_t sink, float empty_pos, float sink_bonus) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
