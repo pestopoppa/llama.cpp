@@ -59,6 +59,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/topk-moe-asm-gfx90a.cuh"
+#include "ggml-cuda/hc-fuse.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -2395,6 +2396,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MEAN:
             ggml_cuda_op_mean(ctx, dst);
             break;
+        case GGML_OP_MEAN_D1:
+            ggml_cuda_op_mean_d1(ctx, dst);
+            break;
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
@@ -4112,6 +4116,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // AK-ASM-H13b: hyper-connection seam fusions (hc-fuse.cu). Single-stream graphs only.
+            ggml_cuda_hc_plan hc_plan;
+            if (stream_ctx.concurrent_events.empty()) {
+                ggml_cuda_hc_fuse_plan(cgraph, hc_plan);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4152,6 +4162,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
+                }
+
+                if (!hc_plan.anchors.empty()) {
+                    if (hc_plan.skip.count(node)) {
+                        continue;  // elided into a later hc anchor
+                    }
+                    const auto hc_it = hc_plan.anchors.find(node);
+                    if (hc_it != hc_plan.anchors.end()) {
+                        ggml_cuda_hc_fuse_run(*cuda_ctx, node, hc_it->second);
+                        continue;
+                    }
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -5267,6 +5288,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+            // C7: ONE wide-row TOP_K on HIP -- the AK-ASM-H12 radix select (top-k.cu, GGML_CUDA_TOPK_RADIX=0 disables);
+            // the AK-ASM-H13c global-memory bitonic was dropped at the C7 merge (falls through to the ARGSORT rule)
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             // AK-ASM-H12: wide TOP_K rows use the radix select (top-k.cu)
@@ -5275,6 +5298,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif
+        case GGML_OP_MEAN_D1:
+            // AK-ASM-H13b: C6 had no device MEAN_D1 (every qwen4exp hc mix split to the CPU); GGML_CUDA_MEAN_D1=0 restores that
+            return ggml_cuda_mean_d1_enabled() && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
@@ -5527,6 +5553,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_cuda_fattn_asm_gfx90a_n_captured;
     }
 #endif
+    // AK-ASM-H13b test witness: hc fused-kernel launches since process start
+    if (strcmp(name, "ggml_backend_cuda_hc_fuse_n_calls") == 0) {
+        return (void *)ggml_cuda_hc_fuse_n_calls;
+    }
 #ifdef GGML_CUDA_TOPK_ASM_GFX90A_AVAILABLE
     // AK-ASM-H11 test witness (NULL = the build has no gfx90a topksoftmax asm fast path)
     if (strcmp(name, "ggml_backend_cuda_topk_asm_n_calls") == 0) {

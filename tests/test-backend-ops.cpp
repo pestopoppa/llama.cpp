@@ -8152,6 +8152,60 @@ struct test_topk_moe_hold : public test_topk_moe {
     // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
     size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
 };
+// AK-ASM-H13b: one qwen4exp hyper-connection seam (src/models/qwen4exp.cpp build_hc_mix + build_hc_combine) with the
+// mixed stream standing in for the sub-layer output. Exercises the CUDA hc fusions (hc-fuse.cu) and device MEAN_D1
+// against the CPU unfused composition. Weights f32 (the fusions cover only the elementwise tail).
+struct test_hc_seam : public test_case {
+    const int64_t n_embd, hc, lr, n_tokens;
+    test_hc_seam(int64_t n_embd = 64, int64_t hc = 4, int64_t lr = 8, int64_t n_tokens = 3)
+        : n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens) {}
+    std::string vars() override { return VARS_TO_STR4(n_embd, hc, lr, n_tokens); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_SEAM"; }
+    // perf: one seam graph per timed run (n_runs = target_size / op_size + 1 = 1): us/run is the seam graph time, not
+    // graph time / thousands of appended no-op view repeats (two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = hc * n_embd;
+        ggml_tensor * x        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * w_norm   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, lr);
+        ggml_tensor * w_up     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr, hc_dim);
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        ggml_set_name(x, "x");
+        // build_hc_mix
+        ggml_tensor * xn = ggml_rms_norm(ctx, x, 1e-6f);
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+        xn = ggml_mul(ctx, xn, w_norm);
+        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+        lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+        ggml_tensor * gated = ggml_mul(ctx, xn, gate);
+        gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
+        ggml_tensor * mixed = ggml_mean_d1(ctx, gated);
+        mixed = ggml_reshape_2d(ctx, mixed, n_embd, n_tokens);
+        ggml_tensor * inject = ggml_mul_mat(ctx, w_inject, xn);
+        // build_hc_combine (block_out = mixed)
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, n_tokens);
+        ggml_tensor * b = ggml_reshape_3d(ctx, mixed, n_embd, 1, n_tokens);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, n_tokens, 1);
+        ggml_tensor * res = ggml_add(ctx, x, ggml_mul(ctx, b, w));
+        // perf mode repeats the returned node n_runs times: return a view so the repeats are no-ops on every backend
+        // (returning the ADD would repeat the fused combine kernel in one arm and a plain add in the other)
+        ggml_tensor * out = ggml_reshape_2d(ctx, res, n_embd * hc, n_tokens);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Same seam under its own label so a residency hold can be selected with -o HC_SEAM_HOLD without any env token.
+struct test_hc_seam_hold : public test_hc_seam {
+    using test_hc_seam::test_hc_seam;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_SEAM_HOLD"; }
+};
 
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
@@ -13441,6 +13495,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // AK-ASM-H13b: qwen4exp hc seam, small and Q38FN-sized. Own op label HC_SEAM (no existing op corpus changes), so
+    // always registered: an env-selected set ran zero cases in the r2 gate smoke (the env token did not reach the run).
+    {
+        for (int64_t T : { 1, 3, 17 }) {
+            test_cases.emplace_back(new test_hc_seam(64, 4, 8, T));
+        }
+        for (int64_t T : { 1, 4, 16, 512 }) {
+            test_cases.emplace_back(new test_hc_seam(2560, 4, 320, T));
+        }
+    }
+
     // AK-ASM-H11 (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_gfx90a): every (n_expert, k) with a gfx90a topksoftmax
     // code object, at 1 row (decode: ids written in place) and several rows (ids via scratch + strided copy, incl. a
     // partial last 4-row workgroup), with and without norm, plus Q38FN's (512, 10), which has no asm kernel and must
@@ -13962,6 +14027,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n_tok : { 1, 4, 16, 512, 2048 }) {
             test_cases.emplace_back(new test_topk_moe_asm({256, n_tok, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
             test_cases.emplace_back(new test_topk_moe_asm({512, n_tok, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+        }
+    }
+    // AK-ASM-H13b: one Q38FN hc seam (n_embd 2560, hc 4, low rank 320); own label HC_SEAM, always registered
+    {
+        for (int64_t T : { 1, 4, 16, 512 }) {
+            test_cases.emplace_back(new test_hc_seam(2560, 4, 320, T));
+        }
+    }
+    // AK-ASM-H13b residency hold (-o HC_SEAM_HOLD): 40 copies of a 4096-token seam (x stream 160 MiB + activations),
+    // each timed >= 1 s: one process stays VRAM-resident for ~1 min. Always registered under its own label.
+    {
+        for (int i = 0; i < 40; ++i) {
+            test_cases.emplace_back(new test_hc_seam_hold(2560, 4, 320, 4096));
         }
     }
     // AK-ASM-H11 residency hold (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_hold): 50 copies of a 131072-row A3B
