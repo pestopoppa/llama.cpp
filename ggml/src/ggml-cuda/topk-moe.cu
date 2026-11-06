@@ -1,6 +1,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "topk-moe.cuh"
+#include "topk-moe-asm-gfx90a.cuh"
 
 #include <cmath>
 #include <initializer_list>
@@ -354,6 +355,12 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    // AK-ASM-H11: gfx90a AITER topksoftmax asm fast path (topk-moe-asm-gfx90a.cu). Returns false without enqueuing
+    // anything for every case it does not cover; the existing kernel below then runs unchanged.
+    if (ggml_cuda_topk_moe_asm_gfx90a_try(ctx, logits, weights, ids, clamp, scale, bias, args)) {
+        return;
+    }
 
     const int n_experts = logits->ne[0];
     const int n_rows    = logits->ne[1];

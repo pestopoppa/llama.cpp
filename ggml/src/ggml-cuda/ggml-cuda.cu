@@ -54,6 +54,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/topk-moe-asm-gfx90a.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -5453,6 +5454,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kv_mirror_get_ops") == 0) {
         return (void *)ggml_backend_cuda_kv_mirror_get_ops;
     }
+#ifdef GGML_CUDA_TOPK_ASM_GFX90A_AVAILABLE
+    // AK-ASM-H11 test witness (NULL = the build has no gfx90a topksoftmax asm fast path)
+    if (strcmp(name, "ggml_backend_cuda_topk_asm_n_calls") == 0) {
+        return (void *)ggml_cuda_topk_moe_asm_gfx90a_n_calls;
+    }
+#endif
     return nullptr;
 }
 
