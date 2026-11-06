@@ -8049,7 +8049,10 @@ struct test_hc_seam : public test_case {
         w = ggml_reshape_3d(ctx, w, 1, hc, n_tokens);
         ggml_tensor * b = ggml_reshape_3d(ctx, mixed, n_embd, 1, n_tokens);
         b = ggml_repeat_4d(ctx, b, n_embd, hc, n_tokens, 1);
-        ggml_tensor * out = ggml_add(ctx, x, ggml_mul(ctx, b, w));
+        ggml_tensor * res = ggml_add(ctx, x, ggml_mul(ctx, b, w));
+        // perf mode repeats the returned node n_runs times: return a view so the repeats are no-ops on every backend
+        // (returning the ADD would repeat the fused combine kernel in one arm and a plain add in the other)
+        ggml_tensor * out = ggml_reshape_2d(ctx, res, n_embd * hc, n_tokens);
         ggml_set_name(out, "out");
         return out;
     }
