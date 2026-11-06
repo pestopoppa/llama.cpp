@@ -12906,6 +12906,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
 
+    // AK-ASM-H9: Qwen3.8-27B (hidden 5120, ffn 17408) and Qwen3.6-35B-A3B (hidden 2048) dense Q8_0 shapes, (k, m).
+    // n 129 = first H9 batch, 512/2048 = prefill ubatches; ragged M/N tails and a K = 64-multiple edge.
+    {
+        const std::array<int64_t, 2> q8_h9_shapes[] = {
+            {5120, 6144}, {5120, 1024}, {6144, 5120}, {5120, 12288}, {5120, 10240}, {17408, 5120}, {5120, 17408}, {5120, 48},
+            {2048, 4096}, {2048, 512}, {4096, 2048}, {2048, 8192}, {512, 2048}, {2048, 32},
+        };
+        for (const auto & km : q8_h9_shapes) {
+            for (int64_t n : {129, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km[1], n, km[0], {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t n : {130, 200, 300, 1000}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 77, n, 64, {1, 1}, {1, 1}));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13128,6 +13146,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
+
+    // AK-ASM-H9 perf: Qwen3.8-27B / Qwen3.6-35B-A3B dense Q8_0 shapes at prefill batch n 512/2048.
+    {
+        const std::array<int64_t, 2> q8_h9_shapes[] = {
+            {5120, 6144}, {5120, 1024}, {6144, 5120}, {5120, 12288}, {5120, 10240}, {17408, 5120}, {5120, 17408}, {5120, 48},
+            {2048, 4096}, {2048, 512}, {4096, 2048}, {2048, 8192}, {512, 2048}, {2048, 32},
+        };
+        for (const auto & km : q8_h9_shapes) {
+            for (int64_t n : {512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km[1], n, km[0], {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
