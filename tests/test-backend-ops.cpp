@@ -8017,10 +8017,16 @@ struct test_topk_moe : public test_case {
 struct test_topk_moe_asm : public test_topk_moe {
     using test_topk_moe::test_topk_moe;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_ASM"; }
+    // perf: one graph per timed run (n_runs = target_size / op_size + 1 = 1), so us/run is the whole router graph time
+    // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
 };
 struct test_topk_moe_hold : public test_topk_moe {
     using test_topk_moe::test_topk_moe;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_HOLD"; }
+    // perf: one graph per timed run (n_runs = target_size / op_size + 1 = 1), so us/run is the whole router graph time
+    // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
 };
 
 struct test_mul_mat_vec_fusion : public test_case {
