@@ -33,6 +33,8 @@ struct ggml_cuda_hc_plan {
 
 bool ggml_cuda_hc_fuse_enabled();
 bool ggml_cuda_mean_d1_enabled();
+bool ggml_cuda_hc_rms_fuse_enabled();  // GGML_CUDA_HC_RMS_FUSE=0 disables the H13c rms_norm*gamma fusion
+bool ggml_cuda_topk_large_enabled();   // GGML_CUDA_TOPK_LARGE=0: HIP TOP_K back to rows <= 1024 (CPU above)
 void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan);
 void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_hc_anchor & an);
 void ggml_cuda_op_mean_d1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

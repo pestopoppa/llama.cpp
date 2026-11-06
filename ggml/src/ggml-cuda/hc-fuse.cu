@@ -19,6 +19,16 @@ bool ggml_cuda_hc_fuse_enabled() {
     return v;
 }
 
+bool ggml_cuda_hc_rms_fuse_enabled() {
+    static const bool v = hc_env_flag("GGML_CUDA_HC_RMS_FUSE", true);  // H13c rms_norm*gamma fusion
+    return v;
+}
+
+bool ggml_cuda_topk_large_enabled() {
+    static const bool v = hc_env_flag("GGML_CUDA_TOPK_LARGE", true);   // H13c TOP_K rows > 1024 on HIP
+    return v;
+}
+
 bool ggml_cuda_mean_d1_enabled() {
     static const bool v = hc_env_flag("GGML_CUDA_MEAN_D1", true);
     return v;
@@ -227,6 +237,7 @@ bool try_mix_tail(const hc_ctx & c, const ggml_tensor * mean, ggml_cuda_hc_plan 
 }
 
 bool try_rms_gamma(const hc_ctx & c, const ggml_tensor * mul, ggml_cuda_hc_plan & plan) {
+    if (!ggml_cuda_hc_rms_fuse_enabled()) return false;
     if (!mul || mul->op != GGML_OP_MUL || !f32c(mul)) return false;
     for (int ri = 0; ri < 2; ++ri) {
         const ggml_tensor * rs  = mul->src[ri];
