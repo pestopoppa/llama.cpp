@@ -12536,6 +12536,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], 2048, 5, 2, type_KV, 77));
         }
+        // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
     }
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));

@@ -22,6 +22,7 @@
 #include "fattn-common.cuh"
 
 #include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <cfloat>
 
@@ -476,14 +477,35 @@ static __global__ void gv_merge_kernel(
     dst[(((int64_t) seq * n_q + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// GGML_CUDA_FA_GQA_VERIFY_DEBUG=1: the first 32 rejections of hd256 FA nodes are logged with their reason (WARN level, so that
+// llama-server's default verbosity shows them; ggml INFO lines are filtered there).
+static bool gv_reject(const ggml_tensor * dst, const char * why) {
+    // expected rejections (kill switch, prefill ubatches, single-token decode) are not logged: they would fill the 32 slots
+    const bool expected = strncmp(why, "disabled", 8) == 0 || strncmp(why, "n_q outside", 11) == 0;
+    if (gv_debug() && !expected && dst->src[0]->ne[0] == GV_D) {
+        static int n_rej = 0;
+        if (n_rej++ < 32) {
+            const ggml_tensor * Q = dst->src[0];
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * M = dst->src[3];
+            GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: reject %s: %s (Q %lld,%lld,%lld,%lld K %lld,%lld,%lld,%lld %s nb %zu,%zu,%zu mask %lld,%lld,%lld,%lld)\n",
+                dst->name, why, (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], ggml_type_name(K->type),
+                K->nb[1], K->nb[2], K->nb[3],
+                M ? (long long) M->ne[0] : -1LL, M ? (long long) M->ne[1] : -1LL, M ? (long long) M->ne[2] : -1LL, M ? (long long) M->ne[3] : -1LL);
+        }
+    }
+    return false;
+}
+
 bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
     if (!gv_enabled()) {
-        return false;
+        return gv_reject(dst, "disabled (GGML_CUDA_FA_GQA_VERIFY=0)");
     }
     const int cc = ggml_cuda_info().devices[device].cc;
     if (!amd_mfma_available(cc)) {
-        return false;
+        return gv_reject(dst, "no MFMA");
     }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -492,59 +514,65 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
     const ggml_tensor * sinks = dst->src[4];
 
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
-        return false;
+        return gv_reject(dst, "Q/dst not f32 or dst not contiguous");
     }
     if (Q->ne[0] != GV_D || K->ne[0] != GV_D || V->ne[0] != GV_D) {
-        return false;
+        return gv_reject(dst, "head dim != 256");
     }
     if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) {
-        return false;
+        return gv_reject(dst, "K/V type not equal f16/q8_0");
     }
     if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || sinks != nullptr) {
-        return false;
+        return gv_reject(dst, "mask missing/not f16/ne2!=1 or sinks");
     }
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
-        return false;
+        return gv_reject(dst, "ALiBi or softcap");
     }
     const int64_t n_q = Q->ne[1];
     if (n_q < gv_min_nq() || n_q < 1 || n_q > GV_MAX_NQ) {
-        return false;
+        return gv_reject(dst, "n_q outside [MIN_NQ,16]");
     }
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2]) {
-        return false;
+        return gv_reject(dst, "GQA layout");
     }
     const int64_t gqa = Q->ne[2] / K->ne[2];
     if (gqa * n_q > GV_MAX_ROWS) {
-        return false;
+        return gv_reject(dst, "gqa*n_q > 192");
     }
     if (K->ne[1] % FATTN_KQ_STRIDE != 0 || V->ne[1] != K->ne[1] || mask->ne[0] < K->ne[1] || mask->ne[1] < n_q) {
-        return false;
+        return gv_reject(dst, "n_kv not multiple of 256 or mask too small");
     }
     if (K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
-        return false;
+        return gv_reject(dst, "K/V/Q ne3 mismatch");
     }
     if (Q->nb[0] != sizeof(float) || K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
-        return false;
+        return gv_reject(dst, "non-unit element stride");
     }
     // f16: 16-byte loads per key row
     if (K->type == GGML_TYPE_F16) {
         if (K->nb[1] % 16 != 0 || V->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || V->nb[2] % 16 != 0 ||
             K->nb[3] % 16 != 0 || V->nb[3] % 16 != 0 ||
             (uintptr_t) K->data % 16 != 0 || (uintptr_t) V->data % 16 != 0) {
-            return false;
+            return gv_reject(dst, "f16 K/V stride/alignment not 16 B");
         }
     } else {
         if (K->nb[1] % 2 != 0 || V->nb[1] % 2 != 0 || (uintptr_t) K->data % 2 != 0 || (uintptr_t) V->data % 2 != 0) {
-            return false;
+            return gv_reject(dst, "q8_0 K/V stride/alignment");
         }
     }
     // batched decode of several sequences on a unified KV stays on the per-sequence vec layout
     if (ggml_cuda_fattn_rows_are_seqs(dst)) {
-        return false;
+        return gv_reject(dst, "rows_are_seqs (multi-sequence decode)");
+    }
+    if (gv_debug()) {
+        static int n_ok = 0;
+        if (n_ok++ < 4) {
+            GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: accept %s n_q=%lld n_kv=%lld type=%s\n", dst->name, (long long) Q->ne[1], (long long) K->ne[1], ggml_type_name(K->type));
+        }
     }
     return true;
 #else
@@ -636,14 +664,14 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // path witness for the gate: emitted once per process, on the first call
     static int n_calls = 0;
     if (n_calls++ == 0) {
-        GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: GQA-packed verify attention ran (call 1)\n");
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GQA-packed verify attention ran (call 1)\n");
     }
     static int n_pipe_calls = 0;
     if (pipe && n_pipe_calls++ == 0) {
-        GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
     }
     if (gv_debug() && n_calls <= 8) {
-        GGML_LOG_INFO("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
+        GGML_LOG_WARN("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
             __func__, dst->name, n_q, gqa, n_head_kv, n_kv, n_seq, ggml_type_name(K->type), n_splits, nwaves, smem, (int) pipe);
     }
 }
