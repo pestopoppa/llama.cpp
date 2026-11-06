@@ -542,6 +542,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # AK-ASM-H13b hc seam fusion planner (host-only header from ggml-cuda; runs on the CPU backend)
+    llama_build_and_test(test-hc-fuse-plan.cpp)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
