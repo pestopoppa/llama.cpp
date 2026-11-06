@@ -11290,8 +11290,66 @@ static bool test_backend_ops_extra_case_set(const char * name) {
     return false;
 }
 
+
+// AK-ASM-H1/H7: Qwen3.8-27B Q8_0 weight shapes (from the GGUF: {m = rows, k}) for the skinny-M split-K path.
+static const std::array<int64_t, 2> akh1_q38_27b_shapes[] = {
+    { 6144, 5120},  // attn_gate
+    { 1024, 5120},  // attn_k / attn_v
+    { 5120, 6144},  // attn_output / ssm_out
+    {12288, 5120},  // attn_q
+    {10240, 5120},  // attn_qkv
+    { 5120, 17408}, // ffn_down
+    {17408, 5120},  // ffn_gate / ffn_up
+};
+
+// Qwen3.6-35B-A3B Q8_0 dense (non-expert) weight shapes, from /mnt/raid0/llm/models/Qwen3.6-35B-A3B-MTP-Q8_0.gguf.
+static const std::array<int64_t, 2> akh1_q36_a3b_shapes[] = {
+    { 4096, 2048},  // attn_gate
+    {  512, 2048},  // attn_k / attn_v / ffn_gate_shexp / ffn_up_shexp
+    { 2048, 4096},  // attn_output / ssm_out / nextn.eh_proj
+    { 8192, 2048},  // attn_q / attn_qkv
+    { 2048,  512},  // ffn_down_shexp
+    {   32, 2048},  // ssm_alpha / ssm_beta
+};
+
+static void akh1_add_q8_skinny_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (const auto & sh : akh1_q36_a3b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n = 2; n <= 17; ++n) {  // every template instance, plus the 4/17 edges that must fall back
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, n, 2304, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 129, 7, 2112, {1, 1}, {1, 1}));  // ne00 % 256 != 0 -> fallback
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, 8, 256, {1, 1}, {1, 1}));  // ksplit == 1, row tail
+}
+
+static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (const auto & sh : akh1_q36_a3b_shapes) {
+        for (int64_t n : {5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {5, 8, 16}) {  // output.weight (27B, A3B)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, n, 2048, {1, 1}, {1, 1}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     std::default_random_engine rng(0);
 
@@ -13164,6 +13222,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
