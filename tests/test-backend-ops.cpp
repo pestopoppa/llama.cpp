@@ -11924,7 +11924,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         struct h8_shape { int n_mats; int n_used; int64_t d_model; int64_t d_ff; };
         for (const h8_shape & sh : { h8_shape{256, 8, 2048, 512}, h8_shape{512, 10, 2560, 640} }) {
             for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
-                for (int bs : {1, 8, 512, 2048}) {
+                for (int bs : {1, 8, 64, 128, 256, 512, 1024, 2048}) { // AK-ASM-H8b M sweep
                     test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
                     // down has k = d_ff (640 on Q38FN): IQ4_XS needs k % 256 == 0, so use IQ4_NL (block 32, the GSQ down type)
                     const ggml_type type_down = sh.d_ff % ggml_blck_size(type_a) == 0 ? type_a : GGML_TYPE_IQ4_NL;
@@ -14143,7 +14143,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         struct h8_shape { int n_mats; int n_used; int64_t d_model; int64_t d_ff; };
         for (const h8_shape & sh : { h8_shape{256, 8, 2048, 512}, h8_shape{512, 10, 2560, 640} }) {
             for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
-                for (int bs : {1, 8, 512, 2048}) {
+                for (int bs : {1, 8, 64, 128, 256, 512, 1024, 2048}) { // AK-ASM-H8b M sweep
                     test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, sh.n_mats, sh.n_used, true,  sh.d_ff,    bs, sh.d_model));
                     // down has k = d_ff (640 on Q38FN): IQ4_XS needs k % 256 == 0, so use IQ4_NL (block 32, the GSQ down type)
                     const ggml_type type_down = sh.d_ff % ggml_blck_size(type_a) == 0 ? type_a : GGML_TYPE_IQ4_NL;

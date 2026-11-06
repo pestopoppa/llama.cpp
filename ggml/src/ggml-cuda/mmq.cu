@@ -106,6 +106,16 @@ static float ggml_cuda_mmid_j_headroom() {
     return h;
 }
 
+// AK-ASM-H8b: GGML_HIP_MMID_J_CAP=<int>, default 48 - largest tile hint for which expert-density tiling is used.
+static int64_t ggml_cuda_mmid_j_cap() {
+    static const int64_t c = [] {
+        const char * e = getenv("GGML_HIP_MMID_J_CAP");
+        const long v = e ? atol(e) : 48;
+        return (int64_t) (v >= 8 && v <= 4096 ? v : 48);
+    }();
+    return c;
+}
+
 static int64_t ggml_cuda_mmid_tile_hint(const int64_t n_tokens, const int64_t n_expert_used, const int64_t n_experts,
                                         const int64_t nrows_x, const int64_t ncols_x) {
     if (!ggml_cuda_mmid_h8_enabled() || n_experts <= 1) {
@@ -116,6 +126,14 @@ static int64_t ggml_cuda_mmid_tile_hint(const int64_t n_tokens, const int64_t n_
     hint = std::max<int64_t>(hint, 8);
     if (hint >= n_tokens) {
         return 0; // no narrower tile than upstream would pick
+    }
+    // AK-ASM-H8b: shape-aware window. Gate r4 (C6 baseline, MI210): hint 15..24 (A3B/Q38FN M=512) -> 1.23-1.37x,
+    // hint 60..96 (M=2048, 40-64 tokens/expert) -> 0.99-1.03x. Once the mean expert run fills half of a J=128 tile the
+    // upstream tile wastes little MFMA work, while a narrower J costs per-tile y-staging/MFMA efficiency and the 1.5x
+    // headroom spills hot experts (skewed routing) into 2+ tiles. So the hint applies only while it is <= the cap
+    // (default 48: A3B M <= 1024, Q38FN M <= 1638); above it upstream J selection is used unchanged.
+    if (hint > ggml_cuda_mmid_j_cap()) {
+        return 0;
     }
     // The grid still spans n_tokens, now with narrower tiles: keep the stream-k kbc space far from int overflow
     // (launch_mul_mat_q asserts ntiles*blocks_per_ne00 < 2^30; I >= 16, qk >= 32).
@@ -189,6 +207,12 @@ bool ggml_cuda_should_fuse_mmq_id_glu(const ggml_tensor * up, const ggml_tensor 
     }
     // only the regime ggml_cuda_mul_mat_id routes to MMQ (MMVQ-id has its own fused gate/up path)
     const int64_t n_tokens = src1->ne[2];
+    // AK-ASM-H8b: decode / small verify batches (M <= 8) always keep C6's path (MMVQ-id fused gate/up). Gate r4's
+    // only small-M flag (A3B q8_0 fused, m=1: 2.50 vs 2.41 us) never reached this function - the MMVQ fusion branch in
+    // ggml_cuda_try_fuse returns first - so it is timer jitter on a 2.4 us cell; the guard makes the routing explicit.
+    if (n_tokens <= 8) {
+        return false;
+    }
     if (n_tokens <= MMVQ_MAX_BATCH_SIZE && n_tokens <= get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
