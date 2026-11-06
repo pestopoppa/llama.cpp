@@ -1225,6 +1225,9 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    // AK-ASM-H5-PORT graph mode: signature of the host-side FA asm/CK decisions (mask kind, effective KV length)
+    // baked into the captured kernargs; a change forces the same path as a node-property change
+    uint64_t fa_asm_sig = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1405,10 +1408,31 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// AK-ASM-H5-PORT (fattn-asm-gfx90a.cu): result of the device-side KQ-mask classification, reused by every
+// FLASH_ATTN_EXT node of the same graph compute that reads the same mask tensor (one stream sync per mask).
+struct ggml_cuda_fattn_asm_mask_cache {
+    uint64_t     epoch  = 0;        // ggml_backend_cuda_context::graph_compute_epoch at classification time
+    const void * tensor = nullptr;  // the mask ggml_tensor object
+    const void * data   = nullptr;
+    int64_t      n_q    = 0;
+    int64_t      n_kv   = 0;
+    int          kind   = 0;        // 0 = unsupported, 1 = full (no causal), 2 = bottom-right causal
+    int64_t      len    = 0;        // effective KV length L (the -INF tail beyond it is KV padding)
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // incremented at every graph compute; scopes ggml_cuda_fattn_asm_mask_cache (graph inputs, such as the KQ
+    // mask, only change between graph computes)
+    uint64_t graph_compute_epoch = 0;
+    // a few entries: a graph may carry more than one KQ mask (e.g. SWA + full), and in graph mode every mask is
+    // classified in the pre-capture pass and must still be cached when its node is captured
+    static constexpr int FATTN_ASM_MASK_CACHE_N = 4;
+    ggml_cuda_fattn_asm_mask_cache fattn_asm_mask_cache[FATTN_ASM_MASK_CACHE_N];
+    int fattn_asm_mask_cache_next = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

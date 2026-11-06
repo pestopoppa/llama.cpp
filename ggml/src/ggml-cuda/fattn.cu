@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
+#include "fattn-asm-gfx90a.cuh"
 
 #include <cstdlib>
 
@@ -740,6 +741,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // AK-ASM-H5-PORT: gfx90a hd128 asm fast path (fattn-asm-gfx90a.cu). Returns false without enqueuing anything for
+    // every case it does not cover, and the selection below then runs exactly as before.
+    if (ggml_cuda_fattn_asm_gfx90a_try(ctx, dst)) {
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -9136,6 +9136,141 @@ struct test_flash_attn_ext_large_v : public test_flash_attn_ext {
     }
 };
 
+// [AK-ASM-H5-PORT] GGML_OP_FLASH_ATTN_EXT cases for the gfx90a FA-v3 hd128 bf16 asm fast path
+// (ggml/src/ggml-cuda/fattn-asm-gfx90a.cu), with llama.cpp-shaped masks instead of init_tensor_kq_mask's noise:
+//   mask_mode CAUSAL_PAD : bottom-right causal over the first L = kv - pad cells, -INF on the trailing pad cells
+//                          (what llama.cpp builds for one sequence whose KV view is padded to 256 cells)
+//   mask_mode CAUSAL     : the same with pad 0 (n_q == kv is the configuration the AK-ASM-H5 harness verified)
+//   mask_mode FULL_PAD   : every row 0 on [0, L), -INF on the pad (non-causal attention over L cells)
+//   mask_mode NONE       : no mask tensor at all (non-causal over every cell)
+//   mask_mode NOISE      : init_tensor_kq_mask noise, which the classifier must reject (control: native path)
+// Compared against the CPU reference at the FA tolerance (NMSE 5e-4). The path witness reads the ROCm backend's
+// "ggml_backend_cuda_fa_asm_n_calls" counter: the asm path MUST run when the build has it, the device can load it,
+// the case is eligible and n_q >= GGML_HIP_FA_ASM_MIN_BATCH; it MUST NOT run for the controls and below the
+// threshold. The counter is process-wide, so the witness is armed only with one case at a time (-j 1, default).
+static bool g_fa_asm_witness_exclusive = false;
+
+enum test_fa_asm_mask_mode { FA_ASM_MASK_NONE, FA_ASM_MASK_CAUSAL, FA_ASM_MASK_CAUSAL_PAD, FA_ASM_MASK_FULL_PAD, FA_ASM_MASK_NOISE };
+
+static const char * test_fa_asm_mask_mode_name(test_fa_asm_mask_mode m) {
+    switch (m) {
+        case FA_ASM_MASK_NONE:       return "none";
+        case FA_ASM_MASK_CAUSAL:     return "causal";
+        case FA_ASM_MASK_CAUSAL_PAD: return "causal_pad";
+        case FA_ASM_MASK_FULL_PAD:   return "full_pad";
+        case FA_ASM_MASK_NOISE:      return "noise";
+    }
+    return "?";
+}
+
+struct test_flash_attn_ext_asm : public test_flash_attn_ext {
+    using fa_asm_n_calls_t   = uint64_t (*)();
+    using fa_asm_min_batch_t = int64_t (*)();
+    using fa_asm_usable_t    = bool (*)(int);
+
+    const test_fa_asm_mask_mode mask_mode;
+    const int64_t pad;               // trailing -INF cells (CAUSAL_PAD / FULL_PAD)
+    const bool    asm_eligible;      // apart from n_q and the device, this case is one the fast path must take
+
+    bool     armed        = false;
+    bool     expect_asm   = false;
+    uint64_t calls_before = 0;
+    fa_asm_n_calls_t n_calls = nullptr;
+
+    test_flash_attn_ext_asm(int64_t nh_kv, int64_t gqa, int64_t kv, int64_t nb, test_fa_asm_mask_mode mask_mode,
+                            ggml_type type_KV, std::array<int32_t, 4> permute = {0, 1, 2, 3}, int64_t hs = 128,
+                            float logit_softcap = 0.0f, int64_t pad = 37)
+        : test_flash_attn_ext(hs, hs, nh_kv, {gqa, 1}, kv, nb, mask_mode != FA_ASM_MASK_NONE, false, 0.0f, logit_softcap,
+                              GGML_PREC_F32, type_KV, type_KV, permute),
+          mask_mode(mask_mode),
+          pad((mask_mode == FA_ASM_MASK_CAUSAL_PAD || mask_mode == FA_ASM_MASK_FULL_PAD) ? pad : 0),
+          asm_eligible((hs == 128 || (hs == 256 && type_KV == GGML_TYPE_F16)) && mask_mode != FA_ASM_MASK_NOISE &&
+                       logit_softcap == 0.0f) {
+        GGML_ASSERT(mask_mode == FA_ASM_MASK_NONE || mask_mode == FA_ASM_MASK_NOISE || mask_mode == FA_ASM_MASK_FULL_PAD ||
+                    kv - this->pad >= nb); // a causal row must see at least one cell
+    }
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",fa_asm_mask=" + test_fa_asm_mask_mode_name(mask_mode) +
+               ",pad=" + std::to_string(pad);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (mask_mode == FA_ASM_MASK_NOISE) {
+                init_tensor_kq_mask(t);
+                continue;
+            }
+            const int64_t n_kv = t->ne[0];
+            const int64_t n_q  = t->ne[1];
+            const int64_t L    = kv - pad;
+            const bool causal  = mask_mode == FA_ASM_MASK_CAUSAL || mask_mode == FA_ASM_MASK_CAUSAL_PAD;
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<ggml_fp16_t> data(ggml_nelements(t));
+            for (int64_t i3 = 0; i3 < t->ne[3]*t->ne[2]; ++i3) {
+                for (int64_t r = 0; r < n_q; ++r) {
+                    ggml_fp16_t * row = data.data() + (i3*n_q + r)*n_kv;
+                    for (int64_t c = 0; c < n_kv; ++c) {
+                        const bool visible = c < L && (!causal || c <= L - n_q + r);
+                        row[c] = visible ? zero : ninf;
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (!g_fa_asm_witness_exclusive || ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (fa_asm_n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fa_asm_n_calls");
+        auto min_batch = (fa_asm_min_batch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fa_asm_min_batch");
+        // hd256 is served by the AK-CK-HD256 CK-tile path (its own usable(); NULL in builds that predate it)
+        auto usable    = (fa_asm_usable_t)    ggml_backend_reg_get_proc_address(reg,
+                             hsk == 256 ? "ggml_backend_cuda_fa_ck_hd256_usable" : "ggml_backend_cuda_fa_asm_usable");
+        if (n_calls == nullptr || min_batch == nullptr || usable == nullptr) {
+            fprintf(stderr, "FA_ASM_WITNESS armed=0 (build has no gfx90a FA asm path)\n");
+            return;
+        }
+        // device index = trailing digits of the backend name (ROCm0, CUDA1, ...)
+        const char * name = ggml_backend_name(backend);
+        const char * p = name + strlen(name);
+        while (p > name && p[-1] >= '0' && p[-1] <= '9') {
+            --p;
+        }
+        const int device = *p ? atoi(p) : 0;
+        expect_asm   = asm_eligible && usable(device) && nb >= min_batch();
+        calls_before = n_calls();
+        armed        = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls() - calls_before;
+        std::string reason;
+        if (expect_asm && advanced == 0) {
+            reason = "FA_ASM_WITNESS: gfx90a FA asm path did not run (silent fallback?)";
+        } else if (!expect_asm && advanced != 0) {
+            reason = "FA_ASM_WITNESS: gfx90a FA asm path ran where the existing kernels must";
+        }
+        fprintf(stderr, "FA_ASM_WITNESS nb=%" PRId64 " kv=%" PRId64 " mask=%s expect=%s calls_advanced=%" PRIu64 " verdict=%s\n",
+                nb, kv, test_fa_asm_mask_mode_name(mask_mode), expect_asm ? "asm" : "native", advanced,
+                reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with the mask and K/V layout of a unified KV cache shared by several sequences
 // (--kv-unified): the cells of each sequence are contiguous runs of `run` cells, interleaved with the runs of
 // the other sequences, and the last `n_free` cells belong to no sequence (released cells). The query tokens
@@ -12953,6 +13088,80 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [AK-ASM-H5-PORT] opt-in set "fa_asm_gfx90a" (kept out of the default corpus): the gfx90a FA-v3 hd128 bf16 asm
+    // fast path vs the CPU reference, with its path witness (test_flash_attn_ext_asm above). Run one case at a time:
+    //   TEST_BACKEND_OPS_EXTRA_CASES=fa_asm_gfx90a test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT -p fa_asm_mask
+    // and once more with GGML_HIP_FA_ASM_MIN_BATCH=1 so the decode / small-batch rows (nb 1, 16) also take the asm
+    // path (correctness below the default dispatch threshold; with the default they must stay native).
+    if (test_backend_ops_extra_case_set("fa_asm_gfx90a")) {
+        const std::array<int32_t, 4> llama_layout = {0, 2, 1, 3}; // K/V/Q as llama.cpp's KV-cache views
+        // main grid: D 128, H 32 / KV 8 (GQA 4) and MHA 32/32; kv x nb; causal (padded KV view) and no mask; f16, q8_0 KV
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (std::array<int64_t, 2> h : {std::array<int64_t, 2>{8, 4}, std::array<int64_t, 2>{32, 1}}) {
+                for (int64_t kv : {256, 1024, 8192}) {
+                    for (int64_t nb : {1, 16, 512, 1024}) {
+                        if (kv - 37 >= nb) {
+                            test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_CAUSAL_PAD, type_KV));
+                        }
+                        test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_NONE, type_KV));
+                    }
+                }
+            }
+        }
+        // llama.cpp layout (Q/K/V permuted views), unpadded causal with n_q == n_kv, full mask with a pad tail
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, type_KV, llama_layout));
+            test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 1024, FA_ASM_MASK_CAUSAL, type_KV, llama_layout));
+            test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 512, FA_ASM_MASK_FULL_PAD, type_KV, llama_layout));
+        }
+        // query-tile edges: one tile + 1 row, 300 rows (two tiles, merged head/tail in the causal kernel), the
+        // default threshold and one below it, a long KV with chunked prefill shape (512 new rows after 7.5k cached)
+        for (int64_t nb : {63, 64, 257, 300}) {
+            test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, nb, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 8192, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 128, 0.0f, 211));
+        // other GQA ratios the dispatch admits (2, 8), bf16 KV
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 2, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 8, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_BF16, llama_layout));
+        // controls that MUST stay on the existing kernels: noise mask, logit softcap
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 512, FA_ASM_MASK_NOISE, GGML_TYPE_F16, llama_layout));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 4, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 128, 30.0f));
+    }
+
+    // [AK-CK-HD256] opt-in set "fa_ck_hd256": FLASH_ATTN_EXT hs=256 through the gfx90a CK-tile fp16 path
+    // (GGML_HIP_CK_FMHA_HD256), same witness (ggml_backend_cuda_fa_ck_hd256_usable decides expect=asm):
+    //   TEST_BACKEND_OPS_EXTRA_CASES=fa_ck_hd256 test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT -p fa_asm_mask
+    // Production head layouts: Qwen3.8-27B 24/4 (KV 4, GQA 6), Qwen3.6-35B-A3B 16/2 (KV 2, GQA 8), Q38FN 24/2 (GQA 12).
+    if (test_backend_ops_extra_case_set("fa_ck_hd256")) {
+        const std::array<int32_t, 4> llama_layout = {0, 2, 1, 3};
+        for (std::array<int64_t, 2> h : {std::array<int64_t, 2>{4, 6}, std::array<int64_t, 2>{2, 8}, std::array<int64_t, 2>{2, 12}}) {
+            for (int64_t kv : {256, 1024, 4096}) {
+                for (int64_t nb : {1, 16, 64, 512, 1024}) {
+                    if (kv - 37 >= nb) {
+                        test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256));
+                    }
+                    test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_NONE, GGML_TYPE_F16, llama_layout, 256));
+                }
+            }
+        }
+        // unpadded causal n_q == n_kv, full mask with pad tail, query-tile edges (CK tile M = 128), default layout,
+        // long KV chunked-prefill shape, MHA
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 1024, FA_ASM_MASK_CAUSAL, GGML_TYPE_F16, llama_layout, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_FULL_PAD, GGML_TYPE_F16, llama_layout, 256));
+        for (int64_t nb : {63, 127, 129, 300}) {
+            test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, nb, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, {0, 1, 2, 3}, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 8192, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256, 0.0f, 211));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(8, 1, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256));
+        // controls that MUST stay on the existing kernels: noise mask, logit softcap, q8_0 / bf16 KV
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_NOISE, GGML_TYPE_F16, llama_layout, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256, 30.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, llama_layout, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_BF16, llama_layout, 256));
+    }
+
     // [FA-INT64-OFFSET] 27B attention shape (D 256, 4 KV heads, GQA 6) at a small KV (512 cells) whose mask
     // rows are 557056 wide (nb31 = 1088 KiB, as for n_kv = 544K). With 2048 queries the last row blocks start
     // at ic0 ~ 2016, so nb31*ic0 ~ 2.25e9 > 2^31: a kernel forming that offset in int32 reads the mask from a
@@ -13696,6 +13905,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         // option R witness: the iqk Q8_0 call counter is process-wide, so it can only be read
         // per case when the cases run one at a time
         g_iqk_q8_0_witness_exclusive = parallel_workers <= 1;
+        // AK-ASM-H5-PORT witness: the FA asm call counter is process-wide, so it can only be read per case when the
+        // cases run one at a time
+        g_fa_asm_witness_exclusive = parallel_workers <= 1;
 
         ggml_backend_ptr backend_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
         if (backend_cpu == NULL) {

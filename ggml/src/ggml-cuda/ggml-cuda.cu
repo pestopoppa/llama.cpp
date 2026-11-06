@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-asm-gfx90a.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/kv-host-mirror.cuh"
@@ -2626,6 +2627,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // AK-ASM-H5-PORT: a FLASH_ATTN_EXT node that may take the gfx90a asm/CK fast path is captured only when its
+        // host-side decisions can be made before capture (ggml_cuda_fattn_asm_gfx90a_graph_prepass: KQ mask is a graph
+        // input, code objects loaded). With GGML_HIP_FA_ASM_GRAPH=0, or a mask computed inside the graph, such a graph
+        // is never captured (the pre-T0 behaviour).
+        if (node->op == GGML_OP_FLASH_ATTN_EXT &&
+            ggml_cuda_fattn_asm_gfx90a_may_apply(ggml_cuda_get_device(), node)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to FLASH_ATTN_EXT gfx90a asm fast path\n", __func__);
+#endif
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -4231,6 +4244,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    cuda_ctx->graph_compute_epoch++; // scopes the FA asm mask classification cache (fattn-asm-gfx90a.cu)
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4244,7 +4259,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+
+            // AK-ASM-H5-PORT graph mode: classify every candidate FA node's mask now, outside capture (one stream sync),
+            // so capture reuses the cached verdicts; a verdict change invalidates the captured kernargs.
+            {
+                const uint64_t fa_sig = ggml_cuda_fattn_asm_gfx90a_graph_prepass(*cuda_ctx, cgraph);
+                if (fa_sig != graph->fa_asm_sig) {
+                    graph->fa_asm_sig  = fa_sig;
+                    properties_changed = true;
+                }
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5467,6 +5492,28 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kv_mirror_get_ops") == 0) {
         return (void *)ggml_backend_cuda_kv_mirror_get_ops;
     }
+#ifdef GGML_CUDA_FA_ASM_GFX90A_AVAILABLE
+    // AK-ASM-H5-PORT test witnesses (NULL = the build has no gfx90a FA asm fast path)
+    if (strcmp(name, "ggml_backend_cuda_fa_asm_n_calls") == 0) {
+        return (void *)ggml_cuda_fattn_asm_gfx90a_n_calls;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_asm_min_batch") == 0) {
+        return (void *)ggml_cuda_fattn_asm_gfx90a_min_batch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_asm_usable") == 0) {
+        return (void *)ggml_cuda_fattn_asm_gfx90a_usable;
+    }
+    // AK-CK-HD256 (the hd256 CK path; always exported with the asm path, usable() is false when not compiled in)
+    if (strcmp(name, "ggml_backend_cuda_fa_ck_hd256_usable") == 0) {
+        return (void *)ggml_cuda_fattn_ck_hd256_usable;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_ck_hd256_n_calls") == 0) {
+        return (void *)ggml_cuda_fattn_ck_hd256_n_calls;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_asm_n_captured") == 0) {
+        return (void *)ggml_cuda_fattn_asm_gfx90a_n_captured;
+    }
+#endif
     return nullptr;
 }
 
