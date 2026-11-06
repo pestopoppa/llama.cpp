@@ -159,7 +159,47 @@ static std::mt19937 suite_seed_rng() {
     return std::mt19937(sequence);
 }
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f);
+
+// AK-ASM-H8: TEST_BACKEND_OPS_FAST_INIT=1 (perf timing only - values do not affect kernel time): large contiguous tensors get a
+// random 64-row seed block (normal init path, incl. quantization) tiled across the whole tensor, instead of generating and
+// quantizing every element on the host (minutes per 0.8 GB MoE expert tensor). Never set it for correctness runs.
+static bool fast_init_enabled() {
+    static const bool on = [] { const char * e = getenv("TEST_BACKEND_OPS_FAST_INIT"); return e && e[0] == '1'; }();
+    return on;
+}
+
+static bool init_tensor_uniform_fast(ggml_tensor * tensor, float min, float max) {
+    const int64_t nrows = ggml_nrows(tensor);
+    const int64_t seed_rows = 64;
+    if (!fast_init_enabled() || nrows <= 4*seed_rows || tensor->ne[1] < seed_rows || !ggml_is_contiguous(tensor) || tensor->view_src) {
+        return false;
+    }
+    ggml_tensor seed = *tensor;
+    seed.ne[1] = seed_rows; seed.ne[2] = 1; seed.ne[3] = 1;
+    seed.nb[2] = seed.nb[1]*seed_rows; seed.nb[3] = seed.nb[2];
+    const size_t seed_bytes = ggml_row_size(tensor->type, tensor->ne[0]) * seed_rows;
+    // generate into a host staging tensor-sized buffer via the normal path on a 64-row view of the same buffer
+    seed.data = tensor->data;
+    init_tensor_uniform(&seed, min, max);
+    std::vector<uint8_t> blk(seed_bytes);
+    ggml_backend_tensor_get(tensor, blk.data(), 0, seed_bytes);
+    const size_t total = ggml_nbytes(tensor);
+    const size_t chunk_reps = std::max<size_t>(1, (64u << 20) / seed_bytes);
+    std::vector<uint8_t> big(seed_bytes * chunk_reps);
+    for (size_t r = 0; r < chunk_reps; ++r) memcpy(big.data() + r*seed_bytes, blk.data(), seed_bytes);
+    for (size_t off = seed_bytes; off < total; ) {
+        const size_t n = std::min(big.size(), total - off);
+        ggml_backend_tensor_set(tensor, big.data(), off, n);
+        off += n;
+    }
+    return true;
+}
+
+static void init_tensor_uniform(ggml_tensor * tensor, float min, float max) {
+    if (init_tensor_uniform_fast(tensor, min, max)) {
+        return;
+    }
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
