@@ -48,6 +48,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/ak-fused.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -3259,6 +3260,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // AK-ASM-H15: concat + conv-state cpy + ssm_conv + silu + q/k l2_norm (GGML_CUDA_AK_H15=0 disables)
+    // (at SSM_CONV it only skips a tail the fused kernel already computed at the CONCAT position)
+    if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
+        const int n_skip = ggml_cuda_ak_h15_try(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    // AK-ASM-H14: rms_norm + mul + rope [+ view + set_rows] (GGML_CUDA_AK_H14=0 disables)
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_skip = ggml_cuda_ak_h14_try(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
