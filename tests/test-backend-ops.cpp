@@ -8021,6 +8021,9 @@ struct test_hc_seam : public test_case {
         : n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens) {}
     std::string vars() override { return VARS_TO_STR4(n_embd, hc, lr, n_tokens); }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_SEAM"; }
+    // perf: one seam graph per timed run (n_runs = target_size / op_size + 1 = 1): us/run is the seam graph time, not
+    // graph time / thousands of appended no-op view repeats (two significant digits)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 1e-6; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
