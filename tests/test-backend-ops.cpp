@@ -4317,6 +4317,12 @@ struct test_ak_h14 : public test_case {
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_H14"; }
 
+    // perf: time ONE whole fused-vs-unfused graph per run. The default sizing re-adds the returned tail node n_runs times
+    // (us/run = graph time / n_runs), which for these tiny graphs times the repeated tail (SET_ROWS / ROPE / ADD), not the
+    // fusion. An op_size >= the 32 GiB GPU target makes n_runs = 1, so us/run = one whole-graph execution (incl. host sync).
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return size_t(64) << 30; }
+
+
     // f32 / f16 cache and the f32 rope output keep the default 1e-7 (same as test_rope_set_rows, which stores f16 at 1e-7).
     // q8_0 cache: same reasoning as test_set_rows' q8_0 bound -- fused and unfused differ only in f32 rounding (rms reduction
     // order), which can move one value across a q8_0 rounding boundary, i.e. one quant off by one. Our values are rms-normed
@@ -4425,6 +4431,12 @@ struct test_ak_h15 : public test_case {
     std::vector<ggml_tensor *> cpys;
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_H15"; }
+
+    // perf: time ONE whole fused-vs-unfused graph per run. The default sizing re-adds the returned tail node n_runs times
+    // (us/run = graph time / n_runs), which for these tiny graphs times the repeated tail (SET_ROWS / ROPE / ADD), not the
+    // fusion. An op_size >= the 32 GiB GPU target makes n_runs = 1, so us/run = one whole-graph execution (incl. host sync).
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return size_t(64) << 30; }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) {
