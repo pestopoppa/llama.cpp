@@ -2613,10 +2613,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // AK-ASM-H5-PORT: a FLASH_ATTN_EXT node that may take the gfx90a asm fast path classifies its KQ mask on the
-        // device and reads the verdict back (stream sync) before it can pick a kernel, and it may load the code
-        // objects (hipModuleLoadData) on first use. Neither is legal inside stream capture, so such a graph is never
-        // captured. The predicate is shape-only (prefill-sized batches); decode graphs keep CUDA graphs.
+        // AK-ASM-H5-PORT: a FLASH_ATTN_EXT node that may take the gfx90a asm/CK fast path is captured only when its
+        // host-side decisions can be made before capture (ggml_cuda_fattn_asm_gfx90a_graph_prepass: KQ mask is a graph
+        // input, code objects loaded). With GGML_HIP_FA_ASM_GRAPH=0, or a mask computed inside the graph, such a graph
+        // is never captured (the pre-T0 behaviour).
         if (node->op == GGML_OP_FLASH_ATTN_EXT &&
             ggml_cuda_fattn_asm_gfx90a_may_apply(ggml_cuda_get_device(), node)) {
             use_cuda_graph = false;
@@ -4245,7 +4245,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+
+            // AK-ASM-H5-PORT graph mode: classify every candidate FA node's mask now, outside capture (one stream sync),
+            // so capture reuses the cached verdicts; a verdict change invalidates the captured kernargs.
+            {
+                const uint64_t fa_sig = ggml_cuda_fattn_asm_gfx90a_graph_prepass(*cuda_ctx, cgraph);
+                if (fa_sig != graph->fa_asm_sig) {
+                    graph->fa_asm_sig  = fa_sig;
+                    properties_changed = true;
+                }
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5485,6 +5495,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_fa_ck_hd256_n_calls") == 0) {
         return (void *)ggml_cuda_fattn_ck_hd256_n_calls;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fa_asm_n_captured") == 0) {
+        return (void *)ggml_cuda_fattn_asm_gfx90a_n_captured;
     }
 #endif
     return nullptr;

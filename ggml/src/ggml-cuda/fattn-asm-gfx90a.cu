@@ -82,6 +82,13 @@ bool fa_asm_enabled() {
     return enabled;
 }
 
+// AK-ASM-T0 (ROCm 6.2): hipModuleLaunchKernel captures and replays correctly, the kernarg buffer being copied
+// into the graph node at capture. GGML_HIP_FA_ASM_GRAPH=0 restores the pre-T0 exclusion from CUDA-graph capture.
+bool fa_asm_graph_enabled() {
+    static const bool enabled = fa_asm_env_flag("GGML_HIP_FA_ASM_GRAPH", true);
+    return enabled;
+}
+
 bool fa_asm_log_all() {
     static const bool v = fa_asm_env_flag("GGML_HIP_FA_ASM_LOG", false);
     return v;
@@ -112,18 +119,28 @@ int64_t fa_asm_min_batch() {
 
 std::atomic<uint64_t> g_fa_asm_n_calls{0}; // every fast-path call (asm hd128 + CK hd256)
 std::atomic<uint64_t> g_fa_ck_n_calls{0};  // AK-CK-HD256 calls only
+std::atomic<uint64_t> g_fa_asm_n_captured{0}; // fast-path calls recorded into a CUDA graph (graph-mode witness)
+
+void fa_asm_note_captured(const ggml_tensor * dst, const bool ck) {
+    const uint64_t n = g_fa_asm_n_captured.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || fa_asm_log_all()) {
+        GGML_LOG_INFO("ggml_cuda_fa_asm: fast path captured into a CUDA graph (call %llu) node=%s %s\n",
+                      (unsigned long long) n, dst->name, ck ? "ck-hd256" : "asm-hd128");
+    }
+}
 
 struct fa_asm_module {
-    std::once_flag once;
-    bool           ok = false;
+    std::once_flag    once;
+    std::atomic<bool> done{false}; // call_once finished (no module API call can follow; safe inside capture)
+    bool              ok = false;
     hipModule_t    mod[2] = { nullptr, nullptr };
     hipFunction_t  fn[2]  = { nullptr, nullptr };
 };
 
 fa_asm_module g_fa_asm_modules[GGML_CUDA_MAX_DEVICES];
 
-// Lazily load both code objects on the current device. Called outside stream capture only (the graph check keeps
-// any graph containing a candidate node uncaptured, and _try() refuses while the stream is capturing).
+// Lazily load both code objects on the current device. Called outside stream capture only (the graph pre-pass loads
+// them before capture, and _try() refuses while capturing if they were never loaded).
 bool fa_asm_load(int device) {
     fa_asm_module & m = g_fa_asm_modules[device];
     std::call_once(m.once, [&] {
@@ -161,6 +178,7 @@ bool fa_asm_load(int device) {
             }
         }
         m.ok = ok;
+        m.done.store(true, std::memory_order_release);
     });
     return m.ok;
 }
@@ -473,15 +491,22 @@ void fa_asm_convert(const ggml_tensor * t, const int64_t n_rows, uint16_t * dst,
 }
 
 // Classify the mask (cached per graph compute and mask tensor). Returns kind; *len = effective KV length.
+// allow_sync = false (inside stream capture): a cache miss returns FA_ASM_MASK_UNSUPPORTED (the caller falls back).
 int fa_asm_classify_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int64_t n_q, const int64_t n_kv,
-                         int64_t * len) {
-    ggml_cuda_fattn_asm_mask_cache & c = ctx.fattn_asm_mask_cache;
+                         int64_t * len, const bool allow_sync = true) {
     // Keyed on the tensor object as well as its data: a graph input is written once before the graph runs, while an
     // intermediate mask computed in-graph (e.g. a per-layer sparse mask) is a different tensor object per layer even
     // where the allocator reuses its memory.
-    if (c.epoch == ctx.graph_compute_epoch && c.tensor == mask && c.data == mask->data && c.n_q == n_q && c.n_kv == n_kv) {
-        *len = c.len;
-        return c.kind;
+    for (int i = 0; i < ggml_backend_cuda_context::FATTN_ASM_MASK_CACHE_N; ++i) {
+        const ggml_cuda_fattn_asm_mask_cache & c = ctx.fattn_asm_mask_cache[i];
+        if (c.epoch == ctx.graph_compute_epoch && c.tensor == mask && c.data == mask->data && c.n_q == n_q && c.n_kv == n_kv) {
+            *len = c.len;
+            return c.kind;
+        }
+    }
+    if (!allow_sync) {
+        *len = 0;
+        return FA_ASM_MASK_UNSUPPORTED;
     }
 
     cudaStream_t stream = ctx.stream();
@@ -500,6 +525,8 @@ int fa_asm_classify_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * ma
     CUDA_CHECK(cudaMemcpyAsync(h_res, d_res, sizeof(h_res), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    ggml_cuda_fattn_asm_mask_cache & c = ctx.fattn_asm_mask_cache[ctx.fattn_asm_mask_cache_next];
+    ctx.fattn_asm_mask_cache_next = (ctx.fattn_asm_mask_cache_next + 1) % ggml_backend_cuda_context::FATTN_ASM_MASK_CACHE_N;
     c.epoch  = ctx.graph_compute_epoch;
     c.tensor = mask;
     c.data   = mask->data;
@@ -524,7 +551,52 @@ struct fa_asm_kargs {
 
 bool ggml_cuda_fattn_asm_gfx90a_may_apply(int device, const ggml_tensor * dst) {
     const char * why = nullptr;
-    return fa_asm_shape_ok(device, dst, &why);
+    if (!fa_asm_shape_ok(device, dst, &why)) {
+        return false;
+    }
+    if (!fa_asm_graph_enabled()) {
+        return true;
+    }
+    // a mask computed inside the graph cannot be classified before capture
+    const ggml_tensor * mask = dst->src[3];
+    return mask != nullptr && mask->op != GGML_OP_NONE;
+}
+
+uint64_t ggml_cuda_fattn_asm_gfx90a_graph_prepass(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    if (!fa_asm_graph_enabled()) {
+        return 0;
+    }
+    uint64_t sig = 0;
+    const auto mix = [&sig](uint64_t v) { sig = (sig ^ v) * 0x100000001b3ull; };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        const char * why = nullptr;
+        if (!fa_asm_shape_ok(ctx.device, node, &why)) {
+            continue;
+        }
+        const ggml_tensor * mask = node->src[3];
+        if (mask != nullptr && mask->op != GGML_OP_NONE) {
+            continue; // graph not captured (may_apply)
+        }
+        if (sig == 0) {
+            sig = 0xcbf29ce484222325ull;
+        }
+        const bool hd256  = node->src[0]->ne[0] == FA_CK_D;
+        const bool loaded = hd256 || fa_asm_load(ctx.device);
+        int     kind = FA_ASM_MASK_FULL;
+        int64_t L    = node->src[1]->ne[1];
+        if (mask != nullptr) {
+            kind = fa_asm_classify_mask(ctx, mask, node->src[0]->ne[1], node->src[1]->ne[1], &L, true);
+        }
+        mix((uint64_t) i);
+        mix((uint64_t) loaded);
+        mix((uint64_t) kind);
+        mix((uint64_t) L);
+    }
+    return sig;
 }
 
 uint64_t ggml_cuda_fattn_asm_gfx90a_n_calls() {
@@ -545,6 +617,10 @@ bool ggml_cuda_fattn_asm_gfx90a_usable(int device) {
 
 bool ggml_cuda_fattn_ck_hd256_usable(int device) {
     return fa_asm_enabled() && fa_ck_hd256_enabled() && fa_asm_device_ok(device);
+}
+
+uint64_t ggml_cuda_fattn_asm_gfx90a_n_captured() {
+    return g_fa_asm_n_captured.load(std::memory_order_relaxed);
 }
 
 uint64_t ggml_cuda_fattn_ck_hd256_n_calls() {
@@ -639,16 +715,27 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 
     cudaStream_t stream = ctx.stream();
+    bool capturing = false;
     {
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-        if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) {
+        if (hipStreamIsCapturing(stream, &capture) != hipSuccess) {
             (void) hipGetLastError();
-            fa_asm_log_reject("stream is capturing", dst);
+            fa_asm_log_reject("stream capture status unknown", dst);
+            return false;
+        }
+        capturing = capture != hipStreamCaptureStatusNone;
+        if (capturing && !fa_asm_graph_enabled()) {
+            fa_asm_log_reject("stream is capturing (GGML_HIP_FA_ASM_GRAPH=0)", dst);
             return false;
         }
     }
 
     const bool is_hd256 = dst->src[0]->ne[0] == FA_CK_D;
+    if (!is_hd256 && capturing && !g_fa_asm_modules[device].done.load(std::memory_order_acquire)) {
+        // hipModuleLoadData is not legal inside capture; the pre-pass should have loaded them
+        fa_asm_log_reject("capturing before the code objects were loaded", dst);
+        return false;
+    }
     if (!is_hd256 && !fa_asm_load(device)) {
         fa_asm_log_reject("code objects failed to load", dst);
         return false;
@@ -667,7 +754,9 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
     int     kind = FA_ASM_MASK_FULL;
     int64_t L    = n_kv;
     if (mask) {
-        kind = fa_asm_classify_mask(ctx, mask, n_q, n_kv, &L);
+        // inside capture only the pre-pass verdict may be used (no stream sync); a miss falls back to the
+        // existing (capture-safe) kernels, which are correct for any mask
+        kind = fa_asm_classify_mask(ctx, mask, n_q, n_kv, &L, !capturing);
     }
     if (kind == FA_ASM_MASK_UNSUPPORTED || L < 1 || L > n_kv || (kind == FA_ASM_MASK_CAUSAL && L < n_q)) {
         fa_asm_log_reject("mask is not a (padded) causal or full mask", dst);
@@ -677,7 +766,11 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
 
     if (is_hd256) {
 #ifdef GGML_HIP_CK_FMHA_HD256
-        return fa_ck_hd256_run(ctx, dst, causal, L);
+        const bool ran = fa_ck_hd256_run(ctx, dst, causal, L);
+        if (ran && capturing) {
+            fa_asm_note_captured(dst, true);
+        }
+        return ran;
 #else
         GGML_ABORT("unreachable: hd256 admitted without GGML_HIP_CK_FMHA_HD256"); // fa_ck_hd256_enabled() is false
 #endif
@@ -750,6 +843,11 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
     const unsigned gdx    = (unsigned) (((n_q + FA_ASM_TS_QO - 1) / FA_ASM_TS_QO + tg_div - 1) / tg_div);
     const unsigned gdy    = (unsigned) H;
 
+    // Kernargs by value: HIP copies the HIP_LAUNCH_PARAM_BUFFER_POINTER blob at launch / at capture into the graph
+    // node (AK-ASM-T0 verified replay x7 and hipGraphExecUpdate with a stack buffer that is gone by replay time), so
+    // the stack-local blob need not outlive this call. Every value in it is fixed by the node's tensor properties plus
+    // the mask verdict (kind, L), which the graph signature (graph_prepass) covers; the scratch pointers come from the
+    // pool, whose addresses ggml's graph mode already relies on being stable across replays.
     size_t arg_size = FA_ASM_KARGS;
     void * config[] = {
         HIP_LAUNCH_PARAM_BUFFER_POINTER, a.b,
@@ -773,6 +871,9 @@ bool ggml_cuda_fattn_asm_gfx90a_try(ggml_backend_cuda_context & ctx, ggml_tensor
     fa_asm_o_to_f32<<<(unsigned) fa_asm_cvt_blocks(n_out), FA_ASM_CVT_BLOCK, 0, stream>>>(o_bf16.ptr, n_out, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
 
+    if (capturing) {
+        fa_asm_note_captured(dst, false);
+    }
     const uint64_t n = g_fa_asm_n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1 || fa_asm_log_all()) {
         GGML_LOG_INFO("ggml_cuda_fa_asm: gfx90a FA-v3 asm path ran (call %llu) node=%s %s n_q=%lld H=%lld H_kv=%lld n_kv=%lld L=%lld K=%s\n",
