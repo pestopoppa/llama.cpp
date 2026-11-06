@@ -48,6 +48,106 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+
+// ---------------------------------------------------------------------------------------------
+// AK-ASM-H12: radix-select top-k for rows wider than the bitonic limit (no CUB on HIP)
+
+#include <cstdlib>
+
+bool ggml_cuda_top_k_radix_enabled() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_CUDA_TOPK_RADIX");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return v;
+}
+
+static __device__ __forceinline__ uint32_t top_k_radix_key(const float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u); // order-preserving: larger float -> larger key
+}
+
+// one workgroup per row: 4 passes of an 8-bit histogram find the k-th largest key T, then a collect
+// pass writes every index with key > T plus the first (k - #greater) indices with key == T (unordered)
+template <int NT>
+static __global__ void __launch_bounds__(NT) k_top_k_radix(const float * src, int * dst, const int ncols, const int k) {
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t s_prefix;
+    __shared__ uint32_t s_mask;
+    __shared__ int      s_remaining;
+    __shared__ int      s_gt;
+    __shared__ int      s_eq;
+
+    const int64_t row = blockIdx.x;
+    const float * x = src + row*ncols;
+    int         * y = dst + row*k;
+    const int     t = threadIdx.x;
+
+    if (t == 0) {
+        s_prefix    = 0;
+        s_mask      = 0;
+        s_remaining = k;
+        s_gt        = 0;
+        s_eq        = 0;
+    }
+
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = t; i < 256; i += NT) {
+            hist[i] = 0;
+        }
+        __syncthreads();
+        const uint32_t prefix = s_prefix;
+        const uint32_t mask   = s_mask;
+        for (int i = t; i < ncols; i += NT) {
+            const uint32_t key = top_k_radix_key(x[i]);
+            if ((key & mask) == prefix) {
+                atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
+            }
+        }
+        __syncthreads();
+        if (t == 0) {
+            int remaining = s_remaining;
+            int b = 255;
+            for (; b > 0; --b) {
+                const int c = (int) hist[b];
+                if (c >= remaining) {
+                    break;
+                }
+                remaining -= c;
+            }
+            s_remaining = remaining;
+            s_prefix    = prefix | ((uint32_t) b << shift);
+            s_mask      = mask | (0xFFu << shift);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t T        = s_prefix;
+    const int      n_eq     = s_remaining;
+    const int      n_gt_all = k - n_eq;
+
+    for (int i = t; i < ncols; i += NT) {
+        const uint32_t key = top_k_radix_key(x[i]);
+        if (key > T) {
+            y[atomicAdd(&s_gt, 1)] = i;
+        } else if (key == T) {
+            const int e = atomicAdd(&s_eq, 1);
+            if (e < n_eq) {
+                y[n_gt_all + e] = i;
+            }
+        }
+    }
+}
+
+static void top_k_radix_cuda(const float * src, int * dst, const int ncols, const int64_t nrows, const int k, cudaStream_t stream) {
+    constexpr int NT = 256;
+    k_top_k_radix<NT><<<nrows, NT, 0, stream>>>(src, dst, ncols, k);
+    static int n_calls = 0;
+    if (n_calls++ == 0) {
+        GGML_LOG_INFO("ggml_cuda_top_k_radix: radix select top-k ran (call 1)\n");
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -96,6 +196,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+    if (ncols > 1024 && ggml_cuda_top_k_radix_enabled()) {
+        top_k_radix_cuda(src0_d, dst_d, (int) ncols, nrows, (int) k, stream);
+        return;
+    }
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
     argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);

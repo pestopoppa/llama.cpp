@@ -885,6 +885,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+
+    // AK-ASM-H12: hand the top-k indices and the base mask to the FLASH_ATTN_EXT node as extra sources
+    // (src[5], src[6]) so a backend that fuses this composition (ggml-cuda qsa-sparse) reads tensors that
+    // are kept alive until the FA runs and are copied to its backend by the scheduler. Without the edge the
+    // graph allocator may reuse top_k's memory after SET_ROWS, before the FA. Other backends ignore them.
+    {
+        ggml_tensor * fa = cur;
+        while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT &&
+               (fa->op == GGML_OP_PERMUTE || fa->op == GGML_OP_RESHAPE || fa->op == GGML_OP_VIEW || fa->op == GGML_OP_CONT)) {
+            fa = fa->src[0];
+        }
+        if (fa && fa->op == GGML_OP_FLASH_ATTN_EXT && fa->src[5] == nullptr && fa->src[6] == nullptr) {
+            fa->src[5] = top_k_3d;
+            fa->src[6] = kq_mask;
+        }
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
