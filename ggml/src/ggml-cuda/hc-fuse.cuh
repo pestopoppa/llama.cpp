@@ -8,8 +8,9 @@
 //     - mix tail: MEAN_D1(RESHAPE(MUL(xn, SIGMOID(u))))                         -> 1 kernel (3 launches -> 1)
 //     - gate:     SILU(SCALE(x))                                                -> 1 kernel (2 launches -> 1)
 //     - norm:     MUL(RESHAPE(RMS_NORM(x [E,hc,T])), gamma [hc*E])                -> 1 kernel (2 launches -> 1, H13c)
-//  The plan is built per graph evaluation from the node list; an intermediate is elided only when its single consumer
-//  is inside the chain and it is not a graph output.
+//  The plan is built per graph evaluation from the node list (hc-fuse-plan.h); an intermediate is elided only when its
+//  single consumer in the whole graph is inside the chain and it is not a graph output, and an anchor is kept only if no
+//  memory its fused kernel reads was reused by ggml-alloc before the anchor (C7R buffer-lifetime guard).
 
 #include "common.cuh"
 

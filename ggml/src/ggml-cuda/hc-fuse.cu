@@ -153,11 +153,18 @@ void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
 
 // ---------------------------------------------------------------------------------------------------- planning
 // the planner is host-only C++ in hc-fuse-plan.h (unit-tested on the CPU by tests/test-hc-fuse-plan.cpp)
+static std::atomic<uint64_t> g_hc_n_unsafe{0};
+
 void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan) {
     plan.skip.clear();
     plan.anchors.clear();
+    plan.chains.clear();
+    plan.n_unsafe = 0;
     if (!ggml_cuda_hc_fuse_enabled()) {
         return;
     }
     ggml_hc_fuse_plan_build(cgraph, ggml_cuda_hc_rms_fuse_enabled(), plan);
+    if (plan.n_unsafe > 0 && g_hc_n_unsafe.fetch_add((uint64_t) plan.n_unsafe, std::memory_order_relaxed) == 0) {
+        GGML_LOG_INFO("ggml_cuda_hc_fuse: buffer-lifetime guard kept %d hc fusion(s) unfused (first graph)\n", plan.n_unsafe);
+    }
 }

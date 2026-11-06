@@ -2,12 +2,27 @@
 
 // AK-ASM-H13b planner for the qwen4exp hyper-connection seam fusions (see hc-fuse.cuh). Host-only C++ so the
 // planning rules can be unit-tested on the CPU (tests/test-hc-fuse-plan.cpp) without a GPU.
+//
+// C7R (2026-11-06) safety rules. The fusions are NOT over consecutive nodes: a fused kernel runs at its anchor and reads
+// the chain's external inputs there, after the elided nodes that were their last unfused readers. ggml-alloc sized and
+// laid out the buffers for the UNFUSED graph, so it may already have reused an input's memory for a node computed
+// between the elided reader and the anchor, or for the anchor's own dst. On the real Q38FN prompt graph
+// (-ngl 99 --n-cpu-moe 48 -ub 512) hc_inject (MUL_MAT) is allocated over the block_out that the fused COMBINE still reads,
+// and the head mix-tail dst lands inside the u it reads: C7 Q38FN ln(PPL/PPL_C6) +0.11, KLD 0.18. Hence:
+//  1. an intermediate is elided only if it has exactly one use in the WHOLE graph (cgraph->use_counts, shared by every
+//     scheduler split view, like ggml_node_get_use_count), not just one use inside the split;
+//  2. every anchor is checked by address after planning: from the start of its chain to the anchor, no node that will be
+//     computed may write memory overlapping an input of the fused kernel, and the anchor's dst may overlap an input only
+//     as an exact same-index alias (combine: residual, gate: x, norm: x). An anchor that fails runs unfused (its chain is
+//     un-elided), and the check repeats until no anchor fails, since un-elided nodes are writers too.
 
 #include "ggml.h"
 #include "../ggml-impl.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 enum ggml_cuda_hc_kind { HC_FUSE_COMBINE = 1, HC_FUSE_MIX_TAIL = 2, HC_FUSE_SCALE_SILU = 3, HC_FUSE_RMS_GAMMA = 4 };
 
@@ -20,27 +35,43 @@ struct ggml_cuda_hc_anchor {
 };
 
 struct ggml_cuda_hc_plan {
-    std::unordered_set<const ggml_tensor *>                     skip;
-    std::unordered_map<const ggml_tensor *, ggml_cuda_hc_anchor> anchors;
+    std::unordered_set<const ggml_tensor *>                                       skip;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_hc_anchor>                   anchors;
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>>      chains;   // anchor -> its elided nodes
+    int                                                                           n_unsafe = 0;  // anchors dropped by rule 2
 };
 
 namespace ggml_hc_plan_detail {
 
 struct hc_ctx {
-    std::unordered_map<const ggml_tensor *, int> uses;
-    std::unordered_set<const ggml_tensor *>      in_graph;
+    const ggml_cgraph *                          graph = nullptr;
+    std::unordered_map<const ggml_tensor *, int> uses;      // uses inside this graph (split view)
+    std::unordered_map<const ggml_tensor *, int> pos;       // node index inside this graph
     bool rms_enabled = true;
 };
 
+// uses of t over the whole graph this one is a view of (-1: unknown)
+inline int global_uses(const ggml_cgraph * g, const ggml_tensor * t) {
+    if (!g || !g->use_counts || !g->visited_hash_set.keys || !g->visited_hash_set.used) {
+        return -1;
+    }
+    const size_t h = ggml_hash_find(&g->visited_hash_set, t);
+    if (h == GGML_HASHSET_FULL || !ggml_bitset_get(g->visited_hash_set.used, h) || g->visited_hash_set.keys[h] != t) {
+        return -1;
+    }
+    return g->use_counts[h];
+}
+
 inline bool f32c(const ggml_tensor * t) { return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
 
-// an elidable intermediate: a node of this graph, single consumer, not an output
+// an elidable intermediate: a node of this graph, not an output, with a single consumer in this graph AND in the whole
+// graph (a scheduler split is a view: a consumer in another split would read memory nobody wrote)
 inline bool inner(const hc_ctx & c, const ggml_tensor * t) {
-    if (!t || !c.in_graph.count(t) || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (!t || !c.pos.count(t) || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
     auto it = c.uses.find(t);
-    return it != c.uses.end() && it->second == 1;
+    return it != c.uses.end() && it->second == 1 && global_uses(c.graph, t) == 1;
 }
 
 inline bool is_unary(const ggml_tensor * t, ggml_unary_op op) { return t && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op; }
@@ -78,6 +109,7 @@ inline bool try_combine(const hc_ctx & c, const ggml_tensor * add, ggml_cuda_hc_
             scale_params(s1, an.s1, an.b1);
             scale_params(s2, an.s2, an.b2);
             plan.anchors[add] = an;
+            plan.chains[add] = { m, rep, wr, s2, sg, s1 };
             for (const ggml_tensor * t : { m, rep, wr, s2, sg, s1 }) plan.skip.insert(t);
             return true;
         }
@@ -100,6 +132,7 @@ inline bool try_mix_tail(const hc_ctx & c, const ggml_tensor * mean, ggml_cuda_h
     ggml_cuda_hc_anchor an{HC_FUSE_MIX_TAIL};
     an.a = xn; an.b = u;
     plan.anchors[mean] = an;
+    plan.chains[mean] = { rg, g, sig };
     for (const ggml_tensor * t : { rg, g, sig }) plan.skip.insert(t);
     return true;
 }
@@ -120,6 +153,7 @@ inline bool try_rms_gamma(const hc_ctx & c, const ggml_tensor * mul, ggml_cuda_h
         ggml_cuda_hc_anchor an{HC_FUSE_RMS_GAMMA};
         an.b = gam; an.c = rms;
         plan.anchors[mul] = an;
+        plan.chains[mul] = { rs, rms };
         plan.skip.insert(rs);
         plan.skip.insert(rms);
         return true;
@@ -136,7 +170,63 @@ inline bool try_scale_silu(const hc_ctx & c, const ggml_tensor * silu, ggml_cuda
     an.a = s->src[0];
     scale_params(s, an.s1, an.b1);
     plan.anchors[silu] = an;
+    plan.chains[silu] = { s };
     plan.skip.insert(s);
+    return true;
+}
+
+inline bool is_noop(const ggml_tensor * t) {
+    return t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+           t->op == GGML_OP_TRANSPOSE;
+}
+
+inline const ggml_tensor * root_of(const ggml_tensor * t) {
+    while (t->view_src) t = t->view_src;
+    return t;
+}
+
+inline bool overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// rule 2: the fused kernel at `dst` reads only memory that still holds what the unfused chain would have read there
+inline bool anchor_safe(const hc_ctx & c, const ggml_cuda_hc_plan & plan, const ggml_tensor * dst, const ggml_cuda_hc_anchor & an) {
+    const ggml_tensor * ins[3] = { an.a, an.b, an.kind == HC_FUSE_RMS_GAMMA ? an.c->src[0] : an.c };
+    // an exact same-index alias is harmless: each element is read before the same thread writes it
+    const ggml_tensor * same_index_ok = an.kind == HC_FUSE_COMBINE ? an.a : an.kind == HC_FUSE_SCALE_SILU ? an.a :
+                                        an.kind == HC_FUSE_RMS_GAMMA ? an.c->src[0] : nullptr;
+    const auto ia = c.pos.find(dst);
+    const auto ic = plan.chains.find(dst);
+    if (ia == c.pos.end() || ic == plan.chains.end() || !dst->data) {
+        return false;
+    }
+    int chain_start = ia->second;
+    for (const ggml_tensor * t : ic->second) {
+        const auto ip = c.pos.find(t);
+        if (ip == c.pos.end()) return false;
+        chain_start = std::min(chain_start, ip->second);
+    }
+    for (const ggml_tensor * x : ins) {
+        if (!x) continue;
+        if (!x->data) return false;
+        if (overlaps(dst, x) && !(x == same_index_ok && dst->data == x->data && ggml_nbytes(dst) == ggml_nbytes(x))) {
+            return false;
+        }
+        // before the chain starts x still has an unfused reader pending, so the allocator kept it; before x's producer
+        // any write to its memory is overwritten by the producer
+        const ggml_tensor * r  = root_of(x);
+        const auto          ip = c.pos.find(r);
+        const int           i0 = std::max(chain_start + 1, ip == c.pos.end() ? 0 : ip->second + 1);
+        for (int i = i0; i < ia->second; ++i) {
+            const ggml_tensor * w = c.graph->nodes[i];
+            if (w == r || is_noop(w) || plan.skip.count(w) || !w->data) continue;
+            if (overlaps(w, x)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -147,6 +237,8 @@ inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled
     using namespace ggml_hc_plan_detail;
     plan.skip.clear();
     plan.anchors.clear();
+    plan.chains.clear();
+    plan.n_unsafe = 0;
     // cheap pre-check: only graphs that contain a MEAN_D1 (the qwen4exp hc mix) are planned
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
@@ -156,10 +248,11 @@ inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled
         return;
     }
     hc_ctx c;
+    c.graph       = cgraph;
     c.rms_enabled = rms_enabled;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        c.in_graph.insert(n);
+        c.pos[n] = i;
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (n->src[j]) c.uses[n->src[j]]++;
         }
@@ -176,7 +269,24 @@ inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled
         if (plan.skip.count(kv.first)) {
             plan.skip.clear();
             plan.anchors.clear();
+            plan.chains.clear();
             return;
+        }
+    }
+    // rule 2, to a fixed point: dropping an anchor un-elides its chain, whose nodes then write memory too
+    for (bool changed = true; changed;) {
+        changed = false;
+        std::vector<const ggml_tensor *> order;
+        order.reserve(plan.anchors.size());
+        for (const auto & kv : plan.anchors) order.push_back(kv.first);
+        std::sort(order.begin(), order.end(), [&](const ggml_tensor * x, const ggml_tensor * y) { return c.pos[x] < c.pos[y]; });
+        for (const ggml_tensor * dst : order) {
+            if (anchor_safe(c, plan, dst, plan.anchors.at(dst))) continue;
+            for (const ggml_tensor * t : plan.chains[dst]) plan.skip.erase(t);
+            plan.chains.erase(dst);
+            plan.anchors.erase(dst);
+            plan.n_unsafe++;
+            changed = true;
         }
     }
 }
