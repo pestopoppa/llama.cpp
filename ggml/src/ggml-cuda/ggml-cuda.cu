@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-q8-skinny.cuh"
+#include "ggml-cuda/mmq-q8-wvsk.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1914,6 +1915,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_log_mul_mat_route("MMF", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // AK-ASM-H1b: wvSplitK-style Q8_0 path for LARGE weights (> 6 MiB; GGML_HIP_Q8_WVSK=0 disables -> C6 route).
+    if (ggml_cuda_q8_wvsk_eligible(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("Q8_WVSK", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_wvsk(ctx, src0, src1, dst);
         return;
     }
     // AK-ASM-H1/H7: skinny-M Q8_0 split-K fast path (CDNA only, GGML_HIP_Q8_SKINNY=0 disables).
