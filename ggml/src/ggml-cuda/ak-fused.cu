@@ -17,6 +17,12 @@ static bool ak_env_enabled(const char * name) {
     return v == nullptr || atoi(v) != 0; // default ON, "0" disables
 }
 
+// C7: AK-ASM-H14 was DROPPED at its gate; it stays compiled but default OFF (GGML_CUDA_AK_H14=1 opts in).
+static bool ak_env_opt_in(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
 static void ak_log_once(std::atomic<bool> & flag, const char * what, const ggml_tensor * t) {
     static const bool do_log = getenv("GGML_CUDA_AK_FUSE_LOG") != nullptr && atoi(getenv("GGML_CUDA_AK_FUSE_LOG")) != 0;
     if (do_log && !flag.exchange(true)) {
@@ -185,7 +191,7 @@ static __global__ void ak_h14_rms_rope_kernel(const ak_h14_params p) {
 }
 
 int ggml_cuda_ak_h14_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = ak_env_enabled("GGML_CUDA_AK_H14");
+    static const bool enabled = ak_env_opt_in("GGML_CUDA_AK_H14");
     static std::atomic<bool> logged_sr{false}, logged_rope{false};
     if (!enabled || i + 2 >= cgraph->n_nodes) {
         return 0;
