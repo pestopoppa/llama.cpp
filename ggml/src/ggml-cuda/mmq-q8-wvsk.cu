@@ -41,7 +41,8 @@
 //     (window loads splitting TA segments, barrier serialization): ~0.7 TB/s = 1.2x. Gate target 1.10x = ~630 GB/s.
 //  Env: GGML_HIP_Q8_WVSK=0 disables (C6 route), GGML_HIP_Q8_WVSK_MIN_BYTES (default 6 MiB: fast path only when the
 //       Q8_0 weight is strictly larger), GGML_HIP_Q8_WVSK_MIN / _MAX (M range, default 5..16), GGML_HIP_Q8_WVSK_WAVES
-//       (max waves per WG, default 16).
+//       (max waves per WG, default 16; 8 at M >= 12), GGML_HIP_Q8_WVSK_M12_MIN_ROWS (M >= 12 needs >= this many rows,
+//       default 4096; 0 = off).
 #include "mmq-q8-wvsk.cuh"
 
 #include <atomic>
@@ -59,7 +60,7 @@ static int q8wv_env_int(const char * name, int def) {
 }
 
 struct q8wv_cfg {
-    bool enabled; int mmin; int mmax; int waves; int64_t min_bytes;
+    bool enabled; int mmin; int mmax; int waves; int64_t min_bytes; int big_m_min_rows;
 };
 
 static const q8wv_cfg & q8wv_get_cfg() {
@@ -69,6 +70,9 @@ static const q8wv_cfg & q8wv_get_cfg() {
         c.mmin    = std::max(2, q8wv_env_int("GGML_HIP_Q8_WVSK_MIN", 5));
         c.mmax    = std::min(Q8WV_MAXM, q8wv_env_int("GGML_HIP_Q8_WVSK_MAX", Q8WV_MAXM));
         c.waves   = std::min(Q8WV_MAXWAVE, std::max(1, q8wv_env_int("GGML_HIP_Q8_WVSK_WAVES", Q8WV_MAXWAVE)));
+        // Post hoc from gate r1 (ea922d61f): at M >= 12 the only A3B loss was 2048x4096 M16 (0.966x; 2048 rows = too few row
+        // tiles for 104 CUs), while every >= 4096-row shape won. M >= 12 therefore needs >= 4096 rows; r2 confirms on fresh reps.
+        c.big_m_min_rows = std::max(0, q8wv_env_int("GGML_HIP_Q8_WVSK_M12_MIN_ROWS", 4096));
         const char * mb = getenv("GGML_HIP_Q8_WVSK_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (6ll << 20);
         return c;
@@ -90,7 +94,7 @@ bool ggml_cuda_q8_wvsk_eligible(const ggml_tensor * src0, const ggml_tensor * sr
        
         src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
         dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0 &&
-        nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096;
+        nbytes > cfg.min_bytes && (src1->ne[1] < 12 || src0->ne[1] >= cfg.big_m_min_rows) && nbytes < (int64_t) INT32_MAX - 4096;
 #else
     GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(cc);
     return false;
@@ -143,8 +147,8 @@ __device__ short     q8wv_buf_s16(q8wv_int4 rsrc, int voffset, int soffset, int 
 
 // grid = #CUs, block = (64, wv); every wave runs the same number of row-tile iterations (n_rnd) so the WG-wide
 // barriers of the activation page restage are uniform.
-template <int M, int UN>
-static __global__ void __launch_bounds__(64 * Q8WV_MAXWAVE)
+template <int M, int UN, int YT, int MAXW>
+static __global__ void __launch_bounds__(64 * MAXW)
 q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const int N, const uint32_t wbytes,
              const int8_t * __restrict__ yq, const float * __restrict__ yd, const int P, const int n_tiles, const int n_rnd,
              const int m_real, float * __restrict__ dst, const int64_t dst_s1) {
@@ -166,11 +170,11 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
     for (int rnd = 0; rnd < n_rnd; ++rnd) {
         const int  t      = (rnd * gridDim.x + blockIdx.x) * wv + threadIdx.y;
         const bool active = t < n_tiles;
-        const int  row0   = t * Q8WV_YT;
+        const int  row0   = t * YT;
 
-        float acc[Q8WV_YT][M];
+        float acc[YT][M];
 #pragma unroll
-        for (int y = 0; y < Q8WV_YT; ++y) {
+        for (int y = 0; y < YT; ++y) {
 #pragma unroll
             for (int n = 0; n < M; ++n) {
                 acc[y][n] = 0.0f;
@@ -179,9 +183,9 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 
         for (int k1 = 0; k1 < nblk; k1 += 32 * UN) {
             // 1) weight windows for this step, all issued before any wait (AITER: bigB loads first)
-            q8wv_int4 wa[Q8WV_YT][UN];
-            int       wb[Q8WV_YT][UN];
-            short     ws[Q8WV_YT][UN];
+            q8wv_int4 wa[YT][UN];
+            int       wb[YT][UN];
+            short     ws[YT][UN];
             int       sh[UN];
 #pragma unroll
             for (int u = 0; u < UN; ++u) {
@@ -189,7 +193,7 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
                 const int tb = bb * 34 + 2 + 16 * h;   // first qs byte of this lane's half block (row-relative)
                 sh[u] = tb & 3;
 #pragma unroll
-                for (int y = 0; y < Q8WV_YT; ++y) {
+                for (int y = 0; y < YT; ++y) {
                     const int  row = row0 + y;
                     const bool ok  = active && row < N && bb < nblk;
                     const int  rb  = row * nb01;
@@ -227,10 +231,10 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 #pragma unroll
             for (int u = 0; u < UN; ++u) {
                 const int bl = k1 - page + 32 * u + hb;
-                int qw[Q8WV_YT][4];
-                float dw[Q8WV_YT];
+                int qw[YT][4];
+                float dw[YT];
 #pragma unroll
-                for (int y = 0; y < Q8WV_YT; ++y) {
+                for (int y = 0; y < YT; ++y) {
                     const int d5[5] = {wa[y][u][0], wa[y][u][1], wa[y][u][2], wa[y][u][3], wb[y][u]};
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
@@ -243,7 +247,7 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
                     const q8wv_int4 a  = lds[(n * P + bl) * 2 + h];
                     const float     da = lds_d[n * P + bl];
 #pragma unroll
-                    for (int y = 0; y < Q8WV_YT; ++y) {
+                    for (int y = 0; y < YT; ++y) {
                         int s = ggml_cuda_dp4a(qw[y][0], a[0], 0);
                         s     = ggml_cuda_dp4a(qw[y][1], a[1], s);
                         s     = ggml_cuda_dp4a(qw[y][2], a[2], s);
@@ -256,7 +260,7 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 
         // 4) 64-lane DPP reduction (AITER), lane 63 holds the row total
 #pragma unroll
-        for (int y = 0; y < Q8WV_YT; ++y) {
+        for (int y = 0; y < YT; ++y) {
 #pragma unroll
             for (int n = 0; n < M; ++n) {
                 Q8WV_DPP_ADD(acc[y][n], "row_shr:8");
@@ -269,7 +273,7 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
         }
         if (active && lane == 63) {
 #pragma unroll
-            for (int y = 0; y < Q8WV_YT; ++y) {
+            for (int y = 0; y < YT; ++y) {
                 if (row0 + y < N) {
 #pragma unroll
                     for (int n = 0; n < M - 1; ++n) {
@@ -292,18 +296,23 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 template <int M>
 static void q8wv_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int8_t * yq, const float * yd,
                         int ncu, int max_waves, int m_real, float * dst, int64_t dst_s1, cudaStream_t stream) {
-    constexpr int UN   = M <= 5 ? 2 : 1;   // UN=2 at M 6..8 spills under the 128-VGPR cap of 16 waves/CU
+    constexpr int UN   = M <= 5 ? 2 : 1;
+    // M >= 12: 8 rows per wave at 8 waves/CU (256-VGPR budget) - halves the per-weight-byte LDS activation reads that capped
+    // r1 M=16 at ~550-600 GB/s on every large shape regardless of page restaging (gate r1 per-cell table).
+    constexpr int YT   = M >= 12 ? 8 : Q8WV_YT;
+    constexpr int MAXW = M >= 12 ? 8 : Q8WV_MAXWAVE;
+    max_waves = std::min(max_waves, MAXW);   // UN=2 at M 6..8 spills under the 128-VGPR cap of 16 waves/CU
     constexpr int STEP = 32 * UN;
     int P = (Q8WV_LDS_B / (36 * M)) / STEP * STEP;
     P = std::min(P, (nblk + STEP - 1) / STEP * STEP);
     GGML_ASSERT(P >= STEP && M * P * 36 <= Q8WV_LDS_B);
 
     // mindiv (AITER): fewest rounds at max_waves, then the fewest waves per WG that still need only that many rounds
-    const int n_tiles = (N + Q8WV_YT - 1) / Q8WV_YT;
+    const int n_tiles = (N + YT - 1) / YT;
     const int n_rnd   = (n_tiles + ncu * max_waves - 1) / (ncu * max_waves);
     const int wv      = (n_tiles + ncu * n_rnd - 1) / (ncu * n_rnd);
     const dim3 block(64, wv, 1);
-    q8wv_mul_mat<M, UN><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, m_real, dst, dst_s1);
+    q8wv_mul_mat<M, UN, YT, MAXW><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, m_real, dst, dst_s1);
 }
 
 void ggml_cuda_mul_mat_q8_wvsk(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
