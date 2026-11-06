@@ -17,7 +17,8 @@
 // Everything else returns false before anything is enqueued, and the caller runs the existing selection unchanged.
 //
 // Env (read once):
-//   GGML_HIP_FA_ASM=0              disable the fast path at run time (default: enabled when compiled in)
+//   GGML_HIP_FA_ASM=0              disable every fast path (hd128 asm and hd256 CK) at run time
+//   GGML_HIP_FA_ASM=1              also enable the hd128 bf16 asm path, which is OFF by default (bf16 PPL drift, R5)
 //   GGML_HIP_FA_ASM_MIN_BATCH=n    smallest query-row count that takes the fast path (default 64, minimum 1)
 //   GGML_HIP_FA_ASM_LOG=1          log every fast-path decision (default: one line at first use, one per new reject)
 //
@@ -79,6 +80,18 @@ bool fa_asm_env_flag(const char * name, bool def) {
 
 bool fa_asm_enabled() {
     static const bool enabled = fa_asm_env_flag("GGML_HIP_FA_ASM", true);
+    return enabled;
+}
+
+// AK-ASM-H5-PORT-R5: the hd128 asm kernels are bf16-only (AITER ships no fp16 FA-v3 fwd); Q, K, V and O are rounded
+// to bf16 (8-bit mantissa vs f16's 11) and that drifts Qwen3-1.7B PPL +1.27% (20.2097 vs 19.9571, bound 0.5%).
+// So hd128 is OFF by default and taken only when GGML_HIP_FA_ASM is set explicitly to a non-zero value.
+// GGML_HIP_FA_ASM=0 still disables every fast path (hd128 asm and hd256 CK); unset leaves hd256 CK on.
+bool fa_asm_hd128_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HIP_FA_ASM");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return enabled;
 }
 
@@ -207,6 +220,8 @@ bool fa_asm_shape_ok(int device, const ggml_tensor * dst, const char ** why) {
     FA_ASM_REQUIRE(K->ne[0] == D && V->ne[0] == D && dst->ne[0] == D, "head dims differ (K/V/dst vs Q)");
     FA_ASM_REQUIRE(D == FA_ASM_D || (D == FA_CK_D && fa_ck_hd256_enabled()),
                    "head dim not 128 (asm) or 256 (CK, compiled in and GGML_HIP_FA_CK_HD256 != 0)");
+    FA_ASM_REQUIRE(D != FA_ASM_D || fa_asm_hd128_enabled(),
+                   "hd128 bf16 asm off by default (PPL drift; set GGML_HIP_FA_ASM=1 to enable)");
     FA_ASM_REQUIRE(dst->type == GGML_TYPE_F32, "dst is not f32");
     FA_ASM_REQUIRE(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16, "Q type");
     if (D == FA_CK_D) {
@@ -608,7 +623,7 @@ int64_t ggml_cuda_fattn_asm_gfx90a_min_batch() {
 }
 
 bool ggml_cuda_fattn_asm_gfx90a_usable(int device) {
-    if (!fa_asm_enabled() || !fa_asm_device_ok(device)) {
+    if (!fa_asm_enabled() || !fa_asm_hd128_enabled() || !fa_asm_device_ok(device)) {
         return false;
     }
     ggml_cuda_set_device(device);
