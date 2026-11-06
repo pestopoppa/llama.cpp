@@ -9400,6 +9400,213 @@ struct test_qsa_sparse_attn : public test_case {
     }
 };
 
+// LSA-H12-INDEXER: the Qwen3.8-27B global-layer LSA composition exactly as src/models/qwen35.cpp build_attn_lsa_h12
+// builds it: PCA-map scorer (llama_lsa_h12::build_scores, replicated below op for op) -> top_k -> qwen4exp mask chain ->
+// FLASH_ATTN_EXT with the src[5]/src[6] edge. ggml-cuda fuses the FA into the H12 sparse kernel (G = 6 for 24/4).
+//   mode 0 "sel":   output = 0/1 membership of the selected cells (exact; structured fixture => unique top-k set)
+//   mode 1 "attn":  output = attention (fused sparse on GPU vs dense masked FA on CPU), structured fixture
+//   mode 2 "full":  every visible cell fits in the budget (n_used <= width): output == dense FA over the base mask
+//   mode 3 "dense": plain FA on the same shapes, no indexer (the C7 path these layers run) -- perf baseline only
+// Structured fixture: the maps pick head-0 dims 64..127, q head 0 is e0 there, K head 0 is (s_j, sqrt(1 - s_j^2)), so the
+// index score of cell j is exactly s_j: a "high" set (s ~ 0.6..0.9) of exactly width - window - sink cells outside every
+// window, everything else low (-0.6..-0.3). With the window/sink bonuses the top-k set is unique for every query.
+struct test_lsa_h12 : public test_case {
+    const int64_t   kv;      // n_kv cells
+    const int64_t   nb;      // query tokens per stream
+    const int64_t   ns;      // streams
+    const int64_t   top_k;
+    const int64_t   window;
+    const int64_t   sink;
+    const int64_t   n_used;  // filled cells (the rest are empty: masked, empty_pos)
+    const int       mode;
+
+    static constexpr int64_t hs = 256, nh = 24, nh_kv = 4, rope = 64, idx = 64;
+
+    int64_t width() const { return std::min<int64_t>(kv, top_k + window + sink); }
+
+    std::string vars() override {
+        return "lsah12=1," + VARS_TO_STR8(kv, nb, ns, top_k, window, sink, n_used, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "LSA_H12"; }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return mode == 0 ? 1e-12 : 5e-4; }
+
+    // perf: one whole graph per run (scorer + top-k + mask chain + attention), never the tail node repeated
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 0; }
+    size_t   op_size (ggml_tensor * t) override { GGML_UNUSED(t); return size_t(64) << 30; }
+
+    test_lsa_h12(int64_t kv = 4096, int64_t nb = 8, int64_t ns = 1, int64_t top_k = 256, int64_t window = 128, int64_t sink = 4,
+                 int64_t n_used = -1, int mode = 1)
+        : kv(kv), nb(nb), ns(ns), top_k(top_k), window(window), sink(sink), n_used(n_used < 0 ? kv - 100 : n_used), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb*ns);
+        ggml_set_name(q_raw, "q");
+
+        // get_k / get_v views of a cache with kv_size > n_kv cells per stream
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, nh_kv, kv + 256, ns);
+        ggml_set_name(kc, "kc");
+        ggml_tensor * vc = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, nh_kv, kv + 256, ns);
+        ggml_set_name(vc, "vc");
+        ggml_tensor * k = ggml_view_4d(ctx, kc, hs, nh_kv, kv, ns, kc->nb[1], kc->nb[2], kc->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, vc, hs, nh_kv, kv, ns, vc->nb[1], vc->nb[2], vc->nb[3], 0);
+
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(kq_mask, "m");
+
+        // build_attn_mha layout
+        ggml_tensor * q4 = ggml_view_4d(ctx, q_raw, hs, nh, nb, ns, q_raw->nb[1], q_raw->nb[2], q_raw->nb[2]*nb, 0);
+        ggml_tensor * qp = ggml_permute(ctx, q4, 0, 2, 1, 3);
+        ggml_tensor * kp = ggml_permute(ctx, k, 0, 2, 1, 3);
+        ggml_tensor * vp = ggml_permute(ctx, v, 0, 2, 1, 3);
+        const float scale = 1.0f/sqrtf((float) hs);
+
+        if (mode == 3) {
+            ggml_tensor * out = ggml_flash_attn_ext(ctx, qp, kp, vp, kq_mask, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * mq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs*nh, idx);
+        ggml_set_name(mq, "mq");
+        ggml_tensor * mk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs*nh_kv, idx);
+        ggml_set_name(mk, "mk");
+        ggml_tensor * kpos = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kv, 1, ns);
+        ggml_set_name(kpos, "kpos");
+        ggml_tensor * kbias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kv, 1, ns);
+        ggml_set_name(kbias, "kbias");
+        ggml_tensor * qwin = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nb, ns);
+        ggml_set_name(qwin, "qwin");
+
+        // --- llama_lsa_h12::build_scores (verbatim)
+        ggml_tensor * kfull = ggml_view_3d(ctx, k, hs*nh_kv, kv, ns, k->nb[2], k->nb[3], 0);
+        ggml_tensor * mkb   = ns > 1 ? ggml_repeat_4d(ctx, mk, mk->ne[0], mk->ne[1], ns, 1) : mk;
+        ggml_tensor * khat  = ggml_mul_mat(ctx, kfull, mkb);
+        khat = ggml_cont(ctx, ggml_permute(ctx, khat, 1, 0, 2, 3));
+        khat = ggml_l2_norm(ctx, khat, 1e-12f);
+        ggml_tensor * qr   = ggml_reshape_2d(ctx, q_raw, hs*nh, nb*ns);
+        ggml_tensor * qhat = ggml_mul_mat(ctx, mq, qr);
+        qhat = ggml_l2_norm(ctx, qhat, 1e-12f);
+        qhat = ggml_reshape_3d(ctx, qhat, idx, nb, ns);
+        ggml_tensor * score = ggml_mul_mat(ctx, khat, qhat);
+        ggml_tensor * win = ggml_add(ctx, ggml_repeat(ctx, kpos, score), qwin);
+        win = ggml_scale(ctx, ggml_step(ctx, win), 4.0f);
+        score = ggml_add(ctx, score, win);
+        score = ggml_add(ctx, score, kbias);
+        ggml_tensor * mf = ggml_cast(ctx, kq_mask, GGML_TYPE_F32);
+        score = ggml_add(ctx, score, ggml_reshape_3d(ctx, mf, kv, nb, ns));
+
+        // --- qwen35 build_attn_lsa_h12 (verbatim)
+        const int64_t w = width();
+        ggml_tensor * top_k_t = ggml_cont(ctx, ggml_top_k(ctx, score, w));
+        top_k_t = ggml_reshape_4d(ctx, top_k_t, w, nb, 1, ns);
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx, top_k_t, top_k_t->ne[0], top_k_t->ne[1], top_k_t->ne[3], 1, top_k_t->nb[1], top_k_t->nb[2], top_k_t->ne[3]*top_k_t->nb[3], 0);
+
+        if (mode == 0) {
+            ggml_tensor * memb = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, kv, nb, ns), 0.0f);
+            ggml_tensor * ones = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, w, nb, ns), 1.0f);
+            ggml_tensor * out  = ggml_set_rows(ctx, memb, ones, top_k_3d);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * kq_mask_all = ggml_fill(ctx, kq_mask, -INFINITY);
+        kq_mask_all = ggml_view_4d(ctx, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx, zeros, 0.0f);
+        ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx, kq_mask_all, zeros, top_k_3d);
+        kq_mask_top_k = ggml_view_4d(ctx, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+        kq_mask_top_k = ggml_add(ctx, kq_mask_top_k, kq_mask);
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, qp, kp, vp, kq_mask_top_k, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out->src[5] = top_k_3d;
+        out->src[6] = kq_mask;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> uni(-1.0f, 1.0f), u01(0.0f, 1.0f);
+
+        const int64_t P0 = n_used - nb; // position of the first query; query i sits at P0 + i, cell j holds position j
+        const bool structured = mode != 2;
+
+        // high set: exactly width - window - sink cells in [sink, P0 - window + 1), outside every query's window
+        std::vector<char> high(kv, 0);
+        if (structured) {
+            const int64_t lo = sink, hi = P0 - window + 1, n_high = width() - window - sink;
+            GGML_ASSERT(hi - lo >= n_high && n_high >= 0);
+            std::vector<int64_t> cand;
+            for (int64_t j = lo; j < hi; ++j) {
+                cand.push_back(j);
+            }
+            std::shuffle(cand.begin(), cand.end(), rng);
+            for (int64_t i = 0; i < n_high; ++i) {
+                high[cand[i]] = 1;
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            const std::string name = t->name;
+            if (name == "m") {
+                std::vector<ggml_fp16_t> d(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) for (int64_t i = 0; i < nb; ++i) for (int64_t j = 0; j < kv; ++j) {
+                    d[(s*nb + i)*kv + j] = ggml_fp32_to_fp16(j < n_used && j <= P0 + i ? 0.0f : -INFINITY);
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (name == "kpos" || name == "kbias") {
+                std::vector<float> d(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) for (int64_t j = 0; j < kv; ++j) {
+                    d[s*kv + j] = name == "kpos" ? (j < n_used ? (float) j : -1.0e9f) : (j < n_used && j < sink ? 8.0f : 0.0f);
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (name == "qwin") {
+                std::vector<float> d(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) for (int64_t i = 0; i < nb; ++i) {
+                    d[s*nb + i] = (float) window - (float) (P0 + i);
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (structured && (name == "mq" || name == "mk")) {
+                std::vector<float> d(ggml_nelements(t), 0.0f);
+                for (int64_t o = 0; o < idx; ++o) {
+                    d[o*t->ne[0] + rope + o] = 1.0f; // head 0, dim 64 + o
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (structured && name == "q") {
+                std::vector<float> d(ggml_nelements(t));
+                for (auto & x : d) x = uni(rng);
+                for (int64_t tok = 0; tok < nb*ns; ++tok) {
+                    float * h0 = d.data() + tok*hs*nh;
+                    for (int64_t e = rope; e < rope + idx; ++e) h0[e] = e == rope ? 1.0f : 0.0f;
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (structured && name == "kc") {
+                std::vector<ggml_fp16_t> d(ggml_nelements(t));
+                for (auto & x : d) x = ggml_fp32_to_fp16(uni(rng));
+                for (int64_t s = 0; s < ns; ++s) for (int64_t j = 0; j < kv + 256; ++j) {
+                    ggml_fp16_t * h0 = d.data() + (s*(kv + 256) + j)*hs*nh_kv;
+                    const float sj = j < kv && high[j] ? 0.6f + 0.3f*u01(rng) : -0.6f + 0.3f*u01(rng);
+                    for (int64_t e = rope; e < rope + idx; ++e) h0[e] = ggml_fp32_to_fp16(0.0f);
+                    h0[rope + 0] = ggml_fp32_to_fp16(sj);
+                    h0[rope + 1] = ggml_fp32_to_fp16(sqrtf(1.0f - sj*sj));
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // AK-ASM-H10: multi-token verify attention exactly as llama builds it for a DFlash/MTP verify step: q [hs, nh, nb, ns] and
 // the K/V caches [hs, nh_kv, kv, ns] permuted to [hs, n, h, s] (non-contiguous K/V views, as get_k/get_v give), causal
 // f16 mask [kv, nb, 1, ns]: query i sits at position n_used - nb + i and sees cells j <= its position; cells
@@ -13291,6 +13498,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_sparse_attn(256, 24, 2, 4096, nb, 2051, 2, type_KV, true));
         }
     }
+    // LSA-H12-INDEXER: index selection exact vs CPU, fused sparse attention vs dense masked FA, all-keys == dense
+    for (int mode : {0, 1}) {
+        for (int64_t ns : {1, 2}) {
+            for (int64_t nb : {1, 8, 33}) {
+                test_cases.emplace_back(new test_lsa_h12(4096, nb, ns, 256, 128, 4, -1, mode));
+            }
+        }
+        test_cases.emplace_back(new test_lsa_h12(40960, 8, 1, 4096, 512, 4, -1, mode)); // production budgets, n_kv/width 8.9
+    }
+    for (int64_t nb : {1, 8, 16}) {
+        test_cases.emplace_back(new test_lsa_h12(8192, nb, 1, 892, 128, 4, 600, 2)); // every visible key selected
+    }
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -13900,6 +14119,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                     test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], kv, nb, 1, type_KV, 0));
                 }
+            }
+        }
+    }
+
+    // LSA-H12-INDEXER: 27B global layer (24/4, hd256, f16 KV), production budgets width 4612, whole graph per run.
+    // mode 1 = indexer + top-k + mask chain + attention (fused H12 sparse when n_kv >= GGML_CUDA_QSA_SPARSE_MIN_KV_RATIO*width),
+    // mode 3 = plain dense FA on the same shapes (the C7 path). Ratio = mode 3 / mode 1 per (kv, nb).
+    for (int64_t kv : {16384, 32768, 65536}) {
+        for (int64_t nb : {1, 8, 16, 512}) {
+            for (int mode : {1, 3}) {
+                test_cases.emplace_back(new test_lsa_h12(kv, nb, 1, 4096, 512, 4, -1, mode));
             }
         }
     }
