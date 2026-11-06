@@ -57,9 +57,10 @@ static int gv_splits_env() {
     return v;
 }
 
-// GGML_CUDA_FA_GQA_VERIFY_PIPE=1: register-prefetch pipelined K/V load (default OFF until the GPU gate times it)
+// GGML_CUDA_FA_GQA_VERIFY_PIPE: register-prefetch pipelined K/V load, default ON (H10 gate r3: best arm, 2.63x geomean vs C6
+// over kv>=32k n_q 2..16, no cell < 0.95); =0 selects the single-buffered kernel.
 static bool gv_pipe() {
-    static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_PIPE", 0) != 0;
+    static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_PIPE", 1) != 0;
     return v;
 }
 
