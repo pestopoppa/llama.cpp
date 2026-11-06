@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/q8-h9.cuh"
+#include "ggml-cuda/q8-h9b.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1919,6 +1920,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_log_mul_mat_route("MMVQ", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_q8_h9b_mul_mat(ctx, src0, src1, dst)) { // AK-ASM-H9B fused dequant f16 MFMA (GGML_HIP_Q8_H9B=0 disables)
+        ggml_cuda_log_mul_mat_route("Q8H9B", src0, src1, dst, cc, ne11);
         return;
     }
     if (ggml_cuda_q8_h9_mul_mat(ctx, src0, src1, dst)) { // AK-ASM-H9 (gfx90a Q8_0 ne11>=129, GGML_HIP_Q8_H9=0 disables)
