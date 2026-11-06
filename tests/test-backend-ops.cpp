@@ -8055,6 +8055,12 @@ struct test_hc_seam : public test_case {
     }
 };
 
+// Same seam under its own label so a residency hold can be selected with -o HC_SEAM_HOLD without any env token.
+struct test_hc_seam_hold : public test_hc_seam {
+    using test_hc_seam::test_hc_seam;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_SEAM_HOLD"; }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12869,8 +12875,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // AK-ASM-H13b (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=hc_fuse): qwen4exp hc seam, small and Q38FN-sized
-    if (test_backend_ops_extra_case_set("hc_fuse")) {
+    // AK-ASM-H13b: qwen4exp hc seam, small and Q38FN-sized. Own op label HC_SEAM (no existing op corpus changes), so
+    // always registered: an env-selected set ran zero cases in the r2 gate smoke (the env token did not reach the run).
+    {
         for (int64_t T : { 1, 3, 17 }) {
             test_cases.emplace_back(new test_hc_seam(64, 4, 8, T));
         }
@@ -13338,17 +13345,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_topk_moe({512, n_tok, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
         }
     }
-    // AK-ASM-H13b (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=hc_fuse): one Q38FN hc seam (n_embd 2560, hc 4, low rank 320)
-    if (test_backend_ops_extra_case_set("hc_fuse")) {
+    // AK-ASM-H13b: one Q38FN hc seam (n_embd 2560, hc 4, low rank 320); own label HC_SEAM, always registered
+    {
         for (int64_t T : { 1, 4, 16, 512 }) {
             test_cases.emplace_back(new test_hc_seam(2560, 4, 320, T));
         }
     }
-    // AK-ASM-H13b residency hold (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=hc_hold): 40 copies of a 4096-token seam
-    // (x stream 160 MiB + activations), each timed >= 1 s: one process stays VRAM-resident for ~1 min.
-    if (test_backend_ops_extra_case_set("hc_hold")) {
+    // AK-ASM-H13b residency hold (-o HC_SEAM_HOLD): 40 copies of a 4096-token seam (x stream 160 MiB + activations),
+    // each timed >= 1 s: one process stays VRAM-resident for ~1 min. Always registered under its own label.
+    {
         for (int i = 0; i < 40; ++i) {
-            test_cases.emplace_back(new test_hc_seam(2560, 4, 320, 4096));
+            test_cases.emplace_back(new test_hc_seam_hold(2560, 4, 320, 4096));
         }
     }
     // AK-ASM-H11 residency hold (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_hold): 50 copies of a 131072-row A3B
