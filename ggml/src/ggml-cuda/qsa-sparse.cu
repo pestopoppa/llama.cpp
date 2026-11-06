@@ -444,6 +444,7 @@ static bool qsa_dispatch_g(ggml_backend_cuda_context & ctx, const qsa_params & p
         case  1: qsa_launch<D,  1, type>(ctx, p, n_chunks); return true;
         case  2: qsa_launch<D,  2, type>(ctx, p, n_chunks); return true;
         case  4: qsa_launch<D,  4, type>(ctx, p, n_chunks); return true;
+        case  6: qsa_launch<D,  6, type>(ctx, p, n_chunks); return true; // LSA-H12-INDEXER: Qwen3.8-27B 24/4
         case  8: qsa_launch<D,  8, type>(ctx, p, n_chunks); return true;
         case 12: qsa_launch<D, 12, type>(ctx, p, n_chunks); return true;
         case 16: qsa_launch<D, 16, type>(ctx, p, n_chunks); return true;
@@ -573,7 +574,7 @@ bool ggml_cuda_qsa_sparse_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int n_chunks = (int) ((width + D - 1)/D);
 
     bool ok;
-    if (G != 1 && G != 2 && G != 4 && G != 8 && G != 12 && G != 16) {
+    if (G != 1 && G != 2 && G != 4 && G != 6 && G != 8 && G != 12 && G != 16) {
         qsa_reject(dst, "unsupported GQA group size"); return false;
     }
     if (k->type == GGML_TYPE_F16) {
