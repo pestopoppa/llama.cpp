@@ -4,6 +4,7 @@
 // sum over ne1 then / ne1).
 
 #include "hc-fuse.cuh"
+#include "norm.cuh"
 
 #include <atomic>
 #include <cstdlib>
@@ -118,6 +119,21 @@ void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
             k_hc_mix_tail<<<hc_blocks(E * T), 256, 0, stream>>>((const float *) an.a->data, (const float *) an.b->data,
                 (float *) dst->data, E, H, T);
         } break;
+        case HC_FUSE_RMS_GAMMA: {
+            // the existing fused rms_norm*mul kernel, given views in the RMS_NORM layout: output [E,hc,T] contiguous is
+            // the MUL's [hc*E, T]; gamma [hc*E] is viewed [E,hc,1,1] so it broadcasts over T
+            ggml_tensor rms = *an.c;
+            ggml_tensor gam = *an.b;
+            gam.ne[0] = rms.ne[0]; gam.ne[1] = rms.ne[1]; gam.ne[2] = 1; gam.ne[3] = 1;
+            gam.nb[1] = gam.nb[0] * gam.ne[0]; gam.nb[2] = gam.nb[1] * gam.ne[1]; gam.nb[3] = gam.nb[2];
+            ggml_tensor mul = *dst;
+            for (int d = 0; d < 4; ++d) { mul.ne[d] = rms.ne[d]; }
+            mul.nb[0] = sizeof(float);
+            for (int d = 1; d < 4; ++d) { mul.nb[d] = mul.nb[d - 1] * mul.ne[d - 1]; }
+            mul.src[0] = &rms;
+            mul.src[1] = &gam;
+            ggml_cuda_op_rms_norm_fused(ctx, &rms, &mul);
+        } break;
         case HC_FUSE_SCALE_SILU: {
             const int64_t n = ggml_nelements(dst);
             k_hc_scale_silu<<<hc_blocks(n), 256, 0, stream>>>((const float *) an.a->data, (float *) dst->data, n, an.s1, an.b1);
@@ -210,6 +226,28 @@ bool try_mix_tail(const hc_ctx & c, const ggml_tensor * mean, ggml_cuda_hc_plan 
     return true;
 }
 
+bool try_rms_gamma(const hc_ctx & c, const ggml_tensor * mul, ggml_cuda_hc_plan & plan) {
+    if (!mul || mul->op != GGML_OP_MUL || !f32c(mul)) return false;
+    for (int ri = 0; ri < 2; ++ri) {
+        const ggml_tensor * rs  = mul->src[ri];
+        const ggml_tensor * gam = mul->src[1 - ri];
+        if (!is_reshape(rs) || !inner(c, rs) || !ggml_is_contiguous(rs)) continue;
+        const ggml_tensor * rms = rs->src[0];
+        if (!rms || rms->op != GGML_OP_RMS_NORM || !inner(c, rms) || !f32c(rms) || !f32c(rms->src[0])) continue;
+        if (rms->ne[3] != 1 || !ggml_are_same_shape(rs, mul)) continue;
+        // gamma covers exactly the hc*E columns of one token and broadcasts over tokens
+        if (!f32c(gam) || gam->ne[0] != mul->ne[0] || ggml_nelements(gam) != mul->ne[0]) continue;
+        if (mul->ne[0] != rms->ne[0] * rms->ne[1] || ggml_nelements(rms) != ggml_nelements(mul)) continue;
+        ggml_cuda_hc_anchor an{HC_FUSE_RMS_GAMMA};
+        an.b = gam; an.c = rms;
+        plan.anchors[mul] = an;
+        plan.skip.insert(rs);
+        plan.skip.insert(rms);
+        return true;
+    }
+    return false;
+}
+
 bool try_scale_silu(const hc_ctx & c, const ggml_tensor * silu, ggml_cuda_hc_plan & plan) {
     if (!is_unary(silu, GGML_UNARY_OP_SILU) || !f32c(silu)) return false;
     const ggml_tensor * s = silu->src[0];
@@ -250,7 +288,7 @@ void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (plan.skip.count(n)) continue;
-        if (!try_combine(c, n, plan) && !try_mix_tail(c, n, plan)) {
+        if (!try_combine(c, n, plan) && !try_mix_tail(c, n, plan) && !try_rms_gamma(c, n, plan)) {
             try_scale_silu(c, n, plan);
         }
     }

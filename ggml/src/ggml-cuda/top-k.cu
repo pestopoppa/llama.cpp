@@ -48,6 +48,46 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+
+// AK-ASM-H13c: rows wider than the shared-memory bitonic limit on builds without CUB (HIP): one block per row runs a
+// bitonic argsort over a global scratch of (key, index) pairs padded to a power of two. Order: larger key first, equal
+// keys by smaller index; padding (index >= ncols) sorts after every real element, -INF included. Used by the qwen4exp
+// QSA indexer top-k (n_kv columns), which otherwise fell back to the CPU at n_kv > 1024 on every attention layer.
+static __global__ void top_k_large_bitonic(const float * __restrict__ x, int * __restrict__ dst, float * __restrict__ keys,
+                                           int * __restrict__ idx, const int ncols, const int npad, const int k) {
+    const int64_t row = blockIdx.x;
+    const float * xr = x + row * ncols;
+    float * kr = keys + row * npad;
+    int *   ir = idx  + row * npad;
+    for (int i = threadIdx.x; i < npad; i += blockDim.x) {
+        kr[i] = i < ncols ? xr[i] : -INFINITY;
+        ir[i] = i;
+    }
+    __syncthreads();
+    for (int kk = 2; kk <= npad; kk <<= 1) {
+        for (int j = kk >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < npad; i += blockDim.x) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const float ki = kr[i], kl = kr[l];
+                    const int   ii = ir[i], il = ir[l];
+                    // "l before i" in the target order (desc key, asc index; padding last)
+                    const bool i_pad = ii >= ncols, l_pad = il >= ncols;
+                    const bool l_first = (i_pad != l_pad) ? i_pad : (kl > ki || (kl == ki && il < ii));
+                    const bool up = (i & kk) == 0;
+                    if (up ? l_first : !l_first) {
+                        kr[i] = kl; kr[l] = ki; ir[i] = il; ir[l] = ii;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        dst[row * k + i] = ir[i];
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -96,6 +136,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+    if (ncols > 1024) {
+        int npad = 1;
+        while (npad < ncols) {
+            npad <<= 1;
+        }
+        ggml_cuda_pool_alloc<float> keys(pool, (size_t) npad * nrows);
+        ggml_cuda_pool_alloc<int>   idx(pool, (size_t) npad * nrows);
+        top_k_large_bitonic<<<(unsigned) nrows, 1024, 0, stream>>>(src0_d, dst_d, keys.get(), idx.get(), (int) ncols, npad, (int) k);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
     argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);

@@ -7,6 +7,7 @@
 //     - combine: ADD(res, MUL(REPEAT(b), RESHAPE(SCALE(SIGMOID(SCALE(inject)))))) -> 1 kernel (6 launches -> 1)
 //     - mix tail: MEAN_D1(RESHAPE(MUL(xn, SIGMOID(u))))                         -> 1 kernel (3 launches -> 1)
 //     - gate:     SILU(SCALE(x))                                                -> 1 kernel (2 launches -> 1)
+//     - norm:     MUL(RESHAPE(RMS_NORM(x [E,hc,T])), gamma [hc*E])                -> 1 kernel (2 launches -> 1, H13c)
 //  The plan is built per graph evaluation from the node list; an intermediate is elided only when its single consumer
 //  is inside the chain and it is not a graph output.
 
@@ -15,13 +16,13 @@
 #include <unordered_map>
 #include <unordered_set>
 
-enum ggml_cuda_hc_kind { HC_FUSE_COMBINE = 1, HC_FUSE_MIX_TAIL = 2, HC_FUSE_SCALE_SILU = 3 };
+enum ggml_cuda_hc_kind { HC_FUSE_COMBINE = 1, HC_FUSE_MIX_TAIL = 2, HC_FUSE_SCALE_SILU = 3, HC_FUSE_RMS_GAMMA = 4 };
 
 struct ggml_cuda_hc_anchor {
     ggml_cuda_hc_kind   kind;
     const ggml_tensor * a = nullptr;  // combine: residual | mix: xn          | silu: x
     const ggml_tensor * b = nullptr;  // combine: block_out [E,1,T] | mix: u (pre-sigmoid) | silu: -
-    const ggml_tensor * c = nullptr;  // combine: inject [hc,T]
+    const ggml_tensor * c = nullptr;  // combine: inject [hc,T] | norm: the RMS_NORM node
     float s1 = 1.0f, b1 = 0.0f, s2 = 1.0f, b2 = 0.0f;  // the SCALE op params (scale, bias) of the chain
 };
 
