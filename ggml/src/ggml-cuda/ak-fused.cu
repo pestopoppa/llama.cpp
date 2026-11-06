@@ -603,8 +603,8 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
 
     // Hazards of running the tail early, before the gap nodes [j_first_tail_search, j):
     //  - a gap node must not consume any fused node;
-    //  - a gap node's output must not alias what the fused kernel reads (st, qkv, weight) or writes
-    //    (silu, l2q, l2k, snapshot slots) -- the allocator may reuse memory across dead tensors;
+    //  - a gap node's output must not alias what the fused kernel writes (silu, l2q, l2k, snapshot slots) -- the
+    //    allocator may reuse memory across dead tensors (aliasing what it READ is fine: those reads already happened);
     //  - a gap node's inputs must not alias what the fused kernel writes.
     if (j > j_first_tail_search) {
         auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
@@ -615,7 +615,6 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
             const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
             return a0 < b1 && b0 < a1;
         };
-        const ggml_tensor * rd[3] = { st, qkv, wt };
         std::vector<const ggml_tensor *> wr = { silu, l2q, l2k };
         for (int k = 0; k < K; ++k) {
             wr.push_back(cpys[k]->src[1]);
@@ -639,11 +638,9 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
                 }
             }
             if (!(g->op == GGML_OP_VIEW || g->op == GGML_OP_RESHAPE || g->op == GGML_OP_PERMUTE || g->op == GGML_OP_TRANSPOSE || g->op == GGML_OP_NONE)) {
-                for (const ggml_tensor * r : rd) {
-                    if (overlaps(g, r)) {
-                        return ak_h15_reject(12, concat);
-                    }
-                }
+                // (former reject 12, removed: a gap node writing over st/qkv/weight is harmless -- the fused kernel has already
+                // read them at the CONCAT position, before any gap node runs. The allocator does exactly this in the model:
+                // st and qkv die at CONCAT and the recurrent-state get_rows reuses their memory.)
                 for (const ggml_tensor * w : wr) {
                     if (overlaps(g, w)) {
                         return ak_h15_reject(13, concat);
