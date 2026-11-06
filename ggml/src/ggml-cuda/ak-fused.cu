@@ -424,6 +424,17 @@ static bool ak_h15_l2_view_ok(const ggml_tensor * view, const ggml_tensor * l2, 
     return off_ch + view->ne[1]*hk <= silu->ne[0];
 }
 
+// GGML_CUDA_AK_FUSE_DEBUG=1: log why H15 did not take a CONCAT it started matching (first 32 rejects per process).
+// Reject ids are numbered in source order inside ggml_cuda_ak_h15_try.
+static int ak_h15_reject(int id, const ggml_tensor * concat) {
+    static const bool dbg = getenv("GGML_CUDA_AK_FUSE_DEBUG") != nullptr && atoi(getenv("GGML_CUDA_AK_FUSE_DEBUG")) != 0;
+    static std::atomic<int> n{0};
+    if (dbg && n.fetch_add(1) < 32) {
+        GGML_LOG_INFO("ggml_cuda_ak: H15 reject %d at %s\n", id, concat->name);
+    }
+    return 0;
+}
+
 int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     static const bool enabled = ak_env_enabled("GGML_CUDA_AK_H15");
     static std::atomic<bool> logged{false};
@@ -487,7 +498,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
         j += 3 + o;
     }
     if (K == 0) {
-        return 0;
+        return ak_h15_reject(1, concat);
     }
     const int j_first_tail_search = j;
 
@@ -502,7 +513,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
         }
     }
     if (jt < 0 || jt + 5 >= cgraph->n_nodes) {
-        return 0;
+        return ak_h15_reject(2, concat);
     }
     j = jt;
 
@@ -515,7 +526,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
     if (conv->op != GGML_OP_SSM_CONV || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
         vq->op != GGML_OP_VIEW || l2q->op != GGML_OP_L2_NORM || vk->op != GGML_OP_VIEW || l2k->op != GGML_OP_L2_NORM ||
         conv->src[0] != concat || silu->src[0] != conv) {
-        return 0;
+        return ak_h15_reject(3, concat);
     }
     const ggml_op tail_ops[6] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_L2_NORM, GGML_OP_VIEW, GGML_OP_L2_NORM };
     for (int k = 0; k < 6; ++k) {
@@ -526,7 +537,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
     outs[n_out++] = j + 5;
 
     if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outs, n_out)) {
-        return 0;
+        return ak_h15_reject(4, concat);
     }
 
     // geometry
@@ -543,17 +554,17 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
         concat->ne[0] != dconv - 1 + nt || concat->ne[2] != ns || wt->ne[1] != C ||
         conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 || conv->ne[0] != C || !ggml_is_contiguous(silu) ||
         !ggml_are_same_shape(conv, silu)) {
-        return 0;
+        return ak_h15_reject(5, concat);
     }
 
     int64_t q_off, hkq, k_off, hkk;
     if (!ak_h15_l2_view_ok(vq, l2q, silu, q_off, hkq) || !ak_h15_l2_view_ok(vk, l2k, silu, k_off, hkk) || hkq != hkk) {
-        return 0;
+        return ak_h15_reject(6, concat);
     }
     const int64_t hk   = hkq;
     const int     warp = ggml_cuda_info().devices[ctx.device].warp_size;
     if (hk % warp != 0 || hk > 1024 || C % hk != 0) {
-        return 0;
+        return ak_h15_reject(7, concat);
     }
 
     ak_h15_params p{};
@@ -573,7 +584,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
             (int64_t) (src->view_offs / sizeof(float)) + dconv - 1 > concat->ne[0] ||
             dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float) || dst->ne[0] != (dconv - 1)*C || dst->ne[1] != ns ||
             ggml_nelements(dst) != ggml_nelements(src)) {
-            return 0;
+            return ak_h15_reject(8, concat);
         }
         // the snapshot write must not alias anything the other blocks still read
         const char * d0 = (const char *) dst->data;
@@ -582,7 +593,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
             const char * r0 = (const char *) r->data;
             const char * r1 = r0 + ggml_nbytes(r);
             if (d0 < r1 && r0 < d1) {
-                return 0;
+                return ak_h15_reject(9, concat);
             }
         }
         p.sidx[k]     = src->view_offs / sizeof(float);
@@ -597,7 +608,7 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
     //  - a gap node's inputs must not alias what the fused kernel writes.
     if (j > j_first_tail_search) {
         auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
-            if (!a->data || !b->data) {
+            if (!a->data || !b->data || ggml_nbytes(a) == 0 || ggml_nbytes(b) == 0) {
                 return false;
             }
             const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
@@ -618,24 +629,24 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
                 }
                 for (int f = 0; f < n; ++f) {
                     if (src == cgraph->nodes[idxs[f]]) {
-                        return 0;
+                        return ak_h15_reject(10, concat);
                     }
                 }
                 for (const ggml_tensor * w : wr) {
                     if (overlaps(src, w)) {
-                        return 0;
+                        return ak_h15_reject(11, concat);
                     }
                 }
             }
             if (!(g->op == GGML_OP_VIEW || g->op == GGML_OP_RESHAPE || g->op == GGML_OP_PERMUTE || g->op == GGML_OP_TRANSPOSE || g->op == GGML_OP_NONE)) {
                 for (const ggml_tensor * r : rd) {
                     if (overlaps(g, r)) {
-                        return 0;
+                        return ak_h15_reject(12, concat);
                     }
                 }
                 for (const ggml_tensor * w : wr) {
                     if (overlaps(g, w)) {
-                        return 0;
+                        return ak_h15_reject(13, concat);
                     }
                 }
             }
