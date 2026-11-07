@@ -13797,6 +13797,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // CPU backend refuses it in supports_op, so on CPU these report "not supported [CPU]" (and a GPU
     // backend that supports a BF16 state is skipped, since the CPU reference cannot run it):
     //   TEST_BACKEND_OPS_EXTRA_CASES=gdn_bf16_state test-backend-ops -b CPU -o GATED_DELTA_NET
+    // C8-5-H20 opt-in set "h20_q8_0_prefill": Q8_0 x F32 at the Qwen3.8-27B prefill GEMM shapes (hipBLAS f16 route on
+    // gfx90a: vectorized q8_0->f16 / f32->f16 converts), default NMSE 5e-4 vs CPU, M (= n tokens) 512 and 2048, plus
+    // odd K (k % 256 != 0) and odd-N tails for the vector tails:
+    //   TEST_BACKEND_OPS_EXTRA_CASES=h20_q8_0_prefill test-backend-ops test -b ROCm0 -o MUL_MAT -p type_a=q8_0
+    if (test_backend_ops_extra_case_set("h20_q8_0_prefill")) {
+        const std::array<std::pair<int64_t, int64_t>, 5> q38_27b_mk = {{
+            {17408, 5120}, {5120, 17408}, {10240, 5120}, {48, 5120}, {5120, 6144},
+        }};
+        for (const auto & [m, k] : q38_27b_mk) {
+            for (int64_t n : {512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 517, 2080, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 1023, 4128, {1, 1}, {1, 1}));
+    }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));

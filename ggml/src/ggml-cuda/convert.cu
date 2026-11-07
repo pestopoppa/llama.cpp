@@ -1,4 +1,6 @@
 #include "convert.cuh"
+
+#include <atomic>
 #include "dequantize.cuh"
 
 #include <cstdint>
@@ -1018,6 +1020,10 @@ bool ggml_cuda_h20_convert_f16(ggml_type type, const void * x, half * y, int64_t
         }
         const int64_t nthr = (k + 7)/8;
         h20_f32_to_f16_vec<<<(nthr + nt - 1)/nt, nt, 0, stream>>>((const float *) x, y, k);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_cuda_h20: vectorized f32->f16 src1 convert ran\n");
+        }
         return true;
     }
     if (type == GGML_TYPE_Q8_0) {
@@ -1026,6 +1032,10 @@ bool ggml_cuda_h20_convert_f16(ggml_type type, const void * x, half * y, int64_t
         }
         const int64_t nthr = k/8;
         h20_q8_0_to_f16_vec<<<(nthr + nt - 1)/nt, nt, 0, stream>>>(x, y, k);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_cuda_h20: vectorized q8_0->f16 src0 convert ran\n");
+        }
         return true;
     }
     return false;

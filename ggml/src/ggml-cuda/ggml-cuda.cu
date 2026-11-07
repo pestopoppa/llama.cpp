@@ -1518,15 +1518,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool h20_reuse = false;
     if constexpr (compute_type == GGML_TYPE_F16) {
         if (src1->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(src1) && ggml_cuda_h20_reuse_enabled()) {
+            bool capturing = false;
+#ifdef USE_CUDA_GRAPH
             cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
             CUDA_CHECK(cudaStreamIsCapturing(main_stream, &cap));
+            capturing = cap != cudaStreamCaptureStatusNone;
+#endif // USE_CUDA_GRAPH
             const size_t need = ggml_nelements(src1)*sizeof(half);
-            if (cap == cudaStreamCaptureStatusNone && need <= ((size_t) 512 << 20)) {
+            if (!capturing && need <= ((size_t) 512 << 20)) {
                 h20_reuse = true;
                 const bool hit = ctx.h20_src1_buf != nullptr && ctx.h20_src1_key == src1 && ctx.h20_src1_data == src1->data &&
                     ctx.h20_src1_strm == main_stream && ctx.h20_src1_epoch == ctx.graph_compute_epoch &&
                     memcmp(ctx.h20_src1_ne, src1->ne, sizeof(ctx.h20_src1_ne)) == 0 &&
                     memcmp(ctx.h20_src1_nb, src1->nb, sizeof(ctx.h20_src1_nb)) == 0;
+                if (hit) {
+                    static std::atomic<bool> h20_hit_logged{false};
+                    if (!h20_hit_logged.exchange(true)) {
+                        GGML_LOG_INFO("ggml_cuda_h20: GGML_HIP_H20_REUSE src1 f16 reuse hit\n");
+                    }
+                }
                 if (!hit) {
                     if (need > ctx.h20_src1_cap) {
                         if (ctx.h20_src1_buf != nullptr) {
