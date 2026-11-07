@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-q8-skinny.cuh"
 #include "ggml-cuda/mmq-q8-wvsk.cuh"
+#include "ggml-cuda/mmq-q8-h16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1932,6 +1933,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_q8_skinny_eligible(src0, src1, dst, cc)) {
         ggml_cuda_log_mul_mat_route("Q8_SKINNY", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q8_skinny(ctx, src0, src1, dst);
+        return;
+    }
+    // AK-ASM-H16 (C8-2-H16-M36): MFMA f16 skinny Q8_0 path, M 12..36 on weights > 6 MiB (GGML_HIP_Q8_H16=0 -> C7r route).
+    if (ggml_cuda_q8_h16_eligible(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("Q8_H16", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_h16(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {

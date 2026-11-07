@@ -11873,9 +11873,55 @@ static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>
     }
 }
 
+// AK-ASM-H16 (C8-2-H16-M36): MFMA f16 skinny Q8_0 MUL_MAT at the DFlash2 verify widths (np1 9, np2 18, np4 36), on the
+// Qwen3.8-27B Q8_0 weight shapes (akh1_q38_27b_shapes). Own op label so a gate selects them with -o AK_H16_MUL_MAT.
+// perf = true: op_flops 0 and op_size = the Q8_0 weight bytes, so test-backend-ops sizes n_runs by bytes and reports the
+// weight-stream bandwidth; the returned node is the MUL_MAT itself (k_v = 0, o = 1: no view / add tail is timed).
+struct test_mul_mat_akh16 : public test_mul_mat {
+    const bool perf;
+    test_mul_mat_akh16(int64_t m, int64_t n, int64_t k, bool perf)
+        : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), perf(perf) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_H16_MUL_MAT"; }
+    uint64_t op_flops(ggml_tensor * t) override { return perf ? 0 : test_mul_mat::op_flops(t); }
+    size_t op_size(ggml_tensor * t) override {
+        return perf && t->src[0] != nullptr ? ggml_nbytes(t->src[0]) : test_mul_mat::op_size(t);
+    }
+};
+
+static const int64_t akh16_m_set[] = {9, 12, 16, 18, 24, 27, 32, 36};
+
+static void akh16_add_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : akh16_m_set) {
+            test_cases.emplace_back(new test_mul_mat_akh16(sh[0], n, sh[1], false));
+        }
+    }
+    for (int64_t n = 10; n <= 40; ++n) {   // every NT (1..3) instance and its 16/17, 32/33, 36/37 (default MAX) edges
+        test_cases.emplace_back(new test_mul_mat_akh16(6144, n, 5120, false));
+    }
+    test_cases.emplace_back(new test_mul_mat_akh16(6152, 36, 5120, false));   // row tail: N % 32 = 8 (> 6 MiB, default-eligible)
+    test_cases.emplace_back(new test_mul_mat_akh16(6160, 20, 5120, false));   // row tail: N % 32 = 16
+    test_cases.emplace_back(new test_mul_mat_akh16(5120, 36, 5184, false));   // K % 128 != 0 -> must fall back
+    test_cases.emplace_back(new test_mul_mat_akh16(5120, 36, 5248, false));   // K % 256 != 0 -> must fall back
+    test_cases.emplace_back(new test_mul_mat_akh16(1000, 36, 2304, false));   // small + tail (h16 only with MIN_BYTES=0)
+    test_cases.emplace_back(new test_mul_mat_akh16(1024, 36, 5120, false));   // attn_k/v 5.6 MB (h16 only with MIN_BYTES=0)
+}
+
+static void akh16_add_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : akh16_m_set) {
+            test_cases.emplace_back(new test_mul_mat_akh16(sh[0], n, sh[1], true));
+        }
+    }
+    for (int64_t n : {18, 36}) {   // output.weight (27B)
+        test_cases.emplace_back(new test_mul_mat_akh16(248320, n, 5120, true));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
+    akh16_add_eval_cases(test_cases);  // AK-ASM-H16
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     std::default_random_engine rng(0);
 
@@ -13891,6 +13937,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
+    akh16_add_perf_cases(test_cases);  // AK-ASM-H16
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
