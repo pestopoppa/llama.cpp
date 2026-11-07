@@ -1559,12 +1559,12 @@ void launch_fattn(
 
 #if defined(GGML_USE_HIP)
         // C8-1-LCATTN (b): single-token decode at long context reads the KV with too few blocks in flight (~8% of HBM peak
-        // flat from 32k on MI210). Multiply the KV split count by GGML_HIP_FA_VEC_LONGCTX_PB (default 4; 1 = C7r) when
+        // flat from 32k on MI210). Multiply the KV split count by GGML_HIP_FA_VEC_LONGCTX_PB (default 1 = C7r = off; opt-in) when
         // n_q == 1 and n_kv >= GGML_HIP_FA_VEC_LONGCTX_MIN_KV (default 32768).
         if (Q->ne[1] == 1) {
             static const int pb_mult = [] {
                 const char * e = getenv("GGML_HIP_FA_VEC_LONGCTX_PB");
-                return e ? std::max(1, atoi(e)) : 4;
+                return e ? std::max(1, atoi(e)) : 1; // default OFF: gate r2 showed PB=4 cuts FA BW 95->85 GB/s and tg -7..-10% at d>=32k
             }();
             static const int pb_min_kv = [] {
                 const char * e = getenv("GGML_HIP_FA_VEC_LONGCTX_MIN_KV");
