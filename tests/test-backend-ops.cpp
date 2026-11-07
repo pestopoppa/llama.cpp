@@ -9575,7 +9575,7 @@ struct test_flash_attn_ext_asm : public test_flash_attn_ext {
                               GGML_PREC_F32, type_KV, type_KV, permute),
           mask_mode(mask_mode),
           pad((mask_mode == FA_ASM_MASK_CAUSAL_PAD || mask_mode == FA_ASM_MASK_FULL_PAD) ? pad : 0),
-          asm_eligible((hs == 128 || (hs == 256 && type_KV == GGML_TYPE_F16)) && mask_mode != FA_ASM_MASK_NOISE &&
+          asm_eligible((hs == 128 || (hs == 256 && (type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0))) && mask_mode != FA_ASM_MASK_NOISE &&
                        logit_softcap == 0.0f) {
         GGML_ASSERT(mask_mode == FA_ASM_MASK_NONE || mask_mode == FA_ASM_MASK_NOISE || mask_mode == FA_ASM_MASK_FULL_PAD ||
                     kv - this->pad >= nb); // a causal row must see at least one cell
@@ -13590,10 +13590,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, {0, 1, 2, 3}, 256));
         test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 8192, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256, 0.0f, 211));
         test_cases.emplace_back(new test_flash_attn_ext_asm(8, 1, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256));
-        // controls that MUST stay on the existing kernels: noise mask, logit softcap, q8_0 / bf16 KV
+        // C8-4-H18: q8_0 K/V (the 27B serving cache) is dequantized to f16 and served by the same kernels
+        for (std::array<int64_t, 2> h : {std::array<int64_t, 2>{4, 6}, std::array<int64_t, 2>{2, 8}}) {
+            for (int64_t kv : {1024, 4096}) {
+                for (int64_t nb : {16, 64, 512, 1024}) {
+                    if (kv - 37 >= nb) {
+                        test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, llama_layout, 256));
+                    }
+                    test_cases.emplace_back(new test_flash_attn_ext_asm(h[0], h[1], kv, nb, FA_ASM_MASK_NONE, GGML_TYPE_Q8_0, llama_layout, 256));
+                }
+            }
+        }
+        for (int64_t nb : {127, 129, 300}) {
+            test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, nb, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, llama_layout, 256));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 2048, 2048, FA_ASM_MASK_CAUSAL, GGML_TYPE_Q8_0, llama_layout, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 8192, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, llama_layout, 256, 0.0f, 211));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, {0, 1, 2, 3}, 256));
+        // controls that MUST stay on the existing kernels: noise mask, logit softcap, bf16 KV
         test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_NOISE, GGML_TYPE_F16, llama_layout, 256));
         test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_F16, llama_layout, 256, 30.0f));
-        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_Q8_0, llama_layout, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_NOISE, GGML_TYPE_Q8_0, llama_layout, 256));
         test_cases.emplace_back(new test_flash_attn_ext_asm(4, 6, 1024, 512, FA_ASM_MASK_CAUSAL_PAD, GGML_TYPE_BF16, llama_layout, 256));
     }
 

@@ -31,5 +31,13 @@ struct ggml_ck_fmha_hd256_args {
 // Enqueues the kernel on stream and returns hipSuccess, or returns the launch error (nothing written to o then).
 hipError_t ggml_ck_fmha_fwd_hd256_f16(const ggml_ck_fmha_hd256_args & args, hipStream_t stream);
 
+// C8-4-H18: same, but launch fn (a kernel of the embedded spill-free code object, hipModuleGetFunction of
+// ggml_ck_fmha_fwd_hd256_f16_co_kernel(args.causal)) with hipModuleLaunchKernel. fn == nullptr = the in-library
+// ROCm 6.2 instance (ggml_ck_fmha_fwd_hd256_f16).
+hipError_t ggml_ck_fmha_fwd_hd256_f16_co(const ggml_ck_fmha_hd256_args & args, hipFunction_t fn, hipStream_t stream);
+
+// Mangled kernel name of the code-object instance that serves causal.
+const char * ggml_ck_fmha_fwd_hd256_f16_co_kernel(int causal);
+
 // Name of the instance that serves args.causal (for logs / content proof).
 const char * ggml_ck_fmha_fwd_hd256_f16_name(int causal);
