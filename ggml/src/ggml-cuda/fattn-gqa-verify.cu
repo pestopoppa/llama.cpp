@@ -48,8 +48,11 @@ static bool gv_enabled() {
     return v;
 }
 
+// C8-FOLD1: default 1 routes n_q=1 decode through gv (27B Q8_0 tg64 1.08x @32k, 1.25x @128k vs 2);
+// GGML_CUDA_FA_GQA_VERIFY_MIN_NQ=2 restores the old vec-kernel decode path. n_q=1 never groups
+// (gv_group_rows returns 0 below n_q 2) and multi-seq n_q=1 decode is rejected by rows_are_seqs.
 static int gv_min_nq() {
-    static const int v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_MIN_NQ", 2);
+    static const int v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_MIN_NQ", 1);
     return v;
 }
 
