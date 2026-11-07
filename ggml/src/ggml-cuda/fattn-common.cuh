@@ -1557,6 +1557,31 @@ void launch_fattn(
             }
         }
 
+#if defined(GGML_USE_HIP)
+        // C8-1-LCATTN (b): single-token decode at long context reads the KV with too few blocks in flight (~8% of HBM peak
+        // flat from 32k on MI210). Multiply the KV split count by GGML_HIP_FA_VEC_LONGCTX_PB (default 4; 1 = C7r) when
+        // n_q == 1 and n_kv >= GGML_HIP_FA_VEC_LONGCTX_MIN_KV (default 32768).
+        if (Q->ne[1] == 1) {
+            static const int pb_mult = [] {
+                const char * e = getenv("GGML_HIP_FA_VEC_LONGCTX_PB");
+                return e ? std::max(1, atoi(e)) : 4;
+            }();
+            static const int pb_min_kv = [] {
+                const char * e = getenv("GGML_HIP_FA_VEC_LONGCTX_MIN_KV");
+                return e ? atoi(e) : 32768;
+            }();
+            if (pb_mult > 1 && K->ne[1] >= pb_min_kv) {
+                parallel_blocks = std::min(ntiles_KV, parallel_blocks*pb_mult);
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    GGML_LOG_WARN("launch_fattn: GGML_HIP_FA_VEC_LONGCTX_PB long-context split ran (n_kv=%lld parallel_blocks=%d)\n",
+                        (long long) K->ne[1], parallel_blocks);
+                }
+            }
+        }
+#endif // defined(GGML_USE_HIP)
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
