@@ -13641,6 +13641,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f));
     test_cases.emplace_back(new test_flash_attn_ext_unified(80, 80, 4, 4, 8192, 8, 4, 1024, 1024));
+    // C8-1-LCATTN: hd256 multi-sequence DFlash2 verify on a unified KV (27B 4x6: np4 x 9 = 36 rows; Q38FN 2x12), routed to
+    // the GQA-packed row-group kernel (GGML_HIP_GV_MULTISEQ); hint 0 exercises the fallback grouping (16-row groups)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hint : {0, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 36, 4, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV, hint));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 40, 4, 512, 768, 0.0f, 0.0f, type_KV, type_KV, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 36, 3, 2048, 512, 0.0f, 0.0f, type_KV, type_KV, 3));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 2, 12, 8192, 18, 2, 512, 512, 0.0f, 0.0f, type_KV, type_KV, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 16, 2, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 8192, 36, 4, 1024, 1024, 0.0f, 0.0f, type_KV, type_KV, 4, 2048));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_unified(40, 40, 4, 4, 8192, 3, 4, 1024, 1024));
     test_cases.emplace_back(new test_flash_attn_ext_unified(192, 128, 2, 8, 8192, 4, 4, 1024, 1024));
     test_cases.emplace_back(new test_flash_attn_ext_unified(576, 512, 1, 16, 8192, 4, 4, 1024, 1024));
@@ -13902,6 +13914,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+
+    // C8-1-LCATTN: 27B np4 DFlash2 verify (4 seqs x 9 rows, unified KV, q8_0), A/B GGML_HIP_GV_MULTISEQ=1 vs =0
+    for (int64_t kv : {32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, kv, 36, 4, kv/4, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4));
     }
 
     // AK-ASM-H12: Q38FN QSA layer attention at ctx 8k/32k (heads 24/2, hd256, width = top_k 2048 + ratio 4 - 1).

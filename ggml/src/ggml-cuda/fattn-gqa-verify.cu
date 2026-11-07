@@ -65,6 +65,39 @@ static bool gv_pipe() {
     return v;
 }
 
+// C8-1-LCATTN: multi-sequence verify (unified KV, n_seqs_unq > 1, e.g. DFlash2 np4: 4 seqs x 9 tokens = 36 rows).
+// The query rows are split into row groups of G rows (G = rows per sequence when they divide evenly), each group a
+// virtual sequence of the GQA-packed kernel (grid.z = n_seq * n_grp); each workgroup trims its KV split to the live
+// chunk range of its own rows' mask before loading K/V, so a group only streams the KV cells of its own sequence.
+// Default ON; GGML_HIP_GV_MULTISEQ=0 restores the C7r selection (n_q > 16 -> flash_attn_ext_f16).
+static bool gv_multiseq() {
+    static const bool v = gv_env_int("GGML_HIP_GV_MULTISEQ", 1) != 0;
+    return v;
+}
+
+static int gv_multiseq_max_nq() {
+    static const int v = gv_env_int("GGML_HIP_GV_MULTISEQ_MAX_NQ", 64);
+    return v;
+}
+
+// row-group size for a call with n_q query rows, gqa q heads per KV head and n_su distinct sequences; 0 = no grouping
+static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
+    if (!gv_multiseq() || n_q < 2) {
+        return 0;
+    }
+    if (n_su > 1 && n_q % n_su == 0) {
+        const int g = n_q / n_su;
+        if (g <= GV_MAX_NQ && gqa * g <= 16 * GV_PIPE_MAX_WAVES) {
+            return g;
+        }
+    }
+    if (n_q <= GV_MAX_NQ && gqa * n_q <= GV_MAX_ROWS) {
+        return 0; // single group: unchanged H10 path
+    }
+    int g = std::min(GV_MAX_NQ, (16 * GV_PIPE_MAX_WAVES) / gqa);
+    return g >= 1 ? g : 0;
+}
+
 static bool gv_debug() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_DEBUG", 0) != 0;
     return v;
@@ -161,7 +194,7 @@ template <bool KV_Q8, bool PIPE>
 static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
-        const float scale, const int n_q, const int gqa, const int n_head_kv, const int n_seq,
+        const float scale, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G,
         const int chunks_per_split, const int n_chunks,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
@@ -178,7 +211,11 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 
     const int split = blockIdx.x;
     const int hkv   = blockIdx.y;
-    const int seq   = blockIdx.z;
+    const int vseq  = blockIdx.z;          // virtual sequence = (sequence, row group)
+    const int n_vseq = gridDim.z;
+    const int seq   = vseq / n_grp;
+    const int q0    = (vseq % n_grp) * G;  // first query row of this group
+    const int n_q   = min(G, n_q_tot - q0);
     const int tid   = threadIdx.x;
     const int w     = tid / 64;
     const int l     = tid % 64;
@@ -186,13 +223,14 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
     const int kq    = l / 16;
 
     const int R      = gqa * n_q;
+    const int Rs     = gqa * G;            // partial-buffer row stride per (vseq, hkv)
     const int ntiles = (R + 15) / 16;
     const bool tile_active = w < ntiles;
     _Float16 * sP = sP0 + w * 16 * GV_PSTR;
 
     const char * Kb = K + seq * nb13 + hkv * nb12;
     const char * Vb = V + seq * nb23 + hkv * nb22;
-    const char * Mb = mask + (seq % ne33) * nb33;
+    const char * Mb = mask + (seq % ne33) * nb33 + (int64_t) q0 * nb31;
 
     // Q fragments of this wave's tile (A operand), f32 -> f16
     gv_halfx4 qa[GV_D / 16];
@@ -201,7 +239,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         const bool valid = tile_active && r < R;
         const int h = valid ? r / n_q : 0;
         const int q = valid ? r % n_q : 0;
-        const float * Qr = (const float *) (Q + seq * nb03 + (int64_t) (hkv * gqa + h) * nb02 + q * nb01);
+        const float * Qr = (const float *) (Q + seq * nb03 + (int64_t) (hkv * gqa + h) * nb02 + (int64_t) (q0 + q) * nb01);
 #pragma unroll
         for (int s = 0; s < GV_D / 16; ++s) {
 #pragma unroll
@@ -234,8 +272,40 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         row_q[v]  = row_ok[v] ? r % n_q : 0;
     }
 
-    const int c_begin = split * chunks_per_split;
-    const int c_end   = min(c_begin + chunks_per_split, n_chunks);
+    int c_begin = split * chunks_per_split;
+    int c_end   = min(c_begin + chunks_per_split, n_chunks);
+
+    if (n_grp > 1) {
+        // live-range trim: [first, last] chunk of this split with a non -inf mask value in this group's rows
+        __shared__ int s_lo;
+        __shared__ int s_hi;
+        if (tid == 0) {
+            s_lo = c_end;
+            s_hi = c_begin - 1;
+        }
+        __syncthreads();
+        int my_lo = c_end;
+        int my_hi = c_begin - 1;
+        const int nk = (c_end - c_begin) * GV_KC;
+        for (int i = tid; i < n_q * nk; i += nthreads) {
+            const int q   = i / nk;
+            const int key = c_begin * GV_KC + i % nk;
+            const uint16_t u = *(const uint16_t *) (Mb + q * nb31 + (int64_t) key * sizeof(half));
+            if (u != 0xFC00) {
+                my_lo = min(my_lo, key / GV_KC);
+                my_hi = max(my_hi, key / GV_KC);
+            }
+        }
+        if (my_lo < c_end) {
+            atomicMin(&s_lo, my_lo);
+        }
+        if (my_hi >= c_begin) {
+            atomicMax(&s_hi, my_hi);
+        }
+        __syncthreads();
+        c_begin = s_lo;
+        c_end   = s_hi + 1;
+    }
 
     if constexpr (PIPE) {
         // Software pipeline: the raw global data of chunk c+1 (mask halves, q8_0 blocks or f16 16-byte rows) is loaded into
@@ -419,7 +489,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 
     // partials: Opart[(((split*n_seq + seq)*n_head_kv + hkv)*R + r)*D + d], MLpart[... r]
     if (tile_active) {
-        const int64_t base_row = ((int64_t) (split * n_seq + seq) * n_head_kv + hkv) * R;
+        const int64_t base_row = ((int64_t) (split * n_vseq + vseq) * n_head_kv + hkv) * Rs;
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
             if (!row_ok[v]) {
@@ -437,7 +507,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q_tot, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
         nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
@@ -446,16 +516,22 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 // one block per (row r, kv head, seq), one thread per d
 static __global__ void gv_merge_kernel(
         const float * __restrict__ Opart, const float2 * __restrict__ MLpart, float * __restrict__ dst,
-        const int n_splits, const int n_q, const int gqa, const int n_head_kv, const int n_seq) {
-    const int r   = blockIdx.x;
-    const int hkv = blockIdx.y;
-    const int seq = blockIdx.z;
-    const int d   = threadIdx.x;
-    const int R   = gqa * n_q;
+        const int n_splits, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G) {
+    const int r    = blockIdx.x;
+    const int hkv  = blockIdx.y;
+    const int vseq = blockIdx.z;
+    const int n_seq = gridDim.z;           // virtual sequences
+    const int d    = threadIdx.x;
+    const int R    = gqa * G;              // row stride
+    const int q0   = (vseq % n_grp) * G;
+    const int n_q  = min(G, n_q_tot - q0);
+    if (r >= gqa * n_q) {
+        return;
+    }
 
     float M = -FLT_MAX;
     for (int s = 0; s < n_splits; ++s) {
-        const float2 ml = MLpart[((int64_t) (s * n_seq + seq) * n_head_kv + hkv) * R + r];
+        const float2 ml = MLpart[((int64_t) (s * n_seq + vseq) * n_head_kv + hkv) * R + r];
         if (ml.y > 0.0f) {
             M = fmaxf(M, ml.x);
         }
@@ -463,7 +539,7 @@ static __global__ void gv_merge_kernel(
     float acc = 0.0f;
     float L   = 0.0f;
     for (int s = 0; s < n_splits; ++s) {
-        const int64_t row = ((int64_t) (s * n_seq + seq) * n_head_kv + hkv) * R + r;
+        const int64_t row = ((int64_t) (s * n_seq + vseq) * n_head_kv + hkv) * R + r;
         const float2 ml = MLpart[row];
         if (ml.y > 0.0f) {
             const float f = __expf(ml.x - M);
@@ -472,9 +548,10 @@ static __global__ void gv_merge_kernel(
         }
     }
     const int h = r / n_q;
-    const int q = r % n_q;
+    const int q = q0 + r % n_q;
+    const int seq = vseq / n_grp;
     const int n_head = n_head_kv * gqa;
-    dst[(((int64_t) seq * n_q + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
+    dst[(((int64_t) seq * n_q_tot + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
 // GGML_CUDA_FA_GQA_VERIFY_DEBUG=1: the first 32 rejections of hd256 FA nodes are logged with their reason (WARN level, so that
@@ -533,14 +610,17 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
         return gv_reject(dst, "ALiBi or softcap");
     }
     const int64_t n_q = Q->ne[1];
-    if (n_q < gv_min_nq() || n_q < 1 || n_q > GV_MAX_NQ) {
-        return gv_reject(dst, "n_q outside [MIN_NQ,16]");
-    }
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2]) {
         return gv_reject(dst, "GQA layout");
     }
     const int64_t gqa = Q->ne[2] / K->ne[2];
-    if (gqa * n_q > GV_MAX_ROWS) {
+    // C8-1-LCATTN: multi-sequence verify batches (n_q > 16 or gqa*n_q > 192) run as row groups
+    const int n_grp_rows = n_q <= gv_multiseq_max_nq() ?
+        gv_group_rows((int) n_q, (int) gqa, ggml_flash_attn_ext_get_n_seq(dst)) : 0;
+    if (n_q < gv_min_nq() || n_q < 1 || (n_q > GV_MAX_NQ && n_grp_rows == 0)) {
+        return gv_reject(dst, "n_q outside [MIN_NQ,16] (multiseq off or > MAX_NQ)");
+    }
+    if (n_grp_rows == 0 && gqa * n_q > GV_MAX_ROWS) {
         return gv_reject(dst, "gqa*n_q > 192");
     }
     if (K->ne[1] % FATTN_KQ_STRIDE != 0 || V->ne[1] != K->ne[1] || mask->ne[0] < K->ne[1] || mask->ne[1] < n_q) {
@@ -593,7 +673,11 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int gqa       = (int) (Q->ne[2] / K->ne[2]);
     const int n_seq     = (int) Q->ne[3];
     const int n_kv      = (int) K->ne[1];
-    const int R         = gqa * n_q;
+    const int G0        = gv_group_rows(n_q, gqa, ggml_flash_attn_ext_get_n_seq(dst));
+    const int G         = G0 > 0 ? G0 : n_q;
+    const int n_grp     = (n_q + G - 1) / G;
+    const int n_vseq    = n_seq * n_grp;
+    const int R         = gqa * G;
     const int ntiles    = (R + 15) / 16;
     const int nwaves    = std::max(ntiles, GV_MIN_WAVES);
     GGML_ASSERT(ntiles <= GV_MAX_TILES);
@@ -606,6 +690,7 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int nsm      = ggml_cuda_info().devices[ctx.device].nsm;
     int n_splits = gv_splits_env();
     if (n_splits <= 0) {
+        // grouped: each group streams ~1/n_grp of the KV (live-range trim), so size the splits per real sequence
         const int base = n_head_kv * n_seq;
         n_splits = (2 * nsm + base - 1) / base;
         n_splits = std::min(n_splits, std::max(1, n_kv / 256));
@@ -615,12 +700,12 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int chunks_per_split = (n_chunks + n_splits - 1) / n_splits;
     n_splits = (n_chunks + chunks_per_split - 1) / chunks_per_split;
 
-    const size_t n_rows_part = (size_t) n_splits * n_seq * n_head_kv * R;
+    const size_t n_rows_part = (size_t) n_splits * n_vseq * n_head_kv * R;
     ggml_cuda_pool_alloc<float>  Opart(ctx.pool(), n_rows_part * GV_D);
     ggml_cuda_pool_alloc<float2> MLpart(ctx.pool(), n_rows_part);
 
     cudaStream_t stream = ctx.stream();
-    const dim3 grid(n_splits, n_head_kv, n_seq);
+    const dim3 grid(n_splits, n_head_kv, n_vseq);
     const dim3 block(64 * nwaves);
     const size_t smem = gv_smem_bytes(nwaves);
 
@@ -630,13 +715,13 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
         if (q8) {
             gv_fattn_kernel<true, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
         } else {
             gv_fattn_kernel<false, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
         }
@@ -644,27 +729,31 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
         if (q8) {
             gv_fattn_kernel<true, false><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
         } else {
             gv_fattn_kernel<false, false><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_seq, chunks_per_split, n_chunks,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
             mask->nb[1], mask->nb[3], ne33);
         }
     }
     CUDA_CHECK(cudaGetLastError());
 
-    gv_merge_kernel<<<dim3(R, n_head_kv, n_seq), dim3(GV_D), 0, stream>>>(
-        Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_seq);
+    gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
+        Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
     CUDA_CHECK(cudaGetLastError());
 
     // path witness for the gate: emitted once per process, on the first call
     static int n_calls = 0;
     if (n_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GQA-packed verify attention ran (call 1)\n");
+    }
+    static int n_ms_calls = 0;
+    if (n_grp > 1 && n_ms_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_GV_MULTISEQ row-group variant ran (n_q=%d G=%d n_grp=%d)\n", n_q, G, n_grp);
     }
     static int n_pipe_calls = 0;
     if (pipe && n_pipe_calls++ == 0) {
