@@ -6189,6 +6189,67 @@ struct test_gated_delta_net : public test_case {
     std::vector<ggml_tensor *> autokernel_state_inputs() override { return { state_input }; }
     std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { final_state }; }
 
+    // useful work of the recurrence: 4 S_v^2 FMAs per v-head per token (2 FLOP each), the memo's TFLOP/s basis.
+    // Achieved GB/s = memory_kb (default op_size: q,k,v,g,beta,state in + output and state out) / time.
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (uint64_t) 8 * head_size * head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
+    }
+
+    // [C8-6-GDN-CHUNKED] route witness: on a backend exporting the chunked-path counters, the chunked WY kernel
+    // MUST run exactly when the dispatch rule says so (non-KDA, head_size 64/128, n_seq_tokens >= threshold and
+    // > the keep_rs snapshot tail, CDNA device), and must NOT run otherwise. Prints one GDN_CHUNKED_WITNESS line.
+    using gdn_ch_n_calls_t    = uint64_t (*)();
+    using gdn_ch_min_tokens_t = int32_t (*)();
+    using gdn_ch_usable_t     = bool (*)(int);
+    gdn_ch_n_calls_t gdn_ch_n_calls = nullptr;
+    bool     gdn_ch_armed  = false;
+    bool     gdn_ch_expect = false;
+    uint64_t gdn_ch_before = 0;
+
+    void witness_begin(ggml_backend_t backend) override {
+        gdn_ch_armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        gdn_ch_n_calls  = (gdn_ch_n_calls_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_chunked_n_calls");
+        auto min_tokens = (gdn_ch_min_tokens_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_chunked_min_tokens");
+        auto usable     = (gdn_ch_usable_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_chunked_usable");
+        if (gdn_ch_n_calls == nullptr || min_tokens == nullptr || usable == nullptr) {
+            return;
+        }
+        const char * name = ggml_backend_name(backend);
+        const char * p = name + strlen(name);
+        while (p > name && p[-1] >= '0' && p[-1] <= '9') {
+            --p;
+        }
+        const int device = *p ? atoi(p) : 0;
+        const int64_t kt = K > 1 ? K : 0;
+        gdn_ch_expect = usable(device) && !kda && (head_size == 64 || head_size == 128) &&
+                        n_seq_tokens >= min_tokens() && n_seq_tokens > kt && kt <= 64;
+        gdn_ch_before = gdn_ch_n_calls();
+        gdn_ch_armed  = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!gdn_ch_armed) {
+            return "";
+        }
+        const uint64_t advanced = gdn_ch_n_calls() - gdn_ch_before;
+        std::string reason;
+        if (gdn_ch_expect && advanced == 0) {
+            reason = "GDN_CHUNKED_WITNESS: chunked WY prefill kernel did not run (silent recurrent fallback?)";
+        } else if (!gdn_ch_expect && advanced != 0) {
+            reason = "GDN_CHUNKED_WITNESS: chunked WY prefill kernel ran where the recurrent kernel must";
+        }
+        fprintf(stderr, "GDN_CHUNKED_WITNESS H=%" PRId64 " S_v=%" PRId64 " n_tokens=%" PRId64 " n_seqs=%" PRId64 " K=%" PRId64
+                " kda=%d expect=%s calls_advanced=%" PRIu64 " verdict=%s\n", head_count * v_repeat, head_size, n_seq_tokens,
+                n_seqs, K, (int) kda, gdn_ch_expect ? "chunked" : "recurrent", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -13792,6 +13853,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    // [C8-6-GDN-CHUNKED] production geometry: 16 q/k heads, d=128, v_repeat 3 (Qwen3.8-27B, 48 v-heads) and
+    // v_repeat 2 (Qwen3.6-35B-A3B, 32 v-heads); n_tokens across the 64-token chunk boundaries up to a 2048 ubatch,
+    // random state carry-in, two sequences, keep_rs snapshot tails (K=4 MTP, K=9 DFlash2 verify), permuted q/k/v.
+    for (int vr : { 3, 2 }) {
+        for (int64_t nt : { 1, 9, 63, 64, 65, 127, 128, 129, 200, 511, 512, 1000, 2048 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 300, 2, vr));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 300, 1, vr, true));
+        for (int64_t kk : { 4, 9 }) {
+            for (int64_t nt : { 64, 100, 300, 2048 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr, false, false, kk));
+            }
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, vr, false, false, 4));
+    }
+    // S_v=64 snapshot tails and the 64 < n_tokens <= 64+K edges
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 129, 2, 2, false, false, 4));
 
     // [CH-LB1] BF16 recurrent state, opt-in set "gdn_bf16_state" (kept out of the default corpus): the
     // CPU backend refuses it in supports_op, so on CPU these report "not supported [CPU]" (and a GPU
@@ -14263,6 +14343,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // [C8-6-GDN-CHUNKED] production geometry perf: 27B (16 qk heads x3 = 48 v-heads) and A3B (x2 = 32), d=128
+    for (int vr : { 3, 2 }) {
+        for (int64_t nt : { 1, 9, 36, 512, 2048, 8192 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, vr, false, false, 9)); // keep_rs prefill
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
