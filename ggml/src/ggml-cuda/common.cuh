@@ -1428,6 +1428,17 @@ struct ggml_backend_cuda_context {
     // incremented at every graph compute; scopes ggml_cuda_fattn_asm_mask_cache (graph inputs, such as the KQ
     // mask, only change between graph computes)
     uint64_t graph_compute_epoch = 0;
+
+    // C8-5-H20: persistent f16 copy of the last cuBLAS src1 (activation) so consecutive GEMMs that
+    // share one input (gate/up, q/k/v, GDN in-projections) convert it once. GGML_HIP_H20_REUSE=0 disables.
+    void *              h20_src1_buf   = nullptr;
+    size_t              h20_src1_cap   = 0;
+    const ggml_tensor * h20_src1_key   = nullptr;
+    const void *        h20_src1_data  = nullptr;
+    int64_t             h20_src1_ne[4] = {0, 0, 0, 0};
+    size_t              h20_src1_nb[4] = {0, 0, 0, 0};
+    cudaStream_t        h20_src1_strm  = nullptr;
+    uint64_t            h20_src1_epoch = UINT64_MAX;
     // a few entries: a graph may carry more than one KQ mask (e.g. SWA + full), and in graph mode every mask is
     // classified in the pre-capture pass and must still be cached when its node is captured
     static constexpr int FATTN_ASM_MASK_CACHE_N = 4;

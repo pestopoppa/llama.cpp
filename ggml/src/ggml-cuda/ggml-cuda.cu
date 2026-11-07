@@ -741,6 +741,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (h20_src1_buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(h20_src1_buf));
+        h20_src1_buf = nullptr;
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1482,9 +1488,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_alloc.alloc(ggml_nelements(src0));
 
         if (ggml_is_contiguously_allocated(src0)) {
-            const auto convert_func = traits::convert(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+            bool h20_done = false;
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                h20_done = ggml_cuda_h20_convert_f16(src0->type, src0->data, (half *) src0_alloc.get(), ggml_nelements(src0), main_stream);
+            }
+            if (!h20_done) {
+                const auto convert_func = traits::convert(src0->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+            }
             const size_t src0_bs = ggml_blck_size(src0->type);
             s01 *= src0_bs;
             s02 *= src0_bs;
@@ -1501,15 +1513,73 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    // C8-5-H20: reuse the f16 copy of src1 made by the previous GEMM on the same tensor (same graph
+    // evaluation, same stream, not under stream capture). Only for the contiguous F32 -> F16 case.
+    bool h20_reuse = false;
+    if constexpr (compute_type == GGML_TYPE_F16) {
+        if (src1->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(src1) && ggml_cuda_h20_reuse_enabled()) {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(main_stream, &cap));
+            const size_t need = ggml_nelements(src1)*sizeof(half);
+            if (cap == cudaStreamCaptureStatusNone && need <= ((size_t) 512 << 20)) {
+                h20_reuse = true;
+                const bool hit = ctx.h20_src1_buf != nullptr && ctx.h20_src1_key == src1 && ctx.h20_src1_data == src1->data &&
+                    ctx.h20_src1_strm == main_stream && ctx.h20_src1_epoch == ctx.graph_compute_epoch &&
+                    memcmp(ctx.h20_src1_ne, src1->ne, sizeof(ctx.h20_src1_ne)) == 0 &&
+                    memcmp(ctx.h20_src1_nb, src1->nb, sizeof(ctx.h20_src1_nb)) == 0;
+                if (!hit) {
+                    if (need > ctx.h20_src1_cap) {
+                        if (ctx.h20_src1_buf != nullptr) {
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                            CUDA_CHECK(cudaDeviceSynchronize());
+                            CUDA_CHECK(cudaFree(ctx.h20_src1_buf));
+                            ctx.h20_src1_buf = nullptr;
+                            ctx.h20_src1_cap = 0;
+                        }
+                        const size_t cap_bytes = GGML_PAD(need, (size_t) 2 << 20);
+                        if (cudaMalloc(&ctx.h20_src1_buf, cap_bytes) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            ctx.h20_src1_buf = nullptr;
+                            h20_reuse = false;
+                        } else {
+                            ctx.h20_src1_cap = cap_bytes;
+                        }
+                    }
+                    if (h20_reuse) {
+                        if (!ggml_cuda_h20_convert_f16(GGML_TYPE_F32, src1->data, (half *) ctx.h20_src1_buf, ggml_nelements(src1), main_stream)) {
+                            const auto convert_func = traits::convert(src1->type);
+                            convert_func(src1->data, (cuda_t *) ctx.h20_src1_buf, ggml_nelements(src1), main_stream);
+                        }
+                        ctx.h20_src1_key   = src1;
+                        ctx.h20_src1_data  = src1->data;
+                        ctx.h20_src1_strm  = main_stream;
+                        ctx.h20_src1_epoch = ctx.graph_compute_epoch;
+                        memcpy(ctx.h20_src1_ne, src1->ne, sizeof(ctx.h20_src1_ne));
+                        memcpy(ctx.h20_src1_nb, src1->nb, sizeof(ctx.h20_src1_nb));
+                    }
+                }
+            }
+        }
+    }
+
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (h20_reuse) {
+        src1_ptr = (const cuda_t *) ctx.h20_src1_buf;
+        // contiguously allocated F32 (block size 1): the f16 copy keeps the same element strides
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
         if (ggml_is_contiguously_allocated(src1)) {
-            const auto convert_func = traits::convert(src1->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            bool h20_done = false;
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                h20_done = ggml_cuda_h20_convert_f16(src1->type, src1->data, (half *) src1_alloc.get(), ggml_nelements(src1), main_stream);
+            }
+            if (!h20_done) {
+                const auto convert_func = traits::convert(src1->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            }
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
