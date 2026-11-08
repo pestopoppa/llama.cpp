@@ -2769,7 +2769,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         const uint32_t selector_tokens = std::min<uint32_t>(
                 n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
-        res += 32*selector_tokens;
+        // DSpine builds ~40 nodes per lattice row plus ~40 per bridge write
+        res += (model.hparams.dspine_code_size > 0 ? 256 : 32)*selector_tokens;
     }
 
     return res;

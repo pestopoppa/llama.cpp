@@ -211,6 +211,8 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    uint32_t dspine_code_size        = 0;     // DSpine code bridge; > 0 marks a DSpine drafter
+    float    dspine_eps              = 1e-6f;
     // LiLiCorr lattice head on a DFlash drafter (upstream #30506); lilicorr_layers > 0 marks one
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;

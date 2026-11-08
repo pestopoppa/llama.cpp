@@ -349,6 +349,8 @@ struct llama_layer {
 
     struct ggml_tensor * dflash_attn_conv_base = nullptr;
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dspine_read            = nullptr;
+    struct ggml_tensor * dspine_write           = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
@@ -684,6 +686,13 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
+
+    // DSpine code bridge (per-layer read/write live in llama_layer)
+    struct ggml_tensor * dspine_codebook    = nullptr;
+    struct ggml_tensor * dspine_gate        = nullptr;
+    struct ggml_tensor * dspine_gate_b      = nullptr;
+    struct ggml_tensor * dspine_pred_gate   = nullptr;
+    struct ggml_tensor * dspine_prev        = nullptr;
 
     // LiLiCorr lattice head (DFlash drafter, upstream #30506)
     struct ggml_tensor * lilicorr_token_proj          = nullptr;
