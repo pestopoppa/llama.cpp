@@ -5475,9 +5475,43 @@ private:
     // Each step re-decodes ctx_tgt and overwrites its logits, so the capture has to happen inside the
     // loop -- right after sampling, before the next llama_decode -- exactly as the plain (non-
     // speculative) path calls populate_token_probs() on the row it just sampled.
-    llama_tokens sample_and_accept_dspark_serial(server_slot & slot, int32_t off,
+    //
+    // Every llama_decode() below replaces the logits of the shared batch, so with more than one busy slot
+    // a serial decode destroys the rows the other slots have not read yet. post_decode() therefore takes
+    // each serial slot's first sample from the shared batch (serial_first_sample) before any serial decode
+    // runs, and verifies the batched slots first; this function only decodes from the second token on.
+    struct serial_first_sample {
+        bool                                 valid = false;
+        llama_token                          id    = LLAMA_TOKEN_NULL;
+        std::vector<completion_token_output> probs;
+    };
+
+    llama_token serial_sample_row(server_slot & slot, int32_t tok_idx, std::vector<completion_token_output> * out_probs) {
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+        }
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        if (out_probs != nullptr) {
+            // logits row tok_idx is still the one id was sampled from: the next
+            // llama_decode has not run yet.
+            completion_token_output cap;
+            cap.tok  = id;
+            cap.prob = 1.0f;
+            populate_token_probs(slot, cap, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+            out_probs->push_back(std::move(cap));
+        }
+
+        return id;
+    }
+
+    llama_tokens sample_and_accept_dspark_serial(server_slot & slot, serial_first_sample & first,
                                                  std::vector<completion_token_output> * out_probs = nullptr) {
         GGML_ASSERT(use_serial_speculative_verify(slot));
+        GGML_ASSERT(first.valid);
         GGML_ASSERT(!slot.spec_draft.empty());
         GGML_ASSERT(slot.spec_i_batch.size() == 1);
 
@@ -5490,26 +5524,17 @@ private:
         server_batch serial_batch;
         serial_batch.init(1);
 
-        int32_t tok_idx = slot.spec_i_batch.front() - off;
         for (size_t i = 0; i <= draft.size(); ++i) {
             llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            if (i == 0) {
+                id = first.id;
+                if (out_probs != nullptr) {
+                    *out_probs = std::move(first.probs);
+                }
+            } else {
+                id = serial_sample_row(slot, 0, out_probs);
             }
-
-            common_sampler_accept(slot.smpl.get(), id, true);
             accepted.push_back(id);
-
-            if (out_probs != nullptr) {
-                // logits row tok_idx is still the one id was sampled from: the next
-                // llama_decode below has not run yet.
-                completion_token_output cap;
-                cap.tok  = id;
-                cap.prob = 1.0f;
-                populate_token_probs(slot, cap, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-                out_probs->push_back(std::move(cap));
-            }
 
             if (i == draft.size() || id != draft[i]) {
                 break;
@@ -5533,8 +5558,6 @@ private:
             if (!common_speculative_process(spec.get(), serial_batch.batch)) {
                 throw std::runtime_error("failed to process serial DSpark target verification token");
             }
-
-            tok_idx = 0;
         }
 
         slot.spec_i_batch.clear();
@@ -5817,12 +5840,28 @@ private:
             }
         }
 
-        // speculative decoding - main model sample and accept
+        const auto is_speculating = [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty();
+        };
+
+        // serial verification decodes one token at a time and overwrites the shared batch's logits, so read
+        // every serial slot's first row now, before the first of those decodes.
+        std::vector<serial_first_sample> serial_first(slots.size());
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+            if (!is_speculating(slot) || !use_serial_speculative_verify(slot)) {
                 return;
             }
 
+            GGML_ASSERT(slot.spec_i_batch.size() == 1);
+
+            auto & first = serial_first.at(slot.id);
+            first.id    = serial_sample_row(slot, slot.spec_i_batch.front() - off,
+                                            slot.task->params.sampling.n_probs > 0 ? &first.probs : nullptr);
+            first.valid = true;
+        });
+
+        // speculative decoding - main model sample and accept
+        const auto verify_and_accept = [&](server_slot & slot) {
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -5861,7 +5900,7 @@ private:
                     // TD-1d.2 / DS41-T4.1.2: the serial verify path re-decodes ctx_tgt one token
                     // at a time, overwriting its own logits every step, so it captures n_probs
                     // inside its own loop (pre- or post-sampling, as the request asks).
-                    accepted = sample_and_accept_dspark_serial(slot, off, want_probs ? &serial_probs : nullptr);
+                    accepted = sample_and_accept_dspark_serial(slot, serial_first.at(slot.id), want_probs ? &serial_probs : nullptr);
                     GGML_ASSERT(!want_probs || serial_probs.size() == accepted.size());
                 } else if (zos2_phase1 && zos2_pre.at(slot.id).valid) {
                     // GPU-ZOS-2 C3 phase 2: phase 1 cloned (unless lazy-save) and sampled exactly as the branch below
@@ -6083,6 +6122,18 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+        };
+
+        // batched slots read rows of the shared batch, so they go before any serial decode
+        iterate(slots, [&](server_slot & slot) {
+            if (is_speculating(slot) && !use_serial_speculative_verify(slot)) {
+                verify_and_accept(slot);
+            }
+        });
+        iterate(slots, [&](server_slot & slot) {
+            if (is_speculating(slot) && use_serial_speculative_verify(slot)) {
+                verify_and_accept(slot);
+            }
         });
     }
 

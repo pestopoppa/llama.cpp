@@ -310,3 +310,21 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+@pytest.mark.parametrize("n_slots", [2, 4])
+def test_serial_exact_concurrent_slots(n_slots: int, monkeypatch):
+    # a serial verification decode replaces the shared batch's logits: before the fix the next
+    # slot aborted in common_sampler_sample with "invalid logits id"
+    global server
+    monkeypatch.setenv("LLAMA_SPEC_EXACT", "serial")
+    server.n_slots = n_slots
+    server.n_ctx = 2048 * n_slots
+    server.start()
+    prompts = ["I believe the meaning of life is", "Once upon a time", "The sky is", "In the forest"][:n_slots]
+    data = [{"prompt": p, "temperature": 0.0, "top_k": 1, "n_predict": 32, "cache_prompt": False} for p in prompts]
+    sequential = [server.make_request("POST", "/completion", data=d).body["content"] for d in data]
+    tasks = [(server.make_request, ("POST", "/completion", d)) for d in data]
+    results = parallel_function_calls(tasks)
+    assert [r.status_code for r in results] == [200] * n_slots
+    assert [r.body["content"] for r in results] == sequential
