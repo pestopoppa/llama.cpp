@@ -1,4 +1,6 @@
 #include "convert.cuh"
+
+#include <atomic>
 #include "dequantize.cuh"
 
 #include <cstdint>
@@ -941,4 +943,100 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
         default:
             return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// C8-5-H20: vectorized contiguous converts feeding the cuBLAS/hipBLAS f16 GEMM path (prefill).
+// Same arithmetic as the generic kernels (one rounding per element), wider memory transactions.
+// ---------------------------------------------------------------------------------------------
+
+static __global__ void h20_f32_to_f16_vec(const float * __restrict__ x, half * __restrict__ y, const int64_t k) {
+    const int64_t i = 8*((int64_t) blockDim.x*blockIdx.x + threadIdx.x);
+    if (i + 8 <= k) {
+        const float4 a = *((const float4 *) (x + i));
+        const float4 b = *((const float4 *) (x + i + 4));
+        half2 h[4];
+        h[0] = __floats2half2_rn(a.x, a.y);
+        h[1] = __floats2half2_rn(a.z, a.w);
+        h[2] = __floats2half2_rn(b.x, b.y);
+        h[3] = __floats2half2_rn(b.z, b.w);
+        *((uint4 *) (y + i)) = *((const uint4 *) h);
+    } else {
+        for (int64_t j = i; j < k; ++j) {
+            y[j] = __float2half(x[j]);
+        }
+    }
+}
+
+// one thread = 8 values (a quarter of one q8_0 block); output written as one 16-byte store
+static __global__ void h20_q8_0_to_f16_vec(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+    const int64_t t  = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t i  = 8*t;
+    if (i >= k) {
+        return;
+    }
+    const block_q8_0 * xb = ((const block_q8_0 *) vx) + t/4;
+    const int sub = t % 4;
+    const half d = xb->d;
+    const uint16_t * q16 = (const uint16_t *) (xb->qs + 8*sub); // qs is 2-byte aligned (34-byte blocks)
+    half2 h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint16_t v = q16[j];
+        const int8_t q0 = (int8_t) (v & 0xFF);
+        const int8_t q1 = (int8_t) (v >> 8);
+        h[j] = __hmul2(make_half2(q0, q1), __half2half2(d));
+    }
+    *((uint4 *) (y + i)) = *((const uint4 *) h);
+}
+
+bool ggml_cuda_h20_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_H20");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+bool ggml_cuda_h20_reuse_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_H20_REUSE");
+        return ggml_cuda_h20_enabled() && (e == nullptr || atoi(e) != 0);
+    }();
+    return on;
+}
+
+bool ggml_cuda_h20_convert_f16(ggml_type type, const void * x, half * y, int64_t k, cudaStream_t stream) {
+    if (!ggml_cuda_h20_enabled()) {
+        return false;
+    }
+    if ((uintptr_t) y % 16 != 0) {
+        return false;
+    }
+    constexpr int nt = 256;
+    if (type == GGML_TYPE_F32) {
+        if ((uintptr_t) x % 16 != 0) {
+            return false;
+        }
+        const int64_t nthr = (k + 7)/8;
+        h20_f32_to_f16_vec<<<(nthr + nt - 1)/nt, nt, 0, stream>>>((const float *) x, y, k);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_cuda_h20: vectorized f32->f16 src1 convert ran\n");
+        }
+        return true;
+    }
+    if (type == GGML_TYPE_Q8_0) {
+        if (k % QK8_0 != 0 || (uintptr_t) x % 2 != 0) {
+            return false;
+        }
+        const int64_t nthr = k/8;
+        h20_q8_0_to_f16_vec<<<(nthr + nt - 1)/nt, nt, 0, stream>>>(x, y, k);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_cuda_h20: vectorized q8_0->f16 src0 convert ran\n");
+        }
+        return true;
+    }
+    return false;
 }

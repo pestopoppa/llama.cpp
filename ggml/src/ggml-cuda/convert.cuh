@@ -64,3 +64,9 @@ template<typename dst_t, typename src_t>
         return float(x);
     }
 }
+
+// C8-5-H20 (GGML_HIP_H20=0 disables; GGML_HIP_H20_REUSE=0 disables only the src1 f16 reuse)
+bool ggml_cuda_h20_enabled();
+bool ggml_cuda_h20_reuse_enabled();
+// contiguous f32/q8_0 -> f16; returns false (nothing launched) when not applicable
+bool ggml_cuda_h20_convert_f16(ggml_type type, const void * x, half * y, int64_t k, cudaStream_t stream);
