@@ -51,9 +51,14 @@ static bool gv_enabled() {
 // C8-FOLD1: default 1 routes n_q=1 decode through gv (27B Q8_0 tg64 1.08x @32k, 1.25x @128k vs 2);
 // GGML_CUDA_FA_GQA_VERIFY_MIN_NQ=2 restores the old vec-kernel decode path. n_q=1 never groups
 // (gv_group_rows returns 0 below n_q 2) and multi-seq n_q=1 decode is rejected by rows_are_seqs.
-static int gv_min_nq() {
-    static const int v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_MIN_NQ", 1);
-    return v;
+// C8-FOLD3: the n_q=1 win is q8_0-KV only (f16 KV: A3B tg@32k 0.928, 27B 0.978 in the fold2 gate), so the
+// default is 1 when K and V are q8_0 and 2 otherwise; the env var, when set, wins for every K/V type.
+static int gv_min_nq(const bool kv_q8_0) {
+    static const int env = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_MIN_NQ", -1);
+    if (env >= 0) {
+        return env;
+    }
+    return kv_q8_0 ? 1 : 2;
 }
 
 static int gv_splits_env() {
@@ -620,7 +625,7 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
     // C8-1-LCATTN: multi-sequence verify batches (n_q > 16 or gqa*n_q > 192) run as row groups
     const int n_grp_rows = n_q <= gv_multiseq_max_nq() ?
         gv_group_rows((int) n_q, (int) gqa, ggml_flash_attn_ext_get_n_seq(dst)) : 0;
-    if (n_q < gv_min_nq() || n_q < 1 || (n_q > GV_MAX_NQ && n_grp_rows == 0)) {
+    if (n_q < gv_min_nq(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) || n_q < 1 || (n_q > GV_MAX_NQ && n_grp_rows == 0)) {
         return gv_reject(dst, "n_q outside [MIN_NQ,16] (multiseq off or > MAX_NQ)");
     }
     if (n_grp_rows == 0 && gqa * n_q > GV_MAX_ROWS) {
