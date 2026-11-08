@@ -41,6 +41,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+    {"draft-dspine",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}, // DSpine drafter: the bridge is detected from GGUF metadata
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -1526,6 +1527,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
                 causal = strcmp(buf, "laguna") == 0;
+            }
+            // DSpine is trained with draft_block_causal
+            if (llama_model_meta_val_str(model_dft, "dflash.dspine_code_size", buf, sizeof(buf)) >= 0) {
+                causal = true;
             }
         }
         llama_set_causal_attn(ctx_dft, causal);
