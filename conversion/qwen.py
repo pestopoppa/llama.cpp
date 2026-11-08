@@ -687,6 +687,27 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_selector_rank(int(dflash_config["selector_rank"]))
             self.gguf_writer.add_selector_top_k(int(dflash_config["selector_top_k"]))
 
+        bridge = dflash_config.get("selected_prefix_code_bridge")
+        if bridge is not None:
+            second = self.hparams.get("code_bridge_second_pass", {})
+            layers = dflash_config.get("selected_prefix_feature_layers")
+            n_layers = int(self.hparams["num_hidden_layers"])
+            if second.get("mode") != "serial_table" or second.get("first_exact") != n_layers - 1 \
+                    or layers != list(range(1, n_layers + 1)) or dflash_config.get("selected_prefix_terminal") \
+                    or dflash_config.get("selected_prefix_feature_write_mode") != "independent":
+                raise ValueError("Unsupported DSpine bridge configuration")
+            from safetensors import safe_open
+            with safe_open(self.dir_model / "model.safetensors", framework="pt") as st:
+                for key in st.keys():
+                    if key.endswith("_version") and int(st.get_tensor(key).item()) != 1:
+                        raise ValueError(f"Unsupported DSpine checkpoint version scalar: {key}")
+                if st.get_tensor("selected_prefix_bridge.out.weight").count_nonzero() != 0:
+                    raise ValueError("DSpine terminal projection must be zero")
+            self.gguf_writer.add_selector_rank(int(bridge["rank"]))
+            self.gguf_writer.add_selector_top_k(int(second["head_topk"]))
+            self.gguf_writer.add_uint32("dflash.dspine_code_size", int(bridge["code_size"]))
+            self.gguf_writer.add_float32("dflash.dspine_eps", float(bridge["eps"]))
+
         output_multiplier = dflash_config.get(
             "output_multiplier", self.hparams.get("output_multiplier")
         )
@@ -719,11 +740,35 @@ class DFlashModel(Qwen3Model):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+        if name.endswith("_version") and "." not in name.replace("selected_prefix_bridge.", ""):
+            return None  # scalar version markers, validated in set_gguf_parameters
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "selected_prefix_bridge." in name:
+            short = name.split("selected_prefix_bridge.", 1)[1]
+            T = gguf.MODEL_TENSOR
+            if short == "out.weight":
+                return  # all-zero terminal projection, validated in set_gguf_parameters
+            if short == "read_weight":
+                yield (self.format_tensor_name(T.DSPINE_READ, int(self.hparams["num_hidden_layers"]) - 1), data_torch)
+            elif short == "early_read_weights":
+                for i in range(data_torch.shape[0]):
+                    yield (self.format_tensor_name(T.DSPINE_READ, i), data_torch[i])
+            elif short == "feature_write_weights":
+                for i in range(data_torch.shape[0]):
+                    yield (self.format_tensor_name(T.DSPINE_WRITE, i), data_torch[i])
+            else:
+                simple = {"codebook": (T.DSPINE_CODEBOOK, ".weight"), "gate.weight": (T.DSPINE_GATE, ".weight"),
+                          "gate.bias": (T.DSPINE_GATE, ".bias"), "predecessor_gate.weight": (T.DSPINE_PRED_GATE, ".weight"),
+                          "prev.weight": (T.DSPINE_PREV, ".weight")}
+                if short not in simple:
+                    raise ValueError(f"Unmapped DSpine bridge tensor: {name}")
+                yield (self.format_tensor_name(simple[short][0], suffix=simple[short][1]), data_torch)
+            return
+
         if name == "model.embed_tokens.weight" and not self.hparams.get("has_embed_tokens", True):
             return
 
