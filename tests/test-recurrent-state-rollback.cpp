@@ -121,7 +121,7 @@ int main(int argc, char ** argv) {
 
     constexpr float eps = 1e-5f;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    const auto replay_and_compare = [&](const char * mode, bool keep_reference) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
             if (!decode_one(ctx_src, tokens[pos], pos) ||
@@ -137,7 +137,10 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            // the FULL replay is the oracle of the dirty-context stage: a PARTIAL replay must not overwrite it
+            if (keep_reference) {
+                logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
@@ -148,22 +151,27 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
+    if (!replay_and_compare("full", true)) {
         return 1;
     }
 
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
+    // the replay above decoded one token per ubatch, which leaves no snapshot to roll back to
+    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+        llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+        fprintf(stderr, "%s : rollback past the snapshots of the last ubatch was accepted\n", __func__);
         return 1;
     }
+
+    // so return to the rolled-back state through the checkpoint instead
+    ckpt.load_tgt(ctx_src, 0, 0);
+    ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     common_prompt_checkpoint ckpt_partial;
     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
 
-    if (!replay_and_compare("partial")) {
+    if (!replay_and_compare("partial", false)) {
         return 1;
     }
 

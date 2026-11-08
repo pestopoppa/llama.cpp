@@ -178,6 +178,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build(test-recurrent-rollback-guards.cpp get-model.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build_and_test(test-mmap-evict.cpp LABEL "main")
