@@ -1392,6 +1392,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // if the model is fully offloaded to a single GPU, keep the input layer there too:
+    // this removes the only CPU split (token embedding GET_ROWS) from the graph
+    // set LLAMA_TOKEN_EMBD_ON_CPU=1 to restore the old behaviour
+    {
+        const char * env = getenv("LLAMA_TOKEN_EMBD_ON_CPU");
+        bool single_gpu = pimpl->dev_output.dev != cpu_dev && !(env && atoi(env) != 0);
+        for (int il = 0; single_gpu && il < n_layer_all; ++il) {
+            single_gpu = pimpl->dev_layer[il].dev == pimpl->dev_output.dev;
+        }
+        if (single_gpu) {
+            pimpl->dev_input = pimpl->dev_output;
+            LLAMA_LOG_INFO("%s: full offload to %s, input layer (token_embd) assigned to it\n", __func__, ggml_backend_dev_name(pimpl->dev_output.dev));
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
