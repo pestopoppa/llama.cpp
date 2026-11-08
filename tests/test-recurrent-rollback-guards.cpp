@@ -127,15 +127,20 @@ static bool case_exact() {
 
 // X decodes alone, then a later ubatch of other sequences reorders the cells. A rollback of X must be either
 // refused or exact: it must not read the snapshots of a row it no longer owns.
-static bool displaced(const std::vector<llama_seq_id> & order, const char * what, bool expect_refusal_allowed) {
+// prime_others: the other cells also hold a non-zero rollback bound, so a bound left behind by the reorder is visible.
+static bool displaced(const std::vector<llama_seq_id> & order, const char * what, bool expect_refusal_allowed, bool prime_others) {
     ctx_t * a = make_ctx(3, true);
     ctx_t * b = make_ctx(3, true);
     REQUIRE(a && b, "ctx failed");
     for (auto s : order) {
         REQUIRE(decode(a, {{s, 0, N_PREFIX}}), "prefix failed");
     }
+    const llama_pos p_other = prime_others ? N_PREFIX + 6 : N_PREFIX;
+    if (prime_others) {
+        REQUIRE(decode(a, {{1, N_PREFIX, p_other}}) && decode(a, {{2, N_PREFIX, p_other}}), "priming failed");
+    }
     REQUIRE(decode(a, {{0, N_PREFIX, N_PREFIX + 6}}), "X decode failed");
-    REQUIRE(decode(a, {{1, N_PREFIX, N_PREFIX + 1}, {2, N_PREFIX, N_PREFIX + 1}}), "other seqs failed");
+    REQUIRE(decode(a, {{1, p_other, p_other + 1}, {2, p_other, p_other + 1}}), "other seqs failed");
 
     REQUIRE(decode(b, {{0, 0, N_PREFIX}}) && decode(b, {{0, N_PREFIX, N_PREFIX + 3}}) &&
             decode(b, {{0, N_PREFIX + 3, N_PREFIX + 4}}), "reference failed");
@@ -153,8 +158,30 @@ static bool displaced(const std::vector<llama_seq_id> & order, const char * what
     return true;
 }
 
-static bool case_displaced()     { return displaced({2, 0, 1}, "displaced", true); }
-static bool case_not_displaced() { return displaced({0, 1, 2}, "control", false); }
+static bool case_displaced()        { return displaced({2, 0, 1}, "displaced", true, false); }
+static bool case_displaced_primed() { return displaced({2, 0, 1}, "displaced_primed", true, true); }
+static bool case_not_displaced()    { return displaced({0, 1, 2}, "control", false, true); }
+
+// a rollback still pending when another ubatch reorders the cells is applied while the cell moves
+static bool case_pending_displaced() {
+    ctx_t * a = make_ctx(3, true);
+    ctx_t * b = make_ctx(3, true);
+    REQUIRE(a && b, "ctx failed");
+    for (llama_seq_id s : { 2, 0, 1 }) {
+        REQUIRE(decode(a, {{s, 0, N_PREFIX}}), "prefix failed");
+    }
+    REQUIRE(decode(a, {{0, N_PREFIX, N_PREFIX + 6}}), "X decode failed");
+    REQUIRE(rm(a, 0, N_PREFIX + 3), "rollback refused");
+    REQUIRE(decode(a, {{1, N_PREFIX, N_PREFIX + 1}, {2, N_PREFIX, N_PREFIX + 1}}), "other seqs failed");
+    REQUIRE(decode(a, {{0, N_PREFIX + 3, N_PREFIX + 4}}), "replay failed");
+    REQUIRE(decode(b, {{0, 0, N_PREFIX}}) && decode(b, {{0, N_PREFIX, N_PREFIX + 3}}) &&
+            decode(b, {{0, N_PREFIX + 3, N_PREFIX + 4}}), "reference failed");
+    const float d = max_diff(a, b);
+    fprintf(stderr, "    max |logit diff| = %g\n", d);
+    REQUIRE(d <= EPS, "pending rollback applied during a reorder gave wrong state");
+    llama_free(a); llama_free(b);
+    return true;
+}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -173,6 +200,7 @@ int main(int argc, char ** argv) {
     const std::vector<std::pair<const char *, std::function<bool()>>> cases = {
         {"bound", case_bound}, {"shared", case_shared}, {"pending", case_pending}, {"exact", case_exact},
         {"control_not_displaced", case_not_displaced}, {"displaced_by_other_seqs", case_displaced},
+        {"displaced_primed_bound", case_displaced_primed}, {"pending_then_displaced", case_pending_displaced},
     };
     int n_fail = 0;
     for (const auto & [name, fn] : cases) {

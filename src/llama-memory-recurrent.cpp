@@ -648,6 +648,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
+            // the rollback snapshots stay in the rows of the old cell (the extra-state copy of build_rs()
+            // moves group 0 only), so neither sequence can roll back. Sequences of this ubatch get a new bound
+            // below. Without this the bound stays with the row and describes some other sequence.
+            dst_cell.rs_max = 0;
+            src_cell.rs_max = 0;
+
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
                 int32_t & tail = cells[j].tail;
