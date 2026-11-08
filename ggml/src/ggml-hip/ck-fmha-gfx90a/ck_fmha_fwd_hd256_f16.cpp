@@ -57,6 +57,18 @@ struct ck_instance {
         ck_tile::launch_kernel<blocks.x, kBlockPerCu>(ck_tile::stream_config{stream, false}, k_{}, grids, blocks, 0, kargs);
         return hipGetLastError();
     }
+
+    // C8-4-H18: the same kernel from the embedded clang-24 code object (gen_co.sh). kentry<256, 1, kernel, Kargs>
+    // takes (kernel f [empty, offset 0, size 1], Kargs kargs [offset 8]); kernargs are built from these headers.
+    static hipError_t run_co(const fmha_fwd_args & a, hipFunction_t fn, hipStream_t stream) {
+        using k_ = kernel;
+        static_assert(k_::BlockSize().x == 256, "kentry<256,...> in the code object");
+        static_assert(sizeof(typename k_::Kargs) == (kMasking ? 120 : 104), "kernarg layout differs from the code object");
+        auto [kargs, grids] = fmha_fwd_create_kargs_and_grids<k_>(a);
+        k_ f{};
+        void * params[2] = { &f, &kargs };
+        return hipModuleLaunchKernel(fn, grids.x, grids.y, grids.z, k_::BlockSize().x, 1, 1, 0, stream, params, nullptr);
+    }
 };
 
 } // namespace
@@ -66,7 +78,18 @@ const char * ggml_ck_fmha_fwd_hd256_f16_name(int causal) {
                   : "ck_tile fmha_fwd d256 fp16 batch b128x128x32x256x32x256 qr row pssk nmask [ck rocm-6.2.4]";
 }
 
+const char * ggml_ck_fmha_fwd_hd256_f16_co_kernel(int causal) {
+    // .name of the two kernels in ck_fmha_fwd_hd256_f16.gfx90a.co (llvm-readelf --notes)
+    return causal
+        ? "_ZN7ck_tile6kentryILi256ELi1ENS_13FmhaFwdKernelINS_22FmhaFwdTilePartitionerINS_13TileFmhaShapeINS_8sequenceIJLi128ELi128ELi32ELi256ELi32ELi256EEEENS4_IJLi4ELi1ELi1EEEENS4_IJLi32ELi32ELi16EEEES6_S7_Lb1EEEEENS_23BlockFmhaPipelineQRKSVSINS_24BlockFmhaPipelineProblemIDF16_DF16_DF16_ffDF16_fDF16_fDF16_S8_Lb0ENS_30SimplifiedGenericAttentionMaskILb1EEENS_14TileFmhaTraitsILb1ELb1ELb0ELb0ELNS_22BlockAttentionBiasEnumE0ELb0ELb0ELin1EEEEENS_35BlockFmhaPipelineQXKSVSCustomPolicyILb1ELb0ELb0ELi1ELi1EEEEENS_17Default2DEpilogueINS_24Default2DEpilogueProblemIfDF16_Lb1ELb0EEEvEEEEJNSP_21FmhaFwdBatchModeKargsEEEEvT1_DpT2_"
+        : "_ZN7ck_tile6kentryILi256ELi1ENS_13FmhaFwdKernelINS_22FmhaFwdTilePartitionerINS_13TileFmhaShapeINS_8sequenceIJLi128ELi128ELi32ELi256ELi32ELi256EEEENS4_IJLi4ELi1ELi1EEEENS4_IJLi32ELi32ELi16EEEES6_S7_Lb1EEEEENS_23BlockFmhaPipelineQRKSVSINS_24BlockFmhaPipelineProblemIDF16_DF16_DF16_ffDF16_fDF16_fDF16_S8_Lb0ENS_30SimplifiedGenericAttentionMaskILb0EEENS_14TileFmhaTraitsILb1ELb1ELb0ELb0ELNS_22BlockAttentionBiasEnumE0ELb0ELb0ELin1EEEEENS_35BlockFmhaPipelineQXKSVSCustomPolicyILb1ELb0ELb0ELi1ELi1EEEEENS_17Default2DEpilogueINS_24Default2DEpilogueProblemIfDF16_Lb1ELb0EEEvEEEEJNSP_21FmhaFwdBatchModeKargsEEEEvT1_DpT2_";
+}
+
 hipError_t ggml_ck_fmha_fwd_hd256_f16(const ggml_ck_fmha_hd256_args & p, hipStream_t stream) {
+    return ggml_ck_fmha_fwd_hd256_f16_co(p, nullptr, stream);
+}
+
+hipError_t ggml_ck_fmha_fwd_hd256_f16_co(const ggml_ck_fmha_hd256_args & p, hipFunction_t fn, hipStream_t stream) {
     fmha_fwd_args a{};
     a.q_ptr             = p.q;
     a.k_ptr             = p.k;
@@ -110,10 +133,10 @@ hipError_t ggml_ck_fmha_fwd_hd256_f16(const ggml_ck_fmha_hd256_args & p, hipStre
         a.window_size_left  = -1;
         a.window_size_right = 0;
         a.mask_type         = static_cast<ck_tile::index_t>(ck_tile::GenericAttentionMaskEnum::MASK_FROM_BOTTOM_RIGHT);
-        return ck_instance<true>::run(a, stream);
+        return fn ? ck_instance<true>::run_co(a, fn, stream) : ck_instance<true>::run(a, stream);
     }
     a.window_size_left  = -1;
     a.window_size_right = -1;
     a.mask_type         = static_cast<ck_tile::index_t>(ck_tile::GenericAttentionMaskEnum::NO_MASK);
-    return ck_instance<false>::run(a, stream);
+    return fn ? ck_instance<false>::run_co(a, fn, stream) : ck_instance<false>::run(a, stream);
 }
