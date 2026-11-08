@@ -1209,10 +1209,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
     cb(inpL, "inp_noise_embd", -1);
 
-    const int64_t n_blocks_dspine = ubatch.n_seqs_unq;
+    // graph reservation can use a shape that is not a draft block (n_tokens == 1); no bridge then
+    const int64_t n_blocks_dspine = std::max<int64_t>(1, ubatch.n_seqs_unq);
+    const bool dspine_active = model.dspine_codebook && n_tokens % n_blocks_dspine == 0 && n_tokens / n_blocks_dspine >= 2;
     ggml_tensor * dspine_anchors = nullptr, * dspine_raw_last = nullptr, * dspine_rms_last = nullptr, * dspine_q_last = nullptr;
-    if (model.dspine_codebook) {
-        GGML_ASSERT(n_blocks_dspine > 0 && n_tokens % n_blocks_dspine == 0 && n_tokens / n_blocks_dspine >= 2);
+    if (dspine_active) {
         dspine_anchors = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, inp_tokens, 1, n_blocks_dspine,
                 (n_tokens / n_blocks_dspine) * inp_tokens->nb[0], 0), n_blocks_dspine);
     }
@@ -1316,8 +1317,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "l_out", il);
 
-        if (model.dspine_codebook) {
-            GGML_ASSERT(n_blocks_dspine > 0 && n_tokens % n_blocks_dspine == 0);
+        if (dspine_active) {
             dspine_raw_last = cur;
             auto w = build_dspine_write(*this, model, layer, cur, dspine_anchors, n_tokens / n_blocks_dspine, n_blocks_dspine);
             cur = w.out;
@@ -1361,7 +1361,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_build_forward_expand(gf, cur);
 
-    if (model.dspine_codebook && res->t_logits) {
+    if (dspine_active && res->t_logits) {
         // DSpine last-write refinement as a DFlash2-layout lattice: [ids | K x K sender->receiver scores].
         // Evaluates exact-sender terms per candidate instead of vocab-wide TG/TSV tables (same arithmetic).
         const int64_t K      = hparams.dflash_selector_top_k;
@@ -1383,7 +1383,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int64_t b = 0; b < blocks; ++b) {
             append(ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1), 0.0f));
             ggml_tensor * prev_ids = nullptr;
-            for (int64_t pos = 1; pos < t; ++pos) {
+            for (int64_t pos = 1; pos < std::min<int64_t>(t, hparams.dflash_block_size); ++pos) {
                 const int64_t row_i = b * t + pos;
                 ggml_tensor * ids = ggml_cont_1d(ctx0, ggml_view_1d(ctx0, candidates, K, row_i * candidates->nb[1]), K);
                 ggml_tensor * h = ggml_get_rows(ctx0, head, ids);
