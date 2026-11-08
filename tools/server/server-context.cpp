@@ -462,6 +462,10 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // the target refused a partial rollback: its memory for this sequence was cleared and must be rebuilt
+    // from prompt.tokens before the next decode (see rs_rebuild_slots)
+    bool rs_rebuild = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -2280,7 +2284,9 @@ private:
         const int32_t E = spans.back().offset + spans.back().n_tokens;
 
         auto * mem = llama_get_memory(ctx_tgt);
-        llama_memory_seq_rm(mem, slot.id, n_past, -1);
+        if (!llama_memory_seq_rm(mem, slot.id, n_past, -1)) {
+            return skip("the memory refused the partial removal at n_past");
+        }
 
         int32_t n_hit = 0, n_miss = 0, n_encode_failed = 0;
         size_t  hit_bytes = 0;
@@ -4098,6 +4104,67 @@ private:
     };
 #endif
 
+    int64_t n_rs_rebuild = 0;
+
+    // Rebuild the target memory of the sequences whose partial rollback was refused. Runs where no slot still needs
+    // the logits of the last decode, because the decodes below overwrite them. Refusals are rare but legitimate:
+    // the snapshots may be gone (see llama_memory_recurrent::seq_rm), and the recurrent state cannot be recomputed
+    // from anything but the tokens.
+    void rs_rebuild_slots() {
+        for (auto & slot : slots) {
+            if (!slot.rs_rebuild) {
+                continue;
+            }
+            slot.rs_rebuild = false;
+
+            // the slot finished in the same round: nothing to continue, but the cached tokens must not outlive the memory
+            if (slot.state != SLOT_STATE_GENERATING) {
+                slot.prompt.tokens.keep_first(0);
+                continue;
+            }
+
+            const auto fail = [&](const std::string & why) {
+                SLT_ERR(slot, "%s\n", why.c_str());
+                slot.prompt.tokens.keep_first(0);
+                send_error(slot, why, ERROR_TYPE_SERVER);
+                slot.release();
+            };
+
+            if (slot.prompt.tokens.has_mtmd) {
+                fail("recurrent rollback refused and the state cannot be rebuilt for a prompt with media");
+                continue;
+            }
+
+            const llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
+            if (slot.prompt.tokens.pos_next() != (llama_pos) tokens.size()) {
+                fail("recurrent rollback refused and the token positions do not allow a rebuild");
+                continue;
+            }
+
+            const int32_t n_batch_rebuild = llama_n_batch(ctx_tgt);
+            llama_batch   b               = llama_batch_init(n_batch_rebuild, 0, 1);
+            bool          ok              = true;
+            for (size_t i = 0; ok && i < tokens.size(); ) {
+                common_batch_clear(b);
+                for (; i < tokens.size() && b.n_tokens < n_batch_rebuild; ++i) {
+                    common_batch_add(b, tokens[i], (llama_pos) i, { slot.id }, false);
+                }
+                ok = llama_decode(ctx_tgt, b) == 0;
+            }
+            llama_batch_free(b);
+
+            if (!ok) {
+                common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                fail("failed to rebuild the recurrent state after a refused rollback");
+                continue;
+            }
+
+            n_rs_rebuild++;
+            SLT_WRN(slot, "rebuilt the target state from %zu tokens after a refused rollback (total rebuilds = %" PRId64 ")\n",
+                    tokens.size(), n_rs_rebuild);
+        }
+    }
+
     void update_slots() {
 #ifdef LLAMA_LB7_PROBES
         lb7p_t_iter_us = ggml_time_us();
@@ -4250,6 +4317,8 @@ private:
             }
         }
 
+        rs_rebuild_slots();
+
         prefill_budget_on_iter(ggml_time_us() - t_iter_start);
     }
 
@@ -4366,6 +4435,9 @@ private:
         });
 
         // start populating the batch for this iteration
+        // normally done at the end of the previous iteration; catches the paths that return early
+        rs_rebuild_slots();
+
         batch.clear();
         pb_iter = {};
 
@@ -4907,11 +4979,18 @@ private:
                     slot.print_timings_pp();
 
                     // truncate any tokens that are beyond n_past for this slot
-                    const llama_pos p0 = slot.prompt.tokens.pos_next();
+                    llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                        // the recurrent state cannot go back to p0: process the whole prompt again
+                        SLT_WRN(slot, "memory refused the rollback to pos %d, re-processing the full prompt\n", p0);
+                        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+                        slot.prompt.tokens.keep_first(0);
+                        slot.n_prompt_tokens_cache = 0;
+                        p0 = 0;
+                    }
                     if (ctx_dft) {
                         common_context_seq_rm(ctx_dft, slot.id, p0, -1);
                     }
@@ -5934,7 +6013,12 @@ private:
 
             {
                 scoped_timer t_rollback(t_zos2_rollback, n_zos2_rollback);
-            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                // never continue from the unrolled state: drop it and rebuild before the next decode
+                SLT_WRN(slot, "target memory refused the rollback to pos %d, scheduling a state rebuild\n", slot.prompt.tokens.pos_next());
+                common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+                slot.rs_rebuild = true;
+            }
             if (slot.ctx_dft) {
                 common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
             }
