@@ -73,11 +73,11 @@ static bool gv_pipe() {
     return v;
 }
 
-// GGML_HIP_GV_PREFETCH_LATE: C9-LONGCTX-FA-BANDWIDTH prefetch-overlap variant of the q8_0 pipelined kernel, default OFF. Holds the
+// GGML_HIP_GV_PREFETCH_LATE: C9-LONGCTX-FA-BANDWIDTH prefetch-overlap variant of the q8_0 pipelined kernel, default ON (=0 disables). Holds the
 // raw blocks in the dwords the global loads produce and defers all 16-bit extraction to store_raw, so that the wave does not wait on
 // vmcnt before the chunk's MFMA work. The bytes read and the arithmetic of store_raw are unchanged, so results are identical.
 static bool gv_prefetch_late() {
-    static const bool v = gv_env_int("GGML_HIP_GV_PREFETCH_LATE", 0) != 0;
+    static const bool v = gv_env_int("GGML_HIP_GV_PREFETCH_LATE", 1) != 0;
     return v;
 }
 
