@@ -755,8 +755,8 @@ static void mul_mat_qX_K_q8_K_IQ_1(int n, const void * vx, size_t bx, const Data
                     __m256i scales8[2];
                     set_scales_8_iq(j, all_scales[0], scales8);
                     const __m512i scales16 = _mm512_inserti64x4(_mm512_castsi256_si512(scales8[0]), scales8[1], 1);
-                    const __m512i packed = _mm512_packs_epi32(_mm512_shuffle_i64x4(dot_01, dot_23, 0x44),
-                                                              _mm512_shuffle_i64x4(dot_01, dot_23, 0xEE));
+                    const __m512i packed = _mm512_packs_epi32(_mm512_shuffle_i64x2(dot_01, dot_23, 0x44),
+                                                              _mm512_shuffle_i64x2(dot_01, dot_23, 0xEE));
                     sumi = _mm512_dpwssd_epi32(sumi, scales16, packed);
                 }
                 const __m256i sum = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
