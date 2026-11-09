@@ -10390,8 +10390,10 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
     if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return false;
     }
-    // the iqk split-KV paths drop the sinks (ik_llama: "we do not implement sinks"): ggml kernel
-    if (sinks != nullptr) {
+    // AKX-ALL-LB4.9: the iqk merges fold per-head sinks, but sinks still decline to the ggml kernel
+    // unless GGML_IQK_FA_SINKS=1, until the op-case gate has passed on this build.
+    static const bool sinks_on = []() { const char * e = getenv("GGML_IQK_FA_SINKS"); return e != nullptr && atoi(e) != 0; }();
+    if (sinks != nullptr && (!sinks_on || sinks->type != GGML_TYPE_F32 || ggml_nelements(sinks) < q->ne[2])) {
         return false;
     }
     if (!ggml_iqk_fa_kv_types_ok(k->type, v->type) || !ggml_iqk_fa_head_sizes_ok(k->ne[0], v->ne[0])) {
@@ -10431,7 +10433,7 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
             (int) dst->ne[2], (int) dst->ne[1], (long) dst->nb[1],
             k->type, v->type, (int) k->ne[0], (int) v->ne[0], (int) q->ne[1], (int) k->ne[1],
             (int) q->nb[1], (int) k->nb[1], (int) v->nb[1], (int) mask->nb[1],
-            q->data, k->data, v->data, mask->data, nullptr,
+            q->data, k->data, v->data, mask->data, sinks != nullptr ? sinks->data : nullptr,
             scale, softcap, (float *) dst->data,
             params->wdata, ggml_iqk_fa_barrier, params->threadpool,
             params->ith, params->nth, /*n_swa =*/ 0);

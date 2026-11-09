@@ -4,6 +4,16 @@
 // SPDX-License-Identifier: MIT
 //
 
+// AKX-ALL-LB4.9 test-only route witness: tests/test-iqk-fa-sinks.cpp checks each case took the merge it targets.
+#ifdef LB49_TEST_ROUTE_COUNTERS
+#include <atomic>
+static std::atomic<unsigned long long> g_lb49_routes[4];
+extern "C" unsigned long long lb49_route_count(int z) { return g_lb49_routes[z].load(); }
+#define LB49_ROUTE(z) do { if (ith == 0) g_lb49_routes[z].fetch_add(1); } while (0)
+#else
+#define LB49_ROUTE(z) do {} while (0)
+#endif
+
 #include "iqk_config.h"
 #include "iqk_mul_mat.h"
 #include "iqk_flash_impl.h"
@@ -232,6 +242,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nth >= 1 && nek1/32 > 1 && nek2 == 1) {
         int nstep_k = nek1/32;
         if (nstep_k >= 4*nth) {
+            LB49_ROUTE(0);
             int nstep_k_per_thread = (nstep_k + nth - 1)/nth;
             int ith_mid = nth;
             int nstep_k_this_thread = nstep_k_per_thread;
@@ -277,6 +288,17 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     std::memset(Racc, 0, Dv*sizeof(float));
                     continue;
                 }
+                // AKX-ALL-LB4.9: fold this head's sink into the nek2 == 1 merge; same block as the GQA merge.
+                if (sinks) {
+                    float s = ((const float *)sinks)[j];
+                    if (s > M) {
+                        float m = expf(M - s);
+                        for (int i = 0; i < Dv; ++i) Racc[i] *= m;
+                        S = S*m + 1;
+                    } else {
+                        S += expf(s - M);
+                    }
+                }
                 float norm = S > 0 ? 1/S : 1;
                 for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
             }
@@ -289,6 +311,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             int ith_q = ith/gcd_k;
             int nq_per_thread = (rk2 + nth_k - 1)/nth_k;
             if (nq_per_thread > 1) {
+                LB49_ROUTE(1);
                 int ith_mid = nth_k;
                 int nq_this_thread = nq_per_thread;
                 if (nq_per_thread*nth_k > rk2) {
@@ -350,6 +373,17 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         std::memset(Racc, 0, Dv*sizeof(float));
                         continue;
                     }
+                    // AKX-ALL-LB4.9: fold this head's sink into the nek2 == 1 merge; same block as the GQA merge.
+                    if (sinks) {
+                        float s = ((const float *)sinks)[j];
+                        if (s > M) {
+                            float m = expf(M - s);
+                            for (int i = 0; i < Dv; ++i) Racc[i] *= m;
+                            S = S*m + 1;
+                        } else {
+                            S += expf(s - M);
+                        }
+                    }
                     float norm = S > 0 ? 1/S : 1;
                     for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
                 }
@@ -359,6 +393,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     }
 
     if (neq3 == 1 && rk2 > 1 && rk2 == rv2 && neq1 == 1 && nth >= 1 && nek2*nek1 >= 32*nth) {
+        LB49_ROUTE(2);
         auto result_size = (Dv + 16)*rk2*sizeof(float);
         int gcd = simple_gcd(nek2, nth);
         int nth_k  = nth/gcd;
@@ -455,6 +490,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     //    else if (nth%4 == 0 && neq1%4 == 0 && work_per_slice >= (1 << 21)) ntg = 4;
     //    else if (nth%2 == 0 && neq1%2 == 0 && work_per_slice >= (1 << 19)) ntg = 2;
     //}
+    LB49_ROUTE(3);
     int counter = 0;
     for (int64_t iq3 = 0; iq3 < neq3; iq3++) {
         for (int64_t iq2 = 0; iq2 < neq2; iq2++) {
