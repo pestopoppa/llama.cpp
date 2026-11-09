@@ -222,6 +222,35 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+
+// AITER-PORT-1 step (a): rocBLAS 6.2 (CU104 gfx90a Tensile library) picks MT64x64x64 for the 27B Q8_0 `down` GEMM
+// (T,N m=5120 n=2048 k=17408, f16 A/B, f32 C, full ubatch) by Euclidean-nearest table key; MT160x256x64 is 2.03x faster and
+// bit-identical on it (c9-gemm-tile-select-20261109). The override is an exact per-problem key, so no other shape can change,
+// and Tensile still calls canSolve() on the forced solution (a library mismatch falls back to normal selection). Must run
+// before the first GEMM: rocBLAS reads the variable once, when TensileHost is constructed. Solution index is 1-based and
+// specific to this rocBLAS library. GGML_HIP_GEMM_DOWN_TILE=0 disables; a user-set override path is never replaced.
+static void ggml_cuda_install_gemm_down_override(int cc) {
+    static const char csv[] = "T,N,5120,2048,1,17408,1,0,17408,17408,5120,f16_r,f32_r,f32_r,606603521\n";
+    const char * e = getenv("GGML_HIP_GEMM_DOWN_TILE");
+    if ((e != nullptr && atoi(e) == 0) || getenv("ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH") != nullptr || !GGML_CUDA_CC_IS_CDNA2(cc)) {
+        return;
+    }
+    const int fd = memfd_create("ggml_gemm_down_override", 0);
+    if (fd < 0 || write(fd, csv, sizeof(csv) - 1) != (ssize_t) (sizeof(csv) - 1)) {
+        GGML_LOG_WARN("%s: could not create the rocBLAS override, using default GEMM selection\n", __func__);
+        if (fd >= 0) { close(fd); }
+        return;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);  // fd stays open for the process: rocBLAS opens it lazily
+    setenv("ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH", path, 0);
+    GGML_LOG_INFO("%s: GGML_HIP_GEMM_DOWN_TILE rocBLAS override installed (27B down MT160x256x64)\n", __func__);
+}
+#endif
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -393,6 +422,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
     }
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (info.device_count > 0) {
+        ggml_cuda_install_gemm_down_override(info.devices[0].cc);
+    }
+#endif
 
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
