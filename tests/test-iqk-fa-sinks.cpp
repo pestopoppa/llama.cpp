@@ -13,6 +13,7 @@
 #include <cstring>
 #include <vector>
 #include <limits>
+#include <map>
 
 static bool run(ggml_context * ctx, ggml_tensor * t, int nth, bool ref) {
     ggml_cgraph * g = ggml_new_graph(ctx);
@@ -25,6 +26,7 @@ static bool run(ggml_context * ctx, ggml_tensor * t, int nth, bool ref) {
 }
 extern "C" unsigned long long lb49_route_count(int);
 static int gcd(int a,int b) { while (b) { int t=a%b; a=b; b=t; } return a; }
+static bool smoke() { static const bool s = std::getenv("LB49_SMOKE") != nullptr; return s; }
 static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=false) {
     const bool dead = mode == 1;
     constexpr int D=512, H=64;
@@ -80,8 +82,9 @@ static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=
     double off_err=0,off_den=0;for(int i=0;i<D*H;i++) { if (!std::isfinite(oo[i])) off_ok=false; double e=oo[i]-rr[i];off_err+=e*e;off_den+=double(rr[i])*rr[i]; }
     off_ok &= (off_den ? off_err/off_den : (off_err ? INFINITY : 0)) <= 5e-4;
     printf("RESULT case=%s control=off verdict=%s\n",name,off_ok ? "PASS" : "FAIL");
-    set(true);std::vector<float> first(D*H); bool all=off_ok;
-    for (int nth : {1,16,32,64,96}) {
+    set(true);std::map<int,std::pair<int,std::vector<float>>> first_by_route; bool all=off_ok;
+    std::vector<int> nths={1,16,32,64,96}; if (smoke()) nths={1,16};
+    for (int nth : nths) {
         auto * out=make();float * x=(float*)out->data;
         for (int i=0;i<D*H;i++) x[i]=std::numeric_limits<float>::quiet_NaN();
         unsigned long long routes[4];for(int z=0;z<4;z++) routes[z]=lb49_route_count(z);
@@ -91,12 +94,14 @@ static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=
         for(int z=0;z<4;z++) ok &= (lb49_route_count(z)-routes[z]) == (z==route ? 1u : 0u);
         double err=0,den=0,oracle_err=0,oracle_den=0,max_abs=0,mean_abs=0;const float * r=(const float*)reference->data;
         for(int i=0;i<D*H;i++){if(!std::isfinite(x[i]) || !std::isfinite(r[i])) ok=false;double diff=x[i]-r[i];max_abs=std::max(max_abs,std::abs(diff));mean_abs+=std::abs(diff);err+=diff*diff;den+=double(r[i])*r[i];double od=x[i]-oracle[i];oracle_err+=od*od;oracle_den+=oracle[i]*oracle[i];}
-        if(nth==1) std::memcpy(first.data(),x,D*H*sizeof(float));
-        bool bits=std::memcmp(first.data(),x,D*H*sizeof(float))==0;
+        // Operator 2026-11-09: bitwise equality is required within one route, not across routes (NMSE/oracle across routes).
+        auto ins=first_by_route.emplace(route,std::make_pair(nth,std::vector<float>(x,x+D*H)));
+        bool bits=std::memcmp(ins.first->second.second.data(),x,D*H*sizeof(float))==0;
+        int ref_nth=ins.first->second.first;
         double nmse=den ? err/den : (err ? INFINITY : 0);
         double oracle_nmse=oracle_den ? oracle_err/oracle_den : (oracle_err ? INFINITY : 0);
         // Existing test-fa-rowexact/test-backend-ops FLASH_ATTN_EXT threshold is 5e-4 NMSE.
-        printf("RESULT case=%s nk=%d mode=%d nth=%d route=%d iqk_delta=%llu bitwise_nth1=%d nmse=%.9g max_abs=%.9g mean_abs=%.9g oracle_nmse=%.9g ran=%d verdict=%s\n",name,nk,mode,nth,route,(unsigned long long)delta,bits,nmse,max_abs,mean_abs/(D*H),oracle_nmse,ok,ok && delta>0 && bits && nmse<=5e-4 && oracle_nmse<=5e-4 ? "PASS" : "FAIL");
+        printf("RESULT case=%s nk=%d mode=%d nth=%d route=%d iqk_delta=%llu bitwise_within_route=%d bitwise_ref_nth=%d nmse=%.9g max_abs=%.9g mean_abs=%.9g oracle_nmse=%.9g ran=%d verdict=%s\n",name,nk,mode,nth,route,(unsigned long long)delta,bits,ref_nth,nmse,max_abs,mean_abs/(D*H),oracle_nmse,ok,ok && delta>0 && bits && nmse<=5e-4 && oracle_nmse<=5e-4 ? "PASS" : "FAIL");
         all &= ok && delta>0 && bits && nmse<=5e-4 && oracle_nmse<=5e-4;
     }
     ggml_free(c); return all ? 0 : 1;
@@ -104,6 +109,7 @@ static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=
 int main() {
     setenv("GGML_FA_VKQ_F32", "1", 1);
     int rc=0;
+    if (smoke()) { rc |= test("gathered-640",640,2); return rc; }
     rc |= test("ds41-swa-layer0",128,0); rc |= test("ds41-swa-layer1",128,0);
     rc |= test("ds41-stock-mask",8192,0); rc |= test("gathered-640",640,2);
     rc |= test("gathered-768",768,2); rc |= test("fully-masked",128,1);
