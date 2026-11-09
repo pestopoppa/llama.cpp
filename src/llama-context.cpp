@@ -12,6 +12,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-fused-guard.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -1424,9 +1425,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the fused path produces logits only; it exports no t_h_nextn, so an MTP
     // draft target must stay on the graph path or the draft head sees no hidden state
     // EXL3 weights need the matrix executor's aux sources; the fused path calls vec_dot directly
+    // it also needs a previous graph with a logits row to write into, which a
+    // zero-output ubatch does not leave behind; that case takes the graph path
     if (llama_fused_decode_env_enabled() && model.supports_fused_decode() && model.exl3_aux.empty() &&
             gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
-            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr) {
+            ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr &&
+            llama_fused_decode_prev_logits_ok(res->get_logits(), model.vocab.n_tokens())) {
         // snapshot the previous graph's per-layer inputs (the fused path may
         // compare against them for layer-level isolation; the reset clears them)
         const int64_t n_layers = model.hparams.n_layer();
