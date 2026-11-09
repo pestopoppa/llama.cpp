@@ -73,6 +73,14 @@ static bool gv_pipe() {
     return v;
 }
 
+// GGML_HIP_GV_PREFETCH_LATE: C9-LONGCTX-FA-BANDWIDTH prefetch-overlap variant of the q8_0 pipelined kernel, default OFF. Holds the
+// raw blocks in the dwords the global loads produce and defers all 16-bit extraction to store_raw, so that the wave does not wait on
+// vmcnt before the chunk's MFMA work. The bytes read and the arithmetic of store_raw are unchanged, so results are identical.
+static bool gv_prefetch_late() {
+    static const bool v = gv_env_int("GGML_HIP_GV_PREFETCH_LATE", 0) != 0;
+    return v;
+}
+
 // C8-1-LCATTN: multi-sequence verify (unified KV, n_seqs_unq > 1, e.g. DFlash2 np4: 4 seqs x 9 tokens = 36 rows).
 // The query rows are split into row groups of G rows (G = rows per sequence when they divide evenly), each group a
 // virtual sequence of the GQA-packed kernel (grid.z = n_seq * n_grp); each workgroup trims its KV split to the live
@@ -198,7 +206,7 @@ static __device__ __forceinline__ void gv_compute_chunk(
 }
 #endif
 
-template <bool KV_Q8, bool PIPE>
+template <bool KV_Q8, bool PIPE, bool LATE = false>
 static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
@@ -325,24 +333,49 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         uint32_t fk[4 * NK]; // plain words: an array of HIP_vector_type uint4 is not promoted to registers (scratch)
         uint32_t fv[4 * NK];
         uint16_t rm[2];
+        // LATE: block_q8_0 (34 B, 2-aligned) as 8 dwords + the last halfword. No 16-bit value exists until store_raw.
+        struct __attribute__((packed, aligned(2))) gv_q8_raw { uint32_t w[8]; uint16_t tail; };
+        uint32_t kw[LATE ? 8 : 1];
+        uint32_t vw[LATE ? 8 : 1];
+        uint16_t kt = 0;
+        uint16_t vt = 0;
 
         auto load_raw = [&](const int c) __attribute__((always_inline)) {
             const int kbase = c * GV_KC;
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 const int i = tid + s * nthreads;
+                if constexpr (LATE) {
+                    // no select against a default: store_raw reads rm[s] only under this same condition
+                    if (i < n_q * GV_KC) {
+                        rm[s] = *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half));
+                    }
+                } else {
                 rm[s] = i < n_q * GV_KC ?
                     *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half)) : (uint16_t) 0xFC00;
+                }
             }
             if constexpr (KV_Q8) {
                 if (tid < GV_KC * (GV_D / QK8_0)) {
                     const int b = tid / GV_KC, key = tid % GV_KC;
                     const uint16_t * pk = (const uint16_t *) (Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0));
                     const uint16_t * pv = (const uint16_t *) (Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0));
+                    if constexpr (LATE) {
+                        const gv_q8_raw * qk = (const gv_q8_raw *) pk;
+                        const gv_q8_raw * qv = (const gv_q8_raw *) pv;
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            kw[t] = qk->w[t];
+                            vw[t] = qv->w[t];
+                        }
+                        kt = qk->tail;
+                        vt = qv->tail;
+                    } else {
 #pragma unroll
                     for (int t = 0; t < 1 + QK8_0 / 2; ++t) {
                         rk[t] = pk[t];
                         rv[t] = pv[t];
+                    }
                     }
                 }
             } else {
@@ -360,8 +393,30 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             }
         };
 
+        // halfword k of the raw block: same bytes as pk[k] (little-endian) in both representations
+        auto raw_k = [&](const int k) __attribute__((always_inline)) -> uint16_t {
+            if constexpr (LATE) {
+                return k == QK8_0 / 2 ? kt : (uint16_t) (kw[k / 2] >> (16 * (k % 2)));
+            } else {
+                return rk[k];
+            }
+        };
+        auto raw_v = [&](const int k) __attribute__((always_inline)) -> uint16_t {
+            if constexpr (LATE) {
+                return k == QK8_0 / 2 ? vt : (uint16_t) (vw[k / 2] >> (16 * (k % 2)));
+            } else {
+                return rv[k];
+            }
+        };
+
         auto store_raw = [&]() __attribute__((always_inline)) -> int {
             int any = 0;
+            if constexpr (LATE) {
+                // opaque point of first use of the raw halfwords: without it the scheduler hoists `tail >> 8` beside the load.
+                uint32_t x0 = kt, x1 = vt, x2 = rm[0], x3 = rm[1];
+                asm volatile("" : "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3));
+                kt = (uint16_t) x0; vt = (uint16_t) x1; rm[0] = (uint16_t) x2; rm[1] = (uint16_t) x3;
+            }
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 const int i = tid + s * nthreads;
@@ -374,14 +429,14 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             if constexpr (KV_Q8) {
                 if (tid < GV_KC * (GV_D / QK8_0)) {
                     const int b = tid / GV_KC, key = tid % GV_KC;
-                    const float dk = __half2float(__ushort_as_half(rk[0]));
-                    const float dv = __half2float(__ushort_as_half(rv[0]));
+                    const float dk = __half2float(__ushort_as_half(raw_k(0)));
+                    const float dv = __half2float(__ushort_as_half(raw_v(0)));
 #pragma unroll
                     for (int g = 0; g < 4; ++g) {
                         _Float16 tmp[8];
 #pragma unroll
                         for (int t = 0; t < 4; ++t) {
-                            const uint16_t u = rk[1 + 4 * g + t];
+                            const uint16_t u = raw_k(1 + 4 * g + t);
                             tmp[2 * t + 0] = (_Float16) (dk * (float) (int8_t) (u & 0xFF));
                             tmp[2 * t + 1] = (_Float16) (dk * (float) (int8_t) (u >> 8));
                         }
@@ -389,7 +444,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                     }
 #pragma unroll
                     for (int t = 0; t < QK8_0 / 2; ++t) {
-                        const uint16_t u = rv[1 + t];
+                        const uint16_t u = raw_v(1 + t);
                         sVt[(b * QK8_0 + 2 * t + 0) * GV_VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
                         sVt[(b * QK8_0 + 2 * t + 1) * GV_VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
                     }
@@ -719,7 +774,14 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
-    if (pipe) {
+    const bool late = pipe && q8 && gv_prefetch_late();
+    if (late) {
+        gv_fattn_kernel<true, true, true><<<grid, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
+            mask->nb[1], mask->nb[3], ne33);
+    } else if (pipe) {
         if (q8) {
             gv_fattn_kernel<true, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
@@ -766,6 +828,10 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     static int n_pipe_calls = 0;
     if (pipe && n_pipe_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
+    }
+    static int n_late_calls = 0;
+    if (late && n_late_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_GV_PREFETCH_LATE prefetch-overlap path ran (call 1)\n");
     }
     if (gv_debug() && n_calls <= 8) {
         GGML_LOG_WARN("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
