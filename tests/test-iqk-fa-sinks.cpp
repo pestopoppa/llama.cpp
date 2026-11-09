@@ -13,7 +13,6 @@
 #include <cstring>
 #include <vector>
 #include <limits>
-#include <map>
 
 static bool run(ggml_context * ctx, ggml_tensor * t, int nth, bool ref) {
     ggml_cgraph * g = ggml_new_graph(ctx);
@@ -82,27 +81,44 @@ static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=
     double off_err=0,off_den=0;for(int i=0;i<D*H;i++) { if (!std::isfinite(oo[i])) off_ok=false; double e=oo[i]-rr[i];off_err+=e*e;off_den+=double(rr[i])*rr[i]; }
     off_ok &= (off_den ? off_err/off_den : (off_err ? INFINITY : 0)) <= 5e-4;
     printf("RESULT case=%s control=off verdict=%s\n",name,off_ok ? "PASS" : "FAIL");
-    set(true);std::map<int,std::pair<int,std::vector<float>>> first_by_route; bool all=off_ok;
+    // Operator 2026-11-09: bitwise equality applies to repeats at one route and one nth. Different nth values are different
+    // partitions and are judged by NMSE and the independent oracle. A thread-split-dependent bug below 5e-4 NMSE passes this gate.
+    struct Prior { int nth; int route; std::vector<float> out; };
+    constexpr int REPEATS=3;
+    set(true);std::vector<Prior> prior; bool all=off_ok;
     std::vector<int> nths={1,16,32,64,96}; if (smoke()) nths={1,16};
     for (int nth : nths) {
-        auto * out=make();float * x=(float*)out->data;
-        for (int i=0;i<D*H;i++) x[i]=std::numeric_limits<float>::quiet_NaN();
-        unsigned long long routes[4];for(int z=0;z<4;z++) routes[z]=lb49_route_count(z);
-        before=count();bool ok=run(c,out,nth,false);auto delta=count()-before;
         int blocks=nk/32, g=gcd(blocks,nth), nth_k=nth/g;
         int route = kvh==1 ? (blocks>=4*nth ? 0 : ((H+nth_k-1)/nth_k>1 ? 1 : (nk>=32*nth ? 2 : 3))) : (kvh*nk>=32*nth ? 2 : 3);
-        for(int z=0;z<4;z++) ok &= (lb49_route_count(z)-routes[z]) == (z==route ? 1u : 0u);
-        double err=0,den=0,oracle_err=0,oracle_den=0,max_abs=0,mean_abs=0;const float * r=(const float*)reference->data;
-        for(int i=0;i<D*H;i++){if(!std::isfinite(x[i]) || !std::isfinite(r[i])) ok=false;double diff=x[i]-r[i];max_abs=std::max(max_abs,std::abs(diff));mean_abs+=std::abs(diff);err+=diff*diff;den+=double(r[i])*r[i];double od=x[i]-oracle[i];oracle_err+=od*od;oracle_den+=oracle[i]*oracle[i];}
-        // Operator 2026-11-09: bitwise equality is required within one route, not across routes (NMSE/oracle across routes).
-        auto ins=first_by_route.emplace(route,std::make_pair(nth,std::vector<float>(x,x+D*H)));
-        bool bits=std::memcmp(ins.first->second.second.data(),x,D*H*sizeof(float))==0;
-        int ref_nth=ins.first->second.first;
-        double nmse=den ? err/den : (err ? INFINITY : 0);
-        double oracle_nmse=oracle_den ? oracle_err/oracle_den : (oracle_err ? INFINITY : 0);
-        // Existing test-fa-rowexact/test-backend-ops FLASH_ATTN_EXT threshold is 5e-4 NMSE.
-        printf("RESULT case=%s nk=%d mode=%d nth=%d route=%d iqk_delta=%llu bitwise_within_route=%d bitwise_ref_nth=%d nmse=%.9g max_abs=%.9g mean_abs=%.9g oracle_nmse=%.9g ran=%d verdict=%s\n",name,nk,mode,nth,route,(unsigned long long)delta,bits,ref_nth,nmse,max_abs,mean_abs/(D*H),oracle_nmse,ok,ok && delta>0 && bits && nmse<=5e-4 && oracle_nmse<=5e-4 ? "PASS" : "FAIL");
-        all &= ok && delta>0 && bits && nmse<=5e-4 && oracle_nmse<=5e-4;
+        std::vector<float> first; bool ok=true, repeat_bits=true; unsigned long long delta=~0ULL;
+        double nmse=0,oracle_nmse=0,max_abs=0,mean_abs=0;const float * r=(const float*)reference->data;
+        for (int rep=0; rep<REPEATS; ++rep) {
+            auto * out=make();float * x=(float*)out->data;
+            for (int i=0;i<D*H;i++) x[i]=std::numeric_limits<float>::quiet_NaN();
+            unsigned long long routes[4];for(int z=0;z<4;z++) routes[z]=lb49_route_count(z);
+            before=count();ok &= run(c,out,nth,false);delta=std::min<unsigned long long>(delta,count()-before);
+            for(int z=0;z<4;z++) ok &= (lb49_route_count(z)-routes[z]) == (z==route ? 1u : 0u);
+            double err=0,den=0,oracle_err=0,oracle_den=0,rep_max=0,rep_mean=0;
+            for(int i=0;i<D*H;i++){if(!std::isfinite(x[i]) || !std::isfinite(r[i])) ok=false;double diff=x[i]-r[i];rep_max=std::max(rep_max,std::abs(diff));rep_mean+=std::abs(diff);err+=diff*diff;den+=double(r[i])*r[i];double od=x[i]-oracle[i];oracle_err+=od*od;oracle_den+=oracle[i]*oracle[i];}
+            // Existing test-fa-rowexact/test-backend-ops FLASH_ATTN_EXT threshold is 5e-4 NMSE; the worst repeat is what counts.
+            nmse=std::max(nmse,den ? err/den : (err ? INFINITY : 0));
+            oracle_nmse=std::max(oracle_nmse,oracle_den ? oracle_err/oracle_den : (oracle_err ? INFINITY : 0));
+            max_abs=std::max(max_abs,rep_max);mean_abs=std::max(mean_abs,rep_mean/(D*H));
+            if (rep==0) first.assign(x,x+D*H); else repeat_bits &= std::memcmp(first.data(),x,D*H*sizeof(float))==0;
+        }
+        // Direct output-to-output NMSE against every earlier nth, including across routes; each pair is printed.
+        double cross=0; int cross_ref=-1;
+        for (const Prior & p : prior) {
+            double err=0,den=0;
+            for(int i=0;i<D*H;i++){double diff=first[i]-p.out[i];err+=diff*diff;den+=double(p.out[i])*p.out[i];}
+            double n=den ? err/den : (err ? INFINITY : 0);
+            printf("CROSS case=%s nth_a=%d route_a=%d nth_b=%d route_b=%d nmse=%.9g\n",name,p.nth,p.route,nth,route,n);
+            if (cross_ref<0 || n>=cross) { cross=n; cross_ref=p.nth; }
+        }
+        prior.push_back({nth,route,first});
+        bool pass=ok && delta>0 && repeat_bits && nmse<=5e-4 && oracle_nmse<=5e-4 && cross<=5e-4;
+        printf("RESULT case=%s nk=%d mode=%d nth=%d route=%d iqk_delta=%llu repeats=%d bitwise_repeats=%d cross_nth_nmse=%.9g cross_ref_nth=%d nmse=%.9g max_abs=%.9g mean_abs=%.9g oracle_nmse=%.9g ran=%d verdict=%s\n",name,nk,mode,nth,route,delta,REPEATS,repeat_bits,cross,cross_ref,nmse,max_abs,mean_abs,oracle_nmse,ok,pass ? "PASS" : "FAIL");
+        all &= pass;
     }
     ggml_free(c); return all ? 0 : 1;
 }
