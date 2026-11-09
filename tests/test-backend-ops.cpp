@@ -2869,6 +2869,9 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
+                // Sentinel bytes are uninitialised under test_generic_op (test-file mode): the memcmp above is the whole
+                // contract; NaN/inf checks on garbage bytes reported a fixture failure on both backends (AK-H5-VERIFY).
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
