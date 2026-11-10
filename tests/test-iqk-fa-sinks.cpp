@@ -26,7 +26,10 @@ static bool run(ggml_context * ctx, ggml_tensor * t, int nth, bool ref) {
 extern "C" unsigned long long lb49_route_count(int);
 static int gcd(int a,int b) { while (b) { int t=a%b; a=b; b=t; } return a; }
 static bool smoke() { static const bool s = std::getenv("LB49_SMOKE") != nullptr; return s; }
-static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=false) {
+// strong_sinks: sink_h = log(nk) + (h-31)/8, i.e. sink mass from e^-4 to e^+4 times the key mass. The default
+// (h-31)/16 sinks sit at most e^2 against a near-uniform mass of ~nk keys (scores |s|<0.5), so a head-0-sink mutant
+// moves the output by NMSE 4.1e-4 at nk=128 and ~1e-7 at nk=8192: under the 5e-4 gate, a control with no power (r4).
+static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=false, bool strong_sinks=false) {
     const bool dead = mode == 1;
     constexpr int D=512, H=64;
     ggml_init_params ip={size_t(128)*1024*1024, nullptr, false};
@@ -41,7 +44,7 @@ static int test(const char * name, int nk, int mode, int kvh=1, bool zero_sinks=
         ((ggml_fp16_t*)k->data)[i]=ggml_fp32_to_fp16(float((i*11)%197-98)/98);
     }
     for (int j=0;j<nk;j++) ((ggml_fp16_t*)mask->data)[j]=ggml_fp32_to_fp16(dead || (mode == 2 && j>0 && j<nk-1 && j%7==0) ? -INFINITY : 0.0f);
-    for (int h=0;h<H;h++) ((float*)sinks->data)[h]=zero_sinks ? 0.0f : float(h-31)/16;
+    for (int h=0;h<H;h++) ((float*)sinks->data)[h]=zero_sinks ? 0.0f : strong_sinks ? std::log(float(nk))+float(h-31)/8 : float(h-31)/16;
     auto make=[&]() {
         auto * o=ggml_flash_attn_ext(c,q,k,v,mask,1.0f/std::sqrt(float(D)),0,0);
         ggml_flash_attn_ext_set_prec(o,GGML_PREC_F32); if (mode!=3) ggml_flash_attn_ext_add_sinks(o,sinks); return o;
@@ -135,5 +138,12 @@ int main() {
     rc |= test("ds41-sinks-zero-stock",8192,0,1,true);
     rc |= test("gathered-640-sinks-zero",640,2,1,true);
     rc |= test("gathered-768-sinks-zero",768,2,1,true);
+
+    // Mutant-power cases (r5): per-head sinks strong enough that a head-0 read is far above 5e-4 NMSE at every
+    // sink read site: route 0 merge [j], route 1 merge [j], route 2 direct [iq2] (kvh>1), route 3 kernel sinks+iq2.
+    rc |= test("strong-sinks-swa",128,0,1,false,true);
+    rc |= test("strong-sinks-gathered-640",640,2,1,false,true);
+    rc |= test("strong-sinks-generic",608,0,1,false,true);
+    rc |= test("strong-sinks-kvh4",128,0,4,false,true);
     return rc;
 }
