@@ -20,11 +20,13 @@
 #include "../ggml-impl.h"
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-enum ggml_cuda_hc_kind { HC_FUSE_COMBINE = 1, HC_FUSE_MIX_TAIL = 2, HC_FUSE_SCALE_SILU = 3, HC_FUSE_RMS_GAMMA = 4 };
+enum ggml_cuda_hc_kind { HC_FUSE_COMBINE = 1, HC_FUSE_MIX_TAIL = 2, HC_FUSE_SCALE_SILU = 3, HC_FUSE_RMS_GAMMA = 4,
+                         HC_FUSE_COMBINE_NORM = 5 };  // 5: AK-ASM-H13-HCTAIL combine + the next mix's rms_norm*gamma
 
 struct ggml_cuda_hc_anchor {
     ggml_cuda_hc_kind   kind;
@@ -32,6 +34,11 @@ struct ggml_cuda_hc_anchor {
     const ggml_tensor * b = nullptr;  // combine: block_out [E,1,T] | mix: u (pre-sigmoid) | norm: gamma
     const ggml_tensor * c = nullptr;  // combine: inject [hc,T] | norm: the RMS_NORM node
     float s1 = 1.0f, b1 = 0.0f, s2 = 1.0f, b2 = 0.0f;  // the SCALE op params (scale, bias) of the chain
+    // HC_FUSE_COMBINE_NORM only (anchored at the combine ADD): the elided rms_norm*gamma MUL whose dst the fused kernel
+    // also writes, its gamma [hc*E] and the RMS_NORM eps
+    const ggml_tensor * d = nullptr;
+    const ggml_tensor * e = nullptr;
+    float eps = 0.0f;
 };
 
 struct ggml_cuda_hc_plan {
@@ -39,6 +46,7 @@ struct ggml_cuda_hc_plan {
     std::unordered_map<const ggml_tensor *, ggml_cuda_hc_anchor>                   anchors;
     std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>>      chains;   // anchor -> its elided nodes
     int                                                                           n_unsafe = 0;  // anchors dropped by rule 2
+    int                                                                           n_combine_norm = 0;  // HCTAIL merges
 };
 
 namespace ggml_hc_plan_detail {
@@ -230,15 +238,80 @@ inline bool anchor_safe(const hc_ctx & c, const ggml_cuda_hc_plan & plan, const 
     return true;
 }
 
+// AK-ASM-H13-HCTAIL: writing the norm MUL's dst early (at the combine ADD instead of at the MUL) is safe only if no node
+// computed strictly between them reads or writes that memory, and the dst aliases none of the fused kernel's inputs.
+inline bool combine_norm_safe(const hc_ctx & c, const ggml_cuda_hc_plan & plan, const ggml_tensor * add,
+                              const ggml_cuda_hc_anchor & ca, const ggml_tensor * mul, const ggml_tensor * gam) {
+    const auto ia = c.pos.find(add);
+    const auto im = c.pos.find(mul);
+    if (ia == c.pos.end() || im == c.pos.end() || ia->second >= im->second || !mul->data || !add->data) return false;
+    for (const ggml_tensor * x : { (const ggml_tensor *) add, ca.a, ca.b, ca.c, gam }) {
+        if (!x || !x->data || overlaps(mul, x)) return false;
+    }
+    for (int i = ia->second + 1; i < im->second; ++i) {
+        const ggml_tensor * w = c.graph->nodes[i];
+        if (is_noop(w) || plan.skip.count(w) || !w->data) continue;
+        if (overlaps(w, mul)) return false;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (w->src[j] && w->src[j]->data && overlaps(w->src[j], mul)) return false;
+        }
+        const auto ian = plan.anchors.find(w);  // a fused anchor reads its chain's external inputs
+        if (ian != plan.anchors.end()) {
+            for (const ggml_tensor * x : { ian->second.a, ian->second.b, ian->second.c }) {
+                if (x && x->data && overlaps(x, mul)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Fold each rms_norm*gamma anchor whose RMS_NORM input is exactly a combine anchor's dst into that combine (one launch
+// and one re-read of the [E,hc,T] stream fewer per hc sublayer). The block size must be the one the unfused
+// rms_norm_mul_f32_cuda picks (1024: E >= 1024 and E != 1536), so the row reduction order and the result are identical.
+inline int merge_combine_norm(const hc_ctx & c, ggml_cuda_hc_plan & plan) {
+    int n = 0;
+    std::vector<const ggml_tensor *> muls;
+    for (const auto & kv : plan.anchors) {
+        if (kv.second.kind == HC_FUSE_RMS_GAMMA) muls.push_back(kv.first);
+    }
+    std::sort(muls.begin(), muls.end(), [&](const ggml_tensor * x, const ggml_tensor * y) { return c.pos.at(x) < c.pos.at(y); });
+    for (const ggml_tensor * mul : muls) {
+        const ggml_cuda_hc_anchor na  = plan.anchors.at(mul);
+        const ggml_tensor *       rms = na.c;
+        const ggml_tensor *       add = rms->src[0];
+        const auto                ic  = plan.anchors.find(add);
+        if (ic == plan.anchors.end() || ic->second.kind != HC_FUSE_COMBINE) continue;
+        if (!ggml_are_same_shape(rms, add) || add->ne[3] != 1 || add->ne[0] < 1024 || add->ne[0] == 1536) continue;
+        if (!f32c(mul) || ggml_nelements(mul) != ggml_nelements(add)) continue;
+        if (!combine_norm_safe(c, plan, add, ic->second, mul, na.b)) continue;
+        ggml_cuda_hc_anchor & ca = ic->second;
+        ca.kind = HC_FUSE_COMBINE_NORM;
+        ca.d    = mul;
+        ca.e    = na.b;
+        memcpy(&ca.eps, rms->op_params, sizeof(float));
+        auto & ch = plan.chains[add];
+        for (const ggml_tensor * t : plan.chains[mul]) ch.push_back(t);
+        ch.push_back(mul);
+        plan.chains.erase(mul);
+        plan.anchors.erase(mul);
+        plan.skip.insert(mul);
+        n++;
+    }
+    return n;
+}
+
 } // namespace ggml_hc_plan_detail
 
 // Build the hc fusion plan for one graph evaluation. `cgraph` may be a view of a larger graph (a scheduler split).
-inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled, ggml_cuda_hc_plan & plan) {
+// combine_norm (AK-ASM-H13-HCTAIL, off by default) folds rms_norm*gamma anchors into the preceding combine anchor.
+inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled, ggml_cuda_hc_plan & plan,
+                                    bool combine_norm = false) {
     using namespace ggml_hc_plan_detail;
     plan.skip.clear();
     plan.anchors.clear();
     plan.chains.clear();
     plan.n_unsafe = 0;
+    plan.n_combine_norm = 0;
     // cheap pre-check: only graphs that contain a MEAN_D1 (the qwen4exp hc mix) are planned
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
@@ -288,5 +361,8 @@ inline void ggml_hc_fuse_plan_build(const ggml_cgraph * cgraph, bool rms_enabled
             plan.n_unsafe++;
             changed = true;
         }
+    }
+    if (combine_norm && rms_enabled) {
+        plan.n_combine_norm = merge_combine_norm(c, plan);
     }
 }

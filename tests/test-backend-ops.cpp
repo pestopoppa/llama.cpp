@@ -8486,6 +8486,45 @@ struct test_hc_seam_hold : public test_hc_seam {
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_SEAM_HOLD"; }
 };
 
+// AK-ASM-H13-HCTAIL: one hc sublayer boundary -- build_hc_combine followed by the next build_hc_mix's grouped RMSNorm
+// (rms_norm over E, reshape, mul by the [hc*E] gamma). With GGML_CUDA_HC_COMBINE_NORM=1 the CUDA/HIP backend runs both
+// in one kernel (hc-fuse.cu k_hc_combine_norm); both the new residual and the normed stream feed the output, so both
+// are compared against the CPU unfused composition.
+struct test_hc_combine_norm : public test_case {
+    const int64_t n_embd, hc, n_tokens;
+    test_hc_combine_norm(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 1)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+    std::string vars() override { return VARS_TO_STR3(n_embd, hc, n_tokens); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_COMBINE_NORM"; }
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = hc * n_embd;
+        ggml_tensor * x         = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * inject    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * w_norm    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        ggml_set_name(x, "x");
+        // build_hc_combine
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, n_tokens);
+        ggml_tensor * b = ggml_reshape_3d(ctx, block_out, n_embd, 1, n_tokens);
+        b = ggml_repeat_4d(ctx, b, n_embd, hc, n_tokens, 1);
+        ggml_tensor * res = ggml_add(ctx, x, ggml_mul(ctx, b, w));
+        // next build_hc_mix: grouped RMSNorm
+        ggml_tensor * xn = ggml_rms_norm(ctx, res, 1e-6f);
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+        xn = ggml_mul(ctx, xn, w_norm);
+        // both the residual and the normed stream reach the output
+        ggml_tensor * sum = ggml_add(ctx, ggml_reshape_2d(ctx, res, hc_dim, n_tokens), xn);
+        ggml_tensor * out = ggml_reshape_2d(ctx, sum, hc_dim, n_tokens);  // view: perf repeats are no-ops
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -13841,6 +13880,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_seam(2560, 4, 320, T));
         }
     }
+    // AK-ASM-H13-HCTAIL: combine + next rms_norm*gamma, Q38FN-sized (fused only under GGML_CUDA_HC_COMBINE_NORM=1);
+    // own label HC_COMBINE_NORM, always registered. E=64 exercises the planner's fall-back (block-size rule: unfused).
+    {
+        for (int64_t T : { 1, 4, 16, 512 }) {
+            test_cases.emplace_back(new test_hc_combine_norm(2560, 4, T));
+        }
+        test_cases.emplace_back(new test_hc_combine_norm(64, 4, 3));
+    }
 
     // AK-ASM-H11 (opt-in: TEST_BACKEND_OPS_EXTRA_CASES=topk_asm_gfx90a): every (n_expert, k) with a gfx90a topksoftmax
     // code object, at 1 row (decode: ids written in place) and several rows (ids via scratch + strided copy, incl. a
@@ -14431,6 +14478,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t T : { 1, 4, 16, 512 }) {
             test_cases.emplace_back(new test_hc_seam(2560, 4, 320, T));
         }
+    }
+    // AK-ASM-H13-HCTAIL: combine + next rms_norm*gamma, Q38FN-sized (fused only under GGML_CUDA_HC_COMBINE_NORM=1);
+    // own label HC_COMBINE_NORM, always registered. E=64 exercises the planner's fall-back (block-size rule: unfused).
+    {
+        for (int64_t T : { 1, 4, 16, 512 }) {
+            test_cases.emplace_back(new test_hc_combine_norm(2560, 4, T));
+        }
+        test_cases.emplace_back(new test_hc_combine_norm(64, 4, 3));
     }
     // AK-ASM-H13b residency hold (-o HC_SEAM_HOLD): 40 copies of a 4096-token seam (x stream 160 MiB + activations),
     // each timed >= 1 s: one process stays VRAM-resident for ~1 min. Always registered under its own label.

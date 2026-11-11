@@ -24,6 +24,12 @@ bool ggml_cuda_hc_rms_fuse_enabled() {
     return v;
 }
 
+// AK-ASM-H13-HCTAIL: combine + the next mix's rms_norm*gamma in one kernel. Experimental, OFF by default.
+bool ggml_cuda_hc_combine_norm_enabled() {
+    static const bool v = hc_env_flag("GGML_CUDA_HC_COMBINE_NORM", false);
+    return v;
+}
+
 bool ggml_cuda_mean_d1_enabled() {
     static const bool v = hc_env_flag("GGML_CUDA_MEAN_D1", true);
     return v;
@@ -85,6 +91,37 @@ static __global__ void k_hc_combine(const float * __restrict__ res, const float 
     }
 }
 
+// ---- combine + norm (AK-ASM-H13-HCTAIL): one block per (h, t) row of the [E, hc, T] stream.
+//   out[e,h,t] = res[e,h,t] + b[e,t] * w[h,t]                                (k_hc_combine, same expression)
+//   xn [e,h,t] = rsqrtf(sum_e out^2 / E + eps) * out[e,h,t] * gamma[h*E + e]  (rms_norm_f32<block_size, true>, same
+//   per-thread column stride, same block_reduce, same scale expression), so both outputs are bit-identical to the
+//   two unfused launches as long as block_size is the one rms_norm_mul_f32_cuda would pick (planner: E >= 1024, != 1536).
+template <int block_size>
+static __global__ void k_hc_combine_norm(const float * res, const float * __restrict__ bo,  // res may alias out (same index)
+                                         const float * __restrict__ inj, const float * __restrict__ gamma,
+                                         float * out, float * __restrict__ xn, const int ncols, const int64_t H,
+                                         const float s1, const float b1, const float s2, const float b2, const float eps) {
+    const int64_t h   = blockIdx.x;
+    const int64_t t   = blockIdx.y;
+    const int     tid = threadIdx.x;
+    const int64_t E   = ncols;
+    const float   w   = s2 * hc_sigmoid(s1 * inj[t * H + h] + b1) + b2;
+    const int64_t row = (t * H + h) * E;
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = res[row + col] + bo[t * E + col] * w;
+        out[row + col] = xi;
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        xn[row + col] = scale * out[row + col] * gamma[h * E + col];
+    }
+}
+
 // ---- mix tail: out[e,t] = (sum_h xn[e + h*E, t] * sigmoid(u[e + h*E, t])) / H
 static __global__ void k_hc_mix_tail(const float * __restrict__ xn, const float * __restrict__ u, float * __restrict__ out,
                                      const int64_t E, const int64_t H, const int64_t T) {
@@ -117,6 +154,14 @@ void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
             const int64_t E = dst->ne[0], H = dst->ne[1], T = dst->ne[2];
             k_hc_combine<<<hc_blocks(E * H * T), 256, 0, stream>>>((const float *) an.a->data, (const float *) an.b->data,
                 (const float *) an.c->data, (float *) dst->data, E, H, T, an.s1, an.b1, an.s2, an.b2);
+        } break;
+        case HC_FUSE_COMBINE_NORM: {
+            const int64_t E = dst->ne[0], H = dst->ne[1], T = dst->ne[2];
+            GGML_ASSERT(E >= 1024 && E != 1536 && an.d && an.e);
+            const dim3 grid((unsigned) H, (unsigned) T, 1);
+            k_hc_combine_norm<1024><<<grid, 1024, 32 * sizeof(float), stream>>>((const float *) an.a->data,
+                (const float *) an.b->data, (const float *) an.c->data, (const float *) an.e->data, (float *) dst->data,
+                (float *) an.d->data, (int) E, H, an.s1, an.b1, an.s2, an.b2, an.eps);
         } break;
         case HC_FUSE_MIX_TAIL: {
             const int64_t E = dst->ne[0], T = dst->ne[2];
@@ -154,6 +199,7 @@ void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
 // ---------------------------------------------------------------------------------------------------- planning
 // the planner is host-only C++ in hc-fuse-plan.h (unit-tested on the CPU by tests/test-hc-fuse-plan.cpp)
 static std::atomic<uint64_t> g_hc_n_unsafe{0};
+static std::atomic<uint64_t> g_hc_n_combine_norm{0};
 
 void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan) {
     plan.skip.clear();
@@ -163,7 +209,10 @@ void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan
     if (!ggml_cuda_hc_fuse_enabled()) {
         return;
     }
-    ggml_hc_fuse_plan_build(cgraph, ggml_cuda_hc_rms_fuse_enabled(), plan);
+    ggml_hc_fuse_plan_build(cgraph, ggml_cuda_hc_rms_fuse_enabled(), plan, ggml_cuda_hc_combine_norm_enabled());
+    if (plan.n_combine_norm > 0 && g_hc_n_combine_norm.fetch_add((uint64_t) plan.n_combine_norm, std::memory_order_relaxed) == 0) {
+        GGML_LOG_INFO("ggml_cuda_hc_fuse: HCTAIL combine+norm fused %d site(s) (first graph)\n", plan.n_combine_norm);
+    }
     if (plan.n_unsafe > 0 && g_hc_n_unsafe.fetch_add((uint64_t) plan.n_unsafe, std::memory_order_relaxed) == 0) {
         GGML_LOG_INFO("ggml_cuda_hc_fuse: buffer-lifetime guard kept %d hc fusion(s) unfused (first graph)\n", plan.n_unsafe);
     }

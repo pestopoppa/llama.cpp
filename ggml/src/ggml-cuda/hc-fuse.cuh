@@ -8,6 +8,8 @@
 //     - mix tail: MEAN_D1(RESHAPE(MUL(xn, SIGMOID(u))))                         -> 1 kernel (3 launches -> 1)
 //     - gate:     SILU(SCALE(x))                                                -> 1 kernel (2 launches -> 1)
 //     - norm:     MUL(RESHAPE(RMS_NORM(x [E,hc,T])), gamma [hc*E])                -> 1 kernel (2 launches -> 1, H13c)
+//     - combine+norm (AK-ASM-H13-HCTAIL, GGML_CUDA_HC_COMBINE_NORM=1, OFF by default): a combine anchor whose dst is the
+//       next mix's RMS_NORM input also writes that mix's rms_norm*gamma output (2 launches -> 1 per hc sublayer)
 //  The plan is built per graph evaluation from the node list (hc-fuse-plan.h); an intermediate is elided only when its
 //  single consumer in the whole graph is inside the chain and it is not a graph output, and an anchor is kept only if no
 //  memory its fused kernel reads was reused by ggml-alloc before the anchor (C7R buffer-lifetime guard).
@@ -18,6 +20,7 @@
 
 bool ggml_cuda_hc_fuse_enabled();
 bool ggml_cuda_mean_d1_enabled();
+bool ggml_cuda_hc_combine_norm_enabled();
 bool ggml_cuda_hc_rms_fuse_enabled();  // GGML_CUDA_HC_RMS_FUSE=0 disables the H13c rms_norm*gamma fusion
 void ggml_cuda_hc_fuse_plan(const ggml_cgraph * cgraph, ggml_cuda_hc_plan & plan);
 void ggml_cuda_hc_fuse_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_hc_anchor & an);
