@@ -416,6 +416,8 @@ llama_build_and_test(test-moe-fused-upgate.cpp) # CH-19 Q8_0 opt-in; external ga
 llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
+# [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
+llama_build(test-akx-numerics.cpp)
 
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-backend-ops NAME test-backend-ops-iqk
