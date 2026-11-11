@@ -303,6 +303,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
+llama_build(test-akx-numerics.cpp)
 
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-backend-ops NAME test-backend-ops-iqk
