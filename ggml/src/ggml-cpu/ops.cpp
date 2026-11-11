@@ -11091,6 +11091,41 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 }
 
 // ggml_compute_forward_gated_delta_net
+#if defined(__AVX512F__)
+static float ggml_vec_mad_dot_f32_avx512(
+        const int n, float * GGML_RESTRICT y, const float * GGML_RESTRICT x,
+        const float v, const float * GGML_RESTRICT q) {
+    const int np = n & ~(GGML_F32_STEP - 1);
+
+    GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+    const GGML_F32_VEC vv = GGML_F32_VEC_SET1(v);
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; ++j) {
+            const int k = i + j * GGML_F32_EPR;
+            const GGML_F32_VEC vx = GGML_F32_VEC_LOAD(x + k);
+            GGML_F32_VEC vy = GGML_F32_VEC_LOAD(y + k);
+            vy = GGML_F32_VEC_FMA(vy, vx, vv);
+            GGML_F32_VEC_STORE(y + k, vy);
+
+            const GGML_F32_VEC vq = GGML_F32_VEC_LOAD(q + k);
+            sum[j] = GGML_F32_VEC_FMA(sum[j], vy, vq);
+        }
+    }
+
+    for (int i = np; i < n; ++i) {
+        y[i] += x[i] * v;
+    }
+
+    float sumf = 0.0f;
+    GGML_F32_VEC_REDUCE(sumf, sum);
+    for (int i = np; i < n; ++i) {
+        sumf += y[i] * q[i];
+    }
+    return sumf;
+}
+#endif
+
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
@@ -11218,6 +11253,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
+#if defined(__AVX512F__)
+            // Update each state row and reuse it for the q dot before evicting it from registers.
+            for (int64_t j = 0; j < S_v; ++j) {
+                const float sum = ggml_vec_mad_dot_f32_avx512(S_v, &s_out[j * S_v], k_d, delta[j], q_d);
+                attn_data[j] = sum * scale;
+            }
+#else
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
             for (int64_t j = 0; j < S_v; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
@@ -11229,6 +11271,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
             }
+#endif
 
             attn_data += S_v * H; // advance to next token
 
@@ -12361,4 +12404,3 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
-
