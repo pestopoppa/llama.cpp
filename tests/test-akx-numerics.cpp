@@ -18,6 +18,7 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,6 +130,17 @@ int main(int argc, char ** argv) {
     receipt("incumbent",         name, inc, inc, true,  true);
     receipt("control_clamp_max", name, c1,  inc, true,  false);
     receipt("control_f16_dot",   name, c2,  inc, false, true);
+    // Residency hold (GPU legs): AKX_HOLD_S=<seconds> keeps a 256 MiB device buffer alive that long after the
+    // receipts, so an external sampler (KFD pid + VRAM) observes the process DURING, not after. Off by default.
+    if (const char * h = getenv("AKX_HOLD_S")) {
+        ggml_backend_buffer_t ballast = ggml_backend_alloc_buffer(be, (size_t) 256 << 20);
+        fprintf(stderr, "AKX_HOLD ballast=%s for %s s\n", ballast ? "ok" : "FAILED", h);
+        if (ballast) {
+            struct timespec ts = { (time_t) atoi(h), 0 };
+            nanosleep(&ts, nullptr);
+            ggml_backend_buffer_free(ballast);
+        }
+    }
     ggml_backend_free(be);
     return 0;
 }
