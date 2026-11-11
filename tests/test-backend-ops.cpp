@@ -8517,9 +8517,11 @@ struct test_hc_combine_norm : public test_case {
         ggml_tensor * xn = ggml_rms_norm(ctx, res, 1e-6f);
         xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
         xn = ggml_mul(ctx, xn, w_norm);
-        // both the residual and the normed stream reach the output
+        // both the residual and the normed stream reach the output; the MEAN_D1 is required: the CUDA hc planner only plans
+        // graphs that contain one (the qwen4exp mix), so without it the fusion would never be exercised
         ggml_tensor * sum = ggml_add(ctx, ggml_reshape_2d(ctx, res, hc_dim, n_tokens), xn);
-        ggml_tensor * out = ggml_reshape_2d(ctx, sum, hc_dim, n_tokens);  // view: perf repeats are no-ops
+        ggml_tensor * mean = ggml_mean_d1(ctx, ggml_reshape_3d(ctx, sum, n_embd, hc, n_tokens));
+        ggml_tensor * out = ggml_reshape_2d(ctx, mean, n_embd, n_tokens);  // view: perf repeats are no-ops
         ggml_set_name(out, "out");
         return out;
     }
