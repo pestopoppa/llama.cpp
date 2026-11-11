@@ -786,6 +786,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 static constexpr __host__ __device__ int calc_nwarps(
         ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool fixed_1536_cdna2 = false,
         bool eight_warp_q8_cdna2 = false) {
+    GGML_UNUSED(eight_warp_q8_cdna2); // selects the vdr=8 k-loop in mul_mat_vec_q, not the warp count
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -806,23 +807,25 @@ static constexpr __host__ __device__ int calc_nwarps(
             return 4;
         }
         // CDNA2 single-stream experiment (mi210-q8-dequant handoff, lever 2/3): batch-1 Q8_0 GEMV is
-        // achieved-BW/occupancy-limited at nwarps=2 (128 thr/block). Raise warps-per-block to put more
-        // weight-load requests in flight (Little's law). RDNA4 already uses nwarps=8 for Q8_0. Same
-        // dp4a math, but the fp cross-warp reduction is split more ways, so numerically-valid-not-
-        // bit-exact (test-backend-ops MUL_MAT 1103/1103 pass). Measured +4.6% (28.99->30.32 t/s, 27B
-        // Q8) single-stream tg128; nwarps=4 beat 2 (baseline). nwarps=8 was rejected only at
-        // rows_per_cuda_block=1, where each row's cross-warp reduction overhead grows with nwarps.
-        // akm-cdna2-q8-b1-eight-warp-four-row: nwarps=8 is confined to the CDNA2 dense bs=1 Q8_0
-        // four-row small_k cell. The caller passes eight_warp_q8_cdna2=true only at the four-row
-        // forcing site in mul_mat_vec_q_switch_ncols_dst (cc == CDNA2 && !has_ids && nrows_x % 4 == 0),
-        // so every other route on this shared GCN/CDNA table keeps nwarps=4 and its existing
-        // geometry: non-small_k fallbacks, MUL_MAT_ID/has_ids launches, shape-triggered small_k,
-        // and other GCN/CDNA architectures. With the four-row CTA (akm-cdna2-q8-b1-four-row-cta)
-        // holding rows_per_cuda_block=rows_per_thread=4 via calc_rows_per_block, the per-row
-        // cross-warp reduction is paid once per 4 rows and is unchanged, so nwarps=8 only widens
-        // the k-split (160 Q8_0 blocks/row at ne00=5120: 3 k-loop iters of 64 blocks -> 2 of 128).
+        // achieved-BW/occupancy-limited at nwarps=2 (128 thr/block). Raise warps-per-block to put
+        // more weight-load requests in flight (Little's law): measured +4.6% (28.99->30.32 t/s, 27B
+        // Q8) single-stream tg128 at nwarps=4 over the nwarps=2 baseline. Same dp4a math, but the
+        // fp cross-warp reduction is split more ways, so numerically-valid-not-bit-exact
+        // (test-backend-ops MUL_MAT 1103/1103 pass). nwarps=8 was rejected at rows_per_cuda_block=1,
+        // where each row's cross-warp reduction overhead grows with nwarps, and the later four-row
+        // keep (akm-cdna2-q8-b1-eight-warp-four-row) confined the nwarps=8 k-split to the
+        // rows_per_cuda_block=4 cell.
+        // akm-cdna2-q8-b1-vdr8-fourwarp: the CDNA2 dense bs=1 Q8_0 four-row cell is re-sliced from
+        // (nwarps=8, vdr=4) to (nwarps=4, vdr=8) and runs on this 256-thread geometry: the
+        // eight_warp_q8_cdna2 flag no longer widens the k-split here, it only selects the cell's
+        // vdr=8 k-loop in mul_mat_vec_q (see the vdr comment there), which keeps blocks_per_iter at
+        // vdr*nwarps*warp_size/qi = 256 so the single k-pass is preserved. The caller passes
+        // eight_warp_q8_cdna2=true only at the four-row forcing site in mul_mat_vec_q_switch_ncols_dst
+        // (cc == CDNA2 && !has_ids && nrows_x % 4 == 0), so every other route on this shared
+        // GCN/CDNA table keeps nwarps=4, vdr=2 and its existing geometry: non-small_k fallbacks,
+        // MUL_MAT_ID/has_ids launches, shape-triggered small_k, and other GCN/CDNA architectures.
         if (ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
-            return eight_warp_q8_cdna2 ? 8 : 4;
+            return 4;
         }
         switch (ncols_dst) {
             case 1:
@@ -923,13 +926,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     if (table_id == MMVQ_PARAMETERS_GCN && type == GGML_TYPE_Q8_0 && ncols_dst == 4 && !small_k) {
         return 4;
     }
-    // akm-cdna2-q8-b1-eight-warp-four-row: for the Q8_0 bs=1 small_k cell, rows-per-CTA stays 4 (4
-    // value chains per thread, 8 with the fused GLU gate chain) regardless of nwarps: only the
-    // k-split widens to 8 warps on the CDNA2 dense four-row route (see calc_nwarps
-    // eight_warp_q8_cdna2). rpb==nwarps would make rows_per_thread 8 and rows_per_cuda_block 8,
-    // changing the epilogue geometry this cell's keeps depend on. For every route where
-    // eight_warp_q8_cdna2 is false, nwarps is 4 and this returns the same 4 the generic
-    // 'small_k ? nwarps : 1' clause below would.
+    // akm-cdna2-q8-b1-vdr8-fourwarp: for the Q8_0 bs=1 small_k cell, rows-per-CTA stays 4 (4 value
+    // chains per thread, 8 with the fused GLU gate chain) regardless of nwarps, so the epilogue
+    // geometry this cell's keeps depend on (rows_per_thread = rows_per_cuda_block = 4) cannot
+    // silently follow the k-split. The generic 'small_k ? nwarps : 1' clause below would return
+    // nwarps, which is 4 on every Q8_0 bs=1 small_k route today - the CDNA2 dense four-row cell of
+    // akm-cdna2-q8-b1-vdr8-fourwarp included - so this pins the same 4 explicitly.
     if (table_id == MMVQ_PARAMETERS_GCN && type == GGML_TYPE_Q8_0 && ncols_dst == 1 && small_k) {
         return 4;
     }
@@ -1129,7 +1131,7 @@ static __global__ void mul_mat_vec_q(
         (ncols_x_fixed == 1536 && ncols_dst == 1 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)),
         "fixed-width MMVQ specialization is only available for Q4_K/Q6_K batch-1 at 1536 columns");
     static_assert(!eight_warp_q8_cdna2 || (type == GGML_TYPE_Q8_0 && ncols_dst == 1 && small_k),
-        "eight-warp Q8_0 geometry is only valid for the bs=1 small_k instantiation");
+        "the Q8_0 vdr cell is only valid for the bs=1 small_k instantiation");
 
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
@@ -1138,20 +1140,24 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    // akm-cdna2-q8-b1-singlepass-vdr4: the CDNA2 dense bs=1 Q8_0 four-row cell
-    // (eight_warp_q8_cdna2, 512-thread CTA, rows_per_thread=4) runs its k-loop at vdr=4 instead
-    // of 2, so blocks_per_iter = vdr*nwarps*warp_size/qi = 4*8*64/8 = 256 >= 160 (the Q8_0
-    // blocks of a 5120-wide row) and the whole row is consumed in one k-pass. The vdr=2 second
-    // pass only covered the 32-block remainder with 128 of 512 lanes live while 384 lanes spun
-    // on loop control; vdr=4 halves the per-row loop trips and parks 192 lanes once from the
-    // start instead. Per-thread dp4a width doubles 2->4 and threads per 32-int8 block halve
-    // (qi/vdr 4->2), so the per-block f32 scale application regroups 4 threads to 2: results
-    // are numerically-valid-not-bit-exact, same class as the eight-warp nwarps=8 keep. Confined
-    // to this cell: eight_warp_q8_cdna2 is host-gated to the CDNA2 dense bs=1 Q8_0 route with
-    // nrows_x % 4 == 0 (forcing site in mul_mat_vec_q_switch_ncols_dst), so dec-b* wide batch,
-    // has_ids, shape-triggered small_k and non-CDNA2 routes all keep vdr=2, and rows with
-    // blocks_per_row_x > 256 remain multi-pass at any vdr.
-    constexpr int vdr = eight_warp_q8_cdna2 ? 4 : get_vdr_mmvq(type);
+    // akm-cdna2-q8-b1-vdr8-fourwarp: the CDNA2 dense bs=1 Q8_0 four-row cell
+    // (eight_warp_q8_cdna2, nwarps=4/256-thread CTA, rows_per_cuda_block=rows_per_thread=4) runs
+    // its k-loop at vdr=8 instead of 4, so one thread covers each 32-int8 block (qi/vdr = 1) and
+    // blocks_per_iter = vdr*nwarps*warp_size/qi = 8*4*64/8 = 256 >= 160 (the Q8_0 blocks of a
+    // 5120-wide row), keeping the whole row in one k-pass as the (nwarps=8, vdr=4) slicing of
+    // akm-cdna2-q8-b1-singlepass-vdr4 did. Per-thread MLP doubles: the weight stream is 8
+    // dwords/row, ~32 independent 4B qs loads in flight across the 4 rows (16 at vdr=4), parked
+    // lanes drop 192 to 96, and the cross-warp epilogue halves from 7 to 3 warp entries
+    // (tmp_shared[(nwarps-1)][4][64] x2: 14.3KB -> 6.1KB). dp4a accumulation is integer and
+    // order-free; the only fp change is the per-block d*ds scale application collapsing 2 thread
+    // partials into 1 per row, so results are numerically-valid-not-bit-exact, same class as the
+    // vdr=2->4 (akm-cdna2-q8-b1-singlepass-vdr4) and nwarps=4->8 (akm-cdna2-q8-b1-eight-warp-
+    // four-row) keeps. Confined to this cell: eight_warp_q8_cdna2 is host-gated to the CDNA2
+    // dense bs=1 Q8_0 route with nrows_x % 4 == 0 (forcing site in
+    // mul_mat_vec_q_switch_ncols_dst), so dec-b* wide batch, has_ids, shape-triggered small_k and
+    // non-CDNA2 routes all keep vdr=2, and rows with blocks_per_row_x > 256 remain multi-pass at
+    // any vdr.
+    constexpr int vdr = eight_warp_q8_cdna2 ? 8 : get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, ncols_x_fixed == 1536, eight_warp_q8_cdna2);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -1170,11 +1176,11 @@ static __global__ void mul_mat_vec_q(
     constexpr bool dpp_q6_K_reduce =
         type == GGML_TYPE_Q6_K && ncols_dst == 1 && ncols_x_fixed == 1536 && rows_per_thread == 1;
     // akm-cdna2-q8-b1-dpp-final-reduce: the CDNA2 dense bs=1 Q8_0 small_k CTA (rows_per_cuda_block
-    // = rows_per_thread = 4; the k-split is nwarps=8 on the eight_warp_q8_cdna2 route of
-    // akm-cdna2-q8-b1-eight-warp-four-row and nwarps=4 everywhere else) reduces each row over the
-    // full 64 lanes of warp 0 after the tmp_shared cross-warp sum; the four per-row butterflies
-    // (plus the four fused gate rows) become interleaved DPP trees that deposit all totals on
-    // lane warp_size-1.
+    // = rows_per_thread = 4) reduces each row over the full 64 lanes of warp 0 after the
+    // tmp_shared cross-warp sum; the four per-row butterflies (plus the four fused gate rows)
+    // become interleaved DPP trees that deposit all totals on lane warp_size-1. The CTA is
+    // nwarps=4 on both the eight_warp_q8_cdna2 vdr=8 cell (akm-cdna2-q8-b1-vdr8-fourwarp) and the
+    // vdr=2 small_k fallback.
     constexpr bool dpp_q8_0_quadrow_reduce =
         type == GGML_TYPE_Q8_0 && ncols_dst == 1 && rows_per_thread == 4;
 #else
@@ -1378,9 +1384,10 @@ static __global__ void mul_mat_vec_q(
                                         tmp_gate[j][i][k_part] += dots.y;
                                     }
                                 } else if constexpr (eight_warp_q8_cdna2) {
-                                    // vdr=4 cell: vec_dot_q8_0_q8_1 bakes vdr=2 into its loads, so
-                                    // load v/u at this kernel's vdr and apply the impl directly
-                                    // (same pattern as the mul_mat_vec_q8_0_prefetch loop above)
+                                    // cell dot: vec_dot_q8_0_q8_1 bakes vdr=2 into its loads, so
+                                    // load v/u at this kernel's vdr (8 on this route) and apply the
+                                    // impl directly (same pattern as the mul_mat_vec_q8_0_prefetch
+                                    // loop above)
                                     const block_q8_1 * bq8_1 = &y[j*stride_col_y + kby];
                                     const block_q8_0 * bq8_0 = (const block_q8_0 *) vx + kbx_row;
                                     int v[vdr];
@@ -1909,13 +1916,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // accumulation order and cross-warp reduction order are untouched, so results are
             // bit-identical to rpb=1. The 4-row unrolled weight loads are unbounded, so require
             // nrows_x % 4 == 0 and keep rows_per_cuda_block=1 otherwise.
-            // akm-cdna2-q8-b1-eight-warp-four-row: this forcing site is exactly the CDNA2 dense
-            // Q8_0 small_k path, so it also raises the k-split to nwarps=8 (512-thread CTA) by
-            // passing eight_warp_q8_cdna2 to calc_launch_params and mul_mat_vec_q_switch_fusion;
-            // rows_per_thread stays 4 because calc_rows_per_block keeps rows_per_cuda_block at 4.
-            // The gate is host-runtime (cc == CDNA2 && !has_ids && nrows_x % 4 == 0), so MUL_MAT_ID/
-            // has_ids routes, shape-triggered small_k with nrows_x % 4 != 0, other GCN/CDNA
-            // architectures and the non-small_k fallback all keep nwarps=4 and their geometry.
+            // akm-cdna2-q8-b1-vdr8-fourwarp: this forcing site is exactly the CDNA2 dense Q8_0
+            // small_k path, so it also passes eight_warp_q8_cdna2 to calc_launch_params and
+            // mul_mat_vec_q_switch_fusion to select the cell's vdr=8 k-loop; the CTA stays on the
+            // shared nwarps=4 geometry (256 threads, see calc_nwarps) and rows_per_thread stays 4
+            // because calc_rows_per_block keeps rows_per_cuda_block at 4 (the re-slice from the
+            // nwarps=8/512-thread slicing of akm-cdna2-q8-b1-eight-warp-four-row keeps the same
+            // rows_per_thread pin). The gate is host-runtime (cc == CDNA2 && !has_ids &&
+            // nrows_x % 4 == 0), so MUL_MAT_ID/has_ids routes, shape-triggered small_k with
+            // nrows_x % 4 != 0, other GCN/CDNA architectures and the non-small_k fallback all
+            // keep vdr=2 and their geometry.
             bool q8_0_cdna2_four_row = false;
             if constexpr (type == GGML_TYPE_Q8_0) {
                 if (cc == GGML_CUDA_CC_CDNA2 && !has_ids && nrows_x % 4 == 0) {
@@ -1965,11 +1975,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
                         calc_nwarps(type, c_ncols_dst, table_id) == 2 && cc == GGML_CUDA_CC_CDNA2,
                     false, q8_0_cdna2_four_row);
                 if constexpr (type == GGML_TYPE_Q8_0) {
-                    // akm-cdna2-q8-b1-eight-warp-four-row: the CDNA2 dense four-row cell takes the
-                    // eight-warp small_k instantiation (the dims above already carry its nwarps=8
-                    // geometry); every other small_k route below keeps the nwarps=4 geometry:
-                    // MUL_MAT_ID/has_ids launches, shape-triggered small_k with nrows_x % 4 != 0,
-                    // and other architectures.
+                    // akm-cdna2-q8-b1-vdr8-fourwarp: the CDNA2 dense four-row cell takes the vdr=8
+                    // small_k instantiation (the dims above already carry its nwarps=4/256-thread
+                    // geometry, re-sliced from the nwarps=8 cell of akm-cdna2-q8-b1-eight-warp-four-
+                    // row); every other small_k route below keeps vdr=2 on the same nwarps=4
+                    // geometry: MUL_MAT_ID/has_ids launches, shape-triggered small_k with
+                    // nrows_x % 4 != 0, and other architectures.
                     if (q8_0_cdna2_four_row) {
                         mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, 0, true>(
                             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
