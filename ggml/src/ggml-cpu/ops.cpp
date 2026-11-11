@@ -9350,8 +9350,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     for (int ir = ir0; ir < ir1; ++ir) {
         // q indices
         const int iq3 = ir/(neq2*neq1);
-        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
-        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+        const int64_t row = ir - iq3*neq2*neq1;
+        // Schedule neighboring heads together without changing each row's KV traversal.
+        const bool query_major = !params->use_ref && !write_partials;
+        const int iq2 = query_major ? row % neq2 : row / neq1;
+        const int iq1 = query_major ? row / neq2 : row % neq1;
 
         const uint32_t h = iq2; // head index
         const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
