@@ -2916,6 +2916,201 @@ static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) 
     return i;
 }
 
+// ---------------------------------------------------------------------------
+// C11-CPU-BARRIER-COST: dependency-aware graph-barrier elision ("pure epochs").
+//
+// The graph loop issues one full-team barrier after every executed node.  That barrier exists
+// to publish node k's writes before node k+1 reads them, and to stop node k+1 from overwriting
+// memory node k is still reading.  When node k+1 neither reads nor writes any byte that the
+// nodes executed since the last barrier wrote, and writes no byte they read, the barrier
+// orders nothing, so it can be dropped: fast threads start k+1 while stragglers finish k.
+//
+// Soundness rests on two restrictions, both decided from graph metadata only, so every thread
+// takes the same decision and the team's barrier count stays identical (required by
+// `#pragma omp barrier`):
+//   1. every node in the barrier-free epoch is PURE: its CPU kernel reads only its src[] tensors,
+//      writes only its dst, never calls ggml_barrier(), never touches the threadpool chunk
+//      counter, and uses params->wdata only in per-thread (ith-indexed) slices.  MUL_MAT*,
+//      FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_*, ACC, SET, custom ops and anything quantized are
+//      excluded, so a barrier always precedes and follows them.
+//   2. byte-range independence: dst(j) is disjoint from dst and src of every epoch node, and
+//      src(j) is disjoint from dst of every epoch node (RAW, WAR and WAW all covered; views and
+//      allocator reuse are covered because the test is on bytes, not tensor identity).
+// The work partition of each node is unchanged, so results are bit-identical by construction.
+// Elision is disabled when an abort callback is installed (an abort read without a barrier could
+// desynchronise the team).  DEFAULT OFF: GGML_BARRIER_DEP=1 enables it; GGML_BARRIER_DEP_MAX caps
+// the epoch length (default 16, max 64).
+#define GGML_CPU_DEP_EPOCH_CAP 64
+static bool ggml_cpu_barrier_dep     = false;  // set once in ggml_cpu_init(), read-only after
+static int  ggml_cpu_barrier_dep_max = 16;
+
+// C11 build marker, auditable with `strings libggml-cpu.so | grep C11_BARRIER_DEP`.
+__attribute__((used)) static const char ggml_c11_barrier_dep_marker[] =
+    "C11_BARRIER_DEP_DEFAULT_OFF=GGML_BARRIER_DEP,GGML_BARRIER_DEP_MAX";
+
+static bool ggml_cpu_dep_type_ok(enum ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_I32;
+}
+
+static bool ggml_cpu_node_is_pure(const struct ggml_tensor * node) {
+    if (!ggml_cpu_dep_type_ok(node->type)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * s = node->src[i];
+        if (s == NULL) {
+            continue;
+        }
+        // GET_ROWS may gather from quantized weights: dequantize-to-dst is per-row, no wdata
+        if (!ggml_cpu_dep_type_ok(s->type) && !(node->op == GGML_OP_GET_ROWS && i == 0)) {
+            return false;
+        }
+    }
+    switch (node->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+        case GGML_OP_FILL:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+        case GGML_OP_CONCAT:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_ROPE:
+        case GGML_OP_SOFT_MAX:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool ggml_cpu_dep_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (a == NULL || b == NULL || a->data == NULL || b->data == NULL) {
+        return false;
+    }
+    const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
+    const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// may node j start without a barrier after the nodes in epoch[0..n)?
+static bool ggml_cpu_dep_independent(const struct ggml_tensor * j,
+                                     const struct ggml_tensor * const * epoch, int n) {
+    if (!ggml_cpu_node_is_pure(j)) {
+        return false;
+    }
+    for (int e = 0; e < n; e++) {
+        const struct ggml_tensor * t = epoch[e];
+        if (ggml_cpu_dep_overlap(j, t)) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (ggml_cpu_dep_overlap(j, t->src[s]) || ggml_cpu_dep_overlap(j->src[s], t)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The nodes the loop executes next, starting at exec node nx, before its next barrier
+// decision: a whole solo run when one starts at nx, both nodes of an RMS_NORM+MUL fusion
+// candidate, otherwise nx alone.  Writes them into out[] and returns the count, 0 when they do
+// not fit.  Mirrors the loop's own solo/fusion detection, from metadata only.  Treating a
+// lone solo node or an unfused RMS_NORM's successor as a member is merely conservative.
+static int ggml_cpu_dep_next_group(const struct ggml_cgraph * cgraph, int nx, int nth,
+                                   const struct ggml_tensor ** out, int cap) {
+    int n = 0;
+    struct ggml_tensor * node = cgraph->nodes[nx];
+    if (cap <= 0) {
+        return 0;
+    }
+    if (ggml_cpu_tiny_solo && nth > 1 && ggml_cpu_node_is_solo(node)) {
+        int k = nx;
+        for (;;) {
+            if (n >= cap) {
+                return 0;
+            }
+            out[n++] = cgraph->nodes[k];
+            const int nk = ggml_cpu_next_exec_node(cgraph, k + 1);
+            if (nk >= cgraph->n_nodes || !ggml_cpu_node_is_solo(cgraph->nodes[nk])) {
+                break;
+            }
+            k = nk;
+        }
+        return n;
+    }
+    out[n++] = node;
+    if (node->op == GGML_OP_RMS_NORM && nx + 1 < cgraph->n_nodes) {
+        if (n >= cap) {
+            return 0;
+        }
+        out[n++] = cgraph->nodes[nx + 1];
+    }
+    return n;
+}
+
+// Decide whether the barrier closing the current epoch may be skipped.  On success the next
+// group is appended to the epoch and true is returned.  Every thread runs this on identical
+// inputs, so all threads skip or all threads barrier.
+static bool ggml_cpu_dep_try_extend(const struct ggml_cgraph * cgraph, int next_from, int nth,
+                                    const struct ggml_tensor ** epoch, int * n_epoch) {
+    if (*n_epoch <= 0) {
+        return false;  // the epoch holds an impure node (or nothing): always barrier
+    }
+    const int nx = ggml_cpu_next_exec_node(cgraph, next_from);
+    if (nx >= cgraph->n_nodes) {
+        return false;
+    }
+    const struct ggml_tensor * grp[GGML_CPU_DEP_EPOCH_CAP];
+    const int ng = ggml_cpu_dep_next_group(cgraph, nx, nth, grp, ggml_cpu_barrier_dep_max - *n_epoch);
+    if (ng == 0) {
+        return false;
+    }
+    for (int g = 0; g < ng; g++) {
+        if (!ggml_cpu_dep_independent(grp[g], epoch, *n_epoch)) {
+            return false;
+        }
+    }
+    for (int g = 0; g < ng; g++) {
+        epoch[(*n_epoch)++] = grp[g];
+    }
+    return true;
+}
+
+// Record the nodes just executed after a barrier as a fresh epoch: n = count when every one is
+// pure, else 0 (an impure node never joins an epoch, so a barrier always follows it).
+static int ggml_cpu_dep_epoch_reset(const struct ggml_cgraph * cgraph, int first, int last,
+                                    const struct ggml_tensor ** epoch) {
+    int n = 0;
+    for (int k = first; k <= last; k++) {
+        const struct ggml_tensor * nk = cgraph->nodes[k];
+        if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0)) {
+            continue;
+        }
+        if (n >= ggml_cpu_barrier_dep_max || !ggml_cpu_node_is_pure(nk)) {
+            return 0;
+        }
+        epoch[n++] = nk;
+    }
+    return n;
+}
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -4904,6 +5099,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
 #endif
 
+    // C11-CPU-BARRIER-COST: barrier-free pure epochs (GGML_BARRIER_DEP=1; default off).
+    const struct ggml_tensor * dep_epoch[GGML_CPU_DEP_EPOCH_CAP];
+    int  dep_n    = 0;
+    bool dep_open = false;  // the last barrier was skipped; the group just run is already in dep_epoch
+    const bool dep_on = ggml_cpu_barrier_dep && params.nth > 1 && cplan->abort_callback == NULL;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -4973,10 +5174,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     tp->ec    = GGML_STATUS_ABORTED;
                 }
 
+                const int solo_first = node_n;
                 node_n = last;
 
                 if (node_n + 1 < cgraph->n_nodes) {
-                    ggml_barrier(state->threadpool);
+                    bool dep_skip = false;
+                    if (dep_on) {
+                        if (!dep_open) {
+                            dep_n = ggml_cpu_dep_epoch_reset(cgraph, solo_first, node_n, dep_epoch);
+                        }
+                        dep_skip = ggml_cpu_dep_try_extend(cgraph, node_n + 1, params.nth, dep_epoch, &dep_n);
+                        dep_open = dep_skip;
+                    }
+                    if (!dep_skip) {
+                        ggml_barrier(state->threadpool);
+                    }
                 }
 #ifdef GGML_CPU_PROF
                 if (st0 != 0) {
@@ -5009,6 +5221,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int dep_first = node_n;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -5031,7 +5244,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
-            ggml_barrier(state->threadpool);
+            bool dep_skip = false;
+            if (dep_on) {
+                if (!dep_open) {
+                    dep_n = ggml_cpu_dep_epoch_reset(cgraph, dep_first, node_n, dep_epoch);
+                }
+                dep_skip = ggml_cpu_dep_try_extend(cgraph, node_n + 1, params.nth, dep_epoch, &dep_n);
+                dep_open = dep_skip;
+            }
+            if (!dep_skip) {
+                ggml_barrier(state->threadpool);
+            }
         }
 
 #ifdef GGML_CPU_PROF
@@ -5871,6 +6094,19 @@ void ggml_cpu_init(void) {
                 const long long v = atoll(envrm);
                 if (v > 0) {
                     ggml_cpu_tiny_solo_rows_max = (int64_t) v;
+                }
+            }
+        }
+
+        {
+            // C11-CPU-BARRIER-COST: dependency-aware barrier elision, DEFAULT OFF
+            const char * env = getenv("GGML_BARRIER_DEP");
+            ggml_cpu_barrier_dep = (env != NULL && *env != '\0' && atoi(env) != 0);
+            const char * envm = getenv("GGML_BARRIER_DEP_MAX");
+            if (envm != NULL) {
+                const int v = atoi(envm);
+                if (v > 0) {
+                    ggml_cpu_barrier_dep_max = v < GGML_CPU_DEP_EPOCH_CAP ? v : GGML_CPU_DEP_EPOCH_CAP;
                 }
             }
         }
