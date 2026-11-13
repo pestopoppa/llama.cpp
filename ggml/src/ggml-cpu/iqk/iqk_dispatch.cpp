@@ -56,6 +56,21 @@ inline bool iqk_mmid_slab_enabled() {
     static const bool e = []() { const char * s = getenv("GGML_MMID_SLAB"); return s == nullptr || atoi(s) != 0; }();
     return e;
 }
+// C11-CPU-MM-BALANCE: dynamic (atomic work-stealing) partition of the batch 2..8 slab
+// path of mul_mat_id. Default OFF; GGML_MM_BALANCE=1 enables it. GGML_MM_BALANCE_CPT sets the
+// target number of chunks per thread (default 4, clamped 1..64).
+inline bool iqk_mm_balance_enabled() {
+    static const bool e = []() { const char * s = getenv("GGML_MM_BALANCE"); return s && atoi(s) != 0; }();
+    return e;
+}
+inline int64_t iqk_mm_balance_cpt() {
+    static const int64_t v = []() -> int64_t {
+        const char * s = getenv("GGML_MM_BALANCE_CPT");
+        int64_t n = (s && *s) ? atoll(s) : 4;
+        return n < 1 ? 1 : (n > 64 ? 64 : n);
+    }();
+    return v;
+}
 inline bool iqk_q8_0_enabled() {
     static const bool e = []() {
         const char * s = getenv("GGML_IQK_Q8_0");
@@ -719,6 +734,11 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
                 matrix_row_counts[i02] += 1;
             }
         }
+        // C11-CPU-MM-BALANCE: publish the work-stealing counter with the existing barrier.
+        // Every thread's first chunk is its own index, so stealing starts at nth.
+        if (iqk_mm_balance_enabled()) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
     }
     ggml_barrier(params->threadpool);
 
@@ -768,6 +788,66 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int64_t work0 = work_total * ith / nth;
     const int64_t work1 = work_total * (ith + 1) / nth;
     int64_t work_prefix = 0;
+
+    // ------------------------------------------------------------------------------
+    // C11-CPU-MM-BALANCE (GGML_MM_BALANCE=1): at MTP verify batch (2..8 tokens) the static slab
+    // gives every thread an equal number of row units, but a unit of an expert hit by cne1
+    // tokens costs ~cne1 dot products while a cne1==1 unit costs one, and threads also run at
+    // different speeds (remote interleaved pages, SMT/CCD contention). The team then waits on
+    // the slowest thread at the node barrier. Here the active experts' row units form ONE flat
+    // queue (experts ascending, rows ascending), cut into ~CPT*nth chunks of whole units; each
+    // thread takes chunk ith first, then claims the next chunk with an atomic fetch_add on the
+    // threadpool chunk counter (initialised to nth by thread 0 before the barrier above).
+    // Bit-identical: every row is still produced by iqk_mul_mat_moe_rows with the same expert,
+    // the same Ny = cne1, the same row mapping, kernel and per-row reduction order; only which
+    // thread computes a row changes, and dst rows are disjoint.
+    // ------------------------------------------------------------------------------
+    if (slab_ok && iqk_mm_balance_enabled() && units_total > 0) {
+        const int64_t cpt = iqk_mm_balance_cpt();
+        int64_t chunk_units = units_total / ((int64_t) nth * cpt);
+        if (chunk_units < 1) chunk_units = 1;
+        const int64_t n_chunks = (units_total + chunk_units - 1) / chunk_units;
+
+        // active experts in ascending order (same order the static path iterates)
+        int64_t chunk = ith;
+        int     cur_a = 0;          // first expert whose unit range may contain the chunk
+        int64_t base_unit = 0;      // flat unit index of expert cur_a's first unit
+        while (chunk < n_chunks) {
+            int64_t u  = chunk * chunk_units;
+            int64_t ue = u + chunk_units < units_total ? u + chunk_units : units_total;
+            // chunks are claimed in increasing order per thread, so the expert cursor only advances
+            while (u < ue) {
+                while (cur_a < n_as && (matrix_row_counts[cur_a] == 0 || base_unit + units_per_expert <= u)) {
+                    if (matrix_row_counts[cur_a] != 0) base_unit += units_per_expert;
+                    ++cur_a;
+                }
+                GGML_ASSERT(cur_a < n_as);
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                const int64_t end  = ue < base_unit + units_per_expert ? ue : base_unit + units_per_expert;
+                const char * A = (const char *) src0->data + (size_t) cur_a * src0->nb[2];
+                const iqk_mmid * rmap = matrix_rows + (size_t) cur_a * n_ids * ids->ne[1];
+                if (!iqk_mul_mat_moe_rows(ne01, cne1, ne10, (int) ne11,
+                        tA, A, src0->nb[1],
+                        activation_type, qact, act_row,
+                        (float *) dst->data, dst->nb[1], dst->nb[2],
+                        rmap, (u - base_unit) * slab_gran, (end - u) * slab_gran)) {
+                    // kernel selection was pre-checked for every cne1 on every thread above
+                    GGML_ABORT("C11-CPU-MM-BALANCE: iqk_mul_mat_moe_rows failed after preflight");
+                }
+                u = end;
+            }
+            chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+        if (ith == 0) {
+            static std::atomic<uint64_t> logged_types_bal{0};
+            if (iqk_first_engagement(logged_types_bal, tA)) {
+                fprintf(stderr, "[iqk] ACTIVE: C11 MM_BALANCE dynamic mul_mat_id slabs (type=%d n_active=%lld chunk_units=%lld n_chunks=%lld)\n",
+                        tA, (long long) n_active, (long long) chunk_units, (long long) n_chunks);
+            }
+        }
+        iqk_q8_0_count(ith, tA, ids->ne[1]);
+        return true;
+    }
 
     // 3) per-expert GEMM via iqk
     bool engaged = false;
