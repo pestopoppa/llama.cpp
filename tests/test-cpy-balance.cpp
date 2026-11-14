@@ -1,4 +1,4 @@
-// C11-CPU-SSM-CPY: correctness test for the balanced row-copy split (GGML_CPY_BALANCE=1,
+// C11-CPU-SSM-CPY: correctness test for the balanced row-copy split (default ON; forced via GGML_CPY_BALANCE=1,
 // ops.cpp ggml_cpy_rows_balanced, dup_bytes / dup_flt same-shape row paths).
 //
 // Builds CPY graphs whose views mirror the recurrent-state snapshot write in

@@ -38,18 +38,18 @@
 
 // ggml_compute_forward_dup
 
-// C11-CPU-SSM-CPY: GGML_CPY_BALANCE=1 (default OFF).
+// C11-CPU-SSM-CPY: balanced row copy, default ON (champion C11 fold); GGML_CPY_BALANCE=0 disables.
 // The row-structured copy paths below split work over ne01 only. The recurrent-state
 // snapshot write (delta-net-base.cpp: ggml_cpy(view(gdn_out), view(ssm_states_all)),
 // ne = {n_embd_s, n_seqs=1, n_written<=K, 1}) has ne01 = 1, so ONE thread copies every
-// multi-MB snapshot while the other nth-1 wait at the barrier. With the knob on, when
+// multi-MB snapshot while the other nth-1 wait at the barrier. With the balance on, when
 // ne01 < nth the flattened (row, byte) space is cut into nth equal 64-byte-aligned byte
 // ranges and each thread memcpys the row segments that fall in its range. Every byte of
 // dst is written exactly once from the same src byte -> byte-identical by construction.
 static bool ggml_cpy_balance_enabled(void) {
     static const bool v = [] {
         const char * s = getenv("GGML_CPY_BALANCE");
-        return s != NULL && atoi(s) != 0;
+        return s == NULL || atoi(s) != 0; // default ON; GGML_CPY_BALANCE=0 disables
     }();
     return v;
 }
