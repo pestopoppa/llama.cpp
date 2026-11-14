@@ -4842,8 +4842,8 @@ static int ggml_cpu_try_fuse_ops(
 // uint32 ns offsets (start, end, arrive-at-barrier, leave-barrier) from the eval's t0; after the
 // team joins, the caller appends one record (header + node table + times) to the file and
 // fflush()es it, so a SIGTERM'd server loses at most nothing already written.
-// Record "GTT1": u32 magic, u32 n_threads, u32 n_rec, u32 batch, u64 eval_idx, u64 t0_ns,
-//   i32 cpu[n_threads], n_rec x {i32 node_idx, i32 op, i16 kind, i16 n_extra, char opname[28], char name[64]},
+// Record "GTT2": u32 magic, u32 n_threads, u32 n_rec, u32 batch, u64 eval_idx, u64 t0_ns,
+//   i32 cpu[n_threads], n_rec x {i32 node_idx, i32 op, i16 kind, i16 n_extra, i32 dst_ne[4], char opname[28], char name[64]},
 //   n_threads x n_rec x u32[4].   kind: 0 node, 1 fused (n_extra extra nodes), 2 solo run.
 // ---------------------------------------------------------------------------------------------
 #define GGML_TT_MARK "C11 STRAGGLER-PROF thread trace v1"
@@ -4863,7 +4863,7 @@ static uint64_t    ggml_tt_t0       = 0;
 static uint32_t *  ggml_tt_times    = NULL; // [nth][cap][4]
 static int *       ggml_tt_nrec     = NULL; // [nth]
 static int *       ggml_tt_cpu      = NULL; // [nth]
-struct ggml_tt_node { int32_t idx; int32_t op; int16_t kind; int16_t n_extra; char opname[28]; char name[64]; };
+struct ggml_tt_node { int32_t idx; int32_t op; int16_t kind; int16_t n_extra; int32_t ne[4]; char opname[28]; char name[64]; };
 static struct ggml_tt_node * ggml_tt_nodes = NULL; // written by thread 0 only
 static size_t      ggml_tt_alloc_nth = 0, ggml_tt_alloc_cap = 0;
 
@@ -4963,7 +4963,7 @@ static void ggml_tt_end(void) {
             return;
         }
     }
-    const uint32_t hdr[4] = { 0x31545447u /* "GTT1" */, (uint32_t) nth, (uint32_t) n_rec, (uint32_t) ggml_tt_batch };
+    const uint32_t hdr[4] = { 0x32545447u /* "GTT2" */, (uint32_t) nth, (uint32_t) n_rec, (uint32_t) ggml_tt_batch };
     const uint64_t h2[2]  = { ggml_tt_eligible - 1, ggml_tt_t0 };
     fwrite(hdr, sizeof(hdr), 1, ggml_tt_fp);
     fwrite(h2, sizeof(h2), 1, ggml_tt_fp);
@@ -4990,6 +4990,7 @@ static inline void ggml_tt_rec(int ith, const struct ggml_cgraph * cg, int idx, 
     if (ith == 0) {
         const struct ggml_tensor * nd = cg->nodes[idx];
         struct ggml_tt_node * n = &ggml_tt_nodes[k];
+        for (int d = 0; d < 4; d++) { n->ne[d] = (int32_t) nd->ne[d]; }
         n->idx = idx; n->op = (int32_t) nd->op; n->kind = (int16_t) kind; n->n_extra = (int16_t) n_extra;
         strncpy(n->opname, ggml_op_desc(nd), sizeof(n->opname) - 1);
         n->opname[sizeof(n->opname) - 1] = 0;
