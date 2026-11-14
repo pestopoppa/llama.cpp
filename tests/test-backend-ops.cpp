@@ -12497,6 +12497,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {2, 2, 524281, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
+    // C11-CPU-SSM-CPY (GGML_CPY_BALANCE): few rows (ne01 < nth), large rows -- the recurrent-state snapshot write shape
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_cpy(t, t, {65536, 1, 5, 1}, {65536, 1, 5, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {65536, 2, 5, 1})); // strided dst, ne01=1
+        test_cases.emplace_back(new test_cpy(t, t, {65536, 1, 5, 1}, {-1, -1, -1, -1}, {0, 2, 1, 3}));                                         // permuted src, few rows
+        test_cases.emplace_back(new test_cpy(t, t, {100003, 3, 1, 1}, {100003, 3, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {100003, 4, 1, 1})); // odd row bytes
+        test_cases.emplace_back(new test_cpy(t, t, {262144, 1, 1, 1}, {262144, 1, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {262144, 2, 1, 1})); // one big row
+    }
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.

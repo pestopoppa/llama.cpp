@@ -38,6 +38,70 @@
 
 // ggml_compute_forward_dup
 
+// C11-CPU-SSM-CPY: GGML_CPY_BALANCE=1 (default OFF).
+// The row-structured copy paths below split work over ne01 only. The recurrent-state
+// snapshot write (delta-net-base.cpp: ggml_cpy(view(gdn_out), view(ssm_states_all)),
+// ne = {n_embd_s, n_seqs=1, n_written<=K, 1}) has ne01 = 1, so ONE thread copies every
+// multi-MB snapshot while the other nth-1 wait at the barrier. With the knob on, when
+// ne01 < nth the flattened (row, byte) space is cut into nth equal 64-byte-aligned byte
+// ranges and each thread memcpys the row segments that fall in its range. Every byte of
+// dst is written exactly once from the same src byte -> byte-identical by construction.
+static bool ggml_cpy_balance_enabled(void) {
+    static const bool v = [] {
+        const char * s = getenv("GGML_CPY_BALANCE");
+        return s != NULL && atoi(s) != 0;
+    }();
+    return v;
+}
+
+static int64_t ggml_cpy_balance_min_bytes(void) {
+    static const int64_t v = []() -> int64_t {
+        const char * s = getenv("GGML_CPY_BALANCE_MIN_BYTES");
+        const int64_t d = s ? atoll(s) : 65536;
+        return d < 0 ? 0 : d;
+    }();
+    return v;
+}
+
+// rows are (i01, i02, i03) with identical row structure in src0 and dst; each row is rs bytes,
+// contiguous in both. Returns true if it handled the copy for this thread.
+static bool ggml_cpy_rows_balanced(const ggml_compute_params * params, ggml_tensor * dst, size_t rs) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    if (nth <= 1 || ne01 >= nth || !ggml_cpy_balance_enabled()) {
+        return false;
+    }
+    const int64_t nrows = ne01*ne02*ne03;
+    const size_t  total = (size_t) nrows * rs;
+    if (rs == 0 || (int64_t) total < ggml_cpy_balance_min_bytes()) {
+        return false;
+    }
+
+    const size_t align = 64;
+    size_t chunk = (total + nth - 1) / nth;
+    chunk = (chunk + align - 1) / align * align;
+    size_t b0 = MIN(chunk * (size_t) ith, total);
+    const size_t b1 = MIN(b0 + chunk, total);
+
+    while (b0 < b1) {
+        const int64_t r   = (int64_t) (b0 / rs);
+        const size_t  off = b0 % rs;
+        const size_t  n   = MIN(rs - off, b1 - b0);
+        const int64_t i01 = r % ne01;
+        const int64_t i02 = (r / ne01) % ne02;
+        const int64_t i03 = r / (ne01*ne02);
+        memcpy(
+            ((char *)  dst->data + i01*dst->nb[1]  + i02*dst->nb[2]  + i03*dst->nb[3]  + off),
+            ((char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3] + off),
+            n);
+        b0 += n;
+    }
+    return true;
+}
+
 static void ggml_compute_forward_dup_same_cont(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -96,6 +160,9 @@ static void ggml_compute_forward_dup_flt(
         nb00 == ggml_type_size(src0->type) && nb0 == ggml_type_size(dst->type)) {
         // copy by rows
         const size_t rs = ne00*nb00;
+        if (ggml_cpy_rows_balanced(params, dst, rs)) {
+            return;
+        }
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
@@ -380,6 +447,9 @@ static void ggml_compute_forward_dup_bytes(
         nb00 == type_size && nb0 == type_size) {
         // copy by rows
         const size_t rs = ggml_row_size(src0->type, ne00);
+        if (ggml_cpy_rows_balanced(params, dst, rs)) {
+            return;
+        }
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
