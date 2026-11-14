@@ -4830,6 +4830,176 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// C11 STRAGGLER-PROF: per-node, per-thread timing of sampled decode graph evaluations.
+// GGML_THREAD_TRACE=1 enables it (default OFF: one predictable branch per node, nothing else).
+//   GGML_THREAD_TRACE_FILE   output path (default ggml-thread-trace.<pid>.bin)
+//   GGML_THREAD_TRACE_EVERY  trace every k-th eligible graph eval (default 7)
+//   GGML_THREAD_TRACE_MAXB   eligible = token batch (first MUL_MAT src1 ne[1]) <= this (default 8)
+//   GGML_THREAD_TRACE_MAX    stop after this many traced evals per process (default 64)
+// The decision and the buffer sizing happen in ggml_graph_compute() before the thread team
+// starts, so the team sees one consistent flag.  Each thread writes only its own column of
+// uint32 ns offsets (start, end, arrive-at-barrier, leave-barrier) from the eval's t0; after the
+// team joins, the caller appends one record (header + node table + times) to the file and
+// fflush()es it, so a SIGTERM'd server loses at most nothing already written.
+// Record "GTT1": u32 magic, u32 n_threads, u32 n_rec, u32 batch, u64 eval_idx, u64 t0_ns,
+//   i32 cpu[n_threads], n_rec x {i32 node_idx, i32 op, i16 kind, i16 n_extra, char opname[28], char name[64]},
+//   n_threads x n_rec x u32[4].   kind: 0 node, 1 fused (n_extra extra nodes), 2 solo run.
+// ---------------------------------------------------------------------------------------------
+#define GGML_TT_MARK "C11 STRAGGLER-PROF thread trace v1"
+static const char * ggml_tt_marker = GGML_TT_MARK;
+static int         ggml_tt_env      = -1;   // -1 unread, 0 off, 1 on
+static int         ggml_tt_every    = 7;
+static int         ggml_tt_maxb     = 8;
+static int         ggml_tt_max      = 64;
+static uint64_t    ggml_tt_eligible = 0;
+static uint64_t    ggml_tt_done     = 0;
+static FILE *      ggml_tt_fp       = NULL;
+static int         ggml_tt_active   = 0;    // this eval is traced (set before the team starts)
+static int         ggml_tt_nth      = 0;
+static int         ggml_tt_cap      = 0;    // records per thread
+static int         ggml_tt_batch    = 0;
+static uint64_t    ggml_tt_t0       = 0;
+static uint32_t *  ggml_tt_times    = NULL; // [nth][cap][4]
+static int *       ggml_tt_nrec     = NULL; // [nth]
+static int *       ggml_tt_cpu      = NULL; // [nth]
+struct ggml_tt_node { int32_t idx; int32_t op; int16_t kind; int16_t n_extra; char opname[28]; char name[64]; };
+static struct ggml_tt_node * ggml_tt_nodes = NULL; // written by thread 0 only
+static size_t      ggml_tt_alloc_nth = 0, ggml_tt_alloc_cap = 0;
+
+static inline uint64_t ggml_tt_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static inline uint32_t ggml_tt_rel(void) {
+    return (uint32_t) (ggml_tt_now() - ggml_tt_t0);
+}
+
+static void ggml_tt_read_env(void) {
+    const char * e = getenv("GGML_THREAD_TRACE");
+    ggml_tt_env = (e != NULL && atoi(e) == 1) ? 1 : 0;
+    if (!ggml_tt_env) {
+        return;
+    }
+    if ((e = getenv("GGML_THREAD_TRACE_EVERY")) != NULL && atoi(e) > 0) { ggml_tt_every = atoi(e); }
+    if ((e = getenv("GGML_THREAD_TRACE_MAXB"))  != NULL && atoi(e) > 0) { ggml_tt_maxb  = atoi(e); }
+    if ((e = getenv("GGML_THREAD_TRACE_MAX"))   != NULL && atoi(e) > 0) { ggml_tt_max   = atoi(e); }
+    char def[128];
+    const char * path = getenv("GGML_THREAD_TRACE_FILE");
+    if (path == NULL) {
+        snprintf(def, sizeof(def), "ggml-thread-trace.%d.bin", (int) getpid());
+        path = def;
+    }
+    ggml_tt_fp = fopen(path, "ab");
+    if (ggml_tt_fp == NULL) {
+        ggml_tt_env = 0;
+        return;
+    }
+    fprintf(stderr, "%s: tracing every %d-th eval with batch <= %d, max %d evals -> %s\n",
+            ggml_tt_marker, ggml_tt_every, ggml_tt_maxb, ggml_tt_max, path);
+}
+
+static int ggml_tt_graph_batch(const struct ggml_cgraph * cg) {
+    for (int i = 0; i < cg->n_nodes; i++) {
+        const struct ggml_tensor * nd = cg->nodes[i];
+        if ((nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID) && nd->src[1]) {
+            return (int) (nd->op == GGML_OP_MUL_MAT ? nd->src[1]->ne[1] : nd->src[1]->ne[2]);
+        }
+    }
+    return -1;
+}
+
+// single-threaded, before the team starts
+static void ggml_tt_begin(const struct ggml_cgraph * cg, int nth) {
+    ggml_tt_active = 0;
+    if (ggml_tt_env < 0) {
+        ggml_tt_read_env();
+    }
+    if (!ggml_tt_env || nth < 2 || ggml_tt_done >= (uint64_t) ggml_tt_max) {
+        return;
+    }
+    const int b = ggml_tt_graph_batch(cg);
+    if (b < 1 || b > ggml_tt_maxb) {
+        return;
+    }
+    if ((ggml_tt_eligible++ % (uint64_t) ggml_tt_every) != 0) {
+        return;
+    }
+    const size_t cap = (size_t) cg->n_nodes + 1;
+    if ((size_t) nth > ggml_tt_alloc_nth || cap > ggml_tt_alloc_cap) {
+        free(ggml_tt_times); free(ggml_tt_nrec); free(ggml_tt_cpu); free(ggml_tt_nodes);
+        ggml_tt_times = (uint32_t *) malloc((size_t) nth * cap * 4 * sizeof(uint32_t));
+        ggml_tt_nrec  = (int *) calloc((size_t) nth, sizeof(int));
+        ggml_tt_cpu   = (int *) calloc((size_t) nth, sizeof(int));
+        ggml_tt_nodes = (struct ggml_tt_node *) calloc(cap, sizeof(struct ggml_tt_node));
+        if (!ggml_tt_times || !ggml_tt_nrec || !ggml_tt_cpu || !ggml_tt_nodes) {
+            ggml_tt_env = 0;
+            ggml_tt_alloc_nth = ggml_tt_alloc_cap = 0;
+            return;
+        }
+        ggml_tt_alloc_nth = (size_t) nth;
+        ggml_tt_alloc_cap = cap;
+    }
+    memset(ggml_tt_nrec, 0, (size_t) nth * sizeof(int));
+    ggml_tt_nth    = nth;
+    ggml_tt_cap    = (int) cap;
+    ggml_tt_batch  = b;
+    ggml_tt_t0     = ggml_tt_now();
+    ggml_tt_active = 1;
+}
+
+// single-threaded, after the team has joined
+static void ggml_tt_end(void) {
+    if (!ggml_tt_active) {
+        return;
+    }
+    ggml_tt_active = 0;
+    const int nth = ggml_tt_nth;
+    int n_rec = ggml_tt_nrec[0];
+    for (int t = 1; t < nth; t++) {
+        if (ggml_tt_nrec[t] != n_rec) {    // team diverged (abort): drop this eval
+            return;
+        }
+    }
+    const uint32_t hdr[4] = { 0x31545447u /* "GTT1" */, (uint32_t) nth, (uint32_t) n_rec, (uint32_t) ggml_tt_batch };
+    const uint64_t h2[2]  = { ggml_tt_eligible - 1, ggml_tt_t0 };
+    fwrite(hdr, sizeof(hdr), 1, ggml_tt_fp);
+    fwrite(h2, sizeof(h2), 1, ggml_tt_fp);
+    fwrite(ggml_tt_cpu, sizeof(int), (size_t) nth, ggml_tt_fp);
+    fwrite(ggml_tt_nodes, sizeof(struct ggml_tt_node), (size_t) n_rec, ggml_tt_fp);
+    for (int t = 0; t < nth; t++) {
+        fwrite(ggml_tt_times + (size_t) t * ggml_tt_cap * 4, 4 * sizeof(uint32_t), (size_t) n_rec, ggml_tt_fp);
+    }
+    fflush(ggml_tt_fp);
+    ggml_tt_done++;
+}
+
+static inline void ggml_tt_rec(int ith, const struct ggml_cgraph * cg, int idx, int kind, int n_extra,
+                               uint32_t ts, uint32_t te, uint32_t ta, uint32_t tl) {
+    if (ith >= ggml_tt_nth) {
+        return;
+    }
+    const int k = ggml_tt_nrec[ith];
+    if (k >= ggml_tt_cap) {
+        return;
+    }
+    uint32_t * r = ggml_tt_times + ((size_t) ith * ggml_tt_cap + k) * 4;
+    r[0] = ts; r[1] = te; r[2] = ta; r[3] = tl;
+    if (ith == 0) {
+        const struct ggml_tensor * nd = cg->nodes[idx];
+        struct ggml_tt_node * n = &ggml_tt_nodes[k];
+        n->idx = idx; n->op = (int32_t) nd->op; n->kind = (int16_t) kind; n->n_extra = (int16_t) n_extra;
+        strncpy(n->opname, ggml_op_desc(nd), sizeof(n->opname) - 1);
+        n->opname[sizeof(n->opname) - 1] = 0;
+        strncpy(n->name, nd->name, sizeof(n->name) - 1);
+        n->name[sizeof(n->name) - 1] = 0;
+    }
+    ggml_tt_nrec[ith] = k + 1;
+}
+// ---------------------------------------------------------------------------------------------
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -4852,6 +5022,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
         /*.disable_rowexact =*/ cplan->disable_rowexact,
     };
+
+    const int tt = ggml_tt_active;   // C11 STRAGGLER-PROF: fixed before the team started
+    if (tt && state->ith < ggml_tt_nth) {
+        ggml_tt_cpu[state->ith] = sched_getcpu();
+    }
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -4944,6 +5119,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
 
             if (last > node_n) {
+                const uint32_t tts = tt ? ggml_tt_rel() : 0;
+                const int      tti = node_n;
 #ifdef GGML_CPU_PROF
                 const int64_t st0 = (state->ith == 0 && ggml_cpu_prof_is_enabled() && prof_acc) ? ggml_time_us() : 0;
                 int solo_n = 0;
@@ -4967,6 +5144,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_CPU_PROF
                 const int64_t st1 = (st0 != 0) ? ggml_time_us() : 0;
 #endif
+                const uint32_t tte = tt ? ggml_tt_rel() : 0;
                 if (state->ith == 0 && cplan->abort_callback &&
                         cplan->abort_callback(cplan->abort_callback_data)) {
                     atomic_store_explicit(&tp->abort, last + 1, memory_order_relaxed);
@@ -4975,8 +5153,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
                 node_n = last;
 
+                const uint32_t tta = tt ? ggml_tt_rel() : 0;
                 if (node_n + 1 < cgraph->n_nodes) {
                     ggml_barrier(state->threadpool);
+                }
+                if (tt) {
+                    ggml_tt_rec(state->ith, cgraph, tti, 2, last - tti, tts, tte, tta, ggml_tt_rel());
                 }
 #ifdef GGML_CPU_PROF
                 if (st0 != 0) {
@@ -5009,12 +5191,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int      tti = node_n;
+        const uint32_t tts = tt ? ggml_tt_rel() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
         }
+        const uint32_t tte = tt ? ggml_tt_rel() : 0;
 
 #ifdef GGML_CPU_PROF
         const int64_t t1 = (t0 != 0) ? ggml_time_us() : 0;
@@ -5030,8 +5215,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        const uint32_t tta = tt ? ggml_tt_rel() : 0;
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        if (tt) {
+            ggml_tt_rec(state->ith, cgraph, tti, n_fused > 0 ? 1 : 0, n_fused > 0 ? n_fused : 0, tts, tte, tta, ggml_tt_rel());
         }
 
 #ifdef GGML_CPU_PROF
@@ -5337,6 +5526,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    ggml_tt_begin(cgraph, n_threads);   // C11 STRAGGLER-PROF (no-op unless GGML_THREAD_TRACE=1)
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -5373,6 +5564,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
+
+    ggml_tt_end();
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
