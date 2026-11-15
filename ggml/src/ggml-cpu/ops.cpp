@@ -5959,20 +5959,24 @@ static void ggml_compute_forward_set_rows_impl(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // rows per thread
-    const int64_t dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = std::min(ir0 + dr, nr);
+    // UP-B12421-CONVSNAP: the scheduler only gives SET_ROWS nth > 1 when dst rows are provably disjoint
+    // across (i02, i03) (ggml-cpu.c: ggml_set_rows_dst_disjoint). Threads then split the flattened
+    // (i02, i03) groups and each keeps ALL i01 rows of its groups in source order, so a duplicated
+    // destination index is still resolved last-writer-wins exactly as on one thread: byte-identical.
+    const int64_t ng  = ne02*ne03;
+    const int64_t dg  = (ng + nth - 1)/nth;
+    const int64_t ig0 = std::min(dg*ith, ng);
+    const int64_t ig1 = std::min(ig0 + dg, ng);
 
     const size_t rs = ggml_row_size(src0->type, nc);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    for (int64_t i03 = 0; i03 < ne03; ++i03) {
-        for (int64_t i02 = 0; i02 < ne02; ++i02) {
-            for (int64_t i = ir0; i < ir1; ++i) {
+    for (int64_t ig = ig0; ig < ig1; ++ig) {
+        const int64_t i03 = ig / ne02;
+        const int64_t i02 = ig % ne02;
+        {
+            for (int64_t i = 0; i < nr; ++i) {
                 const int64_t i12 = i03%ne12;
                 const int64_t i11 = i02%ne11;
                 const int64_t i10 = i;

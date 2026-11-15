@@ -2772,6 +2772,47 @@ static int64_t ggml_get_rows_min_bytes(void) {
     return v;
 }
 
+// UP-B12421-CONVSNAP: GGML_SET_ROWS_BALANCE (default ON; =0 disables) multi-threads large SET_ROWS
+// over (i02, i03) row groups when the destination rows are provably pairwise non-overlapping.
+static bool ggml_set_rows_balance_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_SET_ROWS_BALANCE");
+        v = (s == NULL || atoi(s) != 0) ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// true iff every (i1, i2, i3) of dst addresses a distinct, non-overlapping row:
+// dims 1..3 sorted by stride, each stride must cover the full span of all smaller dims
+static bool ggml_set_rows_dst_disjoint(const struct ggml_tensor * dst) {
+    int64_t ne[3];
+    size_t  nb[3];
+    int nd = 0;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (dst->ne[d] > 1) {
+            ne[nd] = dst->ne[d];
+            nb[nd] = dst->nb[d];
+            nd++;
+        }
+    }
+    for (int i = 1; i < nd; ++i) {
+        for (int j = i; j > 0 && nb[j] < nb[j-1]; --j) {
+            const int64_t te = ne[j]; ne[j] = ne[j-1]; ne[j-1] = te;
+            const size_t  tb = nb[j]; nb[j] = nb[j-1]; nb[j-1] = tb;
+        }
+    }
+    size_t extent = ggml_row_size(dst->type, dst->ne[0]);
+    for (int i = 0; i < nd; ++i) {
+        if (nb[i] < extent) {
+            return false;
+        }
+        extent += nb[i]*(size_t)(ne[i] - 1);
+    }
+    return true;
+}
+
+
 
 // ---------------------------------------------------------------------------
 // INF-70 SYNC-2: tiny-op barrier elision ("solo runs").
@@ -3055,10 +3096,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_SET_ROWS:
             {
-                // NOT parallelised: set_rows splits over source rows, but two source rows may
-                // carry the SAME destination index, so threads are not provably disjoint on the
-                // destination. Measured cost is 0.011 ms/token (INF-70 D0) - nothing to win.
-                n_tasks = 1;
+                // Split over source rows is NOT safe: two source rows may carry the SAME destination
+                // index (INF-70 D0). The impl instead splits over (i02, i03) row groups and keeps every
+                // group's i01 rows, in order, on one thread; that is disjoint (byte-identical to the
+                // single-thread result) whenever dst rows are provably non-overlapping across i02/i03.
+                // UP-B12421-CONVSNAP: the MTP conv snapshot store became ONE set_rows per conv layer
+                // (formerly K cpys that were multi-threaded), so large disjoint set_rows run on n_threads.
+                n_tasks = (ggml_set_rows_balance_enabled() &&
+                           ggml_nbytes(node->src[0]) >= ggml_get_rows_min_bytes() &&
+                           ggml_set_rows_dst_disjoint(node)) ? n_threads : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
