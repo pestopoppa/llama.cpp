@@ -10442,6 +10442,272 @@ static bool ggml_iqk_try_flash_attn_ext(const ggml_compute_params * params, ggml
 }
 #endif // GGML_IQK_FLASH_ATTENTION
 
+// C11-CPU-FATOPK-SPLIT: GGML_STRAGGLER_SPLIT=1 (default OFF) splits a few-row FLASH_ATTN_EXT (q rows < nth, e.g.
+// the MTP d4 draft decode: 1 query x 24 heads at -t 48, where 24 threads idle) over the V/output dimension.
+// Each of ns threads per q row recomputes the row's full KQ score sequence (same kq_vec_dot, same scale/mask,
+// hence the same s, M, S, ms, vs per cell) and accumulates only its DV/ns slice of VKQ. Every VKQ element sees
+// exactly the knob-off sequence of per-element operations (scale_f16 / mad_f16 / mad_f32_f16 / scale_f32 are
+// element-wise; slices are multiples of 64 so no slice hits a scalar tail the full row does not), so the output
+// is byte-identical. The hybrid FP16->FP32 overflow recompute is decided per ROW, as in the knob-off kernel:
+// slices publish their overflow flag, barrier, and a slice recomputes in FP32 iff ANY slice of its row overflowed.
+// Taken only for q F32 / K F16 / V F16 / mask F16, x86 SIMD, non-REG VKQ modes, outside use_ref.
+// TOP_K is NOT split: the knob-off kernel is std::partial_sort, whose tie order (and, at the k-th value, tie
+// membership) depends on the whole sequential heap trajectory; the qwen4exp indexer scores are block-constant,
+// so ties are the norm and no parallel top-k can reproduce the bytes.
+// GGML_STRAGGLER_SPLIT=2: as 1, plus one stderr line the first time the split is taken (test-straggler-split
+// uses it to prove the split path ran, so the on/off identity is not vacuous).
+static int ggml_straggler_split_level() {
+    static const int lvl = [](){
+        const char * e = getenv("GGML_STRAGGLER_SPLIT");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return lvl;
+}
+
+static bool ggml_straggler_split_enabled() {
+    return ggml_straggler_split_level() != 0;
+}
+
+static bool ggml_compute_forward_flash_attn_ext_dsplit(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+#if !(defined(__AVX512F__) || defined(__AVX2__))
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    return false;
+#else
+    if (!ggml_straggler_split_enabled() || params->use_ref || params->threadpool == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (mask && mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // same parse as the one_chunk kernel; the REG accumulators are not split (different reduction blocking)
+    enum { M_HYBRID = 0, M_F16 = 1, M_F32 = 2, M_REG = 3 };
+    static const int mode = [](){
+        auto on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
+        if (on("GGML_FA_VKQ_F16")) return (int) M_F16;
+        if (on("GGML_FA_VKQ_F32")) return (int) M_F32;
+        const char * r = getenv("GGML_FA_VKQ_REG");
+        if (r != nullptr && (strcmp(r, "auto") == 0 || atoi(r) != 0)) return (int) M_REG;
+        return (int) M_HYBRID;
+    }();
+    if (mode == M_REG) {
+        return false;
+    }
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = neq1*neq2*neq3;
+    if (nr <= 0 || nr >= nth) {
+        return false;
+    }
+    int64_t ns = 0;
+    for (int64_t c = nth / nr; c >= 2; --c) {
+        if (DV % (c*64) == 0) { ns = c; break; }
+    }
+    if (ns == 0) {
+        return false;
+    }
+    const int64_t dp = DV / ns;
+
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+
+    // per-thread scratch at the one_chunk stride; row overflow flags after the nth per-thread blocks (inside the
+    // planned decode partials region, which is neq2*nth*(2+DV) floats)
+    float       * VKQ32 = (float *) params->wdata + ith*(DK + 2*DV + CACHE_LINE_SIZE_F32);
+    ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV);
+    ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV);
+    int32_t     * flags = (int32_t *) ((float *) params->wdata + nth*(DK + 2*DV + CACHE_LINE_SIZE_F32));
+
+    const bool active = ith < nr*ns;
+
+    int64_t ir = 0, d0 = 0;
+    int64_t iq1 = 0, iq2 = 0, iq3 = 0;
+    float slope = 1.0f;
+    float S = 0.0f;
+    float M = -INFINITY;
+    const ggml_fp16_t * mp = nullptr;
+    int64_t ik2 = 0, ik3 = 0, iv2 = 0, iv3 = 0;
+
+    if (active) {
+        ir = ith / ns;
+        d0 = (ith % ns) * dp;
+        iq3 = ir/(neq2*neq1);
+        const int64_t row = ir - iq3*neq2*neq1;
+        iq2 = row % neq2;
+        iq1 = row / neq2;
+        const uint32_t h = (uint32_t) iq2;
+        slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+        mp = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+        ik3 = iq3 / rk3; ik2 = iq2 / rk2;
+        iv3 = iq3 / rv3; iv2 = iq2 / rv2;
+        const float * pq = (const float *) ((const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        q_to_vec_dot(pq, Q_q, DK);
+    }
+
+    const int64_t ic_end = nek1;
+
+    auto run = [&](const bool use_f16) {
+        S = 0.0f;
+        M = -INFINITY;
+        if (use_f16) {
+            memset(VKQ16, 0, dp*sizeof(ggml_fp16_t));
+        } else {
+            memset(VKQ32, 0, dp*sizeof(float));
+        }
+        for (int64_t ic = 0; ic < ic_end; ++ic) {
+            if (mp && ic % GGML_FA_MASK_RUN == 0 && ic + GGML_FA_MASK_RUN <= ic_end && ggml_fa_mask_run_is_neginf(mp + ic, GGML_FA_MASK_RUN)) {
+                ic += GGML_FA_MASK_RUN - 1;
+                continue;
+            }
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+            float s;
+            const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            s = s*scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap*tanhf(s);
+            }
+            s += mv;
+
+            const float Mold = M;
+            float ms = 1.0f;
+            float vs = 1.0f;
+            const ggml_fp16_t * v_data = (const ggml_fp16_t *) ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3)) + d0;
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                if (use_f16) {
+                    ggml_vec_scale_f16(dp, VKQ16, ms);
+                } else {
+                    ggml_vec_scale_f32(dp, VKQ32, ms);
+                }
+            } else {
+                vs = expf(s - M);
+            }
+            if (use_f16) {
+                ggml_vec_mad_f16(dp, VKQ16, v_data, vs);
+            } else {
+                ggml_vec_mad_f32_f16(dp, VKQ32, v_data, vs);
+            }
+            S = S*ms + vs;
+        }
+        if (use_f16) {
+            for (int64_t d = 0; d < dp; ++d) {
+                VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+            }
+        }
+    };
+
+    if (active) {
+        run(mode != M_F32);
+    }
+
+    if (ith == 0 && ggml_straggler_split_level() == 2) {
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true)) {
+            fprintf(stderr, "GGML_STRAGGLER_SPLIT: fa dsplit taken (rows=%lld ns=%lld DV=%lld)\n", (long long) nr, (long long) ns, (long long) DV);
+        }
+    }
+
+    if (mode == M_HYBRID) {
+        if (active) {
+            uint32_t bad = 0;
+            for (int64_t d = 0; d < dp; ++d) {
+                uint32_t bits;
+                memcpy(&bits, &VKQ32[d], sizeof(bits));
+                bad |= (uint32_t) ((bits & 0x7f800000u) == 0x7f800000u);
+            }
+            flags[ith] = (int32_t) bad;
+        }
+        ggml_barrier(params->threadpool);
+        if (active) {
+            int32_t row_bad = 0;
+            for (int64_t j = 0; j < ns; ++j) {
+                row_bad |= flags[ir*ns + j];
+            }
+            if (row_bad) {
+                run(false);
+            }
+        }
+    }
+
+    if (!active) {
+        return true;
+    }
+
+    if (sinks) {
+        const float s = ((const float *) sinks->data)[iq2];
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (s > M) {
+            ms = expf(M - s);
+            M = s;
+            ggml_vec_scale_f32(dp, VKQ32, ms);
+        } else {
+            vs = expf(s - M);
+        }
+        S = S*ms + vs;
+    }
+
+    const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+    ggml_vec_scale_f32(dp, VKQ32, S_inv);
+
+    memcpy((char *) dst->data + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1 + d0*sizeof(float), VKQ32, dp*sizeof(float));
+    return true;
+#endif
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10537,6 +10803,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         ggml_barrier(params->threadpool);
         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
+    } else if (ggml_compute_forward_flash_attn_ext_dsplit(params, dst)) {
+        // C11-CPU-FATOPK-SPLIT (GGML_STRAGGLER_SPLIT=1): few-row op split over DV, byte-identical
     } else {
 
         // total rows in q
