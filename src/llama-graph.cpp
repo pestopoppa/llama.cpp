@@ -3884,10 +3884,14 @@ void llm_graph_context::build_conv_state_store(
 
     // window w starts at column n - (Kw - 1) + w (ascending time) and is rollback slot Kw - 1 - w,
     // consecutive windows start one element apart, so they overlap
+    // this tree's ggml_new_tensor_impl bounds a view by its dense size (upstream bbb02c93e, which bounds
+    // it by the bytes its strides reach, is not ported), so the overlapping view is created with one
+    // window and widened after the size check; the Kw windows stay inside conv_x
     ggml_tensor * windows = ggml_view_4d(ctx0, conv_x,
-            n_cols, Kw, channels, n_seqs,
+            n_cols, 1, channels, n_seqs,
             ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2],
             ggml_row_size(conv_x->type, n - (Kw - 1)));
+    windows->ne[1] = Kw;
 
     // [n_cols, slot, channel, seq] view of the cells of this ubatch
     ggml_tensor * slots = ggml_view_4d(ctx0, s,
