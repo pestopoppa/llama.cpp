@@ -14,7 +14,9 @@
 #endif
 
 #include <algorithm>
+#include <atomic>  // C11-CPU-FATOPK-SPLIT: dsplit one-time note (was only included under GGML_IQK_FLASH_ATTENTION)
 #include <cfloat>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
