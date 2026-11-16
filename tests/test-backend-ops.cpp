@@ -9753,11 +9753,15 @@ struct test_flash_attn_ext_unified : public test_case {
     const int64_t hint; // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
     const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
     const bool kv_rows;     // UP-FAROWS-HIP: attach per-sequence K/V row lists (src[7], ggml_flash_attn_ext_set_kv_rows)
+    const bool q_perm;      // Q as llama.cpp builds it: [D, n_head, n_tokens] permuted to [D, n_tokens, n_head] (token-major)
 
     std::string vars() override {
         std::string res = VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
         if (kv_rows) {
             res += ",kv_rows=1";
+        }
+        if (q_perm) {
+            res += ",q_perm=1";
         }
         return res;
     }
@@ -9840,16 +9844,23 @@ struct test_flash_attn_ext_unified : public test_case {
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
                                 ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
-                                int64_t n_shared = 0, bool kv_rows = false)
+                                int64_t n_shared = 0, bool kv_rows = false, bool q_perm = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
           max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared),
-          kv_rows(kv_rows) {}
+          kv_rows(kv_rows), q_perm(q_perm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
 
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
-        ggml_set_name(q, "q");
+        ggml_tensor * q = nullptr;
+        if (q_perm) {
+            ggml_tensor * q_tok = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh*nr2, nb, 1);
+            ggml_set_name(q_tok, "q");
+            q = ggml_permute(ctx, q_tok, 0, 2, 1, 3);
+        } else {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
+            ggml_set_name(q, "q");
+        }
 
         ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_K, hsk*nh, kv_size, 1);
         ggml_set_name(k_cache, "k_cache");
@@ -13826,6 +13837,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 2, 2, 1, 1024, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true));
+    // UP-FAROWS-HIP served shapes (Qwen3.8-27B: hd256, 4 KV heads, GQA 6, q8_0 KV, np 4, --kv-unified, slots at ~40k
+    // cells each). The cases above stay under 12288 cells, so every gathered slice is < 4096 rows and never reaches the
+    // masked-KV-skip / KV_live paths, the multi-group (G > 1) GQA-verify layout or the large-batch MMA/tile kernels.
+    // These do: n_kv 163840 (4 x ~40k, cells in 2048-cell prefill chunks), decode (nb 4 -> 4 slices x 1), DFlash2
+    // verify (nb 32 -> 4 slices x 8, n_max 7), a ragged verify (nb 30 -> one union slice), a shared trunk, and prefill
+    // ubatches (2 slots x 512 -> 2 slices, 2 ragged slots 513 + 512 -> one union slice) at n_kv 32768. Q is token-major as in llama.cpp.
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {4, 32, 30}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, nb, 4, 2048, 512, 0.0f, 0.0f,
+                type_KV, type_KV, 4, 0, true, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 4096, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1024, 2, 2048, 256, 0.0f, 0.0f,
+            type_KV, type_KV, 2, 0, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1025, 2, 2048, 256, 0.0f, 0.0f,
+            type_KV, type_KV, 2, 0, true, true));
+    }
+    // knob-off controls for the same served shapes (no row list): the dense path at these sizes
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1024, 2, 2048, 256, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, false, true));
 
     // ALiBi, softcap, other head sizes (tile, MMA and MLA paths)
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f));
