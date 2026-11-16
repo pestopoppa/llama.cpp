@@ -485,9 +485,11 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+// allow_wmma = false: skip the rocWMMA/WMMA kernel and fall through to the MFMA/tile/vec selection (the selection of a
+// build without GGML_HIP_ROCWMMA_FATTN). Used by the UP-FAROWS-HIP gathered call, see ggml_cuda_fattn_rows_kernel.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_ex(const int device, const ggml_tensor * dst, const bool allow_wmma) {
 #ifndef FLASH_ATTN_AVAILABLE
-    GGML_UNUSED(device); GGML_UNUSED(dst);
+    GGML_UNUSED(device); GGML_UNUSED(dst); GGML_UNUSED(allow_wmma);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
@@ -646,7 +648,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 320 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+    if (allow_wmma && ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 320 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -704,6 +706,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    return ggml_cuda_get_best_fattn_kernel_ex(device, dst, true);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -806,6 +812,28 @@ static const char * ggml_cuda_fattn_rows_gather_why_not(const ggml_tensor * dst)
 
 static bool ggml_cuda_fattn_rows_gather_applies(const ggml_tensor * dst) {
     return ggml_cuda_fattn_rows_gather_why_not(dst) == nullptr;
+}
+
+// Kernel for the gathered [D, n_rows, H_kv, n_slices] call. The WMMA kernel (300) is excluded: with a
+// GGML_HIP_ROCWMMA_FATTN build on gfx90a it is the first choice for every hd256 prefill shape, and at the Qwen3.8-27B
+// prefill shapes (up-farows-hip-gpu-20261116-r3: Q 1200 = 2 x 600 / 848 rows, 1280 / 1536 gathered rows, q8_0) its
+// output was garbage from token 1 while the row lists were exact. No layout defect was found by inspection of the
+// gathered views against fattn-wmma-f16.cu (Q nb03 = nb01*T, contiguous K/V with K-strides reused for V, mask
+// nb33*(seq % ne33), dst row (seq*T + j)*H + head all agree), and the existing kv_rows cases (T multiple of 16,
+// gathered KV >= 8192 rows) pass through WMMA, so the failing regime is WMMA hd256 with T % 16 != 0 per slice and/or a
+// short gathered KV (parallel_blocks 1, gridDim.y == 1 epilogue). The gathered call instead takes the MFMA/tile/vec
+// selection of a non-rocWMMA build, which upstream test-backend-ops covers on CDNA. GGML_CUDA_FA_ROWS_WMMA=1 restores
+// WMMA for the gathered call (reproduction in test-backend-ops, see the UP-FAROWS-HIP r4 cases).
+static bool ggml_cuda_fattn_rows_wmma_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_WMMA");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static best_fattn_kernel ggml_cuda_fattn_rows_kernel(const int device, const ggml_tensor * gathered_dst) {
+    return ggml_cuda_get_best_fattn_kernel_ex(device, gathered_dst, ggml_cuda_fattn_rows_wmma_enabled());
 }
 
 struct ggml_cuda_fattn_rows_plan {
@@ -1001,7 +1029,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 static size_t ggml_cuda_fattn_rows_extra_end(const int device, ggml_cuda_fattn_rows_plan & p) {
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, &p.dst);
+    const best_fattn_kernel kernel = ggml_cuda_fattn_rows_kernel(device, &p.dst);
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -1075,7 +1103,7 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
     ggml_cuda_fattn_rows_plan p;
     ggml_cuda_fattn_rows_build_plan(device, dst, p);
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, &p.dst);
+    const best_fattn_kernel kernel = ggml_cuda_fattn_rows_kernel(device, &p.dst);
     if (kernel == BEST_FATTN_KERNEL_NONE) {
         ggml_cuda_fattn_rows_trace(dst, "dense", "gathered shape has no kernel", (int) ggml_cuda_get_best_fattn_kernel(device, dst));
         return false;

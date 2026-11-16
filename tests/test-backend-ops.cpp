@@ -13868,6 +13868,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 131072, 0.0f, 0.0f,
             type_KV, type_KV, 1, 0, true, true));
     }
+    // UP-FAROWS-HIP r4: the exact Qwen3.8-27B prefill shapes traced in up-farows-hip-gpu-20261116-r3 (garbage with the
+    // knob on, kernel 300 = WMMA chosen for the gathered call on the gfx90a rocWMMA build):
+    //   Q=[256,1200,24] K=[256,2048,4] q8_0, rows=[1280,2]: 2 slots x 600 tokens, seq 0 owns cells 0..612 + 1226..1812
+    //     (1200 cells), seq 1 owns 613..1225 (613 cells), 235 free cells -> n_rows 1280, n_slices 2, T 600 (% 16 = 8)
+    //   Q=[256,848,24]  K=[256,2816,4] q8_0, rows=[1536,1]: one slot, 1500 of 2816 cells -> n_rows 1536, n_slices 1
+    // The gathered call now avoids WMMA; GGML_CUDA_FA_ROWS_WMMA=1 (with GGML_CUDA_FA_ROWS_GATHER=1) forces kernel 300
+    // back for the gathered call, which reproduces the r3 failure here if WMMA is at fault.
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2816, 848, 1, 2816, 1316, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_F16, GGML_TYPE_F16, 2, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, false, true));
     // knob-off controls for the same served shapes (no row list): the dense path at these sizes
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));
