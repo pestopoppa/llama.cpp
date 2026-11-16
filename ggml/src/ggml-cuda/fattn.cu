@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <string>
+#include <vector>
 
 // CDNA (MFMA) tuning of the D=256 MMA FlashAttention kernel (experimental, v11 FA A/B 2026-10-04).
 //
@@ -1215,18 +1218,107 @@ static size_t ggml_cuda_fattn_rows_extra_end(const int device, ggml_cuda_fattn_r
 // Returns false (nothing enqueued) when the gathered shape has no kernel; the caller then runs the dense path.
 static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+static void ggml_cuda_flash_attn_ext_dense(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// UP-FAROWS-HIP r6: GGML_CUDA_FA_ROWS_VERIFY=N runs, for the first N gathered calls, the DENSE path too and compares
+// the two outputs on the host (stderr, unfilterable): max |dense - gathered| and the first bad query row, per slice.
+// This splits "row lists / mask are wrong on the llama side" from "the gathered kernel call is wrong" in a served run
+// without any reference model. Synchronous (D2H copies): calls made inside a HIP/CUDA graph capture are skipped, so
+// run it with GGML_CUDA_DISABLE_GRAPHS=1. The gathered result is the one left in dst (the A/B arm stays the A/B arm).
+static int ggml_cuda_fattn_rows_verify_budget() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_VERIFY");
+        return env ? atoi(env) : 0;
+    }();
+    return n;
+}
+
+static bool ggml_cuda_fattn_rows_verify_take() {
+    static std::atomic<int> n_done{0};
+    return ggml_cuda_fattn_rows_verify_budget() > 0 && n_done.fetch_add(1) < ggml_cuda_fattn_rows_verify_budget();
+}
+
+static bool ggml_cuda_fattn_rows_verify_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return ggml_cuda_fattn_rows_gather_run(ctx, dst);
+    }
+
+    const int64_t n = ggml_nelements(dst);
+    std::vector<float> ref(n);
+    std::vector<float> got(n);
+
+    ggml_cuda_flash_attn_ext_dense(ctx, dst);
+    CUDA_CHECK(cudaMemcpyAsync(ref.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (!ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
+        return true; // dense result already in dst
+    }
+    CUDA_CHECK(cudaMemcpyAsync(got.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // dst is [D_v, H, n_tok, 1]; slice s = query rows [s*T, (s+1)*T)
+    const int64_t D     = dst->ne[0];
+    const int64_t H     = dst->ne[1];
+    const int64_t n_tok = dst->ne[2];
+    const int64_t S     = dst->src[7]->ne[1];
+    const int64_t T     = n_tok/S;
+    std::string per_slice;
+    double max_all = 0.0;
+    for (int64_t s = 0; s < S; ++s) {
+        double  max_s   = 0.0;
+        int64_t first_t = -1;
+        int64_t n_nan   = 0;
+        for (int64_t t = s*T; t < (s + 1)*T; ++t) {
+            double max_t = 0.0;
+            for (int64_t i = t*H*D; i < (t + 1)*H*D; ++i) {
+                if (!std::isfinite(got[i]) != !std::isfinite(ref[i])) {
+                    n_nan++;
+                    max_t = INFINITY;
+                    continue;
+                }
+                const double d = std::fabs((double) got[i] - (double) ref[i]);
+                max_t = std::max(max_t, std::isfinite(d) ? d : 0.0);
+            }
+            if (max_t > 1e-2 && first_t < 0) {
+                first_t = t;
+            }
+            max_s = std::max(max_s, max_t);
+        }
+        max_all = std::max(max_all, max_s);
+        if (s < 8) {
+            per_slice += " s" + std::to_string(s) + "=" + std::to_string(max_s) + "(first_bad_row=" + std::to_string(first_t) +
+                ",nonfinite_mismatch=" + std::to_string(n_nan) + ")";
+        }
+    }
+    fprintf(stderr, "FA_ROWS_VERIFY fattn: node=%s Q=[%lld,%lld,%lld] K=[%lld,%lld] rows=[%lld,%lld] max_abs_diff=%g %s%s\n",
+        dst->name, (long long) dst->src[0]->ne[0], (long long) n_tok, (long long) dst->src[0]->ne[2],
+        (long long) dst->src[1]->ne[1], (long long) dst->src[1]->ne[2], (long long) dst->src[7]->ne[0], (long long) S,
+        max_all, max_all > 1e-2 ? "MISMATCH" : "ok", per_slice.c_str());
+    fflush(stderr);
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     // UP-FAROWS-HIP: per-sequence K/V row gather (GGML_CUDA_FA_ROWS_GATHER=1 and a src[7] row list only).
     if (dst->src[7] != nullptr) {
         const char * why = ggml_cuda_fattn_rows_gather_why_not(dst);
-        if (why == nullptr && ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
-            return;
-        }
-        if (why != nullptr) {
+        if (why == nullptr) {
+            if (ggml_cuda_fattn_rows_verify_take() ? ggml_cuda_fattn_rows_verify_run(ctx, dst) : ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
+                return;
+            }
+        } else {
             ggml_cuda_fattn_rows_trace(dst, "dense", why, (int) ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst));
         }
     }
+    ggml_cuda_flash_attn_ext_dense(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_dense(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // AK-ASM-H5-PORT: gfx90a hd128 asm fast path (fattn-asm-gfx90a.cu). Returns false without enqueuing anything for
     // every case it does not cover, and the selection below then runs exactly as before.
     if (ggml_cuda_fattn_asm_gfx90a_try(ctx, dst)) {

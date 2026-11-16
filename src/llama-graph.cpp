@@ -536,6 +536,75 @@ static int64_t llama_fa_rows_check_superset(const ggml_tensor * mask, const std:
     return bad;
 }
 
+// UP-FAROWS-HIP r6: the slice -> query-token map that the gathered FA call assumes (slice s = ubatch tokens
+// [s*T, (s+1)*T)), as the ubatch actually lays them out: per slice the token range, the distinct seq ids and the
+// position range of its tokens, plus a "contig" verdict (every token of the slice has exactly one seq id, the same
+// one). One-shot: the first call with n_slices > 1 also dumps every token (seq ids, pos) of the ubatch.
+static std::string llama_fa_rows_slice_map(const llama_ubatch & ubatch, int64_t S) {
+    std::string out;
+    const int64_t n_tok = ubatch.n_tokens;
+    if (S <= 0 || n_tok % S != 0) {
+        return " slice_map: n_tok % n_slices != 0";
+    }
+    const int64_t T = n_tok/S;
+    for (int64_t s = 0; s < S && s < 8; ++s) {
+        std::vector<llama_seq_id> ids;
+        bool contig = true;
+        llama_pos p_lo = 0;
+        llama_pos p_hi = 0;
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t i = s*T + t;
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ubatch.seq_id[s*T][0]) {
+                contig = false;
+            }
+            for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+                if (std::find(ids.begin(), ids.end(), ubatch.seq_id[i][k]) == ids.end()) {
+                    ids.push_back(ubatch.seq_id[i][k]);
+                }
+            }
+            const llama_pos p = ubatch.pos ? ubatch.pos[i] : -1;
+            p_lo = t == 0 ? p : std::min(p_lo, p);
+            p_hi = t == 0 ? p : std::max(p_hi, p);
+        }
+        out += " s" + std::to_string(s) + "=tok[" + std::to_string(s*T) + ".." + std::to_string((s + 1)*T - 1) + "]seq{";
+        for (size_t k = 0; k < ids.size() && k < 8; ++k) {
+            out += (k ? "," : "") + std::to_string(ids[k]);
+        }
+        out += "}pos[" + std::to_string(p_lo) + ".." + std::to_string(p_hi) + "]" + (contig ? "contig" : "MIXED");
+    }
+    out += " seq_id_unq{";
+    for (uint32_t u = 0; u < ubatch.n_seqs_unq && u < 8; ++u) {
+        out += (u ? "," : "") + std::to_string(ubatch.seq_id_unq[u]);
+    }
+    out += "}";
+    return out;
+}
+
+static void llama_fa_rows_dump_tokens_once(const llama_ubatch & ubatch, int64_t S) {
+    static std::atomic<bool> done{false};
+    if (S <= 1 || done.exchange(true)) {
+        return;
+    }
+    fprintf(stderr, "FA_ROWS_TRACE llama: one-shot token dump n_tokens=%u n_slices=%lld (tok:seq[/seq..]@pos)\n",
+            ubatch.n_tokens, (long long) S);
+    std::string line;
+    for (uint32_t i = 0; i < ubatch.n_tokens && i < 4096; ++i) {
+        line += " " + std::to_string(i) + ":";
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            line += (k ? "/" : "") + std::to_string(ubatch.seq_id[i][k]);
+        }
+        line += "@" + std::to_string(ubatch.pos ? ubatch.pos[i] : -1);
+        if (line.size() > 2000) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: tokens%s\n", line.c_str());
+            line.clear();
+        }
+    }
+    if (!line.empty()) {
+        fprintf(stderr, "FA_ROWS_TRACE llama: tokens%s\n", line.c_str());
+    }
+    fflush(stderr);
+}
+
 void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (!self_kv_rows || !self_kv_rows->buffer) {
         if (self_kv_rows && llama_fa_rows_trace_take(1)) {
@@ -584,6 +653,8 @@ void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * k
                 self_kq_mask ? (long long) self_kq_mask->ne[0] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[1] : -1LL,
                 self_kq_mask ? (long long) self_kq_mask->ne[2] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[3] : -1LL,
                 (long long) bad, used.c_str());
+        fprintf(stderr, "FA_ROWS_TRACE llama: slice map%s\n", llama_fa_rows_slice_map(*ubatch, S).c_str());
+        llama_fa_rows_dump_tokens_once(*ubatch, S);
         fflush(stderr);
     }
 

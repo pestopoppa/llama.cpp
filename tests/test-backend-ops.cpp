@@ -9754,6 +9754,7 @@ struct test_flash_attn_ext_unified : public test_case {
     const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
     const bool kv_rows;     // UP-FAROWS-HIP: attach per-sequence K/V row lists (src[7], ggml_flash_attn_ext_set_kv_rows)
     const bool q_perm;      // Q as llama.cpp builds it: [D, n_head, n_tokens] permuted to [D, n_tokens, n_head] (token-major)
+    const bool q_interleave; // UP-FAROWS-HIP r6: query rows round-robin over the sequences (row i -> seq i % n_seq), not grouped
 
     std::string vars() override {
         std::string res = VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
@@ -9762,6 +9763,9 @@ struct test_flash_attn_ext_unified : public test_case {
         }
         if (q_perm) {
             res += ",q_perm=1";
+        }
+        if (q_interleave) {
+            res += ",q_interleave=1";
         }
         return res;
     }
@@ -9785,6 +9789,9 @@ struct test_flash_attn_ext_unified : public test_case {
 
     // the sequence of query row i (the batch is n_seq groups of `group` rows, the last group may be short)
     int seq_of_row(int64_t i) const {
+        if (q_interleave) {
+            return (int) (i % n_seq);
+        }
         const int64_t group = (nb + n_seq - 1) / n_seq;
         return (int) std::min<int64_t>(i / group, n_seq - 1);
     }
@@ -9798,7 +9805,8 @@ struct test_flash_attn_ext_unified : public test_case {
         std::vector<int64_t> n_cells;
         cell_layout(owner, pos, n_cells);
 
-        const bool sliced = n_seq > 1 && nb % n_seq == 0;
+        // llama_kv_cache::get_kv_rows only slices when every slice is one contiguous single-sequence run of rows
+        const bool sliced = n_seq > 1 && nb % n_seq == 0 && !q_interleave;
         n_slices = sliced ? n_seq : 1;
 
         std::vector<bool> present(n_seq, false);
@@ -9844,10 +9852,11 @@ struct test_flash_attn_ext_unified : public test_case {
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
                                 ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
-                                int64_t n_shared = 0, bool kv_rows = false, bool q_perm = false)
+                                int64_t n_shared = 0, bool kv_rows = false, bool q_perm = false,
+                                bool q_interleave = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
           max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared),
-          kv_rows(kv_rows), q_perm(q_perm) {}
+          kv_rows(kv_rows), q_perm(q_perm), q_interleave(q_interleave) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
@@ -9933,9 +9942,15 @@ struct test_flash_attn_ext_unified : public test_case {
             const int64_t group = (nb + n_seq - 1) / n_seq;
             for (int64_t i = 0; i < nb; ++i) {
                 const int     s     = seq_of_row(i);
-                const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
                 // the tokens of the batch are the last n_grp cells of their sequence
-                const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                int64_t pos_q;
+                if (q_interleave) {
+                    const int64_t n_grp = (nb - s + n_seq - 1) / n_seq; // rows s, s + n_seq, ...
+                    pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + i / n_seq);
+                } else {
+                    const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
+                    pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                }
                 for (int64_t c = 0; c < kv; ++c) {
                     const bool visible = (owner[c] == s || owner[c] == -2) && pos[c] <= pos_q;
                     data[i*kv + c] = visible ? dis(gen) : -INFINITY;
@@ -13867,6 +13882,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 131072, 0.0f, 0.0f,
             type_KV, type_KV, 1, 0, true, true));
+    }
+    // UP-FAROWS-HIP r6: query rows interleaved across the sequences (row i -> seq i % n_seq) with per-token causal masks:
+    // a layout in which the rows are NOT n_slices contiguous equal blocks. get_kv_rows must fall back to one union
+    // slice; nb % n_seq == 0 so a contiguity-blind slicer would wrongly slice it (and fail this case).
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {2, 8, 1200}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, nb, 2, 2048, 256, 0.0f, 0.0f,
+                type_KV, type_KV, 2, 0, true, true, true));
+        }
     }
     // UP-FAROWS-HIP r4: the exact Qwen3.8-27B prefill shapes traced in up-farows-hip-gpu-20261116-r3 (garbage with the
     // knob on, kernel 300 = WMMA chosen for the gathered call on the gfx90a rocWMMA build):
