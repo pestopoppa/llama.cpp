@@ -1034,6 +1034,14 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
 
     cudaStream_t stream = ctx.stream();
 
+    // engagement proof for A/B rows: one line per process on the first gathered call
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: GGML_CUDA_FA_ROWS_GATHER engaged: n_kv=%lld -> n_rows=%lld x n_slices=%lld, kernel=%d\n", __func__,
+            (long long) dst->src[1]->ne[1], (long long) p.K.ne[1], (long long) p.K.ne[3], (int) kernel);
+    }
+
     ggml_cuda_fattn_rows_gather_one(dst->src[1], p.K, rows_d, rows_s1, stream);
     ggml_cuda_fattn_rows_gather_one(dst->src[2], p.V, rows_d, rows_s1, stream);
     {
