@@ -9557,6 +9557,156 @@ struct test_flash_attn_ext_g10 : public test_flash_attn_ext {
           g10_id(id) {}
 };
 
+// INF48-EQV-FA-RESCALE (RVP-EQV-1 follow-up): FLASH_ATTN_EXT cases whose running row max CHANGES across KV tiles, so the
+// online-softmax rescale (KQ_max_scale = exp(old_max - new_max) applied to the KQ rowsum and the VKQ accumulators) carries
+// real weight. Under init_tensor_uniform the logits are ~U-like noise of width ~1, the max is set inside the first KV tile
+// and later tiles only nudge it, which is why the seeded E1-FA-RESCALE-SKIP mutant (rescale skipped for k_VKQ_0 >= nbatch_fa
+// in fattn-mma-f16.cuh) survived every FA suite in race-eqv r9.
+//
+// K is written as K[j][d] = a_j + noise and Q as qc*(1 + 0.25*u), so logit_j ~= L_j (the pattern's target profile) up to a
+// small per-row factor. V stays uniform random, so a skipped rescale (old tiles over-weighted by exp(L_new - L_old)) moves the
+// output by O(1). K/V are dense (kv_view=false) so the structured K can be written linearly. Patterns:
+//   ramp      L_j rises linearly 0 -> lmax over the whole KV (max changes in every tile)
+//   step      L_j constant inside each tile of T rows, +1.0 at every tile boundary (boundaries at the kernel KV tile size)
+//   spike     flat noise, one large logit (+12) at the LAST KV row (late large logit)
+//   mprefix   the first 2*T KV rows are -inf in the mask (fully masked blocks before finite ones), ramp afterwards
+//   allmask   ramp, with every third query row fully -inf and one fully masked tile in the middle of the others
+//             (CPU reference writes 0 for an all-masked row; a non-zero / NaN device row there is a kernel finding)
+//   softcap   ramp to lmax=40 under logit_softcap=20 (softcap*tanh(x/softcap) compresses the rise)
+//   alibi     flat K, mask = -(kv-1-j) with max_bias=8: the ALiBi bias slope*mask is the rising profile
+//   f16big    qc=8 and K up to ~60 so the raw Q.K dot reaches ~61440 (adjacent to FP16_MAX 65504), logits up to ~5400
+//   firstmax  NEGATIVE CONTROL: the max sits in the first tile (L_j falls 12 -> 0), so a rescale skip after tile 0 is
+//             output-equivalent by construction; a mutant caught ONLY here would mean the gate is not rescale-specific
+// Registered ONLY when AUTOKERNEL_CORRECTNESS_CASE_SET=fa_rescale_v1 (g10 convention). Select with
+// `-o FLASH_ATTN_EXT -p 'fa_rescale='`; every name carries ",fa_rescale=NN,pat=<pattern>,T=<tile>".
+enum fa_rescale_pattern { FAR_RAMP, FAR_STEP, FAR_SPIKE, FAR_MPREFIX, FAR_ALLMASK, FAR_SOFTCAP, FAR_ALIBI, FAR_F16BIG, FAR_FIRSTMAX };
+
+static const char * fa_rescale_pattern_name(fa_rescale_pattern p) {
+    switch (p) {
+        case FAR_RAMP:     return "ramp";
+        case FAR_STEP:     return "step";
+        case FAR_SPIKE:    return "spike";
+        case FAR_MPREFIX:  return "mprefix";
+        case FAR_ALLMASK:  return "allmask";
+        case FAR_SOFTCAP:  return "softcap";
+        case FAR_ALIBI:    return "alibi";
+        case FAR_F16BIG:   return "f16big";
+        case FAR_FIRSTMAX: return "firstmax";
+    }
+    return "?";
+}
+
+struct test_flash_attn_ext_rescale : public test_flash_attn_ext {
+    const int                id;
+    const fa_rescale_pattern pat;
+    const int64_t            tile; // KV tile size the pattern is aligned to (step boundaries, masked prefix length)
+
+    std::string vars() override {
+        char suffix[96];
+        snprintf(suffix, sizeof(suffix), ",fa_rescale=%02d,pat=%s,T=%d", id, fa_rescale_pattern_name(pat), (int) tile);
+        return test_flash_attn_ext::vars() + suffix;
+    }
+
+    test_flash_attn_ext_rescale(int id, fa_rescale_pattern pat, int64_t tile, int64_t hsk, int64_t hsv, int64_t nh,
+                                std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, bool sinks = false)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, /*mask*/ true, sinks,
+                              pat == FAR_ALIBI ? 8.0f : 0.0f, pat == FAR_SOFTCAP ? 20.0f : 0.0f,
+                              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 0, /*kv_view*/ false),
+          id(id), pat(pat), tile(tile) {}
+
+    // target logit for KV row j (before the mask / ALiBi bias)
+    float target_logit(int64_t j) const {
+        const float x = kv > 1 ? float(j)/float(kv - 1) : 0.0f;
+        switch (pat) {
+            case FAR_RAMP:
+            case FAR_MPREFIX:
+            case FAR_ALLMASK:  return 16.0f*x;
+            case FAR_STEP:     return 1.0f*float(j/tile);
+            case FAR_SPIKE:    return j == kv - 1 ? 12.0f : 0.0f;
+            case FAR_SOFTCAP:  return 40.0f*x;
+            case FAR_ALIBI:    return 0.0f;
+            case FAR_F16BIG:   return 0.0f; // handled via k_amp_max below
+            case FAR_FIRSTMAX: return 12.0f*(1.0f - x);
+        }
+        return 0.0f;
+    }
+
+    static void set_f32_as(ggml_tensor * t, const std::vector<float> & v) {
+        GGML_ASSERT((size_t) ggml_nelements(t) == v.size());
+        GGML_ASSERT(ggml_is_contiguous(t));
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+        } else {
+            GGML_ASSERT(t->type == GGML_TYPE_F16);
+            std::vector<ggml_fp16_t> h(v.size());
+            ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+            ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const float qc = pat == FAR_F16BIG ? 8.0f : 1.0f;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                std::mt19937 gen = suite_seed_rng();
+                std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+                std::vector<float> v(ggml_nelements(t));
+                for (float & x : v) {
+                    x = qc*(1.0f + 0.25f*u(gen));
+                }
+                set_f32_as(t, v);
+            } else if (strcmp(t->name, "k") == 0) {
+                // t: [hsk_padded, kv, nh, nr3], contiguous (kv_view=false, native permute)
+                std::mt19937 gen = suite_seed_rng();
+                std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+                const int64_t D = t->ne[0];
+                const float   inv = 1.0f/(sqrtf(float(hsk))*qc); // logit_j ~= a_j * sum(Q)/sqrt(hsk) ~= a_j*sqrt(hsk)*qc
+                const float   k_amp_max = std::min(60.0f, 61440.0f/(float(hsk)*qc)); // f16big: raw dot ~61440
+                std::vector<float> v(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]*t->ne[2]*t->ne[3]; ++r) {
+                    const int64_t j = r % t->ne[1];
+                    float a;
+                    if (pat == FAR_F16BIG) {
+                        a = k_amp_max*(kv > 1 ? float(j)/float(kv - 1) : 0.0f);
+                    } else {
+                        a = target_logit(j)*inv;
+                    }
+                    for (int64_t d = 0; d < D; ++d) {
+                        v[r*D + d] = d < hsk ? a + 0.1f*inv*u(gen) : 0.0f;
+                    }
+                }
+                set_f32_as(t, v);
+            } else if (strcmp(t->name, "m") == 0) {
+                // t: [kv, nb, 1, nr3]
+                const int64_t ne0 = t->ne[0];
+                std::vector<float> v(ggml_nelements(t), 0.0f);
+                for (int64_t r = 0; r < t->ne[1]*t->ne[2]*t->ne[3]; ++r) {
+                    const int64_t i = r % t->ne[1];
+                    for (int64_t j = 0; j < ne0; ++j) {
+                        float m = 0.0f;
+                        if (pat == FAR_ALIBI) {
+                            m = -float(kv - 1 - j);
+                        } else if (pat == FAR_MPREFIX && j < 2*tile) {
+                            m = -INFINITY;
+                        } else if (pat == FAR_ALLMASK) {
+                            const int64_t mid = (kv/2/tile)*tile;
+                            if (i % 3 == 0 || (j >= mid && j < mid + tile)) {
+                                m = -INFINITY;
+                            }
+                        }
+                        v[r*ne0 + j] = m;
+                    }
+                }
+                set_f32_as(t, v);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // [AKX-ALL-LB4] GGML_OP_FLASH_ATTN_EXT with same-sign, large-magnitude V over a long KV. For diffuse
 // attention the un-normalised accumulator sum_i exp(s_i - M) v_i is ~ (visible cells) x |v|, which passes
 // FP16_MAX (65504) long before the normalised output does, so a kernel that accumulates V*softmax in FP16
@@ -11065,6 +11215,54 @@ static void autokernel_add_g10_fa_import_cases(std::vector<std::unique_ptr<test_
     test_cases.emplace_back(new test_flash_attn_ext_g10(23, 256, 256, 2, {16, 1},  20000, 512, true, false, 0, 0, Q8,  Q8));
     test_cases.emplace_back(new test_flash_attn_ext_g10(24, 256, 256, 2, {16, 1},  10000, 512, true, false, 0, 0, F16, F16));
     test_cases.emplace_back(new test_flash_attn_ext_g10(25, 256, 256, 2, {16, 1},  20000, 512, true, false, 0, 0, F16, F16));
+}
+
+// INF48-EQV-FA-RESCALE case set (see test_flash_attn_ext_rescale). Shapes are chosen to reach each gfx90a FA path for f16 KV:
+//   MMA (fattn-mma-f16, CDNA nbatch_fa=64): hs64 gqa4 nb16, hs128 gqa4 nb32, hs192/128 gqa4 nb32, hs256 gqa8 nb16 (kv%256==0)
+//   VEC/decode: hs128 gqa4 nb1;  TILE: hs128 gqa1 nb4 and every kv%256!=0 case
+// T is the KV tile the pattern aligns to: 64 = CDNA MMA nbatch_fa, 32/128 = tile/vec, 256 = FATTN_KQ_STRIDE.
+static void autokernel_add_fa_rescale_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const char * case_set = std::getenv("AUTOKERNEL_CORRECTNESS_CASE_SET");
+    if (case_set == nullptr || std::strcmp(case_set, "fa_rescale_v1") != 0) {
+        return;
+    }
+    struct shape { int64_t hsk, hsv, nh; std::array<int64_t, 2> nr23; int64_t nb; };
+    const shape MMA64   = { 64,  64, 4, {4, 1}, 16};
+    const shape MMA128  = {128, 128, 4, {4, 1}, 32};
+    const shape MMA192  = {192, 128, 4, {4, 1}, 32};
+    const shape MMA256  = {256, 256, 2, {8, 1}, 16};
+    const shape DEC128  = {128, 128, 4, {4, 1},  1};
+    const shape TILE128 = {128, 128, 8, {1, 1},  4};
+
+    int id = 0;
+    auto add = [&](fa_rescale_pattern p, int64_t T, const shape & s, int64_t kv, bool sinks = false) {
+        test_cases.emplace_back(new test_flash_attn_ext_rescale(++id, p, T, s.hsk, s.hsv, s.nh, s.nr23, kv, s.nb, sinks));
+    };
+
+    // block A: every pattern on every path at kv=1024, aligned to the CDNA MMA tile (T=64)
+    for (const shape & s : {MMA64, MMA128, MMA192, MMA256, DEC128, TILE128}) {
+        for (fa_rescale_pattern p : {FAR_RAMP, FAR_SPIKE, FAR_MPREFIX, FAR_ALLMASK, FAR_SOFTCAP, FAR_ALIBI, FAR_F16BIG, FAR_FIRSTMAX}) {
+            add(p, 64, s, 1024);
+        }
+    }
+    // block B: step boundaries at each kernel's KV tile size
+    for (const shape & s : {MMA128, DEC128, TILE128}) {
+        for (int64_t T : {32, 64, 128, 256}) {
+            add(FAR_STEP, T, s, 1024);
+        }
+    }
+    add(FAR_STEP, 64, MMA128, 256);  // one FATTN_KQ_STRIDE, four MMA tiles
+    add(FAR_STEP, 64, MMA256, 1024);
+    // block C: non-multiple KV (padding / tail tile) and long KV
+    for (const shape & s : {MMA128, DEC128, TILE128}) {
+        add(FAR_RAMP,  64, s, 1000);
+        add(FAR_SPIKE, 64, s, 1000);
+    }
+    add(FAR_RAMP, 64, MMA128, 4096);
+    add(FAR_RAMP, 64, MMA256, 4096);
+    // block D: sinks enter the final rescale (sink-path rescale)
+    add(FAR_RAMP, 64, MMA128, 1024, true);
+    add(FAR_RAMP, 64, DEC128, 1024, true);
 }
 
 // V11-086-D512: GGML_FA_VKQ_REG covers DV = 512 as two 16-register halves (fa_vacc_f16_block_x2). Hand-written, not part of
@@ -13776,6 +13974,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // G10 / INF-48: imported cases are additive and opt-in; preserve the complete C5 corpus above.
     autokernel_add_g10_fa_import_cases(test_cases);
+    // INF48-EQV-FA-RESCALE: opt-in rescale-exercising FA cases (AUTOKERNEL_CORRECTNESS_CASE_SET=fa_rescale_v1).
+    autokernel_add_fa_rescale_cases(test_cases);
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
