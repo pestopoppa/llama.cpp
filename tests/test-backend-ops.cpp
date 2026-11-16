@@ -9754,6 +9754,7 @@ struct test_flash_attn_ext_unified : public test_case {
     const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
     const bool kv_rows;     // UP-FAROWS-HIP: attach per-sequence K/V row lists (src[7], ggml_flash_attn_ext_set_kv_rows)
     const bool q_perm;      // Q as llama.cpp builds it: [D, n_head, n_tokens] permuted to [D, n_tokens, n_head] (token-major)
+    const float qk_scale;    // UP-FAROWS-HIP r7: q and K/V init range [-qk_scale, qk_scale] (1: default); >1 = peaked softmax
     const bool q_interleave; // UP-FAROWS-HIP r6: query rows round-robin over the sequences (row i -> seq i % n_seq), not grouped
 
     std::string vars() override {
@@ -9766,6 +9767,9 @@ struct test_flash_attn_ext_unified : public test_case {
         }
         if (q_interleave) {
             res += ",q_interleave=1";
+        }
+        if (qk_scale != 1.0f) {
+            res += ",qk_scale=" + std::to_string(qk_scale);
         }
         return res;
     }
@@ -9853,10 +9857,10 @@ struct test_flash_attn_ext_unified : public test_case {
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
                                 ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
                                 int64_t n_shared = 0, bool kv_rows = false, bool q_perm = false,
-                                bool q_interleave = false)
+                                bool q_interleave = false, float qk_scale = 1.0f)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
           max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared),
-          kv_rows(kv_rows), q_perm(q_perm), q_interleave(q_interleave) {}
+          kv_rows(kv_rows), q_perm(q_perm), qk_scale(qk_scale), q_interleave(q_interleave) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
@@ -9926,7 +9930,7 @@ struct test_flash_attn_ext_unified : public test_case {
                 continue;
             }
             if (strcmp(t->name, "m") != 0) {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -qk_scale, qk_scale);
                 continue;
             }
 
@@ -13891,6 +13895,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, nb, 2, 2048, 256, 0.0f, 0.0f,
                 type_KV, type_KV, 2, 0, true, true, true));
         }
+    }
+    // UP-FAROWS-HIP r7: the r6 served MISMATCH shapes (GGML_CUDA_FA_ROWS_VERIFY): a single-slice prefill (nb 826, 1536
+    // gathered rows at n_kv 5632) and a 2-slice prefill (nb 1210 = 2 x 605, T % 16 != 0, n_kv 4864, two cell runs per
+    // sequence so the slices' cell ranges interleave), with peaked attention (qk_scale 4). Run with
+    // GGML_CUDA_FA_ROWS_GATHER=1 GGML_CUDA_FA_ROWS_ANY_KERNEL=1 to exercise the forced-MMA gathered call that r6 caught
+    // diverging from the dense WMMA call; without ANY_KERNEL the r7 parity rule routes these to the dense kernel.
+    for (float qs : {1.0f, 4.0f}) {
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 5632, 826, 1, 2048, 4096, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true, false, qs));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 4864, 1210, 2, 600, 3584, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true, true, false, qs));
     }
     // UP-FAROWS-HIP r4: the exact Qwen3.8-27B prefill shapes traced in up-farows-hip-gpu-20261116-r3 (garbage with the
     // knob on, kernel 300 = WMMA chosen for the gathered call on the gfx90a rocWMMA build):

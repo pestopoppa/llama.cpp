@@ -1364,6 +1364,24 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
             (int) ggml_cuda_get_best_fattn_kernel(device, dst));
         return false;
     }
+    // r7 kernel-parity rule: run the gather only when the gathered call uses the SAME kernel the dense call would.
+    // up-farows-hip-gpu-20261116-r6 (GGML_CUDA_FA_ROWS_VERIFY=50, served Qwen3.8-27B): all 32 mismatching compares
+    // were prefill calls where dense = WMMA (rocWMMA gfx90a build) and gathered = MMA_F16 (forced by this function
+    // since r4/r5), INCLUDING single-slice calls (Q 826, rows [1536,1]: max |diff| 0.02-0.31 from row 0), so neither
+    // slicing nor the row lists are implicated; all 18 matching compares were decode calls where both took VEC.
+    // A kernel the dense call never runs at that shape is not a drop-in for it on real activations.
+    // GGML_CUDA_FA_ROWS_ANY_KERNEL=1 restores the r5 behaviour (for A/B and test-backend-ops reproduction).
+    {
+        static const bool any_kernel = [] {
+            const char * env = getenv("GGML_CUDA_FA_ROWS_ANY_KERNEL");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        const best_fattn_kernel dense_kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+        if (!any_kernel && kernel != dense_kernel) {
+            ggml_cuda_fattn_rows_trace(dst, "dense", "gathered kernel != dense kernel (r7 parity rule)", (int) dense_kernel);
+            return false;
+        }
+    }
     // last line of defence: never launch a stub from the gathered path
     GGML_ASSERT(ggml_cuda_fattn_kernel_stub_why(device, kernel, &p.dst) == nullptr);
     ggml_cuda_fattn_rows_trace(dst, "gather", stub_why /* first choice was a stub -> promoted */, (int) kernel);
