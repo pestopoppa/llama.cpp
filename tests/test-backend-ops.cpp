@@ -11217,9 +11217,13 @@ static void autokernel_add_g10_fa_import_cases(std::vector<std::unique_ptr<test_
     test_cases.emplace_back(new test_flash_attn_ext_g10(25, 256, 256, 2, {16, 1},  20000, 512, true, false, 0, 0, F16, F16));
 }
 
-// INF48-EQV-FA-RESCALE case set (see test_flash_attn_ext_rescale). Shapes are chosen to reach each gfx90a FA path for f16 KV:
-//   MMA (fattn-mma-f16, CDNA nbatch_fa=64): hs64 gqa4 nb16, hs128 gqa4 nb32, hs192/128 gqa4 nb32, hs256 gqa8 nb16 (kv%256==0)
-//   VEC/decode: hs128 gqa4 nb1;  TILE: hs128 gqa1 nb4 and every kv%256!=0 case
+// INF48-EQV-FA-RESCALE case set (see test_flash_attn_ext_rescale). Kernel selection on gfx90a for f16 KV, read from fattn.cu
+// ggml_cuda_get_best_fattn_kernel at this commit, ASSUMING GGML_HIP_ROCWMMA_FATTN=OFF (with it ON, CDNA takes WMMA for every
+// kv%256==0 shape except hs 192/320/512/576 before the MFMA crossover is reached) and default env:
+//   MMA64 / MMA128 / MMA192 (nb*gqa above the MFMA crossover)     -> MMA for every pattern, also kv=1000 and sinks
+//   MMA256 (hs256 gqa8 nb16)                                        -> GQA_VERIFY (fattn-gqa-verify) unless ALiBi/softcap -> MMA
+//   DEC128 (hs128 gqa4 nb1)                                         -> TILE (gqa opt applies); ALiBi -> VEC; kv=1000 -> TILE
+//   TILE128 (hs128 gqa1 nb4)                                        -> TILE
 // T is the KV tile the pattern aligns to: 64 = CDNA MMA nbatch_fa, 32/128 = tile/vec, 256 = FATTN_KQ_STRIDE.
 static void autokernel_add_fa_rescale_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
     const char * case_set = std::getenv("AUTOKERNEL_CORRECTNESS_CASE_SET");
@@ -11242,6 +11246,11 @@ static void autokernel_add_fa_rescale_cases(std::vector<std::unique_ptr<test_cas
     // block A: every pattern on every path at kv=1024, aligned to the CDNA MMA tile (T=64)
     for (const shape & s : {MMA64, MMA128, MMA192, MMA256, DEC128, TILE128}) {
         for (fa_rescale_pattern p : {FAR_RAMP, FAR_SPIKE, FAR_MPREFIX, FAR_ALLMASK, FAR_SOFTCAP, FAR_ALIBI, FAR_F16BIG, FAR_FIRSTMAX}) {
+            // softcap has device code only for D 128/256 (vec/wmma), DV 128/256/512 (tile), DKQ 128/256/512 (mma); upstream tests it
+            // only at hsk 128. On other head sizes every kernel is NO_DEVICE_CODE and traps (r1: hsa exception 0x1016).
+            if (p == FAR_SOFTCAP && s.hsk != 128 && s.hsk != 256) {
+                continue;
+            }
             add(p, 64, s, 1024);
         }
     }
