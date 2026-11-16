@@ -873,6 +873,26 @@ static bool ggml_cuda_fattn_rows_gather_enabled() {
     return enabled;
 }
 
+// r8 diagnostics.
+// GGML_CUDA_FA_ROWS_LISTS_ONLY=1: llama.cpp still builds and uploads the row lists (src[7]), but the backend never
+//   gathers and never reserves gather scratch: splits llama-side effects of the knob from ggml-side ones.
+// GGML_CUDA_FA_ROWS_SCRATCH_CANARY=1: a FA_ROWS_GUARD_BYTES guard band follows each scratch region of the gathered
+//   call (f16 conversion area, gathered K, V, mask); filled with 0xA5 before the gather, checked on the host after the
+//   kernel (outside graph capture only). Any overwrite is printed as FA_ROWS_CANARY ... CLOBBERED.
+#define FA_ROWS_GUARD_BYTES 4096
+static bool ggml_cuda_fattn_rows_env_flag(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && atoi(env) != 0;
+}
+static bool ggml_cuda_fattn_rows_lists_only() {
+    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_LISTS_ONLY");
+    return v;
+}
+static bool ggml_cuda_fattn_rows_canary() {
+    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_SCRATCH_CANARY");
+    return v;
+}
+
 // GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace of every FA node that carries a row list (src[7]), first
 // FA_ROWS_TRACE_MAX calls: which path it takes and why. Written with fprintf(stderr) on purpose: GGML_LOG_INFO is
 // mapped to TRACE verbosity by llama-server's log callback (common/log.cpp common_get_verbosity) and dropped below -lv 4.
@@ -1015,25 +1035,6 @@ struct ggml_cuda_fattn_rows_plan {
     size_t off_guard[4]; // r8 GGML_CUDA_FA_ROWS_SCRATCH_CANARY: guard bands after f16 extra, K, V, mask (0: none)
 };
 
-// r8 diagnostics.
-// GGML_CUDA_FA_ROWS_LISTS_ONLY=1: llama.cpp still builds and uploads the row lists (src[7]), but the backend never
-//   gathers and never reserves gather scratch: splits llama-side effects of the knob from ggml-side ones.
-// GGML_CUDA_FA_ROWS_SCRATCH_CANARY=1: a FA_ROWS_GUARD_BYTES guard band follows each scratch region of the gathered
-//   call (f16 conversion area, gathered K, V, mask); filled with 0xA5 before the gather, checked on the host after the
-//   kernel (outside graph capture only). Any overwrite is printed as FA_ROWS_CANARY ... CLOBBERED.
-#define FA_ROWS_GUARD_BYTES 4096
-static bool ggml_cuda_fattn_rows_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && atoi(env) != 0;
-}
-static bool ggml_cuda_fattn_rows_lists_only() {
-    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_LISTS_ONLY");
-    return v;
-}
-static bool ggml_cuda_fattn_rows_canary() {
-    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_SCRATCH_CANARY");
-    return v;
-}
 
 static void ggml_cuda_fattn_rows_set_contiguous(ggml_tensor & t, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
     t.type  = type;
