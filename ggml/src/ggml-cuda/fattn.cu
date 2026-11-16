@@ -4,7 +4,10 @@
 #include "fattn-tile.cuh"
 #include "fattn-asm-gfx90a.cuh"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // CDNA (MFMA) tuning of the D=256 MMA FlashAttention kernel (experimental, v11 FA A/B 2026-10-04).
 //
@@ -726,39 +729,83 @@ static bool ggml_cuda_fattn_rows_gather_enabled() {
     return enabled;
 }
 
-static bool ggml_cuda_fattn_rows_gather_applies(const ggml_tensor * dst) {
+// GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace of every FA node that carries a row list (src[7]), first
+// FA_ROWS_TRACE_MAX calls: which path it takes and why. Written with fprintf(stderr) on purpose: GGML_LOG_INFO is
+// mapped to TRACE verbosity by llama-server's log callback (common/log.cpp common_get_verbosity) and dropped below -lv 4.
+#define FA_ROWS_TRACE_MAX 20
+
+static bool ggml_cuda_fattn_rows_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_fattn_rows_trace(const ggml_tensor * dst, const char * path, const char * why, int kernel) {
+    // separate budgets for gathered and dense calls, so that one kind cannot hide the other
+    static std::atomic<int> n_trace[2] = {{0}, {0}};
+    const bool gathered = strcmp(path, "gather") == 0;
+    if (!ggml_cuda_fattn_rows_trace_enabled() || n_trace[gathered ? 1 : 0].fetch_add(1) >= FA_ROWS_TRACE_MAX) {
+        return;
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * rows = dst->src[7];
+    fprintf(stderr, "FA_ROWS_TRACE fattn: node=%s path=%s why=%s kernel=%d knob=%d Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] %s "
+            "mask=[%lld,%lld,%lld,%lld] %s rows=[%lld,%lld] n_seq_hint=%d src5=%d src6=%d\n",
+        dst->name, path, why ? why : "-", kernel, (int) ggml_cuda_fattn_rows_gather_enabled(),
+        (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+        (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], ggml_type_name(K->type),
+        mask ? (long long) mask->ne[0] : -1LL, mask ? (long long) mask->ne[1] : -1LL,
+        mask ? (long long) mask->ne[2] : -1LL, mask ? (long long) mask->ne[3] : -1LL, mask ? ggml_type_name(mask->type) : "none",
+        rows ? (long long) rows->ne[0] : -1LL, rows ? (long long) rows->ne[1] : -1LL,
+        (int) ggml_flash_attn_ext_get_n_seq(dst), dst->src[5] != nullptr, dst->src[6] != nullptr);
+    fflush(stderr);
+}
+
+// nullptr when the gather applies, else the reason it does not (traced by GGML_CUDA_FA_ROWS_TRACE)
+static const char * ggml_cuda_fattn_rows_gather_why_not(const ggml_tensor * dst) {
     if (!ggml_cuda_fattn_rows_gather_enabled()) {
-        return false;
+        return "knob off";
     }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * rows = dst->src[7];
-    if (rows == nullptr || dst->src[5] != nullptr || dst->src[6] != nullptr) {
-        return false; // no row list, or an AK-ASM-H12 qsa top-k FA
+    if (rows == nullptr) {
+        return "no row list";
+    }
+    if (dst->src[5] != nullptr || dst->src[6] != nullptr) {
+        return "qsa top-k FA (src5/src6)";
     }
     if (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) || rows->ne[2] != 1 || rows->ne[3] != 1) {
-        return false;
+        return "row list type/layout";
     }
     const int64_t n_rows   = rows->ne[0];
     const int64_t n_slices = rows->ne[1];
     if (n_rows <= 0 || n_rows % FATTN_KQ_STRIDE != 0 || n_slices <= 0 || n_slices > 65535) {
-        return false;
+        return "n_rows/n_slices";
     }
     if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
             mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] || mask->nb[0] != sizeof(half)) {
-        return false;
+        return "mask missing/type/shape";
     }
     if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || Q->ne[1] % n_slices != 0 || Q->ne[1]/n_slices > 65535) {
-        return false;
+        return "Q/K/V ne3 != 1 or n_tok % n_slices";
     }
     for (const ggml_tensor * t : {K, V}) {
         if (t->nb[0] != ggml_type_size(t->type) || ggml_row_size(t->type, t->ne[0]) % 2 != 0) {
-            return false;
+            return "K/V element stride";
         }
     }
-    return true;
+    return nullptr;
+}
+
+static bool ggml_cuda_fattn_rows_gather_applies(const ggml_tensor * dst) {
+    return ggml_cuda_fattn_rows_gather_why_not(dst) == nullptr;
 }
 
 struct ggml_cuda_fattn_rows_plan {
@@ -835,6 +882,11 @@ static void ggml_cuda_fattn_rows_build_plan(const int device, const ggml_tensor 
     p.dst.src[2] = &p.V;
     p.dst.src[3] = &p.mask;
     p.dst.src[4] = dst->src[4]; // sinks (per head)
+    if (S > 1) {
+        // each ne[3] slice of the gathered view is ONE sequence: the dst's n_seq hint (distinct sequences over all
+        // n_tok query rows) would make GQA-verify split each slice's T rows into n_seq row groups (gv_group_rows)
+        ggml_set_op_params_i32(&p.dst, 4, 1);
+    }
 
     p.end = ggml_cuda_fattn_rows_extra_end(device, p);
 
@@ -978,8 +1030,14 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     // UP-FAROWS-HIP: per-sequence K/V row gather (GGML_CUDA_FA_ROWS_GATHER=1 and a src[7] row list only).
-    if (ggml_cuda_fattn_rows_gather_applies(dst) && ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
-        return;
+    if (dst->src[7] != nullptr) {
+        const char * why = ggml_cuda_fattn_rows_gather_why_not(dst);
+        if (why == nullptr && ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
+            return;
+        }
+        if (why != nullptr) {
+            ggml_cuda_fattn_rows_trace(dst, "dense", why, (int) ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst));
+        }
     }
     // AK-ASM-H5-PORT: gfx90a hd128 asm fast path (fattn-asm-gfx90a.cu). Returns false without enqueuing anything for
     // every case it does not cover, and the selection below then runs exactly as before.
@@ -1019,8 +1077,10 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, &p.dst);
     if (kernel == BEST_FATTN_KERNEL_NONE) {
+        ggml_cuda_fattn_rows_trace(dst, "dense", "gathered shape has no kernel", (int) ggml_cuda_get_best_fattn_kernel(device, dst));
         return false;
     }
+    ggml_cuda_fattn_rows_trace(dst, "gather", nullptr, (int) kernel);
 
     char * base = (char *) dst->data;
     p.K.data    = base + p.off_K;
@@ -1034,11 +1094,13 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
 
     cudaStream_t stream = ctx.stream();
 
-    // engagement proof for A/B rows: one line per process on the first gathered call
+    // engagement proof for A/B rows: one line per process on the first gathered call. WARN, not INFO: llama-server maps
+    // ggml INFO to TRACE verbosity (common/log.cpp common_get_verbosity) and drops it below -lv 4, which hid this line
+    // in up-farows-hip-gpu-20261116-r2 (-lv 3).
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: GGML_CUDA_FA_ROWS_GATHER engaged: n_kv=%lld -> n_rows=%lld x n_slices=%lld, kernel=%d\n", __func__,
+        GGML_LOG_WARN("%s: GGML_CUDA_FA_ROWS_GATHER engaged: n_kv=%lld -> n_rows=%lld x n_slices=%lld, kernel=%d\n", __func__,
             (long long) dst->src[1]->ne[1], (long long) p.K.ne[1], (long long) p.K.ne[3], (int) kernel);
     }
 

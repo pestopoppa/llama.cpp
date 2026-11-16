@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <algorithm>
 #include <cmath>
@@ -483,8 +484,65 @@ static bool llama_fa_rows_gather_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace (fprintf, not LLAMA_LOG_*: llama-server drops ggml/llama INFO
+// below -lv 4) of the first FA_ROWS_TRACE_MAX row-list events on the llama side. Pairs with the "FA_ROWS_TRACE fattn:"
+// lines of ggml-cuda/fattn.cu.
+static bool llama_fa_rows_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// separate budgets so that frequent skip events (DFlash KV-injection graphs build an unused row list) cannot use up
+// the attach lines: 0 = attached at set_input, 1 = skipped at set_input, 2 = not attached at graph build
+static bool llama_fa_rows_trace_take(int which) {
+    static std::atomic<int> n[3] = {{0}, {0}, {0}};
+    return llama_fa_rows_trace_enabled() && n[which].fetch_add(1) < 20;
+}
+
+// Checks the row-list contract on the host copies: every cell the KQ mask leaves visible for a query row must be in
+// that row's slice list. Returns the number of (row, cell) pairs that violate it; -1 when not checked.
+static int64_t llama_fa_rows_check_superset(const ggml_tensor * mask, const std::vector<int32_t> & rows, int64_t n_rows, int64_t n_slices) {
+    if (!mask || !mask->buffer || !ggml_backend_buffer_is_host(mask->buffer) || mask->type != GGML_TYPE_F16 || mask->ne[3] != 1) {
+        return -1;
+    }
+    const int64_t n_kv  = mask->ne[0];
+    const int64_t n_tok = mask->ne[1];
+    if (n_slices <= 0 || n_tok % n_slices != 0 || n_kv*n_tok > (int64_t) 64*1024*1024) {
+        return -1;
+    }
+    const int64_t T = n_tok/n_slices;
+    int64_t bad = 0;
+    std::vector<uint8_t> in_list(n_kv);
+    for (int64_t s = 0; s < n_slices; ++s) {
+        std::fill(in_list.begin(), in_list.end(), 0);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            const int32_t r = rows[s*n_rows + i];
+            if (r >= 0 && r < n_kv) {
+                in_list[r] = 1;
+            }
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            const ggml_fp16_t * m = (const ggml_fp16_t *) ((const char *) mask->data + (s*T + t)*mask->nb[1]);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!in_list[j] && !std::isinf(ggml_fp16_to_fp32(m[j]))) {
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
 void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (!self_kv_rows || !self_kv_rows->buffer) {
+        if (self_kv_rows && llama_fa_rows_trace_take(1)) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: set_input skipped: row list [%lld,%lld] has no buffer (not consumed by any FA node) "
+                    "n_tokens=%u n_seqs_unq=%u n_kv=%u\n", (long long) self_kv_rows->ne[0], (long long) self_kv_rows->ne[1],
+                    ubatch->n_tokens, ubatch->n_seqs_unq, kv->get_n_kv());
+        }
         kv_rows_valid = false;
         return;
     }
@@ -500,6 +558,34 @@ void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * k
 
     GGML_ASSERT((int64_t) kv_rows_data.size() == ggml_nelements(self_kv_rows));
     memcpy(self_kv_rows->data, kv_rows_data.data(), kv_rows_data.size()*sizeof(int32_t));
+
+    if (llama_fa_rows_trace_take(0)) {
+        const int64_t R = self_kv_rows->ne[0];
+        const int64_t S = self_kv_rows->ne[1];
+        std::string used;
+        for (int64_t s = 0; s < S && s < 8; ++s) {
+            int64_t n = 0;
+            int32_t lo = -1;
+            int32_t hi = -1;
+            for (int64_t i = 0; i < R; ++i) {
+                const int32_t r = kv_rows_data[s*R + i];
+                if (r >= 0) {
+                    lo = n == 0 ? r : lo;
+                    hi = r;
+                    n++;
+                }
+            }
+            used += " s" + std::to_string(s) + "=" + std::to_string(n) + "[" + std::to_string(lo) + ".." + std::to_string(hi) + "]";
+        }
+        const int64_t bad = llama_fa_rows_check_superset(self_kq_mask, kv_rows_data, R, S);
+        fprintf(stderr, "FA_ROWS_TRACE llama: row list attached n_rows=%lld n_slices=%lld n_kv=%u n_tokens=%u n_seqs_unq=%u "
+                "mask=[%lld,%lld,%lld,%lld] superset_violations=%lld (-1 = not checked) used:%s\n",
+                (long long) R, (long long) S, kv->get_n_kv(), ubatch->n_tokens, ubatch->n_seqs_unq,
+                self_kq_mask ? (long long) self_kq_mask->ne[0] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[1] : -1LL,
+                self_kq_mask ? (long long) self_kq_mask->ne[2] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[3] : -1LL,
+                (long long) bad, used.c_str());
+        fflush(stderr);
+    }
 
     kv_rows_valid = false;
 }
@@ -2896,6 +2982,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // UP-FAROWS-HIP: per-sequence K/V row lists (src[7]); only set by build_attn over a unified KV cache
         if (fa_kv_rows && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_kv_rows->ne[1] == 0) {
             ggml_flash_attn_ext_set_kv_rows(cur, fa_kv_rows);
+        } else if (fa_kv_rows && llama_fa_rows_trace_take(2)) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: build il=%d row list NOT attached (n_stream=%lld mask_ne3=%lld n_q=%lld n_slices=%lld)\n",
+                    il, (long long) n_stream, kq_mask ? (long long) kq_mask->ne[3] : -1LL, (long long) q->ne[1], (long long) fa_kv_rows->ne[1]);
         }
 
         if (v_mla) {

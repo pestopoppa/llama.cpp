@@ -13855,6 +13855,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1025, 2, 2048, 256, 0.0f, 0.0f,
             type_KV, type_KV, 2, 0, true, true));
     }
+    // UP-FAROWS-HIP r3: lists much shorter than n_kv (163840 cells, 131072 of them free: 4 x 8192 owned, so most of the
+    // gathered K/V of a padded slice is the -inf tail), at decode / DFlash2 verify / a 4 x 512 prefill ubatch (gathered
+    // MMA/tile with n_slices 4 at hd256, which the cases above only reach at n_kv 32768 with 2 slices). hint 1 = an
+    // n_seq hint that disagrees with the slicing (the gathered view resets it to 1 per slice; the dense path must not
+    // care either).
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {4, 32, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, nb, 4, 2048, 131072, 0.0f, 0.0f,
+                type_KV, type_KV, 4, 0, true, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 131072, 0.0f, 0.0f,
+            type_KV, type_KV, 1, 0, true, true));
+    }
     // knob-off controls for the same served shapes (no row list): the dense path at these sizes
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));
