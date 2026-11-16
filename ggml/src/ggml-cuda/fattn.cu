@@ -914,6 +914,9 @@ static const char * ggml_cuda_fattn_rows_gather_why_not(const ggml_tensor * dst)
     if (!ggml_cuda_fattn_rows_gather_enabled()) {
         return "knob off";
     }
+    if (ggml_cuda_fattn_rows_lists_only()) {
+        return "lists-only (GGML_CUDA_FA_ROWS_LISTS_ONLY=1)";
+    }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -1009,7 +1012,28 @@ struct ggml_cuda_fattn_rows_plan {
     size_t off_V;
     size_t off_mask;
     size_t end;      // total bytes needed from dst->data on
+    size_t off_guard[4]; // r8 GGML_CUDA_FA_ROWS_SCRATCH_CANARY: guard bands after f16 extra, K, V, mask (0: none)
 };
+
+// r8 diagnostics.
+// GGML_CUDA_FA_ROWS_LISTS_ONLY=1: llama.cpp still builds and uploads the row lists (src[7]), but the backend never
+//   gathers and never reserves gather scratch: splits llama-side effects of the knob from ggml-side ones.
+// GGML_CUDA_FA_ROWS_SCRATCH_CANARY=1: a FA_ROWS_GUARD_BYTES guard band follows each scratch region of the gathered
+//   call (f16 conversion area, gathered K, V, mask); filled with 0xA5 before the gather, checked on the host after the
+//   kernel (outside graph capture only). Any overwrite is printed as FA_ROWS_CANARY ... CLOBBERED.
+#define FA_ROWS_GUARD_BYTES 4096
+static bool ggml_cuda_fattn_rows_env_flag(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && atoi(env) != 0;
+}
+static bool ggml_cuda_fattn_rows_lists_only() {
+    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_LISTS_ONLY");
+    return v;
+}
+static bool ggml_cuda_fattn_rows_canary() {
+    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_SCRATCH_CANARY");
+    return v;
+}
 
 static void ggml_cuda_fattn_rows_set_contiguous(ggml_tensor & t, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
     t.type  = type;
@@ -1081,15 +1105,28 @@ static void ggml_cuda_fattn_rows_build_plan(const int device, const ggml_tensor 
 
     p.end = ggml_cuda_fattn_rows_extra_end(device, p);
 
+    const bool canary = ggml_cuda_fattn_rows_canary();
+    const auto guard = [&](int i) {
+        p.off_guard[i] = 0;
+        if (canary) {
+            p.end = GGML_PAD(p.end, 128);
+            p.off_guard[i] = p.end - (uintptr_t) dst->data;
+            p.end += FA_ROWS_GUARD_BYTES;
+        }
+    };
+    guard(0);
     p.end      = GGML_PAD(p.end, 128);
     p.off_K    = p.end - (uintptr_t) dst->data;
     p.end     += ggml_nbytes(&p.K);
+    guard(1);
     p.end      = GGML_PAD(p.end, 128);
     p.off_V    = p.end - (uintptr_t) dst->data;
     p.end     += ggml_nbytes(&p.V);
+    guard(2);
     p.end      = GGML_PAD(p.end, 128);
     p.off_mask = p.end - (uintptr_t) dst->data;
     p.end     += ggml_nbytes(&p.mask);
+    guard(3);
 }
 
 template <typename word_t>
@@ -1408,6 +1445,16 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
             (long long) dst->src[1]->ne[1], (long long) p.K.ne[1], (long long) p.K.ne[3], (int) kernel);
     }
 
+    bool canary_armed = false;
+    if (ggml_cuda_fattn_rows_canary()) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+        canary_armed = cs == cudaStreamCaptureStatusNone;
+        for (int i = 0; canary_armed && i < 4; ++i) {
+            CUDA_CHECK(cudaMemsetAsync(base + p.off_guard[i], 0xA5, FA_ROWS_GUARD_BYTES, stream));
+        }
+    }
+
     ggml_cuda_fattn_rows_gather_one(dst->src[1], p.K, rows_d, rows_s1, stream);
     ggml_cuda_fattn_rows_gather_one(dst->src[2], p.V, rows_d, rows_s1, stream);
     {
@@ -1438,6 +1485,28 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
         case BEST_FATTN_KERNEL_GQA_VERIFY:
             ggml_cuda_fattn_gqa_verify(ctx, &p.dst);
             break;
+    }
+    if (canary_armed) {
+        static const char * names[4] = {"after_f16_extra", "after_K", "after_V", "after_mask"};
+        std::vector<uint8_t> g(FA_ROWS_GUARD_BYTES);
+        for (int i = 0; i < 4; ++i) {
+            CUDA_CHECK(cudaMemcpyAsync(g.data(), base + p.off_guard[i], FA_ROWS_GUARD_BYTES, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int64_t first = -1;
+            int64_t n_bad = 0;
+            for (int64_t b = 0; b < FA_ROWS_GUARD_BYTES; ++b) {
+                if (g[b] != 0xA5) {
+                    first = first < 0 ? b : first;
+                    n_bad++;
+                }
+            }
+            if (n_bad > 0) {
+                fprintf(stderr, "FA_ROWS_CANARY fattn: node=%s kernel=%d guard=%s CLOBBERED n_bad=%lld first_byte=%lld rows=[%lld,%lld]\n",
+                    dst->name, (int) kernel, names[i], (long long) n_bad, (long long) first,
+                    (long long) rows->ne[0], (long long) rows->ne[1]);
+                fflush(stderr);
+            }
+        }
     }
     return true;
 }
