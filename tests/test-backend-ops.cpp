@@ -9752,9 +9752,80 @@ struct test_flash_attn_ext_unified : public test_case {
     const ggml_type type_V;
     const int64_t hint; // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
     const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
+    const bool kv_rows;     // UP-FAROWS-HIP: attach per-sequence K/V row lists (src[7], ggml_flash_attn_ext_set_kv_rows)
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
+        std::string res = VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
+        if (kv_rows) {
+            res += ",kv_rows=1";
+        }
+        return res;
+    }
+
+    // owner sequence and position of each cell (-2: the shared trunk, owned by every sequence; -1: free)
+    void cell_layout(std::vector<int> & owner, std::vector<int64_t> & pos, std::vector<int64_t> & n_cells) const {
+        const int64_t n_trunk = std::min(n_shared, kv - n_free);
+        owner.assign(kv, -1);
+        pos.assign(kv, -1);
+        n_cells.assign(n_seq, n_trunk);
+        for (int64_t c = 0; c < n_trunk; ++c) {
+            owner[c] = -2;
+            pos[c]   = c;
+        }
+        for (int64_t c = n_trunk; c < kv - n_free; ++c) {
+            const int s = ((c - n_trunk) / run) % n_seq;
+            owner[c] = s;
+            pos[c]   = n_cells[s]++;
+        }
+    }
+
+    // the sequence of query row i (the batch is n_seq groups of `group` rows, the last group may be short)
+    int seq_of_row(int64_t i) const {
+        const int64_t group = (nb + n_seq - 1) / n_seq;
+        return (int) std::min<int64_t>(i / group, n_seq - 1);
+    }
+
+    // Row lists as llama.cpp builds them (llama_kv_cache::get_kv_rows): one slice per sequence when the rows are equal
+    // single-sequence runs, else one slice over the union of the cells of the sequences present. Ascending cell order,
+    // padded with -1 to a multiple of 256.
+    void row_lists(std::vector<int32_t> & data, int64_t & n_rows, int64_t & n_slices) const {
+        std::vector<int> owner;
+        std::vector<int64_t> pos;
+        std::vector<int64_t> n_cells;
+        cell_layout(owner, pos, n_cells);
+
+        const bool sliced = n_seq > 1 && nb % n_seq == 0;
+        n_slices = sliced ? n_seq : 1;
+
+        std::vector<bool> present(n_seq, false);
+        for (int64_t i = 0; i < nb; ++i) {
+            present[seq_of_row(i)] = true;
+        }
+
+        std::vector<std::vector<int32_t>> lists(n_slices);
+        for (int64_t c = 0; c < kv; ++c) {
+            if (owner[c] == -1) {
+                continue;
+            }
+            if (sliced) {
+                for (int64_t s = 0; s < n_slices; ++s) {
+                    if (owner[c] == -2 || owner[c] == s) {
+                        lists[s].push_back((int32_t) c);
+                    }
+                }
+            } else if (owner[c] == -2 || present[owner[c]]) {
+                lists[0].push_back((int32_t) c);
+            }
+        }
+        size_t n_max = 1;
+        for (const auto & l : lists) {
+            n_max = std::max(n_max, l.size());
+        }
+        n_rows = GGML_PAD((int64_t) n_max, 256);
+        data.assign(n_rows*n_slices, -1);
+        for (int64_t s = 0; s < n_slices; ++s) {
+            std::copy(lists[s].begin(), lists[s].end(), data.begin() + s*n_rows);
+        }
     }
 
     double max_nmse_err() override {
@@ -9769,9 +9840,10 @@ struct test_flash_attn_ext_unified : public test_case {
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
                                 ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
-                                int64_t n_shared = 0)
+                                int64_t n_shared = 0, bool kv_rows = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
-          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared) {}
+          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared),
+          kv_rows(kv_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
@@ -9808,6 +9880,15 @@ struct test_flash_attn_ext_unified : public test_case {
         if (hint > 0) {
             ggml_flash_attn_ext_set_n_seq(out, (int32_t) hint);
         }
+        if (kv_rows) {
+            std::vector<int32_t> data;
+            int64_t n_rows   = 0;
+            int64_t n_slices = 0;
+            row_lists(data, n_rows, n_slices);
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_rows, n_slices);
+            ggml_set_name(r, "kv_rows");
+            ggml_flash_attn_ext_set_kv_rows(out, r);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9815,25 +9896,24 @@ struct test_flash_attn_ext_unified : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kv_rows") == 0) {
+                std::vector<int32_t> data;
+                int64_t n_rows   = 0;
+                int64_t n_slices = 0;
+                row_lists(data, n_rows, n_slices);
+                GGML_ASSERT((int64_t) data.size() == ggml_nelements(t));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+                continue;
+            }
             if (strcmp(t->name, "m") != 0) {
                 init_tensor_uniform(t);
                 continue;
             }
 
-            // owner sequence and position of each cell (-2: the shared trunk, owned by every sequence)
-            const int64_t n_trunk = std::min(n_shared, kv - n_free);
-            std::vector<int>     owner(kv, -1);
-            std::vector<int64_t> pos(kv, -1);
-            std::vector<int64_t> n_cells(n_seq, n_trunk);
-            for (int64_t c = 0; c < n_trunk; ++c) {
-                owner[c] = -2;
-                pos[c]   = c;
-            }
-            for (int64_t c = n_trunk; c < kv - n_free; ++c) {
-                const int s = ((c - n_trunk) / run) % n_seq;
-                owner[c] = s;
-                pos[c]   = n_cells[s]++;
-            }
+            std::vector<int>     owner;
+            std::vector<int64_t> pos;
+            std::vector<int64_t> n_cells;
+            cell_layout(owner, pos, n_cells);
 
             std::mt19937 gen = suite_seed_rng();
             std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
@@ -9841,7 +9921,7 @@ struct test_flash_attn_ext_unified : public test_case {
             std::vector<float> data(kv*nb);
             const int64_t group = (nb + n_seq - 1) / n_seq;
             for (int64_t i = 0; i < nb; ++i) {
-                const int     s     = std::min<int64_t>(i / group, n_seq - 1);
+                const int     s     = seq_of_row(i);
                 const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
                 // the tokens of the batch are the last n_grp cells of their sequence
                 const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
@@ -13725,6 +13805,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one sequence owns a large span, the others are idle neighbours (the decode shape of a busy unified server)
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 1, 4, 4096, 0));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 8, 4, 4096, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // UP-FAROWS-HIP: the same unified layouts with per-sequence K/V row lists (src[7]). The CPU reference ignores the
+    // lists (the mask alone defines the result); the HIP/CUDA backend gathers the listed rows when
+    // GGML_CUDA_FA_ROWS_GATHER=1 and ignores them otherwise, so a run with the knob off and one with it on compare both
+    // paths against the same reference. Layouts: contiguous runs, fully interleaved (run 1, concurrent decode),
+    // unaligned runs, a shared trunk, decode (nb = n_seq), DFlash2 verify (np4 x 9), a union slice (nb % n_seq != 0).
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t run : {1, 300, 2048}) {
+            for (int64_t nb : {1, 4, 36}) {
+                test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, nb, 4, run, 1024, 0.0f, 0.0f,
+                    type_KV, type_KV, nb >= 4 ? 4 : 0, 0, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 4, 4, 1, 1024, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 2048, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 6, 4, 64, 512, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 0, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 8, 4, 1, 1024, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 0, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 2, 2, 1, 1024, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true));
+
     // ALiBi, softcap, other head sizes (tile, MMA and MLA paths)
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f));

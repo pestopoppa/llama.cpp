@@ -5699,6 +5699,22 @@ int32_t ggml_flash_attn_ext_get_n_seq(
     return ggml_get_op_params_i32(a, 4);
 }
 
+void ggml_flash_attn_ext_set_kv_rows(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_rows) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!kv_rows) {
+        a->src[7] = NULL;
+        return;
+    }
+    GGML_ASSERT(kv_rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(kv_rows));
+    GGML_ASSERT(kv_rows->ne[2] == 1 && kv_rows->ne[3] == 1);
+    GGML_ASSERT(a->src[0]->ne[1] % kv_rows->ne[1] == 0);
+
+    a->src[7] = kv_rows;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

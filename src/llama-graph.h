@@ -364,6 +364,17 @@ public:
     // fills the DCA inputs; also called by the hybrid memory inputs, which set the attention inputs themselves
     void set_input_dca(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
 
+    // UP-FAROWS-HIP (GGML_CUDA_FA_ROWS_GATHER=1, unified KV + flash attention only): per-sequence K/V row lists for
+    // FLASH_ATTN_EXT src[7]. The lists computed by the graph build / reuse check are cached for the set_input that
+    // follows, so the cells are scanned once per ubatch.
+    ggml_tensor * self_kv_rows = nullptr; // I32 [n_rows, n_slices]
+    std::vector<int32_t> kv_rows_data;
+    bool kv_rows_valid = false;
+
+    // also called by the hybrid memory inputs
+    void set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
+    bool can_reuse_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch & ubatch);
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -1029,6 +1040,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // UP-FAROWS-HIP: the K/V row list of the attention input being built (set around build_attn_mha by build_attn)
+    mutable ggml_tensor * fa_kv_rows = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

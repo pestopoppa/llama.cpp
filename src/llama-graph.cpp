@@ -473,6 +473,55 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// UP-FAROWS-HIP: GGML_CUDA_FA_ROWS_GATHER=1 attaches per-sequence K/V row lists to the FA ops of a unified KV cache.
+// The same variable turns the HIP/CUDA gather on (ggml-cuda/fattn.cu); off (the default) the graph is unchanged.
+static bool llama_fa_rows_gather_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_GATHER");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    if (!self_kv_rows || !self_kv_rows->buffer) {
+        kv_rows_valid = false;
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(self_kv_rows->buffer));
+
+    if (!kv_rows_valid) {
+        int64_t n_rows   = 0;
+        int64_t n_slices = 0;
+        const bool ok = kv->get_kv_rows(*ubatch, kv_rows_data, n_rows, n_slices);
+        GGML_ASSERT(ok && n_rows == self_kv_rows->ne[0] && n_slices == self_kv_rows->ne[1]);
+    }
+
+    GGML_ASSERT((int64_t) kv_rows_data.size() == ggml_nelements(self_kv_rows));
+    memcpy(self_kv_rows->data, kv_rows_data.data(), kv_rows_data.size()*sizeof(int32_t));
+
+    kv_rows_valid = false;
+}
+
+bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) {
+    kv_rows_valid = false;
+
+    if (!llama_fa_rows_gather_enabled() || !cparams.flash_attn || !cparams.kv_unified) {
+        return self_kv_rows == nullptr;
+    }
+
+    int64_t n_rows   = 0;
+    int64_t n_slices = 0;
+    if (!kv->get_kv_rows(ubatch, kv_rows_data, n_rows, n_slices)) {
+        return self_kv_rows == nullptr;
+    }
+
+    kv_rows_valid = true;
+
+    return self_kv_rows != nullptr && self_kv_rows->ne[0] == n_rows && self_kv_rows->ne[1] == n_slices;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -482,6 +531,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
+
+    set_input_kv_rows(mctx, ubatch);
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
@@ -560,6 +611,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= can_reuse_kv_rows(mctx, params.ubatch);
 
     return res;
 }
@@ -1125,6 +1178,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    inp_attn->set_input_kv_rows(mctx->get_attn(), ubatch);
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1160,6 +1215,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->can_reuse_kv_rows(mctx->get_attn(), params.ubatch);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2836,6 +2893,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_set_n_seq(cur, (int32_t) ubatch.n_seqs_unq);
         }
 
+        // UP-FAROWS-HIP: per-sequence K/V row lists (src[7]); only set by build_attn over a unified KV cache
+        if (fa_kv_rows && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_kv_rows->ne[1] == 0) {
+            ggml_flash_attn_ext_set_kv_rows(cur, fa_kv_rows);
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -3020,6 +3082,18 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
+    // UP-FAROWS-HIP: per-sequence K/V row lists (unified KV + flash attention, GGML_CUDA_FA_ROWS_GATHER=1)
+    if (llama_fa_rows_gather_enabled() && cparams.flash_attn && cparams.kv_unified && inp->self_kq_mask->ne[3] == 1) {
+        int64_t n_rows   = 0;
+        int64_t n_slices = 0;
+        if (mctx_cur->get_kv_rows(ubatch, inp->kv_rows_data, n_rows, n_slices)) {
+            inp->self_kv_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rows, n_slices);
+            ggml_set_input(inp->self_kv_rows);
+            ggml_set_name(inp->self_kv_rows, "attn_inp_kv_rows");
+            inp->kv_rows_valid = true;
+        }
+    }
+
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
@@ -3101,7 +3175,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    fa_kv_rows = inp->self_kv_rows;
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    fa_kv_rows = nullptr;
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

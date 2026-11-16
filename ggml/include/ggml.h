@@ -2504,6 +2504,15 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_get_n_seq(
             const struct ggml_tensor * a);
 
+    // Optional per-sequence K/V row lists (UP-FAROWS-HIP, GGML_CUDA_FA_ROWS_GATHER): kv_rows is I32 [n_rows, n_slices].
+    // The query rows (and mask rows) of the op are n_slices equal runs; slice s attends only to the K/V rows listed in
+    // column s, in the listed order; a negative entry is padding. The list must be a superset of the cells the mask
+    // leaves visible for that slice, so the mask alone still defines the result and a backend may ignore the hint
+    // (the CPU backend does). Stored in src[7] so it never collides with src[5]/src[6] (AK-ASM-H12 qsa).
+    GGML_API void ggml_flash_attn_ext_set_kv_rows(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_rows);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
