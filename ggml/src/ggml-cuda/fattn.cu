@@ -713,6 +713,141 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Host-side mirror of the compile-time NO_DEVICE_CODE stubs of the FA kernels. A stub traps the device
+// (no_device_code -> __trap -> HSA exception 0x1016 on ROCm) and can never produce a result, so a selection that lands
+// on one is a defect. The conditions below are copied from the kernel bodies and must be kept in sync with them:
+//   fattn-tile.cuh   flash_attn_tile:   GGML_USE_WMMA_FATTN && ncols2 != 1 && DV not in {40,72,512} && !(192/128) && !(320/256),
+//                                       or softcap && DV not in {128,256,512}
+//   fattn-wmma-f16.cu flash_attn_ext_f16: whole body needs GGML_HIP_ROCWMMA_FATTN && GGML_USE_WMMA_FATTN (HIP);
+//                                       softcap && D not in {128,256}
+//   fattn-vec.cuh    flash_attn_ext_vec: softcap && D not in {128,256}
+//   fattn-mma-f16.cuh flash_attn_ext_f16: needs VOLTA/TURING MMA or AMD WMMA/MFMA; softcap && DKQ not in {128,256,512}
+// GGML_USE_WMMA_FATTN is a DEVICE-pass macro (fattn-wmma-f16.cuh, from the CDNA/RDNA3/RDNA4 arch macros and the
+// rocWMMA version); on gfx90a with GGML_HIP_ROCWMMA_FATTN and rocWMMA 1.x it IS defined, which compiles every tile
+// variant with ncols2 > 1 (the GQA-packed ones) as a stub. Host side it equals ggml_cuda_should_use_wmma_fattn(cc).
+static bool ggml_cuda_fattn_wmma_macro_on_device(const int cc) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(cc);
+    return true;
+#elif defined(GGML_USE_HIP)
+    return GGML_CUDA_CC_IS_AMD(cc) && ggml_cuda_should_use_wmma_fattn(cc);
+#else
+    GGML_UNUSED(cc);
+    return false;
+#endif
+}
+
+// ncols2 that launch_fattn_tile_switch_ncols2 (fattn-tile.cuh) picks for dst; 0 = that function aborts.
+static int ggml_cuda_fattn_tile_ncols2(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    const int64_t DKQ = Q->ne[0];
+    const int64_t DV  = V->ne[0];
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const int gqa_limit = GGML_CUDA_CC_IS_NVIDIA(cc) && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    if (DKQ == 320) {
+#ifdef GGML_USE_HIP
+        return use_gqa_opt && gqa_ratio % 32 == 0 ? 32 : 0;
+#else
+        return use_gqa_opt && gqa_ratio % 16 == 0 ? 16 : 0;
+#endif
+    }
+    if (DKQ == 576) {
+        if (use_gqa_opt && gqa_ratio % 16 == 0) { return 16; }
+        if (use_gqa_opt && gqa_ratio %  4 == 0) { return  4; }
+    }
+    if (DKQ == 192) {
+        if (use_gqa_opt && gqa_ratio % 16 == 0) { return 16; }
+        if (use_gqa_opt && gqa_ratio %  8 == 0) { return  8; }
+        return 0;
+    }
+    if (DKQ <= 512) {
+        if (use_gqa_opt && gqa_ratio % 8 == 0) { return 8; }
+        if (use_gqa_opt && gqa_ratio % 4 == 0) { return 4; }
+        if (use_gqa_opt && gqa_ratio % 2 == 0) { return 2; }
+        if (DV <= 256) { return 1; }
+    }
+    return 0;
+}
+
+// nullptr if `kernel` has real device code for dst on `device`, else why it is a stub.
+static const char * ggml_cuda_fattn_kernel_stub_why(const int device, const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int64_t DKQ = dst->src[0]->ne[0];
+    const int64_t DV  = dst->src[2]->ne[0];
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool softcap = logit_softcap != 0.0f;
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:
+            return "no kernel";
+        case BEST_FATTN_KERNEL_TILE: {
+            const int ncols2 = ggml_cuda_fattn_tile_ncols2(cc, dst);
+            if (ncols2 == 0) {
+                return "tile: no ncols2 variant";
+            }
+            if (ggml_cuda_fattn_wmma_macro_on_device(cc) && ncols2 != 1 && DV != 40 && DV != 72 && DV != 512 &&
+                    !(DKQ == 192 && DV == 128) && !(DKQ == 320 && DV == 256)) {
+                return "tile: ncols2>1 compiled out (GGML_USE_WMMA_FATTN)";
+            }
+            if (softcap && !(DV == 128 || DV == 256 || DV == 512)) {
+                return "tile: softcap D";
+            }
+            return nullptr;
+        }
+        case BEST_FATTN_KERNEL_WMMA_F16:
+#if defined(GGML_USE_HIP)
+            if (!ggml_cuda_fattn_wmma_macro_on_device(cc)) {
+                return "wmma: not compiled for this arch";
+            }
+#endif
+            if (softcap && !(DKQ == 128 || DKQ == 256)) {
+                return "wmma: softcap D";
+            }
+            return nullptr;
+        case BEST_FATTN_KERNEL_VEC:
+            if (softcap && !(DKQ == 128 || DKQ == 256)) {
+                return "vec: softcap D";
+            }
+            return nullptr;
+        case BEST_FATTN_KERNEL_MMA_F16:
+#if defined(GGML_USE_HIP)
+            if (!amd_mfma_available(cc) && !amd_wmma_available(cc)) {
+                return "mma: no AMD MFMA/WMMA";
+            }
+#endif
+            if (softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
+                return "mma: softcap D";
+            }
+            return nullptr;
+        case BEST_FATTN_KERNEL_GQA_VERIFY:
+            return nullptr; // ggml_cuda_fattn_gqa_verify_applicable already gates arch and shape
+    }
+    return "unknown kernel";
+}
+
+// Dense-path detector for the same defect: warn once per (kernel, reason) family if the dense selection lands on a
+// stub. The dense launch is left unchanged (it traps exactly as before); this only names the cause in the log.
+static void ggml_cuda_fattn_warn_dense_stub(const int device, const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    const char * why = ggml_cuda_fattn_kernel_stub_why(device, kernel, dst);
+    if (why == nullptr) {
+        return;
+    }
+    static std::atomic<int> n_warned{0};
+    if (n_warned.fetch_add(1) < 4) {
+        GGML_LOG_WARN("%s: dense FA selection kernel=%d is a NO_DEVICE_CODE stub for this shape (%s): D=%lld/%lld Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld] %s\n",
+            __func__, (int) kernel, why, (long long) dst->src[0]->ne[0], (long long) dst->src[2]->ne[0],
+            (long long) dst->src[0]->ne[0], (long long) dst->src[0]->ne[1], (long long) dst->src[0]->ne[2], (long long) dst->src[0]->ne[3],
+            (long long) dst->src[1]->ne[1], (long long) dst->src[1]->ne[2], ggml_type_name(dst->src[1]->type));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // UP-FAROWS-HIP: per-sequence K/V row gather (port of upstream 1b6935b22 / #29510 "flash_attn_ext_rows", gather form).
 //
 // With a unified KV cache (--kv-unified) all sequences share one stream, so every query row's K/V view spans the cells
@@ -832,8 +967,33 @@ static bool ggml_cuda_fattn_rows_wmma_enabled() {
     return enabled;
 }
 
-static best_fattn_kernel ggml_cuda_fattn_rows_kernel(const int device, const ggml_tensor * gathered_dst) {
-    return ggml_cuda_get_best_fattn_kernel_ex(device, gathered_dst, ggml_cuda_fattn_rows_wmma_enabled());
+// r5 hard guard: the gathered call may only launch a kernel with real device code (ggml_cuda_fattn_kernel_stub_why).
+// up-farows-hip-gpu-20261116-r4 tbo arm B: the non-WMMA selection for the gathered hd256 GQA-6 shape with few query
+// rows per slice (rows * gqa_ratio_eff <= 64, or under GGML_CUDA_FA_CDNA_D256_MMA_MIN_ROWS) is TILE with ncols2 = 2,
+// which the rocWMMA gfx90a build compiles as a stub -> 56x "fattn-tile.cuh:845 no device code" + HSA 0x1016.
+// The dense path never reaches that variant: for K->ne[1] % 256 == 0 it takes asm/CK, GQA-verify, vec or WMMA first,
+// and otherwise gqa_opt is off and tile runs ncols2 = 1 (real). Order for the gathered call:
+//   1. the selection (WMMA only with GGML_CUDA_FA_ROWS_WMMA=1) if it has device code;
+//   2. a stub TILE on an MFMA/WMMA-capable AMD device with D <= 256 -> MMA_F16 (the selection's own choice for larger
+//      batches of the same shape; real device code on CDNA, gathered n_rows % FATTN_KQ_STRIDE == 0 is guaranteed);
+//   3. otherwise NONE: ggml_cuda_fattn_rows_gather_run returns false and the node runs dense (traced).
+// `why` (optional) receives the stub reason of the first choice, nullptr if it was usable.
+static best_fattn_kernel ggml_cuda_fattn_rows_kernel(const int device, const ggml_tensor * gathered_dst, const char ** why = nullptr) {
+    const best_fattn_kernel first = ggml_cuda_get_best_fattn_kernel_ex(device, gathered_dst, ggml_cuda_fattn_rows_wmma_enabled());
+    const char * stub = ggml_cuda_fattn_kernel_stub_why(device, first, gathered_dst);
+    if (why) {
+        *why = first == BEST_FATTN_KERNEL_NONE ? nullptr : stub;
+    }
+    if (stub == nullptr || first == BEST_FATTN_KERNEL_NONE) {
+        return first;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (first == BEST_FATTN_KERNEL_TILE && GGML_CUDA_CC_IS_AMD(cc) && (amd_mfma_available(cc) || amd_wmma_available(cc)) &&
+            gathered_dst->src[0]->ne[0] <= 256 && gathered_dst->src[0]->ne[0] != 40 && gathered_dst->src[0]->ne[0] != 72 &&
+            ggml_cuda_fattn_kernel_stub_why(device, BEST_FATTN_KERNEL_MMA_F16, gathered_dst) == nullptr) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+    return BEST_FATTN_KERNEL_NONE;
 }
 
 struct ggml_cuda_fattn_rows_plan {
@@ -1072,7 +1232,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (ggml_cuda_fattn_asm_gfx90a_try(ctx, dst)) {
         return;
     }
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel dense_kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    ggml_cuda_fattn_warn_dense_stub(ggml_cuda_get_device(), dense_kernel, dst);
+    switch (dense_kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -1103,12 +1265,16 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
     ggml_cuda_fattn_rows_plan p;
     ggml_cuda_fattn_rows_build_plan(device, dst, p);
 
-    const best_fattn_kernel kernel = ggml_cuda_fattn_rows_kernel(device, &p.dst);
+    const char * stub_why = nullptr;
+    const best_fattn_kernel kernel = ggml_cuda_fattn_rows_kernel(device, &p.dst, &stub_why);
     if (kernel == BEST_FATTN_KERNEL_NONE) {
-        ggml_cuda_fattn_rows_trace(dst, "dense", "gathered shape has no kernel", (int) ggml_cuda_get_best_fattn_kernel(device, dst));
+        ggml_cuda_fattn_rows_trace(dst, "dense", stub_why ? stub_why : "gathered shape has no kernel",
+            (int) ggml_cuda_get_best_fattn_kernel(device, dst));
         return false;
     }
-    ggml_cuda_fattn_rows_trace(dst, "gather", nullptr, (int) kernel);
+    // last line of defence: never launch a stub from the gathered path
+    GGML_ASSERT(ggml_cuda_fattn_kernel_stub_why(device, kernel, &p.dst) == nullptr);
+    ggml_cuda_fattn_rows_trace(dst, "gather", stub_why /* first choice was a stub -> promoted */, (int) kernel);
 
     char * base = (char *) dst->data;
     p.K.data    = base + p.off_K;

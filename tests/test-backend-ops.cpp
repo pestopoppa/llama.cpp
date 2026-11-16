@@ -13883,6 +13883,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_F16, GGML_TYPE_F16, 2, 0, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, false, true));
+    // UP-FAROWS-HIP r5: up-farows-hip-gpu-20261116-r4 tbo arm B (n_kv 12288 -> 2816 gathered rows, 1 slice, hd256 GQA 6,
+    // few query rows): the non-WMMA selection picked TILE with ncols2 = 2, compiled as a NO_DEVICE_CODE stub on the
+    // gfx90a rocWMMA build (fattn-tile.cuh:845 + HSA 0x1016). r5 must promote these to MMA_F16 or run them dense.
+    // A stub launch __trap()s the device, so a regression here aborts test-backend-ops (non-zero exit), it never passes;
+    // runners should still grep the log for "has no device code" and treat any hit as FAIL.
+    for (int64_t nb_tok : {1, 8, 16, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, nb_tok, 1, 2800, 9488, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true));
+    }
     // knob-off controls for the same served shapes (no row list): the dense path at these sizes
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));
