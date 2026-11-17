@@ -504,7 +504,7 @@ static __global__ void flash_attn_ext_f16(
             }
             float dst_val = VKQ[j_VKQ*D_padded + i];
             if (gridDim.y == 1) {
-                dst_val /= KQ_rowsum_j;
+                dst_val = fattn_div_rowsum(dst_val, KQ_rowsum_j);
             }
             dst[j_dst_unrolled*D + i] = dst_val;
         }

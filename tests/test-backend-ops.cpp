@@ -9591,6 +9591,82 @@ struct test_flash_attn_ext_large_v : public test_flash_attn_ext {
     }
 };
 
+// [INF48-FA-ALLMASK-NAN] GGML_OP_FLASH_ATTN_EXT with query rows whose mask is entirely -inf. The softmax row sum of such
+// a row is exactly 0; the CPU reference writes 0 (S_inv = S == 0 ? 0 : 1/S) and the CUDA/HIP kernels used to write
+// 0/0 = NaN (final normalisation in vec/tile/wmma/mma, the parallel-blocks combine and the stream-k fixup). The
+// mask is init_tensor_kq_mask noise with, on top of it:
+//   ALLMASK_MIXED     : row i % 3 == 0 fully -inf, row i % 3 == 1 -inf on the first half of the KV (its early KV
+//                       blocks / parallel blocks see no data), plus one KV tile [mid, mid + 64) -inf for every row
+//   ALLMASK_ALL       : every row fully -inf (every KV block is dead, so the KV-skip / KV_max paths see nothing)
+//   ALLMASK_PREFIX    : every row -inf on the first half of the KV (dead partial results next to live ones)
+// The shapes below pick the kernel families on CUDA/HIP: nb 1-2 vec, small nb tile (or WMMA when rocWMMA FA is
+// compiled in), large nb*gqa MMA (or WMMA), kv % 256 != 0 keeps D=256 off WMMA. Default corpus on purpose.
+enum fa_allmask_mode { ALLMASK_MIXED, ALLMASK_ALL, ALLMASK_PREFIX };
+
+struct test_flash_attn_ext_allmask : public test_flash_attn_ext {
+    const fa_allmask_mode mode;
+
+    std::string vars() override {
+        static const char * names[] = { "mixed", "all", "prefix" };
+        return test_flash_attn_ext::vars() + ",allmask=" + names[mode];
+    }
+
+    test_flash_attn_ext_allmask(int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                                fa_allmask_mode mode, bool sinks = false)
+        : test_flash_attn_ext(hs, hs, nh, nr23, kv, nb, /*mask*/ true, sinks, 0.0f, 0.0f, GGML_PREC_F32,
+                              GGML_TYPE_F16, GGML_TYPE_F16),
+          mode(mode) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16 && ggml_is_contiguous(m));
+
+        const int64_t ne0  = m->ne[0];
+        const int64_t rows = m->ne[1]*m->ne[2]*m->ne[3];
+        std::vector<ggml_fp16_t> data(ne0*rows);
+        ggml_backend_tensor_get(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        const int64_t     mid  = (ne0/2/64)*64;
+        for (int64_t r = 0; r < rows; ++r) {
+            const int64_t i = r % m->ne[1]; // query row
+            for (int64_t j = 0; j < ne0; ++j) {
+                bool dead = false;
+                switch (mode) {
+                    case ALLMASK_MIXED:
+                        dead = i % 3 == 0 || (i % 3 == 1 && j < ne0/2) || (j >= mid && j < mid + 64);
+                        break;
+                    case ALLMASK_ALL:
+                        dead = true;
+                        break;
+                    case ALLMASK_PREFIX:
+                        dead = j < ne0/2;
+                        break;
+                }
+                if (dead) {
+                    data[r*ne0 + j] = ninf;
+                }
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
+// [INF48-FA-HS256-MMA-PRECISION] the five default-corpus D=256 no-mask shapes that exceeded the 5e-4 NMSE limit on the
+// HIP MMA_F16 kernel (GGML_HIP_ROCWMMA_FATTN=OFF, gfx90a). They are ordinary test_flash_attn_ext cases; the subclass
+// only tags the name (",inf48_hs256=1") so a run can select exactly these with -p inf48_hs256.
+struct test_flash_attn_ext_hs256_nomask : public test_flash_attn_ext {
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",inf48_hs256=1";
+    }
+
+    test_flash_attn_ext_hs256_nomask(std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, bool sinks)
+        : test_flash_attn_ext(256, 256, 4, nr23, kv, nb, /*mask*/ false, sinks, 0.0f, 0.0f, GGML_PREC_F32,
+                              GGML_TYPE_F16, GGML_TYPE_F16) {}
+};
+
 // [AK-ASM-H5-PORT] GGML_OP_FLASH_ATTN_EXT cases for the gfx90a FA-v3 hd128 bf16 asm fast path
 // (ggml/src/ggml-cuda/fattn-asm-gfx90a.cu), with llama.cpp-shaped masks instead of init_tensor_kq_mask's noise:
 //   mask_mode CAUSAL_PAD : bottom-right causal over the first L = kv - pad cells, -INF on the trailing pad cells
@@ -13573,6 +13649,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+
+    // [INF48-FA-ALLMASK-NAN] fully masked query rows, every kernel family, D 64/128/256 (default corpus).
+    for (int64_t hs : {64, 128, 256}) {
+        for (std::array<int64_t, 2> nr23 : {std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1}}) {
+            for (int64_t kv : {512, 1024, 300}) {
+                for (int64_t nb : {1, 2, 4, 13, 32, 75, 130}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_MIXED));
+                }
+                for (int64_t nb : {1, 2, 32}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_ALL));
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_PREFIX));
+                }
+            }
+            // with sinks the row sum of a fully masked row is exp(sink) > 0, so the output is 0 by the normal path
+            test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, 512, 75, ALLMASK_MIXED, /*sinks*/ true));
+        }
+    }
+
+    // [INF48-FA-HS256-MMA-PRECISION] the five hs256 no-mask shapes (default corpus, tagged inf48_hs256).
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1},  512, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1}, 1024, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
 
     // [AKX-ALL-LB4] opt-in set "fa_cpu_long_ctx" (kept out of the default corpus): the CPU long-context
     // attention surface the iqk CPU flash-attention wiring must match the reference on. Q38FN-class shape:
