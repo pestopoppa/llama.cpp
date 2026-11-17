@@ -112,6 +112,20 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
+// AKX-ALL-31.EDGE-HIP-NONFINITE: ds.y of a q8_1 block is the half-precision sum of the 32 original activations,
+// which overflows to +-inf once |x| reaches ~2e3 on average (32*6e4 >> 65504). The offset/min correction terms
+// therefore take the exact sum of the quantized int8 values actually multiplied in this call (the same quantity
+// C6-Q4-MMVQ-FIX uses for q4_0/q4_K), scaled by d8 in f32. Each caller sums only its own u ints, so the per-thread
+// partial sums add up to the block sum exactly instead of the QI8_1/vdr fraction of ds.y.
+template <int n> static __device__ __forceinline__ int q8_1_isum_ints(const int * u) {
+    int s = 0;
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        s = ggml_cuda_dp4a(0x01010101, u[i], s);
+    }
+    return s;
+}
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 
@@ -127,10 +141,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
     }
 
-    const float2 ds8f = __half22float2(ds8);
-
-    // second part effectively subtracts 8 from each quant value
-    return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
+    // subtract 8 from each quant value in integer space (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
+    return d4 * __low2float(ds8) * float(sumi - 8*q8_1_isum_ints<2*vdr>(u));
 }
 
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -151,19 +163,10 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
     }
 
-#ifdef FAST_FP16_AVAILABLE
-    const float2 tmp = __half22float2(__hmul2(dm4, ds8));
-    const float d4d8 = tmp.x;
-    const float m4s8 = tmp.y;
-#else
+    // min term from the exact quantized partial sum of this call's u values (AKX-ALL-31), f32 throughout
     const float2 dm4f = __half22float2(dm4);
-    const float2 ds8f = __half22float2(ds8);
-    const float d4d8 = dm4f.x * ds8f.x;
-    const float m4s8 = dm4f.y * ds8f.y;
-#endif // FAST_FP16_AVAILABLE
-
-    // scale second part of sum by QI8_1/(vdr * QR4_1) to compensate for multiple threads adding it
-    return sumi * d4d8 + m4s8 / (QI8_1 / (vdr * QR4_1));
+    const float  d8   = __low2float(ds8);
+    return d8 * (sumi * dm4f.x + dm4f.y * float(q8_1_isum_ints<2*vdr>(u)));
 }
 
 #define VDR_Q5_0_Q8_1_MMVQ 2
@@ -191,10 +194,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
-    const float2 ds8f = __half22float2(ds8);
-
-    // second part effectively subtracts 16 from each quant value
-    return d5 * (sumi * ds8f.x - (16*vdr/QI5_0) * ds8f.y);
+    // subtract 16 from each quant value in integer space (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
+    return d5 * __low2float(ds8) * float(sumi - 16*q8_1_isum_ints<2*vdr>(u));
 }
 
 #define VDR_Q5_1_Q8_1_MMVQ 2
@@ -222,19 +223,10 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
-#ifdef FAST_FP16_AVAILABLE
-    const float2 tmp = __half22float2(__hmul2(dm5, ds8));
-    const float d5d8 = tmp.x;
-    const float m5s8 = tmp.y;
-#else
+    // min term from the exact quantized partial sum of this call's u values (AKX-ALL-31), f32 throughout
     const float2 dm5f = __half22float2(dm5);
-    const float2 ds8f = __half22float2(ds8);
-    const float d5d8 = dm5f.x * ds8f.x;
-    const float m5s8 = dm5f.y * ds8f.y;
-#endif // FAST_FP16_AVAILABLE
-
-    // scale second part of sum by QI5_1 / vdr to compensate for multiple threads adding it
-    return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
+    const float  d8   = __low2float(ds8);
+    return d8 * (sumi * dm5f.x + dm5f.y * float(q8_1_isum_ints<2*vdr>(u)));
 }
 
 #define VDR_Q8_0_Q8_1_MMVQ 2
@@ -265,19 +257,10 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
         sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
     }
 
-#ifdef FAST_FP16_AVAILABLE
-    const float2 tmp = __half22float2(__hmul2(dm8, ds8));
-    const float d8d8 = tmp.x;
-    const float m8s8 = tmp.y;
-#else
+    // min term from the exact quantized partial sum of this call's u values (AKX-ALL-31), f32 throughout
     const float2 dm8f = __half22float2(dm8);
-    const float2 ds8f = __half22float2(ds8);
-    const float d8d8 = dm8f.x * ds8f.x;
-    const float m8s8 = dm8f.y * ds8f.y;
-#endif // FAST_FP16_AVAILABLE
-
-    // scale second part of sum by QI8_1/ vdr to compensate for multiple threads adding it
-    return sumi*d8d8 + m8s8 / (QI8_1 / vdr);
+    const float  d8   = __low2float(ds8);
+    return d8 * (sumi * dm8f.x + dm8f.y * float(q8_1_isum_ints<vdr>(u)));
 }
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_impl(
@@ -557,10 +540,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
             sumi_d1 = ggml_cuda_dp4a((v[j + 1] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j + 1], sumi_d1);
         }
 
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float d8 = __low2float(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * (sumi_d0 + sumi_d1));
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_d += d8 * (sc[i] * (sumi_d0 + sumi_d1));
+        // exact quantized block sum * q4_K min val (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
+        sumf_m += d8 * float(q8_1_isum_ints<QI8_1>(u + i*QI8_1) * m[i]);
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -620,10 +604,11 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
             sumi_d = ggml_cuda_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
         }
 
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float d8 = __low2float(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_d += d8 * (sc[i] * sumi_d);
+        // exact quantized block sum * q5_K min val (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
+        sumf_m += d8 * float(q8_1_isum_ints<QI8_1>(u + i*QI8_1) * m[i]);
     }
 
     const float2 dm4f = __half22float2(dm4);

@@ -12037,10 +12037,58 @@ static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>
     }
 }
 
+// AKX-ALL-31.EDGE-HIP-NONFINITE: activations near the f16 maximum. The CUDA/HIP q8_1 activation block stores
+// ds.y = sum of the 32 activations as f16, which overflows to inf at these magnitudes (|sum| >= 32*3e4 here); the
+// q4_0/q5_0 offset and q4_1/q5_1/q4_K/q5_K min corrections that read it then go non-finite. Every element is
+// drawn from [3e4, 6e4] so EVERY block sum overflows f16 (no seed can dodge the defect). Weights keep the
+// default init. The CPU reference quantizes these types to q8_0/q8_K (no f16 block sum), so it stays finite;
+// q4_1/q5_1 are NOT listed here because their CPU vec_dot_type q8_1 stores the same f16 sum (y.s) and the
+// reference itself overflows -- those two are covered by the GPU-vs-anchor numerics_edge judge instead.
+static void init_near_f16_max_activations(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (strcmp(t->name, "b") == 0) {
+            init_tensor_uniform(t, 3.0e4f, 6.0e4f);
+        }
+    }
+}
+
+struct test_mul_mat_near_f16_max : public test_mul_mat {
+    test_mul_mat_near_f16_max(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    std::string vars() override { return test_mul_mat::vars() + ",act=near_f16_max"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat::initialize_tensors(ctx);
+        init_near_f16_max_activations(ctx);
+    }
+};
+
+struct test_mul_mat_id_near_f16_max : public test_mul_mat_id {
+    test_mul_mat_id_near_f16_max(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k) {}
+    std::string vars() override { return test_mul_mat_id::vars() + ",act=near_f16_max"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);   // ids routing + uniform as/b
+        init_near_f16_max_activations(ctx);
+    }
+};
+
+static void add_near_f16_max_mul_mat_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // n=1 -> MMVQ; n=16 -> MMQ (DS4 MFMA / dp4a) on CDNA2. MoE shape mirrors the akx31 edge row (16 experts, 10 used).
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n : { 1, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_near_f16_max(type_a, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_near_f16_max(type_a, 2560, n, 640));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_near_f16_max(type_a, 16, 10, 640, 16, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_near_f16_max(type_a, 16, 10, 2560, 16, 640));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
+    add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
 
     if (akx_guard_selftest()) {
