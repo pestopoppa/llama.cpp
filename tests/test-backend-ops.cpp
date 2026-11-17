@@ -13650,30 +13650,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
 
-    // [INF48-FA-ALLMASK-NAN] fully masked query rows, every kernel family, D 64/128/256 (default corpus).
-    for (int64_t hs : {64, 128, 256}) {
-        for (std::array<int64_t, 2> nr23 : {std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1}}) {
-            for (int64_t kv : {512, 1024, 300}) {
-                for (int64_t nb : {1, 2, 4, 13, 32, 75, 130}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_MIXED));
-                }
-                for (int64_t nb : {1, 2, 32}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_ALL));
-                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_PREFIX));
-                }
-            }
-            // with sinks the row sum of a fully masked row is exp(sink) > 0, so the output is 0 by the normal path
-            test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, 512, 75, ALLMASK_MIXED, /*sinks*/ true));
-        }
-    }
-
-    // [INF48-FA-HS256-MMA-PRECISION] the five hs256 no-mask shapes (default corpus, tagged inf48_hs256).
-    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1},  512, 75, true));
-    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1}, 1024, 75, true));
-    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, true));
-    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
-    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
-
     // [AKX-ALL-LB4] opt-in set "fa_cpu_long_ctx" (kept out of the default corpus): the CPU long-context
     // attention surface the iqk CPU flash-attention wiring must match the reference on. Q38FN-class shape:
     // D 256, 2 KV heads, GQA 12, decode (nb 1) and verify (nb 5), f16 and q8_0 KV, kv 8k/64k/128k; plus the
@@ -14115,6 +14091,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
+
+    // Appended LAST on purpose: --suite-seed derives each case's input data from its index in this list, so cases
+    // inserted earlier would change the random inputs of every later case (fa-bugfix r2/r3 TOPK_MOE_ASM drift).
+    // [INF48-FA-ALLMASK-NAN] fully masked query rows, every kernel family, D 64/128/256 (default corpus).
+    for (int64_t hs : {64, 128, 256}) {
+        for (std::array<int64_t, 2> nr23 : {std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1}}) {
+            for (int64_t kv : {512, 1024, 300}) {
+                for (int64_t nb : {1, 2, 4, 13, 32, 75, 130}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_MIXED));
+                }
+                for (int64_t nb : {1, 2, 32}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_ALL));
+                    test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, kv, nb, ALLMASK_PREFIX));
+                }
+            }
+            // with sinks the row sum of a fully masked row is exp(sink) > 0, so the output is 0 by the normal path
+            test_cases.emplace_back(new test_flash_attn_ext_allmask(hs, 4, nr23, 512, 75, ALLMASK_MIXED, /*sinks*/ true));
+        }
+    }
+
+    // [INF48-FA-HS256-MMA-PRECISION] the five hs256 no-mask shapes (default corpus, tagged inf48_hs256).
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1},  512, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({1, 1}, 1024, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
 
     return test_cases;
 }
