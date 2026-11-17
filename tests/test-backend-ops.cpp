@@ -14465,6 +14465,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_topk_moe_hold({256, 131072, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
         }
     }
+    // INF48-FAVEC-TAIL perf shapes: 27B architect FA (hd 256, 4 KV heads, GQA 6, f16 KV), decode nb=1 and verify nb=8, at
+    // kv 32768 / 65536 / 131072. Time with GGML_HIP_FA_TAIL_SPLIT unset vs 2/4/8 (vec+combine, gv+merge).
+    for (int kv : { 32768, 65536, 131072 }) {
+        for (int nb : { 1, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     return test_cases;
 }
 
