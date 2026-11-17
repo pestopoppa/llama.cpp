@@ -484,6 +484,24 @@ static bool llama_fa_rows_gather_enabled() {
     return enabled;
 }
 
+// UP-FAROWS-HIP r10 split knobs (r9: GATHER=1 + LISTS_ONLY=1 is garbage with every FA call dense, so the corruption
+// is on the llama/graph side of the knob):
+//   LLAMA_KV_ROWS_NO_ATTACH=1   build, reuse-check and (if allocated) upload the row lists, but never set src[7] on the
+//                               FA node: the list tensor has no consumer, so it is never allocated nor scheduled.
+//   GGML_CUDA_FA_ROWS_NO_REUSE=1 with the knob on, every graph with a row list fails can_reuse (always rebuilt).
+static bool llama_fa_rows_env(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && atoi(env) != 0;
+}
+static bool llama_fa_rows_no_attach() {
+    static const bool v = llama_fa_rows_env("LLAMA_KV_ROWS_NO_ATTACH");
+    return v;
+}
+static bool llama_fa_rows_no_reuse() {
+    static const bool v = llama_fa_rows_env("GGML_CUDA_FA_ROWS_NO_REUSE");
+    return v;
+}
+
 // GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace (fprintf, not LLAMA_LOG_*: llama-server drops ggml/llama INFO
 // below -lv 4) of the first FA_ROWS_TRACE_MAX row-list events on the llama side. Pairs with the "FA_ROWS_TRACE fattn:"
 // lines of ggml-cuda/fattn.cu.
@@ -675,6 +693,10 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
     }
 
     kv_rows_valid = true;
+
+    if (llama_fa_rows_no_reuse()) {
+        return false;
+    }
 
     return self_kv_rows != nullptr && self_kv_rows->ne[0] == n_rows && self_kv_rows->ne[1] == n_slices;
 }
@@ -3051,7 +3073,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // UP-FAROWS-HIP: per-sequence K/V row lists (src[7]); only set by build_attn over a unified KV cache
-        if (fa_kv_rows && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_kv_rows->ne[1] == 0) {
+        if (fa_kv_rows && !llama_fa_rows_no_attach() && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_kv_rows->ne[1] == 0) {
             ggml_flash_attn_ext_set_kv_rows(cur, fa_kv_rows);
         } else if (fa_kv_rows && llama_fa_rows_trace_take(2)) {
             fprintf(stderr, "FA_ROWS_TRACE llama: build il=%d row list NOT attached (n_stream=%lld mask_ne3=%lld n_q=%lld n_slices=%lld)\n",
