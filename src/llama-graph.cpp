@@ -501,6 +501,20 @@ static bool llama_fa_rows_no_reuse() {
     static const bool v = llama_fa_rows_env("GGML_CUDA_FA_ROWS_NO_REUSE");
     return v;
 }
+// UP-FAROWS-HIP r11 split (r10: attaching src[7] alone corrupts generation even with every FA call dense).
+// LLAMA_KV_ROWS_ATTACH_MODE (use with GGML_CUDA_FA_ROWS_LISTS_ONLY=1 so the backend never interprets src[7]):
+//   0 / unset: attach the host-resident I32 row-list input (current behaviour)
+//   1 "k":     attach the FA node's own K view as src[7] (GPU-resident, already a source: no new edge, no new input)
+//   2 "cont":  attach ggml_cont(row list): an I32 node computed in the graph (scheduled next to its consumer)
+// 1 garbage    => ANY 7th source breaks something that walks/uses sources (not residency);
+// 1 coherent, 0 garbage => a host-resident extra input is the trigger (scheduler copy/split inputs/alloc).
+static int llama_fa_rows_attach_mode() {
+    static const int v = [] {
+        const char * env = getenv("LLAMA_KV_ROWS_ATTACH_MODE");
+        return env ? atoi(env) : 0;
+    }();
+    return v;
+}
 
 // GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace (fprintf, not LLAMA_LOG_*: llama-server drops ggml/llama INFO
 // below -lv 4) of the first FA_ROWS_TRACE_MAX row-list events on the llama side. Pairs with the "FA_ROWS_TRACE fattn:"
@@ -3074,7 +3088,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // UP-FAROWS-HIP: per-sequence K/V row lists (src[7]); only set by build_attn over a unified KV cache
         if (fa_kv_rows && !llama_fa_rows_no_attach() && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_kv_rows->ne[1] == 0) {
-            ggml_flash_attn_ext_set_kv_rows(cur, fa_kv_rows);
+            switch (llama_fa_rows_attach_mode()) {
+                case 1:
+                    cur->src[7] = cur->src[1]; // diagnostic only: K view; the backend treats a non-I32 src[7] as dense
+                    break;
+                case 2:
+                    ggml_flash_attn_ext_set_kv_rows(cur, ggml_cont(ctx0, fa_kv_rows));
+                    break;
+                default:
+                    ggml_flash_attn_ext_set_kv_rows(cur, fa_kv_rows);
+                    break;
+            }
         } else if (fa_kv_rows && llama_fa_rows_trace_take(2)) {
             fprintf(stderr, "FA_ROWS_TRACE llama: build il=%d row list NOT attached (n_stream=%lld mask_ne3=%lld n_q=%lld n_slices=%lld)\n",
                     il, (long long) n_stream, kq_mask ? (long long) kq_mask->ne[3] : -1LL, (long long) q->ne[1], (long long) fa_kv_rows->ne[1]);
