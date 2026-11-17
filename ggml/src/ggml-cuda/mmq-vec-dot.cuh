@@ -349,7 +349,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
-            const float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            // AKX-ALL-31: the stored ds.y sum overflows f16 at near-f16-max activations; use d * exact int8 block sum.
+            float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            dsB.y = dsB.x * float(q8_1_isum_ints<QI8_1>(y_qs + j*MMQ_TILE_Y_K + k01));
 
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
@@ -424,6 +426,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 const int j = j0 + tile_C::get_j(l);
 
                 dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                // AKX-ALL-31: d * exact int8 block sum instead of the overflow-prone f16 ds.y
+                dsB[l].y = dsB[l].x * float(q8_1_isum_ints<QI8_1>(y_qs + j*MMQ_TILE_Y_K + k01));
             }
 
 #pragma unroll
