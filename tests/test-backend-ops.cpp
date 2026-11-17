@@ -11973,14 +11973,15 @@ struct test_mul_mat_id_near_f16_max : public test_mul_mat_id {
 };
 
 static void add_near_f16_max_mul_mat_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // k must be a multiple of 256 (QK_K) for q4_K/q5_K, so the transposed shape uses k=1024, not 640.
     // n=1 -> MMVQ; n=16 -> MMQ (DS4 MFMA / dp4a) on CDNA2. MoE shape mirrors the akx31 edge row (16 experts, 10 used).
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL }) {
         for (int64_t n : { 1, 16 }) {
             test_cases.emplace_back(new test_mul_mat_near_f16_max(type_a, 640, n, 2560));
-            test_cases.emplace_back(new test_mul_mat_near_f16_max(type_a, 2560, n, 640));
+            test_cases.emplace_back(new test_mul_mat_near_f16_max(type_a, 2560, n, 1024));
         }
         test_cases.emplace_back(new test_mul_mat_id_near_f16_max(type_a, 16, 10, 640, 16, 2560));
-        test_cases.emplace_back(new test_mul_mat_id_near_f16_max(type_a, 16, 10, 2560, 16, 640));
+        test_cases.emplace_back(new test_mul_mat_id_near_f16_max(type_a, 16, 10, 2560, 16, 1024));
     }
 }
 
