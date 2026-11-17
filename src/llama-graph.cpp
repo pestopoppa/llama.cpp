@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <algorithm>
 #include <cmath>
@@ -473,6 +474,253 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// UP-FAROWS-HIP: GGML_CUDA_FA_ROWS_GATHER=1 attaches per-sequence K/V row lists to the FA ops of a unified KV cache.
+// The same variable turns the HIP/CUDA gather on (ggml-cuda/fattn.cu); off (the default) the graph is unchanged.
+static bool llama_fa_rows_gather_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_GATHER");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// UP-FAROWS-HIP split knobs (C13 side channel):
+//   LLAMA_KV_ROWS_NO_ATTACH=1   build, reuse-check and upload the row lists, but never stamp the key on the FA node
+//                               (the backend never sees a list: every FA call dense; isolates the upload itself).
+//   GGML_CUDA_FA_ROWS_NO_REUSE=1 with the knob on, every graph with a row list fails can_reuse (always rebuilt).
+// (The r11 LLAMA_KV_ROWS_ATTACH_MODE src[7] diagnostics are gone: C13 never attaches a 7th source.)
+static bool llama_fa_rows_env(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && atoi(env) != 0;
+}
+static bool llama_fa_rows_no_attach() {
+    static const bool v = llama_fa_rows_env("LLAMA_KV_ROWS_NO_ATTACH");
+    return v;
+}
+static bool llama_fa_rows_no_reuse() {
+    static const bool v = llama_fa_rows_env("GGML_CUDA_FA_ROWS_NO_REUSE");
+    return v;
+}
+
+// the "ggml_backend_fa_rows_set" procs of every registered backend that has one (CUDA/HIP); empty on CPU-only builds
+static const std::vector<ggml_backend_fa_rows_set_t> & llama_fa_rows_set_procs() {
+    static const std::vector<ggml_backend_fa_rows_set_t> procs = [] {
+        std::vector<ggml_backend_fa_rows_set_t> res;
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto fn = (ggml_backend_fa_rows_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fa_rows_set");
+            if (fn) {
+                res.push_back(fn);
+            }
+        }
+        return res;
+    }();
+    return procs;
+}
+
+// GGML_CUDA_FA_ROWS_TRACE=1: unfilterable stderr trace (fprintf, not LLAMA_LOG_*: llama-server drops ggml/llama INFO
+// below -lv 4) of the first FA_ROWS_TRACE_MAX row-list events on the llama side. Pairs with the "FA_ROWS_TRACE fattn:"
+// lines of ggml-cuda/fattn.cu.
+static bool llama_fa_rows_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// separate budgets so that frequent skip events (DFlash KV-injection graphs build an unused row list) cannot use up
+// the attach lines: 0 = attached at set_input, 1 = skipped at set_input, 2 = not attached at graph build
+static bool llama_fa_rows_trace_take(int which) {
+    static std::atomic<int> n[3] = {{0}, {0}, {0}};
+    return llama_fa_rows_trace_enabled() && n[which].fetch_add(1) < 20;
+}
+
+// Checks the row-list contract on the host copies: every cell the KQ mask leaves visible for a query row must be in
+// that row's slice list. Returns the number of (row, cell) pairs that violate it; -1 when not checked.
+static int64_t llama_fa_rows_check_superset(const ggml_tensor * mask, const std::vector<int32_t> & rows, int64_t n_rows, int64_t n_slices) {
+    if (!mask || !mask->buffer || !ggml_backend_buffer_is_host(mask->buffer) || mask->type != GGML_TYPE_F16 || mask->ne[3] != 1) {
+        return -1;
+    }
+    const int64_t n_kv  = mask->ne[0];
+    const int64_t n_tok = mask->ne[1];
+    if (n_slices <= 0 || n_tok % n_slices != 0 || n_kv*n_tok > (int64_t) 64*1024*1024) {
+        return -1;
+    }
+    const int64_t T = n_tok/n_slices;
+    int64_t bad = 0;
+    std::vector<uint8_t> in_list(n_kv);
+    for (int64_t s = 0; s < n_slices; ++s) {
+        std::fill(in_list.begin(), in_list.end(), 0);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            const int32_t r = rows[s*n_rows + i];
+            if (r >= 0 && r < n_kv) {
+                in_list[r] = 1;
+            }
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            const ggml_fp16_t * m = (const ggml_fp16_t *) ((const char *) mask->data + (s*T + t)*mask->nb[1]);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!in_list[j] && !std::isinf(ggml_fp16_to_fp32(m[j]))) {
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+// UP-FAROWS-HIP r6: the slice -> query-token map that the gathered FA call assumes (slice s = ubatch tokens
+// [s*T, (s+1)*T)), as the ubatch actually lays them out: per slice the token range, the distinct seq ids and the
+// position range of its tokens, plus a "contig" verdict (every token of the slice has exactly one seq id, the same
+// one). One-shot: the first call with n_slices > 1 also dumps every token (seq ids, pos) of the ubatch.
+static std::string llama_fa_rows_slice_map(const llama_ubatch & ubatch, int64_t S) {
+    std::string out;
+    const int64_t n_tok = ubatch.n_tokens;
+    if (S <= 0 || n_tok % S != 0) {
+        return " slice_map: n_tok % n_slices != 0";
+    }
+    const int64_t T = n_tok/S;
+    for (int64_t s = 0; s < S && s < 8; ++s) {
+        std::vector<llama_seq_id> ids;
+        bool contig = true;
+        llama_pos p_lo = 0;
+        llama_pos p_hi = 0;
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t i = s*T + t;
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ubatch.seq_id[s*T][0]) {
+                contig = false;
+            }
+            for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+                if (std::find(ids.begin(), ids.end(), ubatch.seq_id[i][k]) == ids.end()) {
+                    ids.push_back(ubatch.seq_id[i][k]);
+                }
+            }
+            const llama_pos p = ubatch.pos ? ubatch.pos[i] : -1;
+            p_lo = t == 0 ? p : std::min(p_lo, p);
+            p_hi = t == 0 ? p : std::max(p_hi, p);
+        }
+        out += " s" + std::to_string(s) + "=tok[" + std::to_string(s*T) + ".." + std::to_string((s + 1)*T - 1) + "]seq{";
+        for (size_t k = 0; k < ids.size() && k < 8; ++k) {
+            out += (k ? "," : "") + std::to_string(ids[k]);
+        }
+        out += "}pos[" + std::to_string(p_lo) + ".." + std::to_string(p_hi) + "]" + (contig ? "contig" : "MIXED");
+    }
+    out += " seq_id_unq{";
+    for (uint32_t u = 0; u < ubatch.n_seqs_unq && u < 8; ++u) {
+        out += (u ? "," : "") + std::to_string(ubatch.seq_id_unq[u]);
+    }
+    out += "}";
+    return out;
+}
+
+static void llama_fa_rows_dump_tokens_once(const llama_ubatch & ubatch, int64_t S) {
+    static std::atomic<bool> done{false};
+    if (S <= 1 || done.exchange(true)) {
+        return;
+    }
+    fprintf(stderr, "FA_ROWS_TRACE llama: one-shot token dump n_tokens=%u n_slices=%lld (tok:seq[/seq..]@pos)\n",
+            ubatch.n_tokens, (long long) S);
+    std::string line;
+    for (uint32_t i = 0; i < ubatch.n_tokens && i < 4096; ++i) {
+        line += " " + std::to_string(i) + ":";
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            line += (k ? "/" : "") + std::to_string(ubatch.seq_id[i][k]);
+        }
+        line += "@" + std::to_string(ubatch.pos ? ubatch.pos[i] : -1);
+        if (line.size() > 2000) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: tokens%s\n", line.c_str());
+            line.clear();
+        }
+    }
+    if (!line.empty()) {
+        fprintf(stderr, "FA_ROWS_TRACE llama: tokens%s\n", line.c_str());
+    }
+    fflush(stderr);
+}
+
+void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    if (kv_rows_key == 0 || !kv_rows_used) {
+        if (kv_rows_key != 0 && llama_fa_rows_trace_take(1)) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: set_input skipped: row list key=%d [%lld,%lld] stamped on no FA node "
+                    "n_tokens=%u n_seqs_unq=%u n_kv=%u\n", (int) kv_rows_key, (long long) kv_rows_n_rows, (long long) kv_rows_n_slices,
+                    ubatch->n_tokens, ubatch->n_seqs_unq, kv->get_n_kv());
+        }
+        kv_rows_valid = false;
+        return;
+    }
+
+    if (!kv_rows_valid) {
+        int64_t n_rows   = 0;
+        int64_t n_slices = 0;
+        const bool ok = kv->get_kv_rows(*ubatch, kv_rows_data, n_rows, n_slices);
+        GGML_ASSERT(ok && n_rows == kv_rows_n_rows && n_slices == kv_rows_n_slices);
+    }
+
+    GGML_ASSERT((int64_t) kv_rows_data.size() == kv_rows_n_rows*kv_rows_n_slices);
+
+    // refreshed on EVERY set_input, reused graphs included: the backend registry holds one list per key
+    bool uploaded = false;
+    for (auto fn : llama_fa_rows_set_procs()) {
+        uploaded |= fn(kv_rows_key, kv_rows_data.data(), kv_rows_n_rows, kv_rows_n_slices);
+    }
+
+    if (llama_fa_rows_trace_take(0)) {
+        const int64_t R = kv_rows_n_rows;
+        const int64_t S = kv_rows_n_slices;
+        std::string used;
+        for (int64_t s = 0; s < S && s < 8; ++s) {
+            int64_t n = 0;
+            int32_t lo = -1;
+            int32_t hi = -1;
+            for (int64_t i = 0; i < R; ++i) {
+                const int32_t r = kv_rows_data[s*R + i];
+                if (r >= 0) {
+                    lo = n == 0 ? r : lo;
+                    hi = r;
+                    n++;
+                }
+            }
+            used += " s" + std::to_string(s) + "=" + std::to_string(n) + "[" + std::to_string(lo) + ".." + std::to_string(hi) + "]";
+        }
+        const int64_t bad = llama_fa_rows_check_superset(self_kq_mask, kv_rows_data, R, S);
+        fprintf(stderr, "FA_ROWS_TRACE llama: row list uploaded=%d key=%d n_rows=%lld n_slices=%lld n_kv=%u n_tokens=%u n_seqs_unq=%u "
+                "mask=[%lld,%lld,%lld,%lld] superset_violations=%lld (-1 = not checked) used:%s\n",
+                (int) uploaded, (int) kv_rows_key, (long long) R, (long long) S, kv->get_n_kv(), ubatch->n_tokens, ubatch->n_seqs_unq,
+                self_kq_mask ? (long long) self_kq_mask->ne[0] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[1] : -1LL,
+                self_kq_mask ? (long long) self_kq_mask->ne[2] : -1LL, self_kq_mask ? (long long) self_kq_mask->ne[3] : -1LL,
+                (long long) bad, used.c_str());
+        fprintf(stderr, "FA_ROWS_TRACE llama: slice map%s\n", llama_fa_rows_slice_map(*ubatch, S).c_str());
+        llama_fa_rows_dump_tokens_once(*ubatch, S);
+        fflush(stderr);
+    }
+
+    kv_rows_valid = false;
+}
+
+bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) {
+    kv_rows_valid = false;
+
+    if (!llama_fa_rows_gather_enabled() || !cparams.flash_attn || !cparams.kv_unified) {
+        return kv_rows_key == 0;
+    }
+
+    int64_t n_rows   = 0;
+    int64_t n_slices = 0;
+    if (!kv->get_kv_rows(ubatch, kv_rows_data, n_rows, n_slices)) {
+        return kv_rows_key == 0;
+    }
+
+    kv_rows_valid = true;
+
+    if (llama_fa_rows_no_reuse()) {
+        return false;
+    }
+
+    // the shape is baked into the FA op_params (and the gather scratch of get_alloc_size): it must match
+    return kv_rows_key == kv->get_fa_rows_key() && kv_rows_n_rows == n_rows && kv_rows_n_slices == n_slices;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -482,6 +730,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
+
+    set_input_kv_rows(mctx, ubatch);
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
@@ -560,6 +810,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= can_reuse_kv_rows(mctx, params.ubatch);
 
     return res;
 }
@@ -1125,6 +1377,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    inp_attn->set_input_kv_rows(mctx->get_attn(), ubatch);
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1160,6 +1414,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->can_reuse_kv_rows(mctx->get_attn(), params.ubatch);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2836,6 +3092,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_set_n_seq(cur, (int32_t) ubatch.n_seqs_unq);
         }
 
+        // UP-FAROWS-HIP C13: per-sequence K/V row lists by side channel (op_params key + shape, no graph source);
+        // only set by build_attn over a unified KV cache
+        if (fa_rows_key != 0 && !llama_fa_rows_no_attach() && n_stream == 1 && kq_mask && kq_mask->ne[3] == 1 && q->ne[1] % fa_rows_n_slices == 0) {
+            ggml_flash_attn_ext_set_rows_key(cur, fa_rows_key, fa_rows_n_rows, fa_rows_n_slices);
+            if (fa_rows_used) {
+                *fa_rows_used = true;
+            }
+        } else if (fa_rows_key != 0 && llama_fa_rows_trace_take(2)) {
+            fprintf(stderr, "FA_ROWS_TRACE llama: build il=%d row list NOT stamped (no_attach=%d n_stream=%lld mask_ne3=%lld n_q=%lld n_slices=%lld)\n",
+                    il, (int) llama_fa_rows_no_attach(), (long long) n_stream, kq_mask ? (long long) kq_mask->ne[3] : -1LL,
+                    (long long) q->ne[1], (long long) fa_rows_n_slices);
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -3020,6 +3289,18 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
+    // UP-FAROWS-HIP: per-sequence K/V row lists (unified KV + flash attention, GGML_CUDA_FA_ROWS_GATHER=1)
+    if (llama_fa_rows_gather_enabled() && cparams.flash_attn && cparams.kv_unified && inp->self_kq_mask->ne[3] == 1) {
+        int64_t n_rows   = 0;
+        int64_t n_slices = 0;
+        if (mctx_cur->get_kv_rows(ubatch, inp->kv_rows_data, n_rows, n_slices)) {
+            inp->kv_rows_key      = mctx_cur->get_fa_rows_key();
+            inp->kv_rows_n_rows   = n_rows;
+            inp->kv_rows_n_slices = n_slices;
+            inp->kv_rows_valid = true;
+        }
+    }
+
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
@@ -3101,7 +3382,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    fa_rows_key      = inp->kv_rows_key;
+    fa_rows_n_rows   = inp->kv_rows_n_rows;
+    fa_rows_n_slices = inp->kv_rows_n_slices;
+    fa_rows_used     = &inp->kv_rows_used;
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    fa_rows_key      = 0;
+    fa_rows_used     = nullptr;
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

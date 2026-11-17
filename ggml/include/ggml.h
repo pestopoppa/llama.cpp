@@ -2504,6 +2504,30 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_get_n_seq(
             const struct ggml_tensor * a);
 
+    // Optional per-sequence K/V row lists (UP-FAROWS-HIP side channel, GGML_CUDA_FA_ROWS_GATHER): an I32 list
+    // [n_rows, n_slices]. The query rows (and mask rows) of the op are n_slices equal runs; slice s attends only to the
+    // K/V rows listed in column s, in the listed order; a negative entry is padding. The list must be a superset of the
+    // cells the mask leaves visible for that slice, so the mask alone still defines the result and a backend may ignore
+    // the hint (the CPU backend does).
+    // C13 side channel: the list is NOT a graph source. The op only carries (key, n_rows, n_slices) in op_params 8..10;
+    // the list data is uploaded out of band, before every compute of the graph, through the backend registry proc
+    // "ggml_backend_fa_rows_set" (ggml_backend_fa_rows_set_t). src[] stays identical to the dense op. key 0 = none.
+    GGML_API void ggml_flash_attn_ext_set_rows_key(
+            struct ggml_tensor * a,
+            int32_t              key,
+            int64_t              n_rows,
+            int64_t              n_slices);
+
+    // returns the key (0: no row list) and, if non-null, the list shape
+    GGML_API int32_t ggml_flash_attn_ext_get_rows_key(
+            const struct ggml_tensor * a,
+            int64_t                  * n_rows,
+            int64_t                  * n_slices);
+
+    // backend proc "ggml_backend_fa_rows_set": copies the host list (n_rows*n_slices I32) into the backend-owned
+    // device buffer of `key` on every device of the backend; synchronous (returns once the data is on the device).
+    typedef bool (*ggml_backend_fa_rows_set_t)(int32_t key, const int32_t * rows, int64_t n_rows, int64_t n_slices);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

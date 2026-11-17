@@ -283,6 +283,16 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // UP-FAROWS-HIP: per-sequence K/V row lists for FLASH_ATTN_EXT (ggml_flash_attn_ext_set_rows_key) over the first
+    // n_kv cells of a unified cache. The ubatch is split into n_slices equal runs of single-sequence tokens when it is
+    // made of such runs (np slots, draft verify), else one slice over the union of the cells of its sequences. Each
+    // list holds the slice's cells in ascending cell order, padded with -1 to n_rows (a multiple of 256). Returns
+    // false (rows untouched or empty) for a non-unified cache, or when the lists would not be shorter than n_kv.
+    bool get_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv, std::vector<int32_t> & rows, int64_t & n_rows, int64_t & n_slices) const;
+
+    // UP-FAROWS-HIP C13: process-unique, stable non-zero key of this cache's row list in the backend registry
+    int32_t get_fa_rows_key() const;
+
     // Dual Chunk Attention: dst is F32 [n_kv, n_tps, n_stream, 3]; slice 0/1/2 is 1 where the
     // key cell lies in the query's chunk / the previous chunk / an earlier chunk, else 0
     // (chunk = pos / chunk_len). Cells the KQ mask drops get 0 in all three slices.
@@ -303,6 +313,8 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    mutable int32_t fa_rows_key = 0; // UP-FAROWS-HIP C13: see get_fa_rows_key
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -486,6 +498,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
+
+    // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows
+    bool get_kv_rows(const llama_ubatch & ubatch, std::vector<int32_t> & rows, int64_t & n_rows, int64_t & n_slices) const;
+    int32_t get_fa_rows_key() const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
