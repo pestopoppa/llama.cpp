@@ -568,13 +568,13 @@ static __global__ void flash_attn_ext_vec(
             float VKQ_numerator   = 0.0f;
             float VKQ_denominator = 0.0f;
             for (int l = 0; l < int(gridDim.y); ++l) {
-                const float KQ_max_scale = expf(meta[l].x - kqmax);
+                const float KQ_max_scale = fattn_combine_scale(meta[l].x, kqmax);
 
                 VKQ_numerator   += KQ_max_scale*VKQ_parts[l*D + i];
                 VKQ_denominator += KQ_max_scale*meta[l].y;
             }
 
-            dst_ptr[j_dst_unrolled*D + i] = VKQ_numerator/VKQ_denominator;
+            dst_ptr[j_dst_unrolled*D + i] = fattn_div_rowsum(VKQ_numerator, VKQ_denominator);
         }
 
         __syncthreads();
