@@ -14016,6 +14016,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
 
+    // INF48-FAVEC-TAIL (appended last so earlier suite-seed inputs do not shift): 27B architect attention shape
+    // (hd 256, 4 KV heads, GQA 6, f16/q8_0 KV) for decode (nb=1, vec + combine) and the DFlash2 verify batch (nb=8, GQA-verify
+    // merge), plus hd 128 to exercise the S=4 clamp. Run with GGML_HIP_FA_TAIL_SPLIT unset vs 2/4/8; outputs must match.
+    for (ggml_type tkv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int kv : { 4096, 32768 }) {
+            for (int nb : { 1, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     return test_cases;
 }
 #ifdef _MSC_VER

@@ -1278,9 +1278,13 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
-__launch_bounds__(D, 1)
-static __global__ void flash_attn_combine_results(
+// INF48-FAVEC-TAIL: S > 1 widens the combine ("tail") grid from n_head to n_head*S blocks of D/S threads, each block
+// owning a contiguous d-slice. Every output element is reduced over the parallel_blocks partials with exactly the same
+// expression and loop order as S == 1 (kqmax over l ascending, then numerator/denominator over l ascending), so the
+// result is bitwise identical to the stock combine. S == 1 is the stock kernel. Selected by GGML_HIP_FA_TAIL_SPLIT.
+template<int D, int S> // D == head size, S == d-slices per (col, head)
+__launch_bounds__(D/S, 1)
+static __global__ void flash_attn_combine_results_s(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
@@ -1296,10 +1300,11 @@ static __global__ void flash_attn_combine_results(
     // Memory layout is permuted with [0, 2, 1, 3]
 
     const int ne01 = gridDim.x;
-    const int ne02 = gridDim.y;
+    const int ne02 = gridDim.y / S;
 
     const int col      = blockIdx.x;
-    const int head     = blockIdx.y;
+    const int head     = blockIdx.y / S;
+    const int slice    = blockIdx.y % S;
     const int sequence = blockIdx.z;
 
     const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
@@ -1308,12 +1313,12 @@ static __global__ void flash_attn_combine_results(
     VKQ_meta  += j_dst_unrolled * parallel_blocks;
     dst       += j_dst_unrolled *                 D;
 
-    const int tid = threadIdx.x;
+    const int tid = slice*(D/S) + threadIdx.x;
     __builtin_assume(tid < D);
 
     extern __shared__ float2 meta[];
     ggml_cuda_pdl_sync();
-    for (int i = tid; i < 2*parallel_blocks; i += D) {
+    for (int i = threadIdx.x; i < 2*parallel_blocks; i += D/S) {
         ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
     }
 
@@ -1334,6 +1339,17 @@ static __global__ void flash_attn_combine_results(
     }
 
     dst[tid] = VKQ_numerator / VKQ_denominator;
+}
+
+// GGML_HIP_FA_TAIL_SPLIT=S (2, 4 or 8): d-slices per head for the vec combine and the GQA-verify merge; clamped so a
+// block keeps >= 32 threads. Unset/0/1/other = stock grid. Exact vs stock: per-element reduction order is unchanged.
+static int ggml_cuda_fa_tail_split() {
+    static const int v = [] {
+        const char * e = getenv("GGML_HIP_FA_TAIL_SPLIT");
+        const int x = e ? atoi(e) : 0;
+        return (x == 2 || x == 4 || x == 8) ? x : 1;
+    }();
+    return v;
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1677,13 +1693,36 @@ void launch_fattn(
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
     } else if (parallel_blocks > 1) {
-        const dim3 block_dim_combine(DV, 1, 1);
-        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
-
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        int tail_split = ggml_cuda_fa_tail_split();
+        while (tail_split > 1 && (DV % tail_split != 0 || DV / tail_split < 32)) {
+            tail_split /= 2;
+        }
+#define FATTN_COMBINE_LAUNCH_S(S_)                                                                                       \
+        {                                                                                                                \
+            const dim3 block_dim_combine(DV/(S_), 1, 1);                                                                 \
+            const dim3 blocks_num_combine(Q->ne[1], Q->ne[2]*(S_), Q->ne[3]);                                           \
+            const ggml_cuda_kernel_launch_params launch_params =                                                         \
+                ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream); \
+            ggml_cuda_kernel_launch(flash_attn_combine_results_s<DV, (S_)>, launch_params,                              \
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);                                    \
+        }
+        if constexpr (DV % 8 == 0 && DV / 8 >= 32) {
+            if (tail_split == 8) FATTN_COMBINE_LAUNCH_S(8)
+            else if (tail_split == 4) FATTN_COMBINE_LAUNCH_S(4)
+            else if (tail_split == 2) FATTN_COMBINE_LAUNCH_S(2)
+            else FATTN_COMBINE_LAUNCH_S(1)
+        } else if constexpr (DV % 4 == 0 && DV / 4 >= 32) {
+            if (tail_split == 4) FATTN_COMBINE_LAUNCH_S(4)
+            else if (tail_split == 2) FATTN_COMBINE_LAUNCH_S(2)
+            else FATTN_COMBINE_LAUNCH_S(1)
+        } else if constexpr (DV % 2 == 0 && DV / 2 >= 32) {
+            if (tail_split == 2) FATTN_COMBINE_LAUNCH_S(2)
+            else FATTN_COMBINE_LAUNCH_S(1)
+        } else {
+            FATTN_COMBINE_LAUNCH_S(1)
+        }
+#undef FATTN_COMBINE_LAUNCH_S
     }
     CUDA_CHECK(cudaGetLastError());
 }

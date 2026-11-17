@@ -576,15 +576,18 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 }
 
-// one block per (row r, kv head, seq), one thread per d
+// one block per (row r, kv head, seq, d-slice), one thread per d. S > 1 (GGML_HIP_FA_TAIL_SPLIT, INF48-FAVEC-TAIL) splits
+// d into S contiguous slices of GV_D/S threads; each element keeps the same split loop order, so the result is bitwise
+// identical to S == 1.
+template <int S>
 static __global__ void gv_merge_kernel(
         const float * __restrict__ Opart, const float2 * __restrict__ MLpart, float * __restrict__ dst,
         const int n_splits, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G) {
-    const int r    = blockIdx.x;
+    const int r    = blockIdx.x / S;
     const int hkv  = blockIdx.y;
     const int vseq = blockIdx.z;
     const int n_seq = gridDim.z;           // virtual sequences
-    const int d    = threadIdx.x;
+    const int d    = (blockIdx.x % S) * (GV_D / S) + threadIdx.x;
     const int R    = gqa * G;              // row stride
     const int q0   = (vseq % n_grp) * G;
     const int n_q  = min(G, n_q_tot - q0);
@@ -812,8 +815,22 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
     CUDA_CHECK(cudaGetLastError());
 
-    gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
-        Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+    {
+        const int ts = ggml_cuda_fa_tail_split(); // GV_D == 256: S in {2,4,8} keeps >= 32 threads per block
+        if (ts == 8) {
+            gv_merge_kernel<8><<<dim3(R * 8, n_head_kv, n_vseq), dim3(GV_D / 8), 0, stream>>>(
+                Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+        } else if (ts == 4) {
+            gv_merge_kernel<4><<<dim3(R * 4, n_head_kv, n_vseq), dim3(GV_D / 4), 0, stream>>>(
+                Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+        } else if (ts == 2) {
+            gv_merge_kernel<2><<<dim3(R * 2, n_head_kv, n_vseq), dim3(GV_D / 2), 0, stream>>>(
+                Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+        } else {
+            gv_merge_kernel<1><<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
+                Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 
     // path witness for the gate: emitted once per process, on the first call
