@@ -5660,6 +5660,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+    // UP-FAROWS-HIP C13: FA row-list side channel (ggml_backend_fa_rows_set_t)
+    if (strcmp(name, "ggml_backend_fa_rows_set") == 0) {
+        return (void *)ggml_cuda_fa_rows_set;
+    }
     // HSF-5.P host KV mirror (experimental); only looked up when the mirror is enabled
     if (strcmp(name, "ggml_backend_kv_mirror_get_ops") == 0) {
         return (void *)ggml_backend_cuda_kv_mirror_get_ops;
