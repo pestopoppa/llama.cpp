@@ -19,6 +19,18 @@
 #include <cstring>
 #include <cmath>
 
+// INF-70 WRAP-8: GGML_STATIC_CHUNKS=1 gives the FA_EXT prefill and GATED_DELTA_NET chunkers one static chunk per
+// thread (the chunker subset of ggml_is_numa(), without the affinity/loader family that disqualifies --numa).
+// Default off; read once. Must stay declared before its two users below.
+static bool ggml_static_chunks(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_STATIC_CHUNKS");
+        v = (s && s[0] && s[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
 // The gather_rows_e4m3_e8m0 profiler, and everything it needs, exists only in a profiling
 // build (-DGGML_CPU_PROF, cmake option GGML_CPU_PROF).  The measured build must carry none of
 // it -- not the counters, not their headers, not their strings.
@@ -10543,7 +10555,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t nr = neq1*neq2*neq3;
 
         // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+        const bool disable_chunking = ggml_is_numa() || ggml_static_chunks();
 
         // 4x chunks per thread
         int nth_scaled = nth * 4;
@@ -12397,7 +12409,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
     int64_t nr = V->ne[1] * V->ne[3];
 
     // disable for NUMA
-    const bool disable_chunking = ggml_is_numa();
+    const bool disable_chunking = ggml_is_numa() || ggml_static_chunks();
 
     int nth = params->nth;
     int ith = params->ith;
