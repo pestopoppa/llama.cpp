@@ -518,7 +518,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
                 if (gridDim.y == 1) {
-                    dst_val /= KQ_sum[j_VKQ];
+                    dst_val = fattn_div_rowsum(dst_val, KQ_sum[j_VKQ]);
                 }
                 dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
             }

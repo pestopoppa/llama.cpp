@@ -1111,7 +1111,7 @@ static __global__ void flash_attn_tile(
             return;
         }
 
-        const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
+        const float scale = gridDim.y == 1 ? fattn_rowsum_inv(KQ_sum[jc0]) : 1.0f;
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
 

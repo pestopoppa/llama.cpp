@@ -19,6 +19,22 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// INF48-FA-ALLMASK-NAN: a query row whose mask is entirely -inf has a softmax row sum of exactly 0 (every
+// exp(score - KQ_max) underflows to 0 because KQ_max is initialised to a finite floor, -FLT_MAX/2 or -HALF_MAX_HALF).
+// The CPU reference (ggml-cpu ops.cpp: S_inv = S == 0.0f ? 0.0f : 1.0f/S) returns 0 for such rows; the GPU kernels
+// used to compute 0/0 = NaN. Every final normalisation and every partial-result combine goes through these helpers.
+static __device__ __forceinline__ float fattn_div_rowsum(const float val, const float rowsum) {
+    return rowsum == 0.0f ? 0.0f : val / rowsum;
+}
+static __device__ __forceinline__ float fattn_rowsum_inv(const float rowsum) {
+    return rowsum == 0.0f ? 0.0f : 1.0f / rowsum;
+}
+// Scale of a partial result with max m relative to the combined max m_new. A partial that saw no KV at all may carry
+// m == -inf; -inf - -inf would be NaN, and such a partial contributes nothing.
+static __device__ __forceinline__ float fattn_combine_scale(const float m, const float m_new) {
+    return m == -INFINITY ? 0.0f : expf(m - m_new);
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -1164,7 +1180,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = fattn_div_rowsum(dst_val, rowsum);
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -1275,7 +1291,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = fattn_div_rowsum(dst_val, rowsum);
 }
 
 template<int D> // D == head size
@@ -1327,13 +1343,13 @@ static __global__ void flash_attn_combine_results(
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
-        const float KQ_max_scale = expf(meta[l].x - kqmax);
+        const float KQ_max_scale = fattn_combine_scale(meta[l].x, kqmax);
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = fattn_div_rowsum(VKQ_numerator, VKQ_denominator);
 }
 
 template <int DV, int ncols1, int ncols2>
