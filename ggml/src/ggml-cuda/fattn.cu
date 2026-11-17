@@ -115,7 +115,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     // CDNA D=256 with a 16-column cap: every block uses the 16-column config (GQA 6 -> <256,256,8,2>).
-    if constexpr (DKQ == 256 && DV == 256 && ncols2 <= 16) {
+    // INF48-FA-HS256-MMA-PRECISION: not for ncols2 == 1 (no GQA packing: no mask, ALiBi, GQA 1). There the tuned
+    // <256,256,16,1> exceeded the 5e-4 NMSE gate on diffuse no-mask rows (fa-bugfix-gpu-20261117-r2: 5 hs256 cases fail
+    // with the tune, pass 5/5 with GGML_CUDA_FA_CDNA_D256_TUNE=0), so those shapes keep the upstream selection. Serving
+    // shapes (masked, GQA >= 2) keep the tune.
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 > 1 && ncols2 <= 16) {
         if (amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune() && ggml_cuda_fattn_cdna_d256_max_cols() <= 16) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
@@ -131,7 +135,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256) ||
-            (DKQ == 256 && amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune())) {
+            (DKQ == 256 && ncols2 > 1 && amd_mfma_available(cc) && ggml_cuda_fattn_cdna_d256_tune())) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
