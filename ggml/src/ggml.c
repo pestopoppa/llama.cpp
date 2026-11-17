@@ -5699,6 +5699,41 @@ int32_t ggml_flash_attn_ext_get_n_seq(
     return ggml_get_op_params_i32(a, 4);
 }
 
+void ggml_flash_attn_ext_set_rows_key(
+        struct ggml_tensor * a,
+        int32_t              key,
+        int64_t              n_rows,
+        int64_t              n_slices) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (key == 0) {
+        ggml_set_op_params_i32(a, 8, 0);
+        ggml_set_op_params_i32(a, 9, 0);
+        ggml_set_op_params_i32(a, 10, 0);
+        return;
+    }
+    GGML_ASSERT(n_rows > 0 && n_rows <= INT32_MAX && n_slices > 0 && n_slices <= INT32_MAX);
+    GGML_ASSERT(a->src[0]->ne[1] % n_slices == 0);
+    // positions 0..4: scale, max_bias, logit_softcap, prec, n_seq
+    ggml_set_op_params_i32(a, 8, key);
+    ggml_set_op_params_i32(a, 9, (int32_t) n_rows);
+    ggml_set_op_params_i32(a, 10, (int32_t) n_slices);
+}
+
+int32_t ggml_flash_attn_ext_get_rows_key(
+        const struct ggml_tensor * a,
+        int64_t                  * n_rows,
+        int64_t                  * n_slices) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    const int32_t key = ggml_get_op_params_i32(a, 8);
+    if (n_rows) {
+        *n_rows = key ? ggml_get_op_params_i32(a, 9) : 0;
+    }
+    if (n_slices) {
+        *n_slices = key ? ggml_get_op_params_i32(a, 10) : 0;
+    }
+    return key;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

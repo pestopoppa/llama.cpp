@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -1826,6 +1827,94 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv, std::vector<int32_t> & rows, int64_t & n_rows, int64_t & n_slices) const {
+    rows.clear();
+    n_rows   = 0;
+    n_slices = 0;
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    if (n_stream != 1 || v_cells.size() != 1 || n_tokens == 0 || ubatch.n_seqs_unq == 0 || n_kv == 0) {
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+    GGML_ASSERT(n_kv <= cells.size());
+
+    // equal runs of single-sequence tokens -> one slice per run
+    int64_t S = ubatch.n_seqs_unq;
+    bool sliced = S > 1 && n_tokens % S == 0;
+    const int64_t T = sliced ? n_tokens/S : n_tokens;
+
+    std::vector<llama_seq_id> slice_seq;
+    if (sliced) {
+        for (int64_t s = 0; s < S && sliced; ++s) {
+            const llama_seq_id sid = ubatch.seq_id[s*T][0];
+            for (int64_t t = 0; t < T; ++t) {
+                const int64_t i = s*T + t;
+                if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != sid) {
+                    sliced = false;
+                    break;
+                }
+            }
+            slice_seq.push_back(sid);
+        }
+    }
+    if (!sliced) {
+        S = 1;
+    }
+
+    std::vector<std::vector<int32_t>> lists(S);
+    for (uint32_t j = 0; j < n_kv; ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        if (sliced) {
+            for (int64_t s = 0; s < S; ++s) {
+                if (cells.seq_has(j, slice_seq[s])) {
+                    lists[s].push_back((int32_t) j);
+                }
+            }
+        } else {
+            for (uint32_t u = 0; u < ubatch.n_seqs_unq; ++u) {
+                if (cells.seq_has(j, ubatch.seq_id_unq[u])) {
+                    lists[0].push_back((int32_t) j);
+                    break;
+                }
+            }
+        }
+    }
+
+    size_t n_max = 0;
+    for (const auto & l : lists) {
+        n_max = std::max(n_max, l.size());
+    }
+
+    const int64_t R = GGML_PAD((int64_t) std::max<size_t>(n_max, 1), 256);
+    if (R >= (int64_t) n_kv) {
+        return false; // nothing to save over the dense K/V view
+    }
+
+    rows.assign(R*S, -1);
+    for (int64_t s = 0; s < S; ++s) {
+        std::copy(lists[s].begin(), lists[s].end(), rows.begin() + s*R);
+    }
+
+    n_rows   = R;
+    n_slices = S;
+
+    return true;
+}
+
+int32_t llama_kv_cache::get_fa_rows_key() const {
+    // one key per cache for its lifetime: the backend never frees a key's list buffers (captured HIP/CUDA graphs keep
+    // their pointers), so a key per graph build would leak; a key per cache bounds the registry by the cache count
+    static std::atomic<int32_t> next{0};
+    if (fa_rows_key == 0) {
+        fa_rows_key = next.fetch_add(1) + 1;
+    }
+    return fa_rows_key;
+}
+
 void llama_kv_cache::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[3] == 3);
@@ -3417,6 +3506,14 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+int32_t llama_kv_cache_context::get_fa_rows_key() const {
+    return kv->get_fa_rows_key();
+}
+
+bool llama_kv_cache_context::get_kv_rows(const llama_ubatch & ubatch, std::vector<int32_t> & rows, int64_t & n_rows, int64_t & n_slices) const {
+    return kv->get_kv_rows(ubatch, n_kv, rows, n_rows, n_slices);
 }
 
 void llama_kv_cache_context::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const {

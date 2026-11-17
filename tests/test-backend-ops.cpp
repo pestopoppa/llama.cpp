@@ -9752,9 +9752,98 @@ struct test_flash_attn_ext_unified : public test_case {
     const ggml_type type_V;
     const int64_t hint; // value of ggml_flash_attn_ext_set_n_seq (0: not set), as set by llama.cpp for --kv-unified
     const int64_t n_shared; // leading cells shared by every sequence (a forked trunk, KPF-17); 0: none
+    const bool kv_rows;     // UP-FAROWS-HIP C13: per-sequence K/V row lists by side channel (ggml_flash_attn_ext_set_rows_key
+                            // + the backends' "ggml_backend_fa_rows_set" proc; no graph source)
+    int32_t rows_key = 0;   // registry key of this case (process-unique, assigned in build_graph)
+    const bool q_perm;      // Q as llama.cpp builds it: [D, n_head, n_tokens] permuted to [D, n_tokens, n_head] (token-major)
+    const float qk_scale;    // UP-FAROWS-HIP r7: q and K/V init range [-qk_scale, qk_scale] (1: default); >1 = peaked softmax
+    const bool q_interleave; // UP-FAROWS-HIP r6: query rows round-robin over the sequences (row i -> seq i % n_seq), not grouped
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
+        std::string res = VARS_TO_STR15(hsk, hsv, nh, nr2, kv, nb, n_seq, run, n_free, max_bias, logit_softcap, type_K, type_V, hint, n_shared);
+        if (kv_rows) {
+            res += ",kv_rows=1";
+        }
+        if (q_perm) {
+            res += ",q_perm=1";
+        }
+        if (q_interleave) {
+            res += ",q_interleave=1";
+        }
+        if (qk_scale != 1.0f) {
+            res += ",qk_scale=" + std::to_string(qk_scale);
+        }
+        return res;
+    }
+
+    // owner sequence and position of each cell (-2: the shared trunk, owned by every sequence; -1: free)
+    void cell_layout(std::vector<int> & owner, std::vector<int64_t> & pos, std::vector<int64_t> & n_cells) const {
+        const int64_t n_trunk = std::min(n_shared, kv - n_free);
+        owner.assign(kv, -1);
+        pos.assign(kv, -1);
+        n_cells.assign(n_seq, n_trunk);
+        for (int64_t c = 0; c < n_trunk; ++c) {
+            owner[c] = -2;
+            pos[c]   = c;
+        }
+        for (int64_t c = n_trunk; c < kv - n_free; ++c) {
+            const int s = ((c - n_trunk) / run) % n_seq;
+            owner[c] = s;
+            pos[c]   = n_cells[s]++;
+        }
+    }
+
+    // the sequence of query row i (the batch is n_seq groups of `group` rows, the last group may be short)
+    int seq_of_row(int64_t i) const {
+        if (q_interleave) {
+            return (int) (i % n_seq);
+        }
+        const int64_t group = (nb + n_seq - 1) / n_seq;
+        return (int) std::min<int64_t>(i / group, n_seq - 1);
+    }
+
+    // Row lists as llama.cpp builds them (llama_kv_cache::get_kv_rows): one slice per sequence when the rows are equal
+    // single-sequence runs, else one slice over the union of the cells of the sequences present. Ascending cell order,
+    // padded with -1 to a multiple of 256.
+    void row_lists(std::vector<int32_t> & data, int64_t & n_rows, int64_t & n_slices) const {
+        std::vector<int> owner;
+        std::vector<int64_t> pos;
+        std::vector<int64_t> n_cells;
+        cell_layout(owner, pos, n_cells);
+
+        // llama_kv_cache::get_kv_rows only slices when every slice is one contiguous single-sequence run of rows
+        const bool sliced = n_seq > 1 && nb % n_seq == 0 && !q_interleave;
+        n_slices = sliced ? n_seq : 1;
+
+        std::vector<bool> present(n_seq, false);
+        for (int64_t i = 0; i < nb; ++i) {
+            present[seq_of_row(i)] = true;
+        }
+
+        std::vector<std::vector<int32_t>> lists(n_slices);
+        for (int64_t c = 0; c < kv; ++c) {
+            if (owner[c] == -1) {
+                continue;
+            }
+            if (sliced) {
+                for (int64_t s = 0; s < n_slices; ++s) {
+                    if (owner[c] == -2 || owner[c] == s) {
+                        lists[s].push_back((int32_t) c);
+                    }
+                }
+            } else if (owner[c] == -2 || present[owner[c]]) {
+                lists[0].push_back((int32_t) c);
+            }
+        }
+        size_t n_max = 1;
+        for (const auto & l : lists) {
+            n_max = std::max(n_max, l.size());
+        }
+        n_rows = GGML_PAD((int64_t) n_max, 256);
+        data.assign(n_rows*n_slices, -1);
+        for (int64_t s = 0; s < n_slices; ++s) {
+            std::copy(lists[s].begin(), lists[s].end(), data.begin() + s*n_rows);
+        }
     }
 
     double max_nmse_err() override {
@@ -9769,15 +9858,24 @@ struct test_flash_attn_ext_unified : public test_case {
     test_flash_attn_ext_unified(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, int64_t nr2 = 4, int64_t kv = 8192, int64_t nb = 1,
                                 int64_t n_seq = 4, int64_t run = 1024, int64_t n_free = 1024, float max_bias = 0.0f, float logit_softcap = 0.0f,
                                 ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, int64_t hint = 0,
-                                int64_t n_shared = 0)
+                                int64_t n_shared = 0, bool kv_rows = false, bool q_perm = false,
+                                bool q_interleave = false, float qk_scale = 1.0f)
         : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nb(nb), n_seq(n_seq), run(run), n_free(n_free),
-          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared) {}
+          max_bias(max_bias), logit_softcap(logit_softcap), type_K(type_K), type_V(type_V), hint(hint), n_shared(n_shared),
+          kv_rows(kv_rows), q_perm(q_perm), qk_scale(qk_scale), q_interleave(q_interleave) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t kv_size = kv + 256; // the cache is larger than the n_kv view
 
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
-        ggml_set_name(q, "q");
+        ggml_tensor * q = nullptr;
+        if (q_perm) {
+            ggml_tensor * q_tok = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh*nr2, nb, 1);
+            ggml_set_name(q_tok, "q");
+            q = ggml_permute(ctx, q_tok, 0, 2, 1, 3);
+        } else {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
+            ggml_set_name(q, "q");
+        }
 
         ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_K, hsk*nh, kv_size, 1);
         ggml_set_name(k_cache, "k_cache");
@@ -9808,32 +9906,47 @@ struct test_flash_attn_ext_unified : public test_case {
         if (hint > 0) {
             ggml_flash_attn_ext_set_n_seq(out, (int32_t) hint);
         }
+        if (kv_rows) {
+            std::vector<int32_t> data;
+            int64_t n_rows   = 0;
+            int64_t n_slices = 0;
+            row_lists(data, n_rows, n_slices);
+            if (rows_key == 0) {
+                static int32_t next_key = 0x40000000; // disjoint from llama.cpp's per-cache keys (1, 2, ...)
+                rows_key = next_key++;
+            }
+            ggml_flash_attn_ext_set_rows_key(out, rows_key, n_rows, n_slices);
+        }
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        if (kv_rows) {
+            // side channel: upload the list to every backend that has a registry (CUDA/HIP); the CPU reference ignores it
+            std::vector<int32_t> data;
+            int64_t n_rows   = 0;
+            int64_t n_slices = 0;
+            row_lists(data, n_rows, n_slices);
+            GGML_ASSERT(rows_key != 0);
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                auto fn = (ggml_backend_fa_rows_set_t) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_fa_rows_set");
+                if (fn) {
+                    fn(rows_key, data.data(), n_rows, n_slices);
+                }
+            }
+        }
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") != 0) {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -qk_scale, qk_scale);
                 continue;
             }
 
-            // owner sequence and position of each cell (-2: the shared trunk, owned by every sequence)
-            const int64_t n_trunk = std::min(n_shared, kv - n_free);
-            std::vector<int>     owner(kv, -1);
-            std::vector<int64_t> pos(kv, -1);
-            std::vector<int64_t> n_cells(n_seq, n_trunk);
-            for (int64_t c = 0; c < n_trunk; ++c) {
-                owner[c] = -2;
-                pos[c]   = c;
-            }
-            for (int64_t c = n_trunk; c < kv - n_free; ++c) {
-                const int s = ((c - n_trunk) / run) % n_seq;
-                owner[c] = s;
-                pos[c]   = n_cells[s]++;
-            }
+            std::vector<int>     owner;
+            std::vector<int64_t> pos;
+            std::vector<int64_t> n_cells;
+            cell_layout(owner, pos, n_cells);
 
             std::mt19937 gen = suite_seed_rng();
             std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
@@ -9841,10 +9954,16 @@ struct test_flash_attn_ext_unified : public test_case {
             std::vector<float> data(kv*nb);
             const int64_t group = (nb + n_seq - 1) / n_seq;
             for (int64_t i = 0; i < nb; ++i) {
-                const int     s     = std::min<int64_t>(i / group, n_seq - 1);
-                const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
+                const int     s     = seq_of_row(i);
                 // the tokens of the batch are the last n_grp cells of their sequence
-                const int64_t pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                int64_t pos_q;
+                if (q_interleave) {
+                    const int64_t n_grp = (nb - s + n_seq - 1) / n_seq; // rows s, s + n_seq, ...
+                    pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + i / n_seq);
+                } else {
+                    const int64_t n_grp = std::min<int64_t>(group, nb - s*group);
+                    pos_q = std::max<int64_t>(0, n_cells[s] - n_grp + (i - s*group));
+                }
                 for (int64_t c = 0; c < kv; ++c) {
                     const bool visible = (owner[c] == s || owner[c] == -2) && pos[c] <= pos_q;
                     data[i*kv + c] = visible ? dis(gen) : -INFINITY;
@@ -13725,6 +13844,108 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one sequence owns a large span, the others are idle neighbours (the decode shape of a busy unified server)
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 1, 4, 4096, 0));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 16384, 8, 4, 4096, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // UP-FAROWS-HIP: the same unified layouts with per-sequence K/V row lists (C13: side channel, no src[7]). The CPU reference ignores the
+    // lists (the mask alone defines the result); the HIP/CUDA backend gathers the listed rows when
+    // GGML_CUDA_FA_ROWS_GATHER=1 and ignores them otherwise, so a run with the knob off and one with it on compare both
+    // paths against the same reference. Layouts: contiguous runs, fully interleaved (run 1, concurrent decode),
+    // unaligned runs, a shared trunk, decode (nb = n_seq), DFlash2 verify (np4 x 9), a union slice (nb % n_seq != 0).
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t run : {1, 300, 2048}) {
+            for (int64_t nb : {1, 4, 36}) {
+                test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, nb, 4, run, 1024, 0.0f, 0.0f,
+                    type_KV, type_KV, nb >= 4 ? 4 : 0, 0, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 4, 4, 1, 1024, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 2048, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 6, 4, 64, 512, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 0, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 8, 4, 1, 1024, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 0, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 2, 2, 1, 1024, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true));
+    // UP-FAROWS-HIP served shapes (Qwen3.8-27B: hd256, 4 KV heads, GQA 6, q8_0 KV, np 4, --kv-unified, slots at ~40k
+    // cells each). The cases above stay under 12288 cells, so every gathered slice is < 4096 rows and never reaches the
+    // masked-KV-skip / KV_live paths, the multi-group (G > 1) GQA-verify layout or the large-batch MMA/tile kernels.
+    // These do: n_kv 163840 (4 x ~40k, cells in 2048-cell prefill chunks), decode (nb 4 -> 4 slices x 1), DFlash2
+    // verify (nb 32 -> 4 slices x 8, n_max 7), a ragged verify (nb 30 -> one union slice), a shared trunk, and prefill
+    // ubatches (2 slots x 512 -> 2 slices, 2 ragged slots 513 + 512 -> one union slice) at n_kv 32768. Q is token-major as in llama.cpp.
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {4, 32, 30}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, nb, 4, 2048, 512, 0.0f, 0.0f,
+                type_KV, type_KV, 4, 0, true, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
+            type_KV, type_KV, 4, 4096, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1024, 2, 2048, 256, 0.0f, 0.0f,
+            type_KV, type_KV, 2, 0, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1025, 2, 2048, 256, 0.0f, 0.0f,
+            type_KV, type_KV, 2, 0, true, true));
+    }
+    // UP-FAROWS-HIP r3: lists much shorter than n_kv (163840 cells, 131072 of them free: 4 x 8192 owned, so most of the
+    // gathered K/V of a padded slice is the -inf tail), at decode / DFlash2 verify / a 4 x 512 prefill ubatch (gathered
+    // MMA/tile with n_slices 4 at hd256, which the cases above only reach at n_kv 32768 with 2 slices). hint 1 = an
+    // n_seq hint that disagrees with the slicing (the gathered view resets it to 1 per slice; the dense path must not
+    // care either).
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {4, 32, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, nb, 4, 2048, 131072, 0.0f, 0.0f,
+                type_KV, type_KV, 4, 0, true, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 131072, 0.0f, 0.0f,
+            type_KV, type_KV, 1, 0, true, true));
+    }
+    // UP-FAROWS-HIP r6: query rows interleaved across the sequences (row i -> seq i % n_seq) with per-token causal masks:
+    // a layout in which the rows are NOT n_slices contiguous equal blocks. get_kv_rows must fall back to one union
+    // slice; nb % n_seq == 0 so a contiguity-blind slicer would wrongly slice it (and fail this case).
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t nb : {2, 8, 1200}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, nb, 2, 2048, 256, 0.0f, 0.0f,
+                type_KV, type_KV, 2, 0, true, true, true));
+        }
+    }
+    // UP-FAROWS-HIP r7: the r6 served MISMATCH shapes (GGML_CUDA_FA_ROWS_VERIFY): a single-slice prefill (nb 826, 1536
+    // gathered rows at n_kv 5632) and a 2-slice prefill (nb 1210 = 2 x 605, T % 16 != 0, n_kv 4864, two cell runs per
+    // sequence so the slices' cell ranges interleave), with peaked attention (qk_scale 4). Run with
+    // GGML_CUDA_FA_ROWS_GATHER=1 GGML_CUDA_FA_ROWS_ANY_KERNEL=1 to exercise the forced-MMA gathered call that r6 caught
+    // diverging from the dense WMMA call; without ANY_KERNEL the r7 parity rule routes these to the dense kernel.
+    for (float qs : {1.0f, 4.0f}) {
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 5632, 826, 1, 2048, 4096, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true, false, qs));
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 4864, 1210, 2, 600, 3584, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true, true, false, qs));
+    }
+    // UP-FAROWS-HIP r4: the exact Qwen3.8-27B prefill shapes traced in up-farows-hip-gpu-20261116-r3 (garbage with the
+    // knob on, kernel 300 = WMMA chosen for the gathered call on the gfx90a rocWMMA build):
+    //   Q=[256,1200,24] K=[256,2048,4] q8_0, rows=[1280,2]: 2 slots x 600 tokens, seq 0 owns cells 0..612 + 1226..1812
+    //     (1200 cells), seq 1 owns 613..1225 (613 cells), 235 free cells -> n_rows 1280, n_slices 2, T 600 (% 16 = 8)
+    //   Q=[256,848,24]  K=[256,2816,4] q8_0, rows=[1536,1]: one slot, 1500 of 2816 cells -> n_rows 1536, n_slices 1
+    // The gathered call now avoids WMMA; GGML_CUDA_FA_ROWS_WMMA=1 (with GGML_CUDA_FA_ROWS_GATHER=1) forces kernel 300
+    // back for the gathered call, which reproduces the r3 failure here if WMMA is at fault.
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2816, 848, 1, 2816, 1316, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_F16, GGML_TYPE_F16, 2, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 2048, 1200, 2, 613, 235, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, false, true));
+    // UP-FAROWS-HIP r5: up-farows-hip-gpu-20261116-r4 tbo arm B (n_kv 12288 -> 2816 gathered rows, 1 slice, hd256 GQA 6,
+    // few query rows): the non-WMMA selection picked TILE with ncols2 = 2, compiled as a NO_DEVICE_CODE stub on the
+    // gfx90a rocWMMA build (fattn-tile.cuh:845 + HSA 0x1016). r5 must promote these to MMA_F16 or run them dense.
+    // A stub launch __trap()s the device, so a regression here aborts test-backend-ops (non-zero exit), it never passes;
+    // runners should still grep the log for "has no device code" and treat any hit as FAIL.
+    for (int64_t nb_tok : {1, 8, 16, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, nb_tok, 1, 2800, 9488, 0.0f, 0.0f,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true));
+    }
+    // knob-off controls for the same served shapes (no row list): the dense path at these sizes
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 32768, 1024, 2, 2048, 256, 0.0f, 0.0f,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 0, false, true));
+
     // ALiBi, softcap, other head sizes (tile, MMA and MLA paths)
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 1, 8192, 4, 4, 1024, 1024, 8.0f, 0.0f));
     test_cases.emplace_back(new test_flash_attn_ext_unified(128, 128, 4, 4, 8192, 4, 4, 1024, 1024, 0.0f, 10.0f));
