@@ -14016,6 +14016,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
 
+    // AKX-ALL-31.QDEC-CPU-IQ3Q6 (appended; existing case order unchanged).
+    // IQ3_XXS: the iqk Ny >= 2 kernel added its +64 offset with _mm256_add_epi32, carrying one grid
+    // unit into 37.5% of the elements. Ny == 1 takes the (correct) ZMM path, so Ny 2..64 are the
+    // witnesses; the CPU reference (use_ref) runs ggml's vec_dot_iq3_xxs_q8_K, so a correct kernel
+    // matches it to float-accumulation noise and the tight bound has no slack for a whole grid unit.
+    for (int64_t n : { 2, 3, 8, 16, 31, 32, 64 }) {
+        test_cases.emplace_back(new test_mul_mat_served_shape(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 256, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 1e-7));
+    }
+    for (int64_t n : { 2, 32 }) {
+        test_cases.emplace_back(new test_mul_mat_id_served_shape(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 256, n, 1024, 1e-7));
+    }
+    // Q6_K: Ny < 64 is the direct kernel (exact to accumulation noise, tight bound); Ny >= 64 is
+    // the iqk Q6_K -> Q8_0_R8 requantization (per-32 8-bit rescale, a declared bounded
+    // approximation of <= 0.5/127 of each 32-block max), held to the default MUL_MAT bound.
+    test_cases.emplace_back(new test_mul_mat_served_shape(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 63, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 1e-7));
+    for (int64_t n : { 64, 256 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, n, 1024, {1, 1}, {1, 1}));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
