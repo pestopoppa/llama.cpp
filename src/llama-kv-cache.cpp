@@ -1830,6 +1830,11 @@ bool llama_kv_cache::get_kv_rows(const llama_ubatch & ubatch, uint32_t n_kv, std
     n_rows   = 0;
     n_slices = 0;
 
+    // C15: row lists exist only for the CUDA/HIP gather; a KV cache in host memory (CPU FA) takes the C14 path untouched
+    if (layers.empty() || !layers[0].k || !layers[0].k->buffer || ggml_backend_buffer_is_host(layers[0].k->buffer)) {
+        return false;
+    }
+
     const uint32_t n_tokens = ubatch.n_tokens;
     if (n_stream != 1 || v_cells.size() != 1 || n_tokens == 0 || ubatch.n_seqs_unq == 0 || n_kv == 0) {
         return false;
