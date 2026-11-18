@@ -783,6 +783,20 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// RKA-A3B-N4-STEP: on CDNA (fp32/bf16 MFMA present) F32 and BF16 weights leave MMVF at ne11 >= 4 and fall to
+// MMF (64-row blocks: only ne01/64 workgroups, e.g. 4 for a 2048x256 MoE router) or, when ne01 % 64 != 0
+// (shared-expert gate, ne01 = 1), to hipBLAS. That is the only CDNA dispatch threshold between ne11 = 3 and 4 on
+// the Qwen3.6-35B-A3B verify path (40 F32 ffn_gate_inp + 1 BF16 MTP router). GGML_HIP_MMVF_CDNA_MAX_NE11 = N
+// (1..MMVF_MAX_BATCH_SIZE) keeps F32/BF16 on MMVF up to ne11 = N on CDNA. Unset/invalid = upstream (3). Default-off.
+static int ggml_cuda_mmvf_cdna_max_ne11() {
+    static const int v = []() {
+        const char * s = getenv("GGML_HIP_MMVF_CDNA_MAX_NE11");
+        const int n = s ? atoi(s) : 0;
+        return (n >= 1 && n <= MMVF_MAX_BATCH_SIZE) ? n : 3;
+    }();
+    return v;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -812,7 +826,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
+                    return ne11 <= ggml_cuda_mmvf_cdna_max_ne11();
                 }
                 return ne11 <= 8;
             }
@@ -858,7 +872,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
+                    return ne11 <= (GGML_CUDA_CC_IS_CDNA(cc) ? ggml_cuda_mmvf_cdna_max_ne11() : 3);
                 }
                 return ne11 <= 8;
             }
