@@ -2038,7 +2038,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 4;
             const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
             const int rpb = calc_rows_per_block(type, c_ncols_dst, table_id, false, nwarps);
-            if (rpb == 4 && nrows_x % rpb != 0) {
+            // GGML_HIP_MMVQ_Q8_B4_ROWS=2 (unset = C13 behaviour): force the rows_per_cuda_block=2 instantiation
+            // at ncols_dst==4 (RKA-A3B-N4-STEP probe). Only the dense route reaches here; MUL_MAT_ID with
+            // ncols_dst>1 goes to mul_mat_vec_q_moe_launch, which has a fixed rows_per_block=2.
+            static const bool force_b4_r2 = [] {
+                const char * e = getenv("GGML_HIP_MMVQ_Q8_B4_ROWS");
+                return e != nullptr && atoi(e) == 2;
+            }();
+            if (rpb == 4 && (nrows_x % rpb != 0 || force_b4_r2)) {
                 if constexpr (type == GGML_TYPE_Q8_0) {
                     // akm-cdna2-q8-b4-y-stream-amortize: R=4 row tiling needs nrows_x % 4 == 0;
                     // launch the small_k instantiation (rows_per_cuda_block=2) instead, so a

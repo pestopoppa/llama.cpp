@@ -14016,6 +14016,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     autokernel_add_cpu_fa_longctx_cases(test_cases);
     autokernel_add_cpu_fa_d512_reg_cases(test_cases);
 
+    // RKA-A3B-N4-STEP: Q8_0 MUL_MAT / MUL_MAT_ID at n=3/4/5 (A3B-like shapes; GGML_HIP_MMVQ_Q8_B4_ROWS probe)
+    for (int n : {3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4098, n, 2048, {1, 1}, {1, 1}));  // nrows % 4 != 0
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2048, n, 768));
+    }
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14452,6 +14460,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int i = 0; i < 50; ++i) {
             test_cases.emplace_back(new test_topk_moe_hold({256, 131072, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
         }
+    }
+    // RKA-A3B-N4-STEP: Q8_0 MUL_MAT / MUL_MAT_ID at n=3/4/5 (A3B-like shapes; GGML_HIP_MMVQ_Q8_B4_ROWS probe)
+    for (int n : {3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4098, n, 2048, {1, 1}, {1, 1}));  // nrows % 4 != 0
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2048, n, 768));
     }
     return test_cases;
 }
