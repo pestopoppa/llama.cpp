@@ -14127,6 +14127,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [C15-GV-COALESCE] same 27B GQA6 hd256 q8_0 shapes with an odd tail (last chunk partly masked mid-chunk); run with
+    // GGML_HIP_GV_COALESCE=0/1 (x PREFETCH_DEPTH / LDS_ALIAS): the coalesced load + swizzled LDS path must match bitwise.
+    for (int64_t kv : {32768, 131072}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 37));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14150,7 +14158,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // [C15-GV-BW] op-level GB/s of the 27B decode/verify FA: A/B GGML_HIP_GV_PREFETCH_DEPTH / GGML_HIP_GV_LDS_ALIAS
+    // [C15-GV-BW] [C15-GV-COALESCE] op-level GB/s of the 27B decode/verify FA: A/B GGML_HIP_GV_PREFETCH_DEPTH /
+    // GGML_HIP_GV_LDS_ALIAS / GGML_HIP_GV_COALESCE
     for (int64_t kv : {32768, 131072}) {
         for (int64_t nb : {1, 8}) {
             test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 0));

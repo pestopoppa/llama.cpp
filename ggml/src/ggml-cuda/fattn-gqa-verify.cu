@@ -104,6 +104,18 @@ static bool gv_lds_alias() {
     return v;
 }
 
+// C15-GV-COALESCE (C8-1-H17): GGML_HIP_GV_COALESCE=1 (default 0) remaps the q8_0 K/V tile load of the LATE pipeline from
+// key-major lanes (b = tid/32, key = tid%32: one wave instruction touches 32 rows, 9 unaligned 2/4-byte loads per block) to
+// block-minor lanes (key = tid/8, b = tid%8: a wave covers 8 whole 272-byte rows). Each lane loads the 16-byte-aligned
+// 48-byte window [32b, 32b+48) of its row as 3 x 16 B (global_load_dwordx4) and extracts its 34-byte block with a
+// funnel shift, so the raw bits handed to dequant are identical. sK and sVt get XOR swizzles that keep the new store
+// pattern bank-conflict-free; every read applies the same map. Requires 16-byte-aligned K/V data and strides (else off).
+// Composes with GGML_HIP_GV_PREFETCH_DEPTH and GGML_HIP_GV_LDS_ALIAS. Output is bitwise identical to the base path.
+static bool gv_coalesce() {
+    static const bool v = gv_env_int("GGML_HIP_GV_COALESCE", 0) != 0;
+    return v;
+}
+
 static bool gv_multiseq() {
     static const bool v = gv_env_int("GGML_HIP_GV_MULTISEQ", 1) != 0;
     return v;
@@ -148,13 +160,23 @@ static size_t gv_smem_bytes(const int nwaves, const bool alias = false) {
 typedef _Float16 gv_halfx4 __attribute__((ext_vector_type(4)));
 typedef float    gv_floatx4 __attribute__((ext_vector_type(4)));
 
+// C15-GV-COALESCE LDS swizzles (bijections on the column index inside a row; padding columns are never touched).
+// sK : col (halves, 0..255) XOR 8 * ((col >> 6) & 3) -- permutes the 16-byte units inside each 64-half group.
+// sVt: col (keys, 0..31) XOR 4 * ((row >> 5) & 7)    -- row >> 5 is the q8_0 block index b of the V column.
+template <bool SWZ> static __device__ __forceinline__ int gv_swz_k(const int col) {
+    return SWZ ? col ^ (((col >> 6) & 3) << 3) : col;
+}
+template <bool SWZ> static __device__ __forceinline__ int gv_swz_vt(const int row, const int col) {
+    return SWZ ? col ^ (((row >> 5) & 7) << 2) : col;
+}
+
 struct gv_no_mid {
     __device__ __forceinline__ void operator()() const {}
 };
 
 // steps 3+4 of one 32-key chunk (sK / sVt / smask filled, block-synchronized); contains one __syncthreads(), after which
 // mid() runs (the LDS-alias variant stores V there, over sK, and adds its own barrier)
-template <typename Mid = gv_no_mid>
+template <bool SWZ = false, typename Mid = gv_no_mid>
 static __device__ __forceinline__ void gv_compute_chunk(
         const bool tile_active, const _Float16 * sK, const _Float16 * sVt, _Float16 * sP, const float * smask,
         const gv_halfx4 (&qa)[GV_D / 16], gv_floatx4 (&o)[GV_D / 16], float (&m_run)[4], float (&l_run)[4],
@@ -168,7 +190,7 @@ static __device__ __forceinline__ void gv_compute_chunk(
             S[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int s = 0; s < GV_D / 16; ++s) {
-                const gv_halfx4 kb = *(const gv_halfx4 *) (sK + (nb * 16 + li) * GV_KSTR + 16 * s + 4 * kq);
+                const gv_halfx4 kb = *(const gv_halfx4 *) (sK + (nb * 16 + li) * GV_KSTR + gv_swz_k<SWZ>(16 * s + 4 * kq));
                 S[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S[nb], 0, 0, 0);
             }
         }
@@ -225,7 +247,7 @@ static __device__ __forceinline__ void gv_compute_chunk(
             const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * GV_PSTR + 16 * t + 4 * kq);
 #pragma unroll
             for (int nb = 0; nb < GV_D / 16; ++nb) {
-                const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * GV_VTSTR + 16 * t + 4 * kq);
+                const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * GV_VTSTR + gv_swz_vt<SWZ>(nb * 16 + li, 16 * t + 4 * kq));
                 o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
             }
         }
@@ -233,7 +255,7 @@ static __device__ __forceinline__ void gv_compute_chunk(
 }
 #endif
 
-template <bool KV_Q8, bool PIPE, bool LATE = false, int PD = 1, bool ALIAS = false>
+template <bool KV_Q8, bool PIPE, bool LATE = false, int PD = 1, bool ALIAS = false, bool CO = false>
 static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES), ALIAS ? 2 : 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
@@ -350,18 +372,44 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
         c_end   = s_hi + 1;
     }
 
-    if constexpr (PIPE && KV_Q8 && LATE && (PD > 1 || ALIAS)) {
+    if constexpr (PIPE && KV_Q8 && LATE && (PD > 1 || ALIAS || CO)) {
         // C15-GV-BW: PD-deep register ring of raw q8_0 blocks (slot j holds chunk c0 + j), optional LDS alias of sK/sVt.
         // Same bytes, same dequant expressions, same chunk and MFMA order as the PD = 1 LATE branch below.
         struct __attribute__((packed, aligned(2))) gv_q8_raw { uint32_t w[8]; uint16_t tail; };
-        uint32_t kw[PD][8];
-        uint32_t vw[PD][8];
-        uint16_t kt[PD];
-        uint16_t vt[PD];
+        // CO: 12 dwords = the 48-byte window [32*bb, 32*bb + 48) of the key row (3 x uint4); else 8 dwords + tail.
+        constexpr int NW = CO ? 12 : 8;
+        uint32_t kw[PD][NW];
+        uint32_t vw[PD][NW];
+        uint16_t kt[PD] = {};
+        uint16_t vt[PD] = {};
         uint16_t rm[PD][2];
         const bool ld = tid < GV_KC * (GV_D / QK8_0);
-        const int  bb = tid / GV_KC;
-        const int  kk = tid % GV_KC;
+        const int  bb = CO ? tid % (GV_D / QK8_0) : tid / GV_KC;
+        const int  kk = CO ? tid / (GV_D / QK8_0) : tid % GV_KC;
+
+        // CO: block bb starts at byte 34*bb = window byte 2*bb, i.e. dword bb/2 (+ one halfword if bb is odd).
+        // Rebuild exactly the 8 dwords + tail halfword the base path loads (same bits, little-endian).
+        auto blk = [&](const uint32_t (&win)[NW], uint32_t (&w8)[8], uint16_t & tl) __attribute__((always_inline)) {
+            if constexpr (CO) {
+                const int  q   = bb >> 1;
+                const bool odd = bb & 1;
+                uint32_t sh[9];
+#pragma unroll
+                for (int i = 0; i < 9; ++i) {
+                    sh[i] = q == 0 ? win[i] : q == 1 ? win[i + 1] : q == 2 ? win[i + 2] : win[i + 3];
+                }
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    w8[t] = odd ? __builtin_amdgcn_alignbit(sh[t + 1], sh[t], 16) : sh[t];
+                }
+                tl = (uint16_t) (odd ? sh[8] >> 16 : sh[8]);
+            } else {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    w8[t] = win[t];
+                }
+            }
+        };
 
         auto load_raw = [&](const int c, const int j) __attribute__((always_inline)) {
             const int kbase = c * GV_KC;
@@ -372,6 +420,20 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
                     rm[j][s] = *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half));
                 }
             }
+            if constexpr (CO) {
+                if (ld) {
+                    // 3 aligned 16-byte loads per tensor; the 8 lanes of a key row read its bytes [0, 272) (+ overlap)
+                    const uint4 * qk = (const uint4 *) (Kb + (int64_t) (kbase + kk) * nb11 + 32 * bb);
+                    const uint4 * qv = (const uint4 *) (Vb + (int64_t) (kbase + kk) * nb21 + 32 * bb);
+#pragma unroll
+                    for (int s = 0; s < 3; ++s) {
+                        const uint4 a = qk[s];
+                        const uint4 b = qv[s];
+                        kw[j][4 * s + 0] = a.x; kw[j][4 * s + 1] = a.y; kw[j][4 * s + 2] = a.z; kw[j][4 * s + 3] = a.w;
+                        vw[j][4 * s + 0] = b.x; vw[j][4 * s + 1] = b.y; vw[j][4 * s + 2] = b.z; vw[j][4 * s + 3] = b.w;
+                    }
+                }
+            } else
             if (ld) {
                 const gv_q8_raw * qk = (const gv_q8_raw *) (Kb + (int64_t) (kbase + kk) * nb11 + bb * (int64_t) sizeof(block_q8_0));
                 const gv_q8_raw * qv = (const gv_q8_raw *) (Vb + (int64_t) (kbase + kk) * nb21 + bb * (int64_t) sizeof(block_q8_0));
@@ -387,6 +449,12 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
 
         // mask + K of slot j -> smask / sK; returns the chunk's liveness bit
         auto store_mk = [&](const int j) __attribute__((always_inline)) -> int {
+            uint32_t kx[8];
+            uint16_t ktl = kt[j];
+            blk(kw[j], kx, ktl);
+            if constexpr (CO) {
+                kt[j] = ktl; // CO slots load no tail: kt[j] now holds the extracted block's last halfword
+            }
             uint32_t x0 = kt[j], x1 = vt[j], x2 = rm[j][0], x3 = rm[j][1];
             asm volatile("" : "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3));
             kt[j] = (uint16_t) x0; vt[j] = (uint16_t) x1; rm[j][0] = (uint16_t) x2; rm[j][1] = (uint16_t) x3;
@@ -401,18 +469,18 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
                 }
             }
             if (ld) {
-                const float dk = __half2float(__ushort_as_half((uint16_t) kw[j][0]));
+                const float dk = __half2float(__ushort_as_half((uint16_t) kx[0]));
 #pragma unroll
                 for (int g = 0; g < 4; ++g) {
                     _Float16 tmp[8];
 #pragma unroll
                     for (int t = 0; t < 4; ++t) {
                         const int k = 1 + 4 * g + t;
-                        const uint16_t u = k == QK8_0 / 2 ? kt[j] : (uint16_t) (kw[j][k / 2] >> (16 * (k % 2)));
+                        const uint16_t u = k == QK8_0 / 2 ? kt[j] : (uint16_t) (kx[k / 2] >> (16 * (k % 2)));
                         tmp[2 * t + 0] = (_Float16) (dk * (float) (int8_t) (u & 0xFF));
                         tmp[2 * t + 1] = (_Float16) (dk * (float) (int8_t) (u >> 8));
                     }
-                    *(uint4 *) (sK + kk * GV_KSTR + bb * QK8_0 + 8 * g) = *(const uint4 *) tmp;
+                    *(uint4 *) (sK + kk * GV_KSTR + gv_swz_k<CO>(bb * QK8_0 + 8 * g)) = *(const uint4 *) tmp;
                 }
             }
             return any;
@@ -426,8 +494,8 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
                 for (int t = 0; t < QK8_0 / 2; ++t) {
                     const int k = 1 + t;
                     const uint16_t u = k == QK8_0 / 2 ? tl : (uint16_t) (w8[k / 2] >> (16 * (k % 2)));
-                    sVt[(bb * QK8_0 + 2 * t + 0) * GV_VTSTR + kk] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
-                    sVt[(bb * QK8_0 + 2 * t + 1) * GV_VTSTR + kk] = (_Float16) (dv * (float) (int8_t) (u >> 8));
+                    sVt[(bb * QK8_0 + 2 * t + 0) * GV_VTSTR + gv_swz_vt<CO>(bb * QK8_0, kk)] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
+                    sVt[(bb * QK8_0 + 2 * t + 1) * GV_VTSTR + gv_swz_vt<CO>(bb * QK8_0, kk)] = (_Float16) (dv * (float) (int8_t) (u >> 8));
                 }
             }
         };
@@ -448,14 +516,13 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
                     int live;
                     if constexpr (ALIAS) {
                         live = __syncthreads_or(store_mk(j));
-#pragma unroll
-                        for (int t = 0; t < 8; ++t) {
-                            vcur[t] = vw[j][t];
-                        }
                         vtcur = vt[j];
+                        blk(vw[j], vcur, vtcur); // copied out before slot j is reloaded
                     } else {
                         const int any = store_mk(j);
-                        store_v(vw[j], vt[j]);
+                        vtcur = vt[j];
+                        blk(vw[j], vcur, vtcur);
+                        store_v(vcur, vtcur);
                         live = __syncthreads_or(any);
                     }
                     if (c + PD < c_end) {
@@ -463,10 +530,10 @@ static __global__ void __launch_bounds__(ALIAS ? 64 * GV_MIN_WAVES : (PIPE ? 64 
                     }
                     if (live) {
                         if constexpr (ALIAS) {
-                            gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq,
+                            gv_compute_chunk<CO>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq,
                                 [&]() __attribute__((always_inline)) { store_v(vcur, vtcur); __syncthreads(); });
                         } else {
-                            gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                            gv_compute_chunk<CO>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
                         }
                     }
                     __syncthreads();
@@ -927,26 +994,31 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const bool late = pipe && q8 && gv_prefetch_late();
     const int  pd    = late ? gv_prefetch_depth() : 1;
     const bool alias = late && nwaves == GV_MIN_WAVES && gv_lds_alias();
+    // C15-GV-COALESCE: 16-byte loads need 16-byte-aligned K/V bases and row/head/seq strides
+    auto al16 = [](const void * p, const size_t a, const size_t b, const size_t c) {
+        return ((uintptr_t) p % 16) == 0 && a % 16 == 0 && b % 16 == 0 && c % 16 == 0;
+    };
+    const bool coal = late && gv_coalesce() && al16(K->data, K->nb[1], K->nb[2], K->nb[3]) && al16(V->data, V->nb[1], V->nb[2], V->nb[3]);
     const size_t smem = gv_smem_bytes(nwaves, alias);
-#define GV_LAUNCH_BW(PD_, AL_) \
-    gv_fattn_kernel<true, true, true, PD_, AL_><<<grid, block, smem, stream>>>( \
+#define GV_LAUNCH_BW(PD_, AL_, CO_) \
+    gv_fattn_kernel<true, true, true, PD_, AL_, CO_><<<grid, block, smem, stream>>>( \
         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
         Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
         Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], \
         mask->nb[1], mask->nb[3], ne33)
-    if (late && (pd > 1 || alias)) {
-        if (alias) {
-            if (pd == 3) {
-                GV_LAUNCH_BW(3, true);
-            } else if (pd == 2) {
-                GV_LAUNCH_BW(2, true);
-            } else {
-                GV_LAUNCH_BW(1, true);
-            }
+#define GV_LAUNCH_BW_PD(AL_, CO_) \
+    if (pd == 3) { GV_LAUNCH_BW(3, AL_, CO_); } else if (pd == 2) { GV_LAUNCH_BW(2, AL_, CO_); } else { GV_LAUNCH_BW(1, AL_, CO_); }
+    if (late && (pd > 1 || alias || coal)) {
+        if (alias && coal) {
+            GV_LAUNCH_BW_PD(true, true)
+        } else if (alias) {
+            GV_LAUNCH_BW_PD(true, false)
+        } else if (coal) {
+            GV_LAUNCH_BW_PD(false, true)
         } else if (pd == 3) {
-            GV_LAUNCH_BW(3, false);
+            GV_LAUNCH_BW(3, false, false);
         } else {
-            GV_LAUNCH_BW(2, false);
+            GV_LAUNCH_BW(2, false, false);
         }
     } else if (late) {
         gv_fattn_kernel<true, true, true><<<grid, block, smem, stream>>>(
@@ -983,6 +1055,7 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
             mask->nb[1], mask->nb[3], ne33);
         }
     }
+#undef GV_LAUNCH_BW_PD
 #undef GV_LAUNCH_BW
     CUDA_CHECK(cudaGetLastError());
 
@@ -1004,8 +1077,16 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
     }
     static int n_bw_calls = 0;
-    if (late && (pd > 1 || alias) && n_bw_calls++ == 0) {
+    if (late && (pd > 1 || alias || coal) && n_bw_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: C15-GV-BW variant ran (prefetch_depth=%d lds_alias=%d smem=%zu)\n", pd, (int) alias, smem);
+    }
+    static int n_co_calls = 0;
+    if (coal && n_co_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: C15-GV-COALESCE 16-byte K/V load + swizzled LDS path ran (prefetch_depth=%d lds_alias=%d)\n", pd, (int) alias);
+    }
+    static int n_co_off = 0;
+    if (late && gv_coalesce() && !coal && n_co_off++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_GV_COALESCE requested but K/V not 16-byte aligned; base load path used\n");
     }
     static int n_late_calls = 0;
     if (late && n_late_calls++ == 0) {
