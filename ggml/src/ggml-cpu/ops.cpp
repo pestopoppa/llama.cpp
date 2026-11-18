@@ -10527,8 +10527,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const char * e = getenv("GGML_CPU_FA_SPLIT_KV");
         return e ? (atoi(e) != 0) : false;
     }();
-    const bool split_kv_rows_ok = (neq1 == 1 && fa_split_kv_enabled) ||
-        (cpu_fa_split_kv_batch && neq1 >= 2 && neq1 <= GGML_CPU_FA_SPLIT_KV_MAX_N && nth > 1);
+    // Under the knob, N == 1 takes the split path too, even with GGML_FA_SPLIT_KV=0 (the C10 serving env): every
+    // width 1..MAX_N then uses the same KV chunking and merge order, so the INF-70 1-row vs n-row consistency
+    // that GGML_FA_SPLIT_KV=0 buys is kept (both widths split) instead of broken (only the n-row width split).
+    const bool split_kv_rows_ok = cpu_fa_split_kv_batch
+        ? (neq1 >= 1 && neq1 <= GGML_CPU_FA_SPLIT_KV_MAX_N)
+        : (neq1 == 1 && fa_split_kv_enabled);
     const bool use_split_kv_path = split_kv_rows_ok && !use_ref && neq3 == 1 && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
