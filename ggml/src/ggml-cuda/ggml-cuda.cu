@@ -3445,7 +3445,13 @@ static void * ggml_cuda_epilogue_q8_reserve(ggml_backend_cuda_context * cuda_ctx
         return nullptr;
     }
     const ggml_tensor * consumer_src1 = ggml_cuda_epilogue_q8_consumer(cgraph, out_idx);
-    return consumer_src1 ? ggml_cuda_mmvq_q8_1_graph_cache_reserve(*cuda_ctx, consumer_src1) : nullptr;
+    void * q8_1 = consumer_src1 ? ggml_cuda_mmvq_q8_1_graph_cache_reserve(*cuda_ctx, consumer_src1) : nullptr;
+    static std::atomic<bool> logged{false};
+    if (q8_1 != nullptr && !logged.exchange(true)) {
+        GGML_LOG_WARN("GGML_HIP_EPILOGUE_Q8 engaged: producer %s (%s) writes q8_1 for MUL_MAT src1 %s ne0=%lld\n",
+            cgraph->nodes[out_idx]->name, ggml_op_desc(cgraph->nodes[out_idx]), consumer_src1->name, (long long) consumer_src1->ne[0]);
+    }
+    return q8_1;
 }
 
 // try and fuse nodes and return the number of nodes to skip
