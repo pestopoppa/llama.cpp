@@ -541,7 +541,12 @@ struct DequantizerIQ3XXS final : public BaseDequantizer<block_iq3_xxs> {
         make4_unsigned(qs, bits.values);
         sign_2_values(signs+0, bits.values+0);
         sign_2_values(signs+4, bits.values+2);
-        for (int k = 0; k < 4; ++k) bits.values[k] = _mm256_add_epi32(bits.values[k], min_value);
+        // AKX-ALL-31.QDEC-CPU-IQ3Q6: the +minv offset is per int8 lane. The inherited
+        // _mm256_add_epi32 carried out of every negative byte into the next lane, adding one
+        // grid unit (d*(2s+1)/4) to each element whose predecessor in the dword is negative
+        // (37.5% of elements) on every Ny >= 2 IQ3_XXS mul_mat (the Ny == 1 ZMM path signs the
+        // activations instead and was correct).
+        for (int k = 0; k < 4; ++k) bits.values[k] = _mm256_add_epi8(bits.values[k], min_value);
     }
     inline void prepare(int i, int j, const Q8<1>& q8, __m256i * q8_quants) {
         for (int k = 0; k < 4; ++k) q8_quants[k] = q8.load_quants(0, i, 4*j+k);
