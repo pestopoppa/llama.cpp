@@ -12016,6 +12016,12 @@ static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
+    // RKA-A3B-ROUTER-WIDE: Qwen3.6-35B-A3B router ffn_gate_inp (2048x256, F32 x40 / BF16 MTP x1) at verify widths
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int64_t n : {4, 8, 12, 16, 24, 32, 48, 64}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     std::default_random_engine rng(0);
 
@@ -14127,6 +14133,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // RKA-A3B-ROUTER-WIDE: op-level timing of the A3B router at verify widths (knob on vs unset)
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int64_t n : {4, 8, 12, 16, 24, 32, 48, 64}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
