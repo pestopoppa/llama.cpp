@@ -349,9 +349,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
-            // AKX-ALL-31: the stored ds.y sum overflows f16 at near-f16-max activations; use d * exact int8 block sum.
-            float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
-            dsB.y = dsB.x * float(q8_1_isum_ints<QI8_1>(y_qs + j*MMQ_TILE_Y_K + k01));
+            // AKX-ALL-31 v2: DS4 ds.y is the block's exact int8 sum (int16 bits, set by quantize_mmq_q8_1); d * isum in f32.
+            const float2 dsB = q8_1_mmq_ds4_d_dsum(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
 
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
@@ -425,9 +424,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int l = 0; l < tile_C::ne/2; ++l) {
                 const int j = j0 + tile_C::get_j(l);
 
-                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
-                // AKX-ALL-31: d * exact int8 block sum instead of the overflow-prone f16 ds.y
-                dsB[l].y = dsB[l].x * float(q8_1_isum_ints<QI8_1>(y_qs + j*MMQ_TILE_Y_K + k01));
+                // AKX-ALL-31 v2: d * exact int8 block sum, decoded from the DS4 half2 already loaded (no y tile rescan)
+                dsB[l] = q8_1_mmq_ds4_d_dsum(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
 
 #pragma unroll

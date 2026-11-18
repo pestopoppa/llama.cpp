@@ -126,6 +126,14 @@ template <int n> static __device__ __forceinline__ int q8_1_isum_ints(const int 
     return s;
 }
 
+// AKX-ALL-31 v2: in the MMQ DS4 layout (block_q8_1_mmq::ds4), quantize_mmq_q8_1 stores ds.y as the exact integer
+// sum of the block's 32 quantized values in raw int16 bits (same encoding as C6-Q4-MMVQ-FIX isum). Returns
+// {d, d*isum} in f32: finite for every finite input, one cvt + one mul, no extra shared-memory reads.
+static __device__ __forceinline__ float2 q8_1_mmq_ds4_d_dsum(const half2 ds) {
+    const float d = __low2float(ds);
+    return make_float2(d, d * float(__half_as_short(__high2half(ds))));
+}
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 
@@ -543,8 +551,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
         const float d8 = __low2float(ds8[i]);
 
         sumf_d += d8 * (sc[i] * (sumi_d0 + sumi_d1));
-        // exact quantized block sum * q4_K min val (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
-        sumf_m += d8 * float(q8_1_isum_ints<QI8_1>(u + i*QI8_1) * m[i]);
+        // exact quantized block sum (int16 bits in the MMQ DS4 ds.y, AKX-ALL-31 v2) * q4_K min val
+        sumf_m += d8 * float(int(__half_as_short(__high2half(ds8[i]))) * m[i]);
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -607,8 +615,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
         const float d8 = __low2float(ds8[i]);
 
         sumf_d += d8 * (sc[i] * sumi_d);
-        // exact quantized block sum * q5_K min val (AKX-ALL-31: ds8.y overflows at near-f16-max inputs)
-        sumf_m += d8 * float(q8_1_isum_ints<QI8_1>(u + i*QI8_1) * m[i]);
+        // exact quantized block sum (int16 bits in the MMQ DS4 ds.y, AKX-ALL-31 v2) * q5_K min val
+        sumf_m += d8 * float(int(__half_as_short(__high2half(ds8[i]))) * m[i]);
     }
 
     const float2 dm4f = __half22float2(dm4);
