@@ -879,7 +879,7 @@ static void ggml_cuda_fattn_warn_dense_stub(const int device, const best_fattn_k
 static bool ggml_cuda_fattn_rows_gather_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FA_ROWS_GATHER");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0; // C15: default ON (=0 disables)
     }();
     return enabled;
 }

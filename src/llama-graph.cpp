@@ -479,7 +479,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 static bool llama_fa_rows_gather_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FA_ROWS_GATHER");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0; // C15: default ON (=0 disables)
     }();
     return enabled;
 }
