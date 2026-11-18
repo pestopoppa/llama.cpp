@@ -2834,6 +2834,8 @@ struct test_case {
             size_t transform_index;
             std::array<uint64_t, 4> output_hashes;
             std::array<size_t, 4> output_counts;
+            uint64_t test_digest   = 1469598103934665603ULL; // [C15-GV-COALESCE] FNV-1a of backend1 (device) outputs, identity
+            size_t   test_digest_n = 0;
         };
 
         callback_userdata ud {
@@ -2876,6 +2878,12 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
+
+            if (t1->op != GGML_OP_NONE && !f1.empty() && ud->transform_index == 0) {
+                ud->test_digest = autokernel_fnv_update(ud->test_digest, &index, sizeof(index));
+                ud->test_digest = autokernel_fnv_update(ud->test_digest, f1.data(), f1.size() * sizeof(float));
+                ud->test_digest_n += f1.size();
+            }
 
             if (t2->op != GGML_OP_NONE && !f2.empty()) {
                 uint64_t & hash = ud->output_hashes[ud->transform_index];
@@ -3039,6 +3047,13 @@ struct test_case {
             if (!transform_ok || !ud.ok) {
                 break;
             }
+        }
+
+        // [C15-GV-COALESCE] GGML_TBO_OUTPUT_DIGEST=1: one stderr line per case with a digest of the device output, so two
+        // processes (e.g. knob on / off, same --suite-seed) can be compared bitwise. Diagnostic only; no effect on pass/fail.
+        if (getenv("GGML_TBO_OUTPUT_DIGEST") != nullptr && ud.test_digest_n > 0) {
+            fprintf(stderr, "TBO_OUTPUT_DIGEST %s(%s) %016llx n=%zu\n", current_op_name.c_str(), vars().c_str(),
+                (unsigned long long) ud.test_digest, ud.test_digest_n);
         }
 
         const bool checker_sibling_cpu = ggml_backend_is_cpu(backend2);
