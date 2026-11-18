@@ -538,6 +538,23 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
         return;
     }
 
+    // RKA-A3B-ROUTER-WIDE: ncols_dst > MMVF_MAX_BATCH_SIZE only reaches here when GGML_HIP_ROUTER_WIDE=1 admitted a
+    // small (router-class) matrix on CDNA. Tile the columns into launches of <= MMVF_MAX_BATCH_SIZE so the existing,
+    // tested 1..8 template instances (and their VGPR budget) are reused; src0 (2 MiB for the 2048x256 F32 router)
+    // stays L2-resident across the tiles, and every launch keeps one workgroup per row (256 WGs, not MMF's 4).
+    if (ncols_dst > MMVF_MAX_BATCH_SIZE) {
+        GGML_ASSERT(fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
+        for (int64_t c0 = 0; c0 < ncols_dst; c0 += MMVF_MAX_BATCH_SIZE) {
+            const int64_t nc = std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ncols_dst - c0);
+            mul_mat_vec_f_cuda_switch_ncols_dst<T, type_acc>
+                (x, y + c0*stride_col_y, ids, fusion, dst + c0*stride_col_dst, ncols, nrows, nc, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 ids_stride, stream);
+        }
+        return;
+    }
+
     switch (ncols_dst) {
         case 1:
             launch_mul_mat_vec_f_cuda<T, type_acc, 1>
@@ -797,6 +814,19 @@ static int ggml_cuda_mmvf_cdna_max_ne11() {
     return v;
 }
 
+// RKA-A3B-ROUTER-WIDE: multi-session verify batches are np*(D+1) tokens (12/24/48 at D2, np 4/8/16), past the
+// MMVF cap, so the A3B router (F32/BF16 2048x256) falls to MMF (64-row blocks -> 4 WGs) or hipBLAS. With
+// GGML_HIP_ROUTER_WIDE=1, F32/BF16 matrices with <= 1024 rows and a single channel/sample stay on MMVF up to
+// ne11 = 64 on CDNA via column tiling (see mul_mat_vec_f_cuda_switch_ncols_dst). Unset = previous behaviour.
+#define GGML_HIP_ROUTER_WIDE_MAX_NE11 64
+static bool ggml_cuda_router_wide_enabled() {
+    static const bool v = []() {
+        const char * s = getenv("GGML_HIP_ROUTER_WIDE");
+        return s != nullptr && atoi(s) == 1;
+    }();
+    return v;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -812,6 +842,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         if (src0_nb[i] % (2*ts) != 0) {
             return false;
         }
+    }
+
+    if ((type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && GGML_CUDA_CC_IS_CDNA(cc) && ne11 > MMVF_MAX_BATCH_SIZE &&
+            ne11 <= GGML_HIP_ROUTER_WIDE_MAX_NE11 && src0_ne[1] <= 1024 && src0_ne[2]*src0_ne[3] == 1 &&
+            ggml_cuda_router_wide_enabled()) {
+        return true;
     }
 
     switch (type) {
