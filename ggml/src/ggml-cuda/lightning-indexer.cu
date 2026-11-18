@@ -284,6 +284,24 @@ static __global__ void lightning_indexer_kernel_vec(
                 k_reg_f[k] = make_float4(0, 0, 0, 0);
             }
         }
+    } else if constexpr (TYPE_K == GGML_TYPE_BF16) {
+        // BF16 -> F32 by bit shift on a plain uint2 load. The shared dequantize_V_bf16 path stores
+        // the raw bytes through an int2 pointer into a __hip_bfloat162 array and reads them back via
+        // the class copy-ctor (type-punned); on ROCm/gfx90a every bf16 case, nb=1 included, came
+        // back with ERR ~1.0 vs the CPU reference. bf16 is the top half of an f32 (little endian:
+        // element 0 = low 16 bits).
+#pragma unroll
+        for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+            int i_kv = start_kv + k;
+            if (i_kv < n_kv) {
+                const uint2 * k_base = (const uint2 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                const uint2 raw = k_base[i_lane];
+                k_reg_f[k] = make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xFFFF0000u),
+                                         __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xFFFF0000u));
+            } else {
+                k_reg_f[k] = make_float4(0, 0, 0, 0);
+            }
+        }
     } else {
         // dequantize remaining types to float
         constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();

@@ -10323,6 +10323,30 @@ struct test_lightning_indexer : public test_case {
         return 1e-6;
     }
 
+    // The mask (init_tensor_kq_mask) carries random -INF blocks whenever nb*kv*nm is large enough
+    // (nb=512 here), and the op adds the mask straight into its output, so both the "m" leaf and
+    // "out" contain -INF. The caller already fails on a NaN or on an inf/sign mismatch, so matching
+    // infinities are correct values; plain nmse() turned them into (-inf)-(-inf)=NaN -> "ERR is
+    // invalid". The set of failing cases followed the unseeded random mask (std::random_device),
+    // which is why it differed run to run. Compare the finite positions only.
+    double err(const float * a, const float * b, size_t n) override {
+        double mse_a_b = 0.0;
+        double mse_a_0 = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (std::isinf(a[i]) && std::isinf(b[i]) && std::signbit(a[i]) == std::signbit(b[i])) {
+                continue;
+            }
+            const double a_i = a[i];
+            const double b_i = b[i];
+            mse_a_b += (a_i - b_i) * (a_i - b_i);
+            mse_a_0 += a_i * a_i;
+        }
+        if (mse_a_0 == 0.0) {
+            return mse_a_b == 0.0 ? 0.0 : INFINITY;
+        }
+        return mse_a_b / mse_a_0;
+    }
+
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
