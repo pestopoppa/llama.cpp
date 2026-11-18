@@ -14118,6 +14118,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
 
+    // [C15-GV-BW] 27B GQA6 hd256 q8_0 KV at long context, n_q 1 (no-draft decode) and 8 (DFlash2 verify); run with
+    // GGML_HIP_GV_PREFETCH_DEPTH=1/2/3 and GGML_HIP_GV_LDS_ALIAS=0/1. The tail makes the last split partly masked.
+    for (int64_t kv : {32768, 131072}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 0));
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 1000));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14138,6 +14147,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], kv, nb, 1, type_KV, 0));
                 }
             }
+        }
+    }
+
+    // [C15-GV-BW] op-level GB/s of the 27B decode/verify FA: A/B GGML_HIP_GV_PREFETCH_DEPTH / GGML_HIP_GV_LDS_ALIAS
+    for (int64_t kv : {32768, 131072}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 0));
         }
     }
 
