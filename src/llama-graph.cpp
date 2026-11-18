@@ -476,12 +476,14 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 // UP-FAROWS-HIP: GGML_CUDA_FA_ROWS_GATHER=1 attaches per-sequence K/V row lists to the FA ops of a unified KV cache.
 // The same variable turns the HIP/CUDA gather on (ggml-cuda/fattn.cu); off (the default) the graph is unchanged.
+static const std::vector<ggml_backend_fa_rows_set_t> & llama_fa_rows_set_procs();
 static bool llama_fa_rows_gather_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FA_ROWS_GATHER");
         return env == nullptr || atoi(env) != 0; // C15: default ON (=0 disables)
     }();
-    return enabled;
+    // C15: only with a registered backend that takes row lists (CUDA/HIP); CPU-only builds take the C14 path
+    return enabled && !llama_fa_rows_set_procs().empty();
 }
 
 // UP-FAROWS-HIP split knobs (C13 side channel):
