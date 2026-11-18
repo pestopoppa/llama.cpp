@@ -10525,7 +10525,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // Process-wide, read once; it must not change while a graph runs.
     static const bool cpu_fa_split_kv_batch = [](){
         const char * e = getenv("GGML_CPU_FA_SPLIT_KV");
-        return e ? (atoi(e) != 0) : false;
+        return e ? (atoi(e) != 0) : true; // C16: default ON (=0 disables)
     }();
     // Under the knob, N == 1 takes the split path too, even with GGML_FA_SPLIT_KV=0 (the C10 serving env): every
     // width 1..MAX_N then uses the same KV chunking and merge order, so the INF-70 1-row vs n-row consistency
