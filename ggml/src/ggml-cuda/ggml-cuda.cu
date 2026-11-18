@@ -3187,6 +3187,57 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+// C16-TOPK-STAGE (GGML_HIP_TOPK_MOE_STAGE=1, default off): multi-row topk-moe fusion with staged logits.
+// For nrows > 1 the memory-range check above rejects the fusion whenever the allocator placed an output
+// (ids / weights) over the router logits, which is the common case in a verify ubatch: the unfused chain
+// (soft_max, argsort, get_rows, sum_rows, clamp, div) then runs as 6 launches per MoE layer. When the logits
+// are the ONLY overlapping non-elided src, copying them to a pool scratch buffer first makes the fused kernel
+// race-free (it reads only the scratch), at the cost of one small D2D copy.
+static bool ggml_cuda_topk_moe_stage_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HIP_TOPK_MOE_STAGE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_topk_moe_only_logits_overlap(const ggml_cgraph * cgraph, const int node_idx, const int node_count,
+                                                   const int * out_nodes, const int out_count,
+                                                   const ggml_tensor * logits) {
+    auto range = [](const ggml_tensor * t, int64_t & s, int64_t & e) {
+        s = (int64_t) t->data;
+        e = s + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+    };
+    for (int i = 0; i < out_count; ++i) {
+        int64_t ds, de;
+        range(cgraph->nodes[out_nodes[i]], ds, de);
+        for (int j = node_idx; j < node_idx + node_count; ++j) {
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
+                if (!src || src->op == GGML_OP_NONE || src == logits) {
+                    continue;
+                }
+                bool elided = false;
+                for (int k = node_idx; k < j; ++k) {
+                    if (cgraph->nodes[k] == src) {
+                        elided = true;
+                        break;
+                    }
+                }
+                if (elided) {
+                    continue;
+                }
+                int64_t ss, se;
+                range(src, ss, se);
+                if ((ss <= ds && ds < se) || (ds <= ss && ss < de)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3501,10 +3552,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 out_nodes[1] = i + ops.size() - 1;
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                    return ops.size() - 1;
+                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        return ops.size() - 1;
+                    }
+                    // C16-TOPK-STAGE: stage the logits so the multi-row fused kernel cannot read what it writes
+                    if (ggml_cuda_topk_moe_stage_enabled() && logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) &&
+                            ggml_cuda_topk_moe_only_logits_overlap(cgraph, i, ops.size(), out_nodes, 2, logits)) {
+                        ggml_cuda_pool_alloc<float> staged(cuda_ctx->pool(), ggml_nelements(logits));
+                        CUDA_CHECK(cudaMemcpyAsync(staged.get(), logits->data, ggml_nbytes(logits),
+                                                   cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                        ggml_tensor logits_staged = *logits;
+                        logits_staged.data = staged.get();
+                        static std::atomic<bool> stage_logged{false};
+                        if (!stage_logged.exchange(true)) {
+                            GGML_LOG_INFO("%s: C16-TOPK-STAGE staged-logits topk-moe fusion active (rows=%lld)\n",
+                                          __func__, (long long) ggml_nrows(logits));
+                        }
+                        ggml_cuda_op_topk_moe(*cuda_ctx, &logits_staged, weights, ids, clamp, scale, bias, args);
+                        return ops.size() - 1;
+                    }
                 }
             } else if (!args.norm && !args.prob_bias) {
                 //special case gpt-oss, no norm, no bias.
