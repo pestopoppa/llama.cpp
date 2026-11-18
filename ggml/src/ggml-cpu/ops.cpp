@@ -10263,8 +10263,15 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int64_t ne2 = dst->ne[2];
     const size_t  nb1 = dst->nb[1];
 
-    // Each thread reduces a subset of query heads
-    for (int64_t q_head = ith; q_head < n_q_heads; q_head += nth) {
+    // Each thread reduces a subset of (query head, query row) pairs. Row r of the partials buffer is
+    // iq2 = r / neq1, iq1 = r % neq1 (the write_partials order of _one_chunk). neq1 == 1 is the
+    // single-row decode path; neq1 > 1 only under GGML_CPU_FA_SPLIT_KV=1 (AKX-ALL-24). The merge walks
+    // chunks 0..n_chunks-1 in a fixed order, so for a fixed nth the result is deterministic.
+    const int64_t neq1   = q->ne[1];
+    const int64_t n_rows = n_q_heads * neq1;
+    for (int64_t q_row = ith; q_row < n_rows; q_row += nth) {
+        const int64_t q_head = q_row / neq1;
+        const int64_t iq1    = q_row % neq1;
         float   M_final   = -INFINITY;
         float   S_final   = 0.0f;
         float * VKQ_final = thread_wdata;
@@ -10275,7 +10282,7 @@ static void ggml_flash_attn_ext_reduce_partials(
             const int64_t ic_start = chunk_idx * chunk_size;
             if (ic_start >= nek1) continue;
 
-            const float * partial   = partials_base + (q_head * n_chunks + chunk_idx) * partial_size;
+            const float * partial   = partials_base + (q_row * n_chunks + chunk_idx) * partial_size;
             const float   M_chunk   = partial[0];
             const float   S_chunk   = partial[1];
             const float * VKQ_chunk = partial + 2;
@@ -10298,8 +10305,8 @@ static void ggml_flash_attn_ext_reduce_partials(
             const float S_inv = 1.0f / S_final;
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
-        // iq1=0, iq3=0 for decode
-        memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+        // iq3=0; permute(0, 2, 1, 3) as in _one_chunk
+        memcpy((char *) dst->data + (0*ne2*ne1 + q_head + iq1*ne1)*nb1, VKQ_final, nb1);
     }
 }
 
@@ -10508,12 +10515,27 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const char * e = getenv("GGML_FA_SPLIT_KV");
         return e ? (atoi(e) != 0) : true;
     }();
-    const bool use_split_kv_path = fa_split_kv_enabled && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // AKX-ALL-24 (C15 candidate, default OFF): GGML_CPU_FA_SPLIT_KV=1 extends the split-across-KV path to
+    // small verify batches (2 <= neq1 <= GGML_CPU_FA_SPLIT_KV_MAX_N). Without it a decode/verify step with
+    // N <= 5 rows is split over the n_head*N rows only (Q38FN D=4: 120 rows on 96 threads -> 2 full-KV walks
+    // on the critical thread, every thread re-reading the whole KV once per row). With it every thread walks
+    // one contiguous KV chunk for ALL rows (the chunk stays cache-resident across the GQA heads that share
+    // it) and the partials are merged in a fixed chunk order (deterministic for a fixed nth). The 1-row and
+    // n-row paths then share the same KV chunking, so a verify row reduces like the matching decode row.
+    // Process-wide, read once; it must not change while a graph runs.
+    static const bool cpu_fa_split_kv_batch = [](){
+        const char * e = getenv("GGML_CPU_FA_SPLIT_KV");
+        return e ? (atoi(e) != 0) : false;
+    }();
+    const bool split_kv_rows_ok = (neq1 == 1 && fa_split_kv_enabled) ||
+        (cpu_fa_split_kv_batch && neq1 >= 2 && neq1 <= GGML_CPU_FA_SPLIT_KV_MAX_N && nth > 1);
+    const bool use_split_kv_path = split_kv_rows_ok && !use_ref && neq3 == 1 && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
 
-        // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
+        // Partials buffer layout: [q_row][kv_chunk][M, S, VKQ], q_row = iq2*neq1 + iq1
+        const int64_t n_q_rows      = neq2 * neq1;
         const int64_t partial_size  = 2 + DV;
         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
 
@@ -10524,14 +10546,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         float *       chunk_partials = partials_base + ith * partial_size;
 
         if (ic_start < nek1) {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
+            for (int64_t q_row = 0; q_row < n_q_rows; q_row++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
+                    params, dst, q_row, q_row + 1, ic_start, ic_end,
                     chunk_partials, partial_stride);
             }
         } else {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
-                float * q_partials = chunk_partials + q_head * partial_stride;
+            for (int64_t q_row = 0; q_row < n_q_rows; q_row++) {
+                float * q_partials = chunk_partials + q_row * partial_stride;
                 q_partials[0] = -INFINITY;  // M
                 q_partials[1] = 0.0f;       // S
             }

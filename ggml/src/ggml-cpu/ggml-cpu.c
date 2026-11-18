@@ -3725,8 +3725,12 @@ struct ggml_cplan ggml_graph_plan(
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                         // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        // AKX-ALL-24: under GGML_CPU_FA_SPLIT_KV=1 the split path also takes verify batches of up to
+                        // GGML_CPU_FA_SPLIT_KV_MAX_N rows, one partial per (head, row, chunk); sized unconditionally.
+                        const int64_t neq1  = node->src[0]->ne[1];
+                        const int64_t nrows = neq2 * ((neq1 >= 1 && neq1 <= GGML_CPU_FA_SPLIT_KV_MAX_N) ? neq1 : 1);
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(nrows*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         size_t fa_work = MAX(prefill, decode);
 #if defined(GGML_IQK_FLASH_ATTENTION)

@@ -13670,6 +13670,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [AKX-ALL-24] opt-in set "fa_cpu_split_kv" (kept out of the default corpus, so no default seed moves): the
+    // GGML_CPU_FA_SPLIT_KV=1 split-across-KV path for verify batches 2..GGML_CPU_FA_SPLIT_KV_MAX_N (8) vs the
+    // use_ref oracle, which never splits. Q38FN shape D 256, 2 KV heads x GQA 12, f16 KV, masked; kv at the 512
+    // threshold, a non-multiple of the thread count, and long KV (32k/64k); nb 1 (old n=1 path), 2-5 and 8 (new
+    // path), 9 (falls back to row split); q8_0 KV (falls back); DS41-class D 512 GQA 64 with per-head sinks
+    // (sinks are applied on the first KV chunk only). Run with and without the knob, at several -t values:
+    //   GGML_CPU_FA_SPLIT_KV=1 TEST_BACKEND_OPS_EXTRA_CASES=fa_cpu_split_kv test-backend-ops test -b CPU -o FLASH_ATTN_EXT
+    if (test_backend_ops_extra_case_set("fa_cpu_split_kv")) {
+        for (int64_t kv : {512, 4096, 33000, 32768, 65536}) {
+            for (int64_t nb : {1, 2, 3, 4, 5, 8, 9}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+        for (int64_t nb : {1, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, false, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_flash_attn_ext_large_v(256, 256, 2, {12, 1}, 32768, nb, GGML_TYPE_F16, 16.0f, 32.0f));
+        }
+        for (int64_t nb : {1, 3, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, true, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        // GQA 4, D 128 (Qwen3.6-A3B-class, the YARN-CPU-ATTN curve of AKX-ALL-24), kv 32k
+        for (int64_t nb : {2, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 32768, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // [AK-ASM-H5-PORT] opt-in set "fa_asm_gfx90a" (kept out of the default corpus): the gfx90a FA-v3 hd128 bf16 asm
     // fast path vs the CPU reference, with its path witness (test_flash_attn_ext_asm above). Run one case at a time:
     //   TEST_BACKEND_OPS_EXTRA_CASES=fa_asm_gfx90a test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT -p fa_asm_mask

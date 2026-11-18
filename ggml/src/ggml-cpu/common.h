@@ -8,6 +8,8 @@
 
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
+// AKX-ALL-24: largest query-row count the GGML_CPU_FA_SPLIT_KV=1 split-across-KV path takes (verify batches)
+#define GGML_CPU_FA_SPLIT_KV_MAX_N 8
 
 #ifdef __cplusplus
 
