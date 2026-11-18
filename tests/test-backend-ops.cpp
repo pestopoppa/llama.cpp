@@ -9654,6 +9654,79 @@ struct test_flash_attn_ext_allmask : public test_flash_attn_ext {
     }
 };
 
+// [C15-EPI-Q8] producer-epilogue q8_1 (GGML_HIP_EPILOGUE_Q8=1). Decode-shaped producer -> q8_0/q6_K MUL_MAT chains:
+//   EPI_NORM : x = a + r; MUL_MAT(W, rms_norm(x) * w), plus a second f32 consumer of the norm output
+//   EPI_GATE : MUL_MAT(W, reshape(o * act(z)))   (GDN gated-norm tail / sigmoid-gated attention output)
+// Whole-graph run so the fused producer and the MMVQ meet in one graph. The epilogue only engages under HIP graph
+// capture; outside it these are ordinary fused-op cases, so a pass is necessary, not sufficient (the row's
+// on/off identity check covers the captured path). Tagged ",c15_epi_q8=1" for -p selection.
+enum c15_epi_mode { EPI_NORM, EPI_GATE };
+
+struct test_c15_epilogue_q8 : public test_case {
+    const c15_epi_mode mode;
+    const ggml_type    wtype;
+    const int64_t      n_in;
+    const int64_t      n_out;
+    const ggml_unary_op act;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "C15_EPILOGUE_Q8";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(wtype, n_in, n_out, act) + std::string(",mode=") + (mode == EPI_NORM ? "norm" : "gate") +
+            ",c15_epi_q8=1";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_c15_epilogue_q8(c15_epi_mode mode, ggml_type wtype, int64_t n_in, int64_t n_out,
+                         ggml_unary_op act = GGML_UNARY_OP_SILU)
+        : mode(mode), wtype(wtype), n_in(n_in), n_out(n_out), act(act) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * W = ggml_new_tensor_2d(ctx, wtype, n_in, n_out);
+        ggml_set_name(W, "W");
+        if (mode == EPI_NORM) {
+            ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_in);
+            ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_in);
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_in);
+            ggml_set_name(a, "a");
+            ggml_set_name(r, "r");
+            ggml_set_name(w, "w");
+            ggml_tensor * x    = ggml_add(ctx, a, r);
+            ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+            ggml_set_name(norm, "norm");
+            ggml_tensor * y    = ggml_mul_mat(ctx, W, norm);
+            ggml_tensor * side = ggml_sum(ctx, ggml_add(ctx, norm, x)); // second (f32) consumer of the producer
+            ggml_tensor * out  = ggml_add(ctx, y, side);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        const int64_t head = 128;
+        GGML_ASSERT(n_in % head == 0);
+        ggml_tensor * o = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, n_in/head);
+        ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, n_in/head);
+        ggml_set_name(o, "o");
+        ggml_set_name(z, "z");
+        o = ggml_add(ctx, o, z); // keep an op between the inputs and the fused unary+mul
+        ggml_tensor * g    = ggml_mul(ctx, o, ggml_unary(ctx, z, act));
+        ggml_tensor * flat = ggml_reshape_2d(ctx, g, n_in, 1);
+        ggml_tensor * out  = ggml_mul_mat(ctx, W, flat);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.f, 1.f);
+        }
+    }
+};
+
 // [INF48-FA-HS256-MMA-PRECISION] the five default-corpus D=256 no-mask shapes that exceeded the 5e-4 NMSE limit on the
 // HIP MMA_F16 kernel (GGML_HIP_ROCWMMA_FATTN=OFF, gfx90a). They are ordinary test_flash_attn_ext cases; the subclass
 // only tags the name (",inf48_hs256=1") so a run can select exactly these with -p inf48_hs256.
@@ -14117,6 +14190,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, true));
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
+
+    // [C15-EPI-Q8] producer-epilogue q8_1 chains (default corpus, appended last, tagged c15_epi_q8).
+    for (ggml_type wt : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+        for (int64_t n_in : {1024, 5120, 6144}) {
+            test_cases.emplace_back(new test_c15_epilogue_q8(EPI_NORM, wt, n_in, 256));
+        }
+        test_cases.emplace_back(new test_c15_epilogue_q8(EPI_NORM, wt, 1536, 256)); // 384-path: epilogue off
+        for (int64_t n_in : {1024, 6144}) {
+            test_cases.emplace_back(new test_c15_epilogue_q8(EPI_GATE, wt, n_in, 256, GGML_UNARY_OP_SILU));
+            test_cases.emplace_back(new test_c15_epilogue_q8(EPI_GATE, wt, n_in, 256, GGML_UNARY_OP_SIGMOID));
+        }
+    }
 
     return test_cases;
 }

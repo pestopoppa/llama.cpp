@@ -2372,6 +2372,59 @@ static bool mmvq_q8_1_graph_cache_matches(
 }
 #endif
 
+void * ggml_cuda_mmvq_q8_1_graph_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
+    if (ctx.curr_stream_no != 0 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+    cudaStream_t stream = ctx.stream();
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    unsigned long long capture_id = 0;
+    CUDA_CHECK(hipStreamGetCaptureInfo_v2(stream, &capture_status, &capture_id, nullptr, nullptr, nullptr));
+    if (capture_status != hipStreamCaptureStatusActive) {
+        return nullptr;
+    }
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_1_size = ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    std::lock_guard<std::mutex> lock(q8_1_graph_cache_registry.mutex);
+    std::unique_ptr<mmvq_q8_1_graph_cache> & cache_ptr = q8_1_graph_cache_registry.caches[&ctx];
+    if (cache_ptr == nullptr) {
+        cache_ptr = std::make_unique<mmvq_q8_1_graph_cache>();
+    }
+    mmvq_q8_1_graph_cache & cache = *cache_ptr;
+    if (cache.ctx != &ctx || cache.capture_id != capture_id) {
+        cache.clear();
+        cache.ctx = &ctx;
+        cache.capture_id = capture_id;
+        cache.arena.device = ctx.device;
+    }
+    for (const mmvq_q8_1_graph_cache_entry & entry : cache.entries) {
+        if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, q8_1_size, /*q4k_isum=*/ false)) {
+            return nullptr; // already quantized by someone else in this capture
+        }
+    }
+    cache.entries.emplace_back();
+    mmvq_q8_1_graph_cache_entry & entry = cache.entries.back();
+    entry.src1 = src1;
+    entry.type = src1->type;
+    entry.q4k_isum = false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        entry.ne[i] = src1->ne[i];
+        entry.nb[i] = src1->nb[i];
+    }
+    entry.ne10_padded = ne10_padded;
+    entry.q8_1_size = q8_1_size;
+    entry.q8_1 = cache.arena.alloc(q8_1_size);
+    return entry.q8_1;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src1);
+    return nullptr;
+#endif
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {

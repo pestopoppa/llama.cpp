@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "epilogue-q8.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -195,6 +196,46 @@ static __global__ void rms_norm_f32(const float * x,
             }
         }
     }
+}
+
+// C15-EPI-Q8: the generic rms_norm_f32<1024, true> path for a single row, plus the q8_1 epilogue. Same loads,
+// same block_reduce and same `scale * x[col] * mul[mul_col]` as that path, so the f32 output is bit-identical.
+// With block_size a multiple of 32 and ncols % 32 == 0, each q8_1 block lives in 32 consecutive lanes of one
+// iteration, and a 32-lane group is either fully inside or fully outside the loop bound.
+template <int block_size>
+static __global__ void rms_norm_mul_q8_1_f32(const float * x, float * dst, const int ncols, const float eps,
+                                             const float * mul, const uint3 mul_ncols_packed, block_q8_1 * q8) {
+    static_assert(block_size % QK8_1 == 0, "q8_1 epilogue needs whole 32-lane groups");
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int   mul_col = fastmodulo(col, mul_ncols_packed);
+        const float v       = scale * x[col] * mul[mul_col];
+        dst[col] = v;
+        epilogue_q8_1_store(v, q8, col);
+    }
+}
+
+bool ggml_cuda_rms_norm_fused_q8_eligible(const ggml_tensor * rms_norm_node) {
+    const ggml_tensor * src = rms_norm_node->src[0];
+    const int64_t ncols = src->ne[0];
+    return src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) &&
+        src->ne[1] == 1 && src->ne[2] == 1 && src->ne[3] == 1 &&
+        ncols >= 1024 && ncols != 1536 && ncols % QK8_1 == 0;
 }
 
 template <int block_size>
@@ -574,7 +615,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -623,6 +664,16 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    if (q8_1_out != nullptr) {
+        GGML_ASSERT(ggml_cuda_rms_norm_fused_q8_eligible(dst));
+        GGML_ASSERT(mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params{dim3(1, 1, 1), dim3(1024, 1, 1), 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<1024>, launch_params,
+            src0_d, dst_d, (int) ne00, eps, mul_d, init_fastdiv_values(mul_ncols), (block_q8_1 *) q8_1_out);
+        return;
+    }
 
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,

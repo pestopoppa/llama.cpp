@@ -3408,6 +3408,46 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// C15-EPI-Q8 (GGML_HIP_EPILOGUE_Q8=1, default off): when a fused producer's f32 output feeds a q8_0/q6_K MMVQ,
+// the producer also writes that MMVQ's q8_1 input, pre-registered in the MMVQ graph-capture cache, so the
+// MMVQ skips its quantize_q8_1 launch. The f32 output is still written for every other consumer.
+static bool ggml_cuda_epilogue_q8_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HIP_EPILOGUE_Q8");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// First later MUL_MAT whose src1 is `out`, or a zero-offset RESHAPE/VIEW chain of it, with a q8_0/q6_K src0.
+static const ggml_tensor * ggml_cuda_epilogue_q8_consumer(const ggml_cgraph * cgraph, int out_idx) {
+    const ggml_tensor * out = cgraph->nodes[out_idx];
+    const int scan_end = std::min(cgraph->n_nodes, out_idx + 64);
+    for (int j = out_idx + 1; j < scan_end; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op != GGML_OP_MUL_MAT || (node->src[0]->type != GGML_TYPE_Q8_0 && node->src[0]->type != GGML_TYPE_Q6_K)) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        const ggml_tensor * t = src1;
+        while (t != out && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0 && t->src[0] != nullptr) {
+            t = t->src[0];
+        }
+        if (t == out && src1->data == out->data && ggml_nelements(src1) == ggml_nelements(out) && ggml_is_contiguous(src1)) {
+            return src1;
+        }
+    }
+    return nullptr;
+}
+
+static void * ggml_cuda_epilogue_q8_reserve(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int out_idx) {
+    if (!ggml_cuda_epilogue_q8_enabled()) {
+        return nullptr;
+    }
+    const ggml_tensor * consumer_src1 = ggml_cuda_epilogue_q8_consumer(cgraph, out_idx);
+    return consumer_src1 ? ggml_cuda_mmvq_q8_1_graph_cache_reserve(*cuda_ctx, consumer_src1) : nullptr;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4117,7 +4157,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        void * q8_1_out = ggml_cuda_rms_norm_fused_q8_eligible(node) ?
+            ggml_cuda_epilogue_q8_reserve(cuda_ctx, cgraph, i + 1) : nullptr;
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], q8_1_out);
         return 1;
     }
 
@@ -4134,7 +4176,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        void * q8_1_out = ggml_cuda_unary_mul_q8_eligible(cgraph->nodes[i + 1]) ?
+            ggml_cuda_epilogue_q8_reserve(cuda_ctx, cgraph, i + 1) : nullptr;
+        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], q8_1_out);
         return 1;
     }
 

@@ -89,7 +89,12 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+// q8_1_out (C15-EPI-Q8): when non-null, also writes the q8_1 blocks of mul_node's (contiguous, f32) output there.
+// Requires ggml_cuda_unary_mul_q8_eligible(mul_node).
+void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                            void * q8_1_out = nullptr);
+
+bool ggml_cuda_unary_mul_q8_eligible(const ggml_tensor * mul_node);
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
