@@ -1,6 +1,7 @@
 #include "llama-kv-compress.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-hybrid.h"
+#include "llama-model.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -16,10 +17,12 @@
 // RoPE helpers (inverse + averaged forward)
 // ---------------------------------------------------------------------------
 
-static void rope_inverse(float * out, const float * x, int d_head, float theta_base, int pos) {
-    const int half = d_head / 2;
+// d_rot <= d_head: only the first d_rot dims rotate (partial rotary, e.g. qwen35: 64 of 256); the rest pass through
+static void rope_inverse(float * out, const float * x, int d_head, int d_rot, float theta_base, int pos) {
+    const int half = d_rot / 2;
+    for (int i = d_rot; i < d_head; i++) out[i] = x[i];
     for (int i = 0; i < half; i++) {
-        float freq = 1.0f / powf(theta_base, (float)(2 * i) / (float)d_head);
+        float freq = 1.0f / powf(theta_base, (float)(2 * i) / (float)d_rot);
         float angle = (float)pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
@@ -28,12 +31,12 @@ static void rope_inverse(float * out, const float * x, int d_head, float theta_b
     }
 }
 
-static void rope_avg_cos_sin(float * avg_cos, float * avg_sin, int d_head,
+static void rope_avg_cos_sin(float * avg_cos, float * avg_sin, int d_rot,
                              float theta_base, int pos_start, int n_future) {
-    const int half = d_head / 2;
+    const int half = d_rot / 2;
     for (int i = 0; i < half; i++) {
         float sum_cos = 0.0f, sum_sin = 0.0f;
-        float freq = 1.0f / powf(theta_base, (float)(2 * i) / (float)d_head);
+        float freq = 1.0f / powf(theta_base, (float)(2 * i) / (float)d_rot);
         for (int p = pos_start; p < pos_start + n_future; p++) {
             float angle = (float)p * freq;
             sum_cos += cosf(angle);
@@ -45,8 +48,9 @@ static void rope_avg_cos_sin(float * avg_cos, float * avg_sin, int d_head,
 }
 
 static void rope_apply_avg(float * out, const float * x,
-                           const float * avg_cos, const float * avg_sin, int d_head) {
-    const int half = d_head / 2;
+                           const float * avg_cos, const float * avg_sin, int d_head, int d_rot) {
+    const int half = d_rot / 2;
+    for (int i = d_rot; i < d_head; i++) out[i] = x[i];
     for (int i = 0; i < half; i++) {
         out[i]        = x[i] * avg_cos[i] - x[i + half] * avg_sin[i];
         out[i + half] = x[i] * avg_sin[i] + x[i + half] * avg_cos[i];
@@ -113,7 +117,7 @@ static void extract_layer_kv_f32(
 
 static std::vector<float> score_layer(
         const float * k_data, const float * v_data, const int * positions,
-        int n_kv, int n_kv_heads, int d_head, float theta_base,
+        int n_kv, int n_kv_heads, int d_head, int d_rot, float theta_base,
         int n_q_heads, const llama_kv_compress_params & cfg) {
 
     const int n_active = n_kv - cfg.n_sink;
@@ -131,7 +135,7 @@ static std::vector<float> score_layer(
         for (int h = 0; h < n_kv_heads; h++) {
             const float * k_pos = k_data + p * stride_pos + h * stride_head;
             float * k_out = k_prerope.data() + idx * stride_pos + h * stride_head;
-            rope_inverse(k_out, k_pos, d_head, theta_base, positions[p]);
+            rope_inverse(k_out, k_pos, d_head, d_rot, theta_base, positions[p]);
             for (int d = 0; d < d_head; d++) {
                 mu[h * d_head + d] += k_out[d];
             }
@@ -140,13 +144,13 @@ static std::vector<float> score_layer(
     for (auto & v : mu) v /= (float)n_active;
 
     // Step 2: Apply averaged forward RoPE to mean
-    std::vector<float> avg_cos(d_head / 2), avg_sin(d_head / 2);
-    rope_avg_cos_sin(avg_cos.data(), avg_sin.data(), d_head, theta_base, n_kv, cfg.n_future);
+    std::vector<float> avg_cos(d_rot / 2), avg_sin(d_rot / 2);
+    rope_avg_cos_sin(avg_cos.data(), avg_sin.data(), d_rot, theta_base, n_kv, cfg.n_future);
 
     std::vector<float> mu_rotated(n_kv_heads * d_head);
     for (int h = 0; h < n_kv_heads; h++) {
         rope_apply_avg(mu_rotated.data() + h * d_head, mu.data() + h * d_head,
-                       avg_cos.data(), avg_sin.data(), d_head);
+                       avg_cos.data(), avg_sin.data(), d_head, d_rot);
     }
 
     // Step 2b: Covariance (optional)
@@ -262,10 +266,9 @@ std::vector<float> llama_kv_compress_score(
 
     const llama_model * model = llama_get_model(ctx);
     const int n_layers   = llama_model_n_layer(model);
-    const int n_kv_heads = llama_model_n_head_kv(model);
-    const int n_q_heads  = llama_model_n_head(model);
-    const int d_head     = llama_model_n_embd(model) / n_q_heads;
-    const float theta    = get_theta_base(model);
+    const llama_hparams & hp = model->hparams;
+    // theta: the model's own training base (the GGUF key list below only knew a few arch names; qwen35 fell back to 1e6)
+    const float theta    = hp.rope_freq_base_train > 0.0f ? hp.rope_freq_base_train : get_theta_base(model);
 
     llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
     if (pos_max < 0) return {};
@@ -292,14 +295,22 @@ std::vector<float> llama_kv_compress_score(
     for (size_t li = 0; li < attn_layers.size(); li++) {
         int il = attn_layers[li];
         float w = has_weights ? params.layer_weights[std::min(li, params.layer_weights.size() - 1)] : 1.0f;
-        weight_sum += w;
 
         std::vector<float> k_data, v_data;
+        // per-layer geometry from hparams: hybrid models (qwen35) have recurrent layers with n_head_kv = 0 and a head dim
+        // (key_length 256) that is NOT n_embd / n_head, and rotate only n_rot dims
+        const int n_kv_heads = (int) hp.n_head_kv(il);
+        const int n_q_heads  = (int) hp.n_head(il);
+        const int d_head     = (int) hp.n_embd_head_k(il);
+        const int d_rot      = std::min(d_head, (int) hp.n_rot(il)) & ~1;
+        if (n_kv_heads <= 0 || n_q_heads <= 0 || d_head <= 0 || d_rot <= 0 || (int) hp.n_embd_head_v(il) != d_head) continue;
+        weight_sum += w;
+
         extract_layer_kv_f32(kvc, il, n_kv, n_kv_heads, d_head, k_data, v_data);
 
         auto layer_scores = score_layer(
             k_data.data(), v_data.data(), positions.data(),
-            n_kv, n_kv_heads, d_head, theta, n_q_heads, params);
+            n_kv, n_kv_heads, d_head, d_rot, theta, n_q_heads, params);
 
         for (int p = 0; p < n_kv; p++) scores[p] += layer_scores[p] * w;
     }
