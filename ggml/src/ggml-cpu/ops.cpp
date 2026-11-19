@@ -9513,6 +9513,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
+
+        // sparse K/V set: the tiled path only skips tiles that are masked for all queries of the tile
+        // the row path skips every masked position, so it computes only n_kv_max positions per query
+        const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+        use_tiled &= !(n_kv_max > 0 && dst->src[3] && n_kv_cols >= 2*n_kv_max);
 #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();
