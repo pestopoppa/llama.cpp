@@ -4672,6 +4672,18 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_tree_accept(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+        const int32_t * cols,
+               int32_t n_cols) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->tree_accept(seq_id, cols, n_cols);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

@@ -189,6 +189,8 @@ llama_build(bench-grammar-sampler.cpp)
 
 # AK-DTREE-1 greedy token-identity of the path-row tree verify; needs a model argument (qwen35 hybrid, e.g. Qwen3.5-0.8B-Q8_0)
 llama_build(test-spec-dtree-verify.cpp)
+# [AK-DTREE-2] single tree batch verify (llama_batch.parent + llama_memory_tree_accept) on a hybrid model; needs a model arg
+llama_build(test-dtree-batch.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

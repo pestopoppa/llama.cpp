@@ -476,7 +476,30 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (ubatch.parent) {
+        // [AK-DTREE-2] tree ubatch: rollback slot W-1-c receives the conv state after column c (its root path's
+        // last d_conv-1 inputs); llama_memory_tree_accept() selects the accepted column's slot.
+        const int64_t W  = ubatch.n_seq_tokens;
+        const int64_t nk = conv_kernel_size - 1;
+        GGML_ASSERT(W <= (int64_t) cparams.n_rs_seq + 1 && "tree batch wider than the recurrent rollback slots");
+        llm_graph_input_tree * it = build_inp_tree(conv_kernel_size);
+
+        // [nc-1+T, ch, n_seqs] -> rows = columns: [ch, nc-1+T, n_seqs]
+        ggml_tensor * cols = ggml_cont(ctx0, ggml_transpose(ctx0, conv_input));
+        ggml_tensor * win  = ggml_get_rows(ctx0, cols, it->conv_idx);              // [ch, nk*W, n_seqs]
+        win = ggml_reshape_4d(ctx0, win, conv_channels, nk, W, n_seqs);
+        win = ggml_cont(ctx0, ggml_permute(ctx0, win, 1, 0, 2, 3));                 // [nk, ch, W, n_seqs]
+        cb(win, "conv_state_tree", il);
+
+        for (int64_t c = 0; c < W; ++c) {
+            const int64_t s_slot = W - 1 - c;
+            ggml_tensor * src = ggml_view_3d(ctx0, win, nk, conv_channels, n_seqs,
+                    win->nb[1], win->nb[3], c*win->nb[2]);
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1],
+                    (s_slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -524,6 +547,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_ssm_conv(ggml_tensor * conv_input, ggml_tensor * conv_kernel) {
+    if (ubatch.parent) {
+        return ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, build_inp_tree(conv_kernel->ne[0])->parent);
+    }
+    return ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
@@ -567,14 +597,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    int64_t K = cparams.n_rs_seq + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    if (n_seq_tokens > 1) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+    ggml_tensor * gdn_out;
+    if (ubatch.parent) {
+        // [AK-DTREE-2] tree walk (record mode): one snapshot per column, slot W-1-c = state after column c
+        GGML_ASSERT(n_seq_tokens <= K && "tree batch wider than the recurrent rollback slots");
+        K = n_seq_tokens;
+        gdn_out = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, build_inp_tree(hparams.ssm_d_conv)->parent);
     } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
     }
 
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
