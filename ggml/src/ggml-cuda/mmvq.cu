@@ -1948,6 +1948,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 }
             }
 
+            // MMID-Q8-N1-ODDM: with ids the kernel's store guard compares row0+row against
+            // stride_col_dst, which for MUL_MAT_ID is s2 = ne0*n_used (not ne0), so a multi-row
+            // small_k CTA on a row count that is not a multiple of rows_per_cuda_block writes its
+            // tail rows into the NEXT expert slot's output (racing that slot's own CTA) and, on the
+            // last slot, past dst. Seen as R22-5 q8_0 MMID n=1 k=256 m in {33,127,129,1023,2047}
+            // failing with ERR up to 1.0. Fall back to rows_per_cuda_block=1 for that geometry.
+            if (has_ids && use_small_k &&
+                    nrows_x % calc_rows_per_block(type, c_ncols_dst, table_id, true,
+                                                  calc_nwarps(type, c_ncols_dst, table_id)) != 0) {
+                use_small_k = false;
+            }
+
 #ifdef GGML_USE_HIP
             if constexpr (type == GGML_TYPE_Q4_K) {
                 if (ncols_x == 1536 && cc == GGML_CUDA_CC_CDNA2) {
