@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+#include <unordered_map>
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -252,7 +253,31 @@ bool llama_batch_allocr::init(
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
+    if (batch.parent) {
+        // [AK-DTREE-2] tree batch: parent < i, one seq per token, depth positions
+        llama_pos p0[LLAMA_MAX_SEQ];
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            p0[s] = memory ? memory->seq_pos_max(s) + 1 : -1;
+        }
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const int32_t p = batch.parent[i];
+            if (batch.n_seq_id[i] != 1 || p < -1 || p >= i) {
+                LLAMA_LOG_ERROR("%s: tree batch: token %d has parent %d / %d seq ids (need -1 <= parent < i, one seq)\n",
+                        __func__, i, p, batch.n_seq_id[i]);
+                return false;
+            }
+            const llama_seq_id s = batch.seq_id[i][0];
+            if (p >= 0 && (batch.seq_id[p][0] != s || batch.pos[i] != batch.pos[p] + 1)) {
+                LLAMA_LOG_ERROR("%s: tree batch: token %d (seq %d, pos %d) does not continue its parent %d (seq %d, pos %d)\n",
+                        __func__, i, s, batch.pos[i], p, batch.seq_id[p][0], batch.pos[p]);
+                return false;
+            }
+            if (p < 0 && p0[s] >= 0 && batch.pos[i] != p0[s]) {
+                LLAMA_LOG_ERROR("%s: tree batch: root token %d of seq %d has pos %d, expected %d\n", __func__, i, s, batch.pos[i], p0[s]);
+                return false;
+            }
+        }
+    } else if (n_pos_per_embd > 1) {
         // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
         for (uint32_t s = 0; s < n_seq_max; ++s) {
             if (seq_pos[s].empty()) {
@@ -834,6 +859,28 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.data         =*/ std::move(udata),
     };
 
+    if (batch.parent) {
+        // [AK-DTREE-2] map batch-index parents to ubatch indices; a tree must not straddle ubatches or seq sets
+        std::unordered_map<int32_t, int32_t> pos_in_ubatch;
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            pos_in_ubatch[idxs[i]] = (int32_t) i;
+        }
+        const uint32_t n_st = res.n_seq_tokens;
+        res.data->parent.resize(n_tokens);
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            const int32_t pb = batch.parent[idxs[i]];
+            int32_t pu = -1;
+            if (pb >= 0) {
+                auto it = pos_in_ubatch.find(pb);
+                GGML_ASSERT(it != pos_in_ubatch.end() && "tree batch: a tree must fit in one ubatch (raise n_ubatch)");
+                pu = it->second;
+                GGML_ASSERT(pu < (int32_t) i && (!equal_seqs || pu / n_st == i / n_st) && "tree batch: parent in another seq set");
+            }
+            res.data->parent[i] = pu;
+        }
+        res.parent = res.data->parent.data();
+    }
+
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
 
@@ -939,6 +986,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*parent   =*/ nullptr,
     };
 }
 
@@ -951,6 +999,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*parent   =*/ nullptr,
     };
 
     if (embd) {

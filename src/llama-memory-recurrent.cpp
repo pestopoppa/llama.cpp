@@ -422,6 +422,36 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || n_cols < 1) {
+        return false;
+    }
+    auto it = tree_pos.find(seq_id);
+    if (it == tree_pos.end()) {
+        return false;
+    }
+    const int32_t W = (int32_t) it->second.size();
+    const int32_t c = cols[n_cols - 1];
+    const int32_t tail_id = cells[seq_id].tail;
+    if (c < 0 || c >= W || tail_id < 0) {
+        return false;
+    }
+    auto & cell = cells[tail_id];
+    if (cell.seq_id.size() > 1) {
+        return false;
+    }
+    const uint32_t slot = (uint32_t) (W - 1 - c);   // ggml_gated_delta_net_tree: slot W-1-c = state after column c
+    if (slot > cell.rs_max) {
+        return false;
+    }
+    if (slot > 0) {
+        set_rs_idx(seq_id, slot);
+    }
+    cell.pos = it->second[c];
+    tree_pos.erase(it);
+    return true;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
@@ -681,7 +711,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (ubatch.parent) {
+            // [AK-DTREE-2] tree ubatch: each column's state lands in its own rollback slot; tree_accept() picks one
+            GGML_ASSERT(n_seq_tokens <= n_rs_seq + 1 && "tree batch wider than the recurrent rollback slots (raise n_rs_seq)");
+            auto & tp = tree_pos[ubatch.seq_id[i][0]];
+            tp.assign(ubatch.pos + i, ubatch.pos + i + n_seq_tokens);
+        } else if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",

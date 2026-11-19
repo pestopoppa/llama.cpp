@@ -161,6 +161,51 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_tree::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->parent != nullptr);
+    const int64_t n_st = ubatch->n_seq_tokens;
+    const int64_t n_s  = ubatch->n_seqs;
+    const int64_t nc   = d_conv;
+
+    std::vector<int32_t> par(n_st*n_s);
+    for (int64_t s = 0; s < n_s; ++s) {
+        for (int64_t t = 0; t < n_st; ++t) {
+            const int32_t p = ubatch->parent[s*n_st + t];
+            par[s*n_st + t] = p < 0 ? -1 : (int32_t) (p - s*n_st);
+        }
+    }
+    if (parent && parent->buffer) {
+        ggml_backend_tensor_set(parent, par.data(), 0, par.size()*sizeof(int32_t));
+    }
+    if (conv_idx && conv_idx->buffer) {
+        // conv state after column c = the last nc-1 inputs of c's root path (conv history past the root),
+        // oldest first, as conv_input columns (history occupies columns 0..nc-2, token t is column nc-1+t)
+        std::vector<int32_t> ci((nc - 1)*n_st*n_s);
+        for (int64_t s = 0; s < n_s; ++s) {
+            for (int64_t c = 0; c < n_st; ++c) {
+                int32_t pos = (int32_t) (c + nc - 1);
+                int32_t * out = ci.data() + (s*n_st + c)*(nc - 1);
+                out[nc - 2] = pos;
+                for (int64_t w = nc - 3; w >= 0; --w) {
+                    if (pos >= nc - 1) {
+                        const int32_t p = par[s*n_st + pos - (nc - 1)];
+                        pos = p >= 0 ? (int32_t) (p + nc - 1) : (int32_t) (nc - 2);
+                    } else {
+                        pos = pos - 1;
+                    }
+                    out[w] = pos;
+                }
+            }
+        }
+        ggml_backend_tensor_set(conv_idx, ci.data(), 0, ci.size()*sizeof(int32_t));
+    }
+}
+
+bool llm_graph_input_tree::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.parent != nullptr &&
+        parent->ne[0] == params.ubatch.n_seq_tokens && parent->ne[1] == params.ubatch.n_seqs;
+}
+
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2894,6 +2939,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+llm_graph_input_tree * llm_graph_context::build_inp_tree(int64_t d_conv) const {
+    if (!ubatch.parent) {
+        return nullptr;
+    }
+    if (inp_tree) {
+        GGML_ASSERT(inp_tree->d_conv == d_conv);
+        return inp_tree;
+    }
+    auto inp = std::make_unique<llm_graph_input_tree>(d_conv);
+    inp->parent = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ubatch.n_seq_tokens, ubatch.n_seqs);
+    ggml_set_input(inp->parent);
+    inp->conv_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, (d_conv - 1)*ubatch.n_seq_tokens, ubatch.n_seqs);
+    ggml_set_input(inp->conv_idx);
+    inp_tree = inp.get();
+    res->add_input(std::move(inp));
+    return inp_tree;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

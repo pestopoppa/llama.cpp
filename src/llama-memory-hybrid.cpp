@@ -142,6 +142,13 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+bool llama_memory_hybrid::tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) {
+    if (!mem_recr->tree_accept(seq_id, cols, n_cols)) {
+        return false;
+    }
+    return mem_attn->tree_accept(seq_id, cols, n_cols);
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.

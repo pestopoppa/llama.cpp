@@ -79,6 +79,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // [AK-DTREE-2] ggml_ssm_conv, or ggml_ssm_conv_tree on a tree ubatch
+    ggml_tensor * build_ssm_conv(ggml_tensor * conv_input, ggml_tensor * conv_kernel);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

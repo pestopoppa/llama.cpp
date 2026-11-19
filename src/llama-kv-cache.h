@@ -292,6 +292,11 @@ public:
 
     // UP-FAROWS-HIP C13: process-unique, stable non-zero key of this cache's row list in the backend registry
     int32_t get_fa_rows_key() const;
+    // [AK-DTREE-2] tree ubatch: re-mask the cells written by this ubatch so token i sees only its ancestors
+    void set_input_kq_mask_tree(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    // [AK-DTREE-2] keep only the accepted root path of the last tree ubatch of seq_id
+    bool tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) override;
 
     // Dual Chunk Attention: dst is F32 [n_kv, n_tps, n_stream, 3]; slice 0/1/2 is 1 where the
     // key cell lies in the query's chunk / the previous chunk / an earlier chunk, else 0
@@ -314,6 +319,8 @@ public:
 
 private:
     mutable int32_t fa_rows_key = 0; // UP-FAROWS-HIP C13: see get_fa_rows_key
+    // [AK-DTREE-2] cells (stream, idx) of the last tree ubatch per seq, in tree column order
+    std::unordered_map<llama_seq_id, std::vector<std::pair<uint32_t, uint32_t>>> tree_cells;
 
     const llama_model & model;
     const llama_hparams & hparams;
