@@ -2491,6 +2491,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr);
+
+                        // [TAG_MTP_DRAFT_WINDOW] env knob, default off: sink+window mask for the MTP draft head only
+                        if (mtp_on_hybrid_qwen35) {
+                            const char * w_env = getenv("LLAMA_MTP_DRAFT_WINDOW");
+                            const char * s_env = getenv("LLAMA_MTP_DRAFT_SINK");
+                            const long w = w_env ? strtol(w_env, nullptr, 10) : 0;
+                            const long k = s_env ? strtol(s_env, nullptr, 10) : 0;
+                            if (w > 0) {
+                                static_cast<llama_kv_cache *>(res)->set_draft_window((uint32_t) w, (uint32_t) std::max(0L, k));
+                                LLAMA_LOG_INFO("%s: LLAMA_MTP_DRAFT_WINDOW=%ld LLAMA_MTP_DRAFT_SINK=%ld (MTP draft head sink+window mask)\n",
+                                        __func__, w, std::max(0L, k));
+                            }
+                        }
                     }
                 }
             }

@@ -422,6 +422,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for qwen4exp. Attends densely: QSA only prunes context
 // past a 2048-token budget, so dense is a numerical superset and drafts are verified regardless.
 // TODO: wire up QSA here for long-context draft fidelity.
+// [TAG_MTP_DRAFT_WINDOW] LLAMA_MTP_DRAFT_WINDOW / LLAMA_MTP_DRAFT_SINK (default off) mask this head to sink+window cells.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");

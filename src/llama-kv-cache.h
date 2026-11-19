@@ -281,6 +281,10 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // [TAG_MTP_DRAFT_WINDOW] draft-only sink+window attention mask (0 = off, dense). Only the MTP draft
+    // context's cache sets it; cells are never evicted, only masked, so the trunk and rollback are unaffected.
+    void set_draft_window(uint32_t window, uint32_t sink) { draft_window = window; draft_sink = sink; }
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // Dual Chunk Attention: dst is F32 [n_kv, n_tps, n_stream, 3]; slice 0/1/2 is 1 where the
@@ -328,6 +332,9 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    uint32_t draft_window = 0; // [TAG_MTP_DRAFT_WINDOW]
+    uint32_t draft_sink   = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
