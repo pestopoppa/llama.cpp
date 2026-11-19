@@ -953,6 +953,23 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+llama_token llama_context::get_argmax_ith(int32_t i) {
+    output_reorder();
+
+    if (!argmax_valid || argmax_out.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    try {
+        const int64_t j = output_resolve_row(i);
+        if (j < 0 || j >= (int64_t) argmax_out.size() || argmax_out[j] < 0) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return argmax_out[j];
+    } catch (const std::exception &) {
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2247,6 +2264,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    argmax_out.assign(n_outputs_all, -1);
+    argmax_valid = true;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2312,6 +2332,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        // DTREE-A: device argmax rows (one int32 per output)
+        if (n_outputs > 0) {
+            ggml_tensor * t_am = res->t_argmax;
+            if (t_am != nullptr && t_am->ne[0] == n_outputs) {
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(sched.get(), t_am);
+                GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) argmax_out.size());
+                ggml_backend_tensor_get_async(backend_am, t_am, argmax_out.data() + n_outputs_prev, 0, n_outputs*sizeof(int32_t));
+            } else {
+                argmax_valid = false;
+            }
         }
 
         // extract logits
@@ -2695,6 +2727,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
+        }
+
+        if (i0 < argmax_out.size() && i1 < argmax_out.size()) {
+            std::swap(argmax_out[i0], argmax_out[i1]);
         }
 
         if (embd.size > 0) {
@@ -4371,6 +4407,12 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_argmax_ith(i);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
