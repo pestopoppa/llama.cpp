@@ -14402,6 +14402,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, vr, false, false, 4));
     }
+    // [AK-DTREE-2] chunked-WY GDN prefill with the wide rollback tails a tree batch needs (K = 8 / 15 / 16 / 17)
+    for (int64_t kk : { 8, 15, 16, 17 }) {
+        for (int64_t nt : { 17, 20, 33, 64, 100 }) {
+            if (nt > kk) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, kk));
+            }
+        }
+    }
     // [AK-DTREE-2] tree-verification ops at 27B (16 k-heads x3 -> 48 v-heads) and A3B (16 x2 -> 32) GDN
     // dims and conv widths (27B 10240, A3B 8192 channels), W in {8, 12, 16}, chain/layout/bushy trees.
     for (int kind : {0, 1, 2}) {
