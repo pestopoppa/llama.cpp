@@ -9273,6 +9273,58 @@ static void ggml_compute_forward_top_k_f32(
 
     const int top_k = ne0;
 
+    // [TAG_TOPK_PAR] GGML_CPU_TOPK_PAR=1 (default off): when there are fewer rows than threads (the QSA
+    // indexer's n_kv x n_tokens score rows at decode/verify), split each long row over nth/nr threads:
+    // every thread selects its chunk's local top-k with nth_element, then one thread per row selects
+    // the final top-k from the candidates. The set is the top-k under (value desc, index asc), which
+    // is the partial_sort set whenever the k-th value is not tied; the output order is unspecified.
+    static const bool topk_par = [] {
+        const char * e = getenv("GGML_CPU_TOPK_PAR");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (topk_par && nr < nth && ne00 >= 4096 && top_k < ne00) {
+        const int tpr = nth / (int) nr;
+        const int64_t row = ith / tpr;
+        const int     sub = ith % tpr;
+        const auto cmp = [](const float * d) {
+            return [d](int32_t a, int32_t b) { return d[a] > d[b] || (d[a] == d[b] && a < b); };
+        };
+        int32_t * rbuf = nullptr;
+        const float * src_data = nullptr;
+        if (row < nr) {
+            src_data = (const float *)((const char *) src0->data + row*nb01);
+            rbuf = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * row;
+            const int64_t c0 = (ne00 * sub) / tpr;
+            const int64_t c1 = (ne00 * (sub + 1)) / tpr;
+            for (int64_t j = c0; j < c1; ++j) {
+                rbuf[j] = (int32_t) j;
+            }
+            if (c1 - c0 > top_k) {
+                std::nth_element(rbuf + c0, rbuf + c0 + top_k, rbuf + c1, cmp(src_data));
+            }
+        }
+        ggml_barrier(params->threadpool);
+        if (row < nr && sub == 0) {
+            int64_t n_cand = 0;
+            for (int t = 0; t < tpr; ++t) {
+                const int64_t c0 = (ne00 * t) / tpr;
+                const int64_t c1 = (ne00 * (t + 1)) / tpr;
+                const int64_t n  = std::min<int64_t>(top_k, c1 - c0);
+                std::copy(rbuf + c0, rbuf + c0 + n, rbuf + n_cand); // dest <= src: forward copy is safe
+                n_cand += n;
+            }
+            if (n_cand > top_k) {
+                std::nth_element(rbuf, rbuf + top_k, rbuf + n_cand, cmp(src_data));
+            }
+            int32_t * dst_data = (int32_t *)((char *) dst->data + row*nb1);
+            std::copy(rbuf, rbuf + top_k, dst_data);
+            if (top_k > 1) {
+                std::swap(dst_data[0], dst_data[1]);
+            }
+        }
+        return;
+    }
+
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
     for (int64_t i = ith; i < nr; i += nth) {
