@@ -59,6 +59,11 @@ struct common_speculative_draft_params {
 
     float temperature = 0.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // AK-DTREE-1: when > 0 (tree columns incl. the anchor) and tree_alts is set, a drafter that supports it
+    // (DFlash2, greedy) also writes up to 2 alternative root-to-leaf paths, each the same length as *result
+    int32_t tree_nodes = 0;
+    std::vector<llama_tokens> * tree_alts = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

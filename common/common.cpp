@@ -1699,6 +1699,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    if (params.speculative.tree_seqs_per_slot() > 1) {
+        // AK-DTREE-1: alternative tree paths are extra sequences of the target context; fork/promote use the
+        // shared-cell seq_cp of a unified KV cache (a per-stream seq_cp would copy the whole stream every round)
+        cparams.n_seq_max  = params.n_parallel * params.speculative.tree_seqs_per_slot();
+        cparams.kv_unified = true;
+    }
     cparams.cpu_fused_moe_upgate = params.cpu_fused_moe_upgate;
 
     cparams.type_k = params.cache_type_k;

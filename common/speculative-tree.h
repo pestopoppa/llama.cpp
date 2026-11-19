@@ -37,6 +37,27 @@ std::vector<std::vector<int32_t>> common_dtree_build_paths(
 // number of distinct tree columns (anchor included) of a path set returned by common_dtree_build_paths
 int32_t common_dtree_n_columns(const std::vector<std::vector<int32_t>> & paths);
 
+// How a drafted tree is verified (--draft-tree-mode). The drafters produce root-to-leaf paths in both modes;
+// only the verify plumbing differs, so a mode swap needs no drafter change.
+//   PATHS : step 1 (this file): each path is its own target sequence (fork / promote / drop), no new kernel.
+//   BATCH : AK-DTREE-2 (separate branch): ONE sequence, the tree's unique columns in one batch with a parent-index
+//           tensor and a tree attention mask (Infernix design). Not implemented here; the server refuses it.
+enum common_dtree_mode {
+    COMMON_DTREE_MODE_PATHS = 0,
+    COMMON_DTREE_MODE_BATCH = 1,
+};
+
+// Flattened tree for the BATCH mode: unique columns in DFS order. Column 0 is the anchor (parent -1); every other
+// column has parent < its own index. leaf_col[p] is the last column of path p (path 0 = the main draft).
+struct common_dtree_flat {
+    std::vector<llama_token> tokens;   // tokens[0] = anchor
+    std::vector<int32_t>     parent;
+    std::vector<int32_t>     depth;    // anchor depth 0
+    std::vector<int32_t>     leaf_col;
+};
+
+common_dtree_flat common_dtree_flatten(llama_token anchor, const std::vector<std::vector<llama_token>> & paths);
+
 // maximum number of paths (main + alternatives) verified per slot
 constexpr int32_t COMMON_DTREE_MAX_PATHS = 3;
 
