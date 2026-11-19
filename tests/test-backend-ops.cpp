@@ -14008,6 +14008,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 517, 2080, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 1023, 4128, {1, 1}, {1, 1}));
     }
+    // [GDN-COLSPLIT] opt-in set "gdn_colsplit": batch-1 decode / MTP verify shapes (n_seq_tokens 1..9) where the
+    // 64-column value-block split (GGML_GDN_COLSPLIT=1) adds work items, incl. K>1 snapshot slots, KDA, an
+    // S_v=192 (3 blocks) shape and S_v=64 (split is a no-op). The row compares knob on vs off bit-exactly.
+    //   TEST_BACKEND_OPS_EXTRA_CASES=gdn_colsplit test-backend-ops perf -b CPU -o GATED_DELTA_NET
+    if (test_backend_ops_extra_case_set("gdn_colsplit")) {
+        for (int vr : { 3, 2 }) {   // 27B/Q38FN (48 v-heads) and A3B (32 v-heads), d=128
+            for (int64_t nt : { 1, 2, 5, 9 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr));
+            }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, vr, false, false, 5));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 9, 1, vr, false, false, 4));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3, false, true));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 2, 3, false, true, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 192, 3, 2, 2, false, false, 3));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 5, 1, 3, false, false, 5));
+    }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));

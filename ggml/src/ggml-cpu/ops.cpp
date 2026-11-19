@@ -12207,7 +12207,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
     int64_t ir0,
-    int64_t ir1) {
+    int64_t ir1,
+    int64_t nblk) {
 
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
@@ -12275,7 +12276,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    // [GDN-COLSPLIT] work item = (head*seq, value-column block). Every value row j of the transposed
+    // state depends only on k, q, beta, g and its own row, so a block of rows is exact. nblk == 1 is the
+    // original (head, seq) item covering all S_v rows.
+    const int64_t jblk = (nblk > 1) ? (S_v / nblk) : S_v;
+
+    for (int64_t item = ir0; item < ir1; ++item) {
+        const int64_t ir  = item / nblk;
+        const int64_t jb0 = (item % nblk) * jblk;
+        const int64_t jb1 = jb0 + jblk;
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
 
@@ -12294,7 +12303,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        memcpy(s_out + jb0 * S_v, s_in + jb0 * S_v, (jb1 - jb0) * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -12316,17 +12325,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                     delta[i] = expf(g_d[i]);
                 }
                 // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
-                for (int64_t j = 0; j < S_v; ++j) {
+                for (int64_t j = jb0; j < jb1; ++j) {
                     ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
                 }
             } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                ggml_vec_scale_f32((jb1 - jb0) * S_v, s_out + jb0 * S_v, expf(g_d[0]));
             }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            int64_t j = 0;
+            int64_t j = jb0;
 #if defined(__AVX512F__)
-            for (; j + 3 < S_v; j += 4) {
+            for (; j + 3 < jb1; j += 4) {
                 float sum[4];
                 ggml_vec_dot_f32_4_avx512(S_v, sum, &s_out[j * S_v], S_v, k_d);
                 for (int r = 0; r < 4; ++r) {
@@ -12334,7 +12343,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 }
             }
 #endif
-            for (; j < S_v; ++j) {
+            for (; j < jb1; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
@@ -12350,7 +12359,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = jb0; j < jb1; ++j) {
 #if defined(__AVX512F__)
                 if (curr_state_o) {
                     ggml_vec_mad_f32_dual_store_avx512(
@@ -12363,9 +12372,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            j = 0;
+            j = jb0;
 #if defined(__AVX512F__)
-            for (; j + 3 < S_v; j += 4) {
+            for (; j + 3 < jb1; j += 4) {
                 float sum[4];
                 ggml_vec_dot_f32_4_avx512(S_v, sum, &s_out[j * S_v], S_v, q_d);
                 for (int r = 0; r < 4; ++r) {
@@ -12373,7 +12382,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 }
             }
 #endif
-            for (; j < S_v; ++j) {
+            for (; j < jb1; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
@@ -12383,7 +12392,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
 #if !defined(__AVX512F__)
             if (curr_state_o) {
-                memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                memcpy(curr_state_o + jb0 * S_v, s_out + jb0 * S_v, (jb1 - jb0) * S_v * sizeof(float));
             }
 #endif
         }
@@ -12397,6 +12406,18 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
     ggml_tensor * V = dst->src[2];
     int64_t nr = V->ne[1] * V->ne[3];
+
+    // [GDN-COLSPLIT] GGML_GDN_COLSPLIT=1 (default OFF): split each (head, seq) item over 64-column value blocks
+    // (bit-exact; more work items at batch 1). Only when S_v is a multiple of 64 and the block is > 1.
+    int64_t nblk = 1;
+    {
+        const char * e = getenv("GGML_GDN_COLSPLIT");
+        const int64_t S_v = V->ne[0];
+        if (e != nullptr && atoi(e) != 0 && S_v > 64 && (S_v % 64) == 0) {
+            nblk = S_v / 64;
+        }
+        nr *= nblk;
+    }
 
     // disable for NUMA
     const bool disable_chunking = ggml_is_numa();
@@ -12427,7 +12448,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir0 = dr * current_chunk;
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, nblk);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
