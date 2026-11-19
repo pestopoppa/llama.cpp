@@ -1,6 +1,7 @@
 // AK-DTREE-1: unit test of the path decomposition of the path-row tree verify (common/speculative-tree.*).
 // No model needed.
 
+#include <cmath>
 #include "speculative-tree.h"
 
 #include <algorithm>
@@ -126,21 +127,73 @@ int main() {
         CHECK(common_dtree_n_columns(paths) == 8);
     }
 
-    // auto chooser: initial timing widest first, then the fastest arm
+    // DTREE-B auto controller (Infernix TreeWidthController): simulated engine. Each arm a has a true mean
+    // emission g[a] (narrower trees are prefixes: a round of arm u yields arms <= u) and a round time T[a].
     {
-        common_dtree_auto a;
-        for (int i = 0; i < 9; ++i) {
-            const int32_t arm = a.choose();
-            CHECK(arm == 2 - i / 3);
-            a.observe(arm, arm == 1 ? 6 : 4, 100000); // arm 1 is fastest
+        auto sim = [&](const double g[3], const double T[3], int rounds, int spike_at, int & n_best_tail, int best) {
+            common_dtree_auto c;
+            uint32_t rng = 12345u;
+            auto u01 = [&]() { rng = rng * 1664525u + 1013904223u; return (double) (rng >> 8) / 16777216.0; };
+            n_best_tail = 0;
+            for (int r = 0; r < rounds; ++r) {
+                const int32_t arm = c.choose(1, 1000);
+                int32_t e[3] = { -1, -1, -1 };
+                // emissions: nested, each arm adds a chance of a longer path
+                const double x = u01();
+                for (int a = 0; a <= arm; ++a) {
+                    e[a] = 1 + (int32_t) std::floor(g[a] * 2.0 * x + 0.5);
+                    if (a > 0) {
+                        e[a] = std::max(e[a], e[a - 1]);
+                    }
+                }
+                double t = T[arm] * (0.95 + 0.1 * u01());
+                if (r == spike_at) {
+                    t *= 20.0;
+                }
+                c.observe(arm, e, (int64_t) t, 1, 1000);
+                if (r >= rounds - 500) {
+                    n_best_tail += arm == best;
+                }
+            }
+            return c;
+        };
+        // arm 1 has the best tokens/s: mean emission 3/4/4.3 per round, times 50/58/75 ms
+        const double g1[3] = { 2.0, 3.0, 3.3 };
+        const double T1[3] = { 50000, 58000, 75000 };
+        int tail = 0;
+        sim(g1, T1, 3000, -1, tail, 1);
+        CHECK(tail >= 440);   // the widest arm is re-timed 1 round in 32 (~16 of 500)
+        // chain best when trees cost too much
+        const double T2[3] = { 50000, 70000, 90000 };
+        sim(g1, T2, 3000, -1, tail, 0);
+        CHECK(tail >= 440);
+        // one 20x spike on the chosen arm after settling does not flip the choice
+        {
+            common_dtree_auto c;
+            for (int r = 0; r < 2000; ++r) {
+                const int32_t arm = c.choose(1, 1000);
+                int32_t e[3] = { 3, 4, 4 };
+                c.observe(arm, e, (int64_t) T1[arm], 1, 1000);
+            }
+            CHECK(c.choose(1, 1000) == 1);
+            int32_t e[3] = { 3, 4, -1 };
+            c.observe(1, e, (int64_t) T1[1] * 20, 1, 1000);
+            int n1 = 0;
+            for (int r = 0; r < 31; ++r) {
+                const int32_t arm = c.choose(1, 1000);
+                n1 += arm == 1;
+                int32_t e2[3] = { 3, 4, 4 };
+                c.observe(arm, e2, (int64_t) T1[arm], 1, 1000);
+            }
+            CHECK(n1 >= 29);
         }
-        int n1 = 0;
-        for (int i = 0; i < 64; ++i) {
-            const int32_t arm = a.choose();
-            n1 += arm == 1;
-            a.observe(arm, arm == 1 ? 6 : 4, 100000);
+        // batches above 4 run the chain; context buckets time separately
+        {
+            common_dtree_auto c;
+            CHECK(c.choose(5, 100) == 0);
+            CHECK(common_dtree_auto::bucket(1, 100) != common_dtree_auto::bucket(1, 40000));
+            CHECK(common_dtree_auto::bucket(1, 100) != common_dtree_auto::bucket(2, 100));
         }
-        CHECK(n1 >= 60);
         CHECK(common_dtree_auto::arm_nodes(0, 7) == 0);
         CHECK(common_dtree_auto::arm_nodes(1, 7) == 12);
         CHECK(common_dtree_auto::arm_nodes(2, 7) == 16);

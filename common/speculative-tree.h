@@ -191,21 +191,49 @@ void common_dtree_promote(llama_context * ctx, llama_seq_id src, llama_seq_id ds
 // drop an alternative path sequence entirely
 void common_dtree_drop(llama_context * ctx, llama_seq_id seq);
 
-// --draft-tree-nodes auto: per-slot online chooser between the chain and tree widths.
-// Arms: 0 = chain, 1 = D + 5 columns, 2 = D + 9 columns (Infernix's K+5 / K+9 auto widths).
-// The rate of an arm is an EMA (alpha 1/8) of emitted tokens per second of round wall time. Each arm is timed
-// 3 times first (widest first); afterwards the best arm runs, and every other arm is re-timed once per 32 rounds.
+// --draft-tree-nodes auto (DTREE-B): Infernix's TreeWidthController (TV:L73-108) adapted to path rows.
+// Arms: 0 = chain, 1 = D + 5 columns, 2 = D + 9 columns.
+//  * Gain is measured on the generated text: a narrower tree is a prefix of a wider one (paths are added best
+//    first), so a round of arm u also yields what every arm a <= u would have emitted (observe's emit_by_arm).
+//    Per arm: decayed sum (decay 1/512) of emitted tokens per round; an arm's gain is trusted after 32 rounds.
+//  * Cost is the wall time per round, per (batch bucket, context bucket, arm): the minimum of the first 3 rounds,
+//    then a 1/8 EWMA whose sample is clamped to [t/2, 2t] (one spike moves it by at most 1/8 of t).
+//  * Choice: the arm with the most expected tokens per second. Arms lacking gain data are reached by running the
+//    widest arm (its rounds give all narrower gains); arms lacking timing in this bucket are timed 3 times,
+//    widest first. The widest arm is re-timed every 32 rounds and any arm whose timing is 512 rounds old.
+//  * Batches above 4 always run the chain.
 struct common_dtree_auto {
-    static constexpr int32_t N_ARMS = 3;
+    static constexpr int32_t N_ARMS      = 3;
+    static constexpr int32_t N_BATCH_B   = 3;   // 1, 2, 3-4 active slots
+    static constexpr int32_t N_CTX_B     = 4;   // <= 8K, <= 32K, <= 64K, > 64K
+    static constexpr int32_t N_BUCKETS   = N_BATCH_B * N_CTX_B;
+    static constexpr int32_t GAIN_MIN    = 32;
+    static constexpr int32_t RETIME_WIDE = 32;
+    static constexpr int32_t STALE       = 512;
 
-    double  rate[N_ARMS]  = { 0.0, 0.0, 0.0 };
-    int32_t n_obs[N_ARMS] = { 0, 0, 0 };
+    double  gsum[N_ARMS]  = { 0.0, 0.0, 0.0 };  // decayed sum of emitted tokens per round
+    double  gw[N_ARMS]    = { 0.0, 0.0, 0.0 };  // decayed weight
+    int32_t n_gain[N_ARMS] = { 0, 0, 0 };       // rounds that measured this arm's gain
+
+    double  t_us[N_BUCKETS][N_ARMS]   = {};     // round wall time estimate
+    int32_t n_t[N_BUCKETS][N_ARMS]    = {};     // timed rounds
+    int64_t t_last[N_BUCKETS][N_ARMS] = {};     // round index of the last timing
+
     int64_t n_round = 0;
 
-    // pick the arm of the next round
-    int32_t choose() const;
-    // record a finished round of arm `arm`: `n_emit` tokens emitted in `t_us` microseconds
-    void observe(int32_t arm, int32_t n_emit, int64_t t_us);
+    // kept for the server's stats line: tokens/s of each arm in the last bucket chosen (0 = unknown)
+    double  rate[N_ARMS]  = { 0.0, 0.0, 0.0 };
+    int32_t n_obs[N_ARMS] = { 0, 0, 0 };
+
+    static int32_t bucket(int32_t n_batch, int32_t n_ctx);
+    // pick the arm of the next round (n_batch = active generating slots, n_ctx = this slot's context length)
+    int32_t choose(int32_t n_batch = 1, int32_t n_ctx = 0);
+    // record a finished round of arm `arm`: emit_by_arm[a] = tokens arm a would have emitted (a <= arm; < 0 =
+    // unknown), t_us_round = the round's wall time
+    void observe(int32_t arm, const int32_t * emit_by_arm, int64_t t_us_round, int32_t n_batch = 1, int32_t n_ctx = 0);
+    // compatibility: only the used arm's emitted count is known
+    void observe(int32_t arm, int32_t n_emit, int64_t t_us_round);
+    double gain(int32_t arm) const { return gw[arm] > 0.0 ? gsum[arm] / gw[arm] : 0.0; }
     // tree columns for an arm given D draft tokens (0 for the chain)
     static int32_t arm_nodes(int32_t arm, int32_t D);
 };
