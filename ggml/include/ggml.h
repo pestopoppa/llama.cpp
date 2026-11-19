@@ -2546,6 +2546,17 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // [AK-DTREE-2] tree-aware SSM_CONV for speculative tree verification.
+    // parent: I32 [n_t, n_s], parent[t] in [-1, t-1] (-1 = child of the anchor / conv history).
+    // The window of token t is its d_conv-1 nearest ancestors (walking parent links, then the
+    // d_conv-1 conv-history columns of sx once the walk passes the root) followed by t itself.
+    // A chain (parent[t] == t-1) is bit-identical to ggml_ssm_conv.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * parent);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2678,6 +2689,22 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // [AK-DTREE-2] tree-walk gated delta net (ReplaySSM "record mode" for tree verification).
+    // parent: I32 [n_tokens, n_seqs], parent[t] in [-1, t-1]; -1 = child of the initial state s0.
+    // Column t's recurrence starts from the state after its parent (s0 for -1). The op keeps
+    // K = n_tokens snapshot slots with the chain slot mapping (slot n_tokens-1-t = state after
+    // column t), so the accepted path's state is a pure slot select and `state` is never written.
+    // A chain (parent[t] == t-1) is bit-identical to ggml_gated_delta_net(..., K = n_tokens).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent);
 
     // DSA lightning indexer
     //
