@@ -1834,6 +1834,30 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
+    // [TAG_MTP_DRAFT_WINDOW] mask cells with sink <= p0 <= p1 - window (exact superset of the dense mask's drops);
+    // the CPU FA masked-run skip then turns the dropped cells into saved work.
+    if (draft_window > 0) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const llama_pos p1 = ubatch->pos[i];
+            const uint64_t idst = n_kv*i;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get(j);
+                if (llama_hparams::is_masked_draft_window(draft_window, draft_sink, p0, p1)) {
+                    if (dst->type == GGML_TYPE_F16) {
+                        ((ggml_fp16_t *) dst->data)[idst + j] = ggml_fp32_to_fp16(-INFINITY);
+                    } else {
+                        ((float *) dst->data)[idst + j] = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
