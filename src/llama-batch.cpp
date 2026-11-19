@@ -400,7 +400,7 @@ bool llama_batch_allocr::init(
                     return false;
                 }
 
-                if (pos < cur_seq_pos[seq_id]) {
+                if (pos < cur_seq_pos[seq_id] && !batch.parent) { // [AK-DTREE-2] tree siblings revisit depths
                     LLAMA_LOG_ERROR("%s: sequence %d positions are decreasing (not allowed)\n", __func__, seq_id);
                     return false;
                 }
@@ -872,13 +872,29 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             int32_t pu = -1;
             if (pb >= 0) {
                 auto it = pos_in_ubatch.find(pb);
-                GGML_ASSERT(it != pos_in_ubatch.end() && "tree batch: a tree must fit in one ubatch (raise n_ubatch)");
-                pu = it->second;
-                GGML_ASSERT(pu < (int32_t) i && (!equal_seqs || pu / n_st == i / n_st) && "tree batch: parent in another seq set");
+                if (it != pos_in_ubatch.end()) {
+                    pu = it->second;
+                    GGML_ASSERT(pu < (int32_t) i && (!equal_seqs || pu / n_st == i / n_st) && "tree batch: parent in another seq set");
+                }
+                // else: the parent was decoded by an earlier ubatch, so it is committed context. That is valid
+                // only for a chain continuing across ubatches; a branching tree must fit in one ubatch.
             }
             res.data->parent[i] = pu;
         }
-        res.parent = res.data->parent.data();
+        // a ubatch whose parents are all chains (each token follows the previous one of its seq set) is an
+        // ordinary ubatch: keep the chain graph (and its rollback semantics) for it
+        bool any_branch = false;
+        std::unordered_map<llama_seq_id, int32_t> last_of_seq;
+        for (uint32_t i = 0; i < n_tokens && !any_branch; ++i) {
+            const llama_seq_id sid = res.seq_id[i][0];
+            auto it = last_of_seq.find(sid);
+            const int32_t prev = it == last_of_seq.end() ? -1 : it->second;
+            any_branch = res.data->parent[i] != prev;
+            last_of_seq[sid] = (int32_t) i;
+        }
+        if (any_branch) {
+            res.parent = res.data->parent.data();
+        }
     }
 
     if (debug > 0) {

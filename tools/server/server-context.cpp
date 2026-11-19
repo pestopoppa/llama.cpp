@@ -23,6 +23,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <cerrno>
 #include <numeric>
 #include <chrono>
@@ -361,7 +362,12 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
+        int32_t parent = -2; // [AK-DTREE-2] explicit tree parent (batch index, -1 root); -2 = chain (derived)
     };
+
+    // [AK-DTREE-2] tree parents of the rendered batch (empty when no token carries an explicit parent)
+    std::vector<int32_t> parent;
+    mutable std::vector<int32_t> view_parent;
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
 
@@ -387,12 +393,12 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, int32_t parent = -2) {
         GGML_ASSERT(batch.token != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output });
+        tokens.push_back({ id_slot, token, pos, output, parent });
         return true;
     }
 
@@ -421,6 +427,27 @@ struct server_batch {
             const auto & t = tokens[i];
             common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
         }
+        // [AK-DTREE-2] a batch carrying a tree: every token gets a parent; tokens without an explicit one chain
+        // to the previous token of their sequence (or are roots)
+        parent.clear();
+        bool any_tree = false;
+        for (const auto & t : tokens) {
+            any_tree |= t.parent != -2;
+        }
+        if (any_tree) {
+            parent.resize(size());
+            std::unordered_map<int32_t, int32_t> last;
+            for (int32_t i = 0; i < size(); i++) {
+                const auto & t = tokens[i];
+                if (t.parent != -2) {
+                    parent[i] = t.parent;
+                } else {
+                    auto it = last.find(t.id_slot);
+                    parent[i] = (it != last.end() && tokens[it->second].pos + 1 == t.pos) ? it->second : -1;
+                }
+                last[t.id_slot] = i;
+            }
+        }
         batch_rendered = true;
     }
 
@@ -439,6 +466,15 @@ struct server_batch {
             batch.seq_id   + off,
             batch.logits   + off,
         };
+
+        if (!parent.empty()) {
+            view_parent.resize(n_tokens);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const int32_t p = parent[off + i];
+                view_parent[i] = p >= off ? p - off : -1;
+            }
+            view.parent = view_parent.data();
+        }
 
         return view;
     }
@@ -469,6 +505,7 @@ struct server_slot {
     std::vector<std::vector<int32_t>> spec_tree_i_batch;
     llama_seq_id spec_tree_seq0 = -1;  // first alternative sequence id (-1: tree verify off)
     bool    spec_tree_live = false;    // alternative sequences were forked this iteration (cleanup pending)
+    bool    spec_tree_batch = false;   // [AK-DTREE-2] verify the tree as one batch in this slot's sequence
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -830,7 +867,26 @@ struct server_slot {
             // AK-DTREE-1: every alternative path is its own sequence, forked (KV + recurrent state, incl. a
             // pending rollback) from this slot's sequence, with the same anchor and positions
             spec_tree_i_batch.clear();
-            if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_seq0 >= 0) {
+            if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_batch) {
+                // [AK-DTREE-2] the alternatives' unique columns join this slot's own sequence with explicit tree
+                // parents; a shared prefix with the main draft reuses the main rows
+                spec_tree_i_batch.resize(spec_tree_alts.size());
+                const llama_pos pa = prompt.tokens.pos_next(); // anchor position
+                for (size_t a = 0; a < spec_tree_alts.size(); ++a) {
+                    const auto & alt = spec_tree_alts[a];
+                    size_t l = 0;
+                    while (l < alt.size() && l < spec_draft.size() && alt[l] == spec_draft[l]) {
+                        ++l;
+                    }
+                    auto & rows = spec_tree_i_batch[a];
+                    rows.assign(spec_i_batch.begin(), spec_i_batch.begin() + l + 1);
+                    for (size_t j = l; j < alt.size(); ++j) {
+                        const int32_t par = rows.back();
+                        rows.push_back(batch.size());
+                        add_ok &= batch.add(id, alt[j], pa + 1 + (llama_pos) j, true, par);
+                    }
+                }
+            } else if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_seq0 >= 0) {
                 spec_tree_i_batch.resize(spec_tree_alts.size());
                 for (size_t a = 0; a < spec_tree_alts.size(); ++a) {
                     const llama_seq_id seq = spec_tree_seq0 + (llama_seq_id) a;
@@ -1019,7 +1075,7 @@ struct server_slot {
                     "spec_exact extra target tokens = %5d (re-decoded after %5d verification steps)\n",
                     n_spec_exact_extra, n_draft_verif_steps);
             }
-            if (spec_tree_seq0 >= 0) {
+            if (spec_tree_seq0 >= 0 || spec_tree_batch) {
                 SLT_INF(*this,
                     "draft tree: %5d of %5d rounds verified a tree, alternative accepted in %5d (+%d tokens); "
                     "auto rate chain/w5/w9 = %.1f/%.1f/%.1f tok/s (n %d/%d/%d)\n",
@@ -1449,15 +1505,12 @@ private:
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         if (params_base.speculative.draft_tree_nodes != 0) {
-            if (params_base.speculative.draft_tree_mode != COMMON_DTREE_MODE_PATHS) {
-                // AK-DTREE-2 owns the tree-batch verify (parent-index tensor + tree mask kernels)
-                SRV_ERR("%s", "--draft-tree-mode batch needs the AK-DTREE-2 tree kernels, not in this build\n");
-                return false;
-            }
+            // [AK-DTREE-2] batch mode: one tree batch per slot (llama_batch.parent + llama_memory_tree_accept)
             params_base.kv_unified = true; // matches common_context_params_to_llama
-            SRV_INF("draft tree verify: nodes = %d (%s), mode = paths, %d sequences per slot (n_seq_max = %d)\n",
+            SRV_INF("draft tree verify: nodes = %d (%s), mode = %s, %d sequences per slot (n_seq_max = %d)\n",
                     params_base.speculative.draft_tree_nodes,
                     params_base.speculative.draft_tree_nodes < 0 ? "auto" : "fixed",
+                    params_base.speculative.draft_tree_mode == COMMON_DTREE_MODE_BATCH ? "batch" : "paths",
                     params_base.speculative.tree_seqs_per_slot(),
                     params_base.n_parallel * params_base.speculative.tree_seqs_per_slot());
         }
@@ -1801,6 +1854,8 @@ private:
             slot.spec_tree_seq0 = params_base.speculative.tree_seqs_per_slot() > 1
                 ? params_base.n_parallel + i * (params_base.speculative.tree_seqs_per_slot() - 1)
                 : -1;
+            slot.spec_tree_batch = params_base.speculative.draft_tree_nodes != 0 &&
+                params_base.speculative.draft_tree_mode == COMMON_DTREE_MODE_BATCH;
             slot.ctx_dft = ctx_dft;
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
@@ -5412,8 +5467,11 @@ private:
     // probabilities, on the batched verify path with an in-memory rollback, only.
     int32_t spec_tree_nodes_for(server_slot & slot) {
         const int32_t cfg = params_base.speculative.draft_tree_nodes;
-        if (cfg == 0 || slot.spec_tree_seq0 < 0 || !slot.task ||
-            params_base.speculative.draft_tree_mode != COMMON_DTREE_MODE_PATHS) {
+        if (cfg == 0 || (slot.spec_tree_seq0 < 0 && !slot.spec_tree_batch) || !slot.task) {
+            return 0;
+        }
+        // [AK-DTREE-2] the batch accept commits the greedy path, so constrained sampling stays on the chain
+        if (slot.spec_tree_batch && !slot.task->params.sampling.grammar.grammar.empty()) {
             return 0;
         }
         if (slot.task->params.sampling.temp > 0.0f || slot.task->params.sampling.n_probs > 0 ||
@@ -5476,11 +5534,35 @@ private:
                 slot.n_tree_rounds++;
             }
 
+            if (slot.spec_tree_batch) {
+                // [AK-DTREE-2] commit the winner's accepted prefix (anchor + best_n columns) in place: the KV drops
+                // every other tree column, the recurrent state becomes the state after the last accepted column.
+                // The unchanged accept path below then samples the winner rows; its rollback is a no-op.
+                const std::vector<int32_t> & win_rows = best >= 0 ? slot.spec_tree_i_batch[best] : slot.spec_i_batch;
+                std::vector<int32_t> slot_rows; // this seq's batch rows in order = tree column index
+                for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                    if (batch_view.seq_id[i][0] == slot.id) {
+                        slot_rows.push_back(i + off);
+                    }
+                }
+                std::vector<int32_t> cols;
+                for (int32_t k = 0; ok && k <= best_n; ++k) {
+                    const auto it = std::find(slot_rows.begin(), slot_rows.end(), win_rows[k]);
+                    GGML_ASSERT(it != slot_rows.end());
+                    cols.push_back((int32_t) (it - slot_rows.begin()));
+                }
+                if (ok && !llama_memory_tree_accept(llama_get_memory(ctx_tgt), slot.id, cols.data(), (int32_t) cols.size())) {
+                    SLT_ERR(slot, "%s", "llama_memory_tree_accept failed\n");
+                }
+            }
+
             if (best >= 0) {
                 const int32_t n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 const llama_seq_id seq_win = slot.spec_tree_seq0 + best;
 
-                common_dtree_promote(ctx_tgt, seq_win, slot.id);
+                if (!slot.spec_tree_batch) {
+                    common_dtree_promote(ctx_tgt, seq_win, slot.id);
+                }
 
                 if (!relabel) {
                     tree_seq_store.assign(batch_view.seq_id[0] ? batch_view.n_tokens : 0, 0);
@@ -5503,7 +5585,7 @@ private:
                 slot.n_tree_alt_extra += best_n - n_main;
             }
 
-            for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
+            for (size_t a = 0; a < slot.spec_tree_alts.size() && !slot.spec_tree_batch; ++a) {
                 if ((int32_t) a != best) {
                     common_dtree_drop(ctx_tgt, slot.spec_tree_seq0 + (llama_seq_id) a);
                 }

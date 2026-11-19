@@ -409,7 +409,15 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+        // [AK-DTREE-2] batch mode: every tree column gets its own rollback slot (columns - 1, anchor included)
+        if (draft_tree_nodes != 0 && draft_tree_mode == 1) {
+            const int32_t cols = draft_tree_nodes > 0 ? draft_tree_nodes : draft.n_max + 9 + 1;
+            return (uint32_t) std::max<int32_t>(draft.n_max, cols - 1);
+        }
+        return draft.n_max;
     }
 };
 
