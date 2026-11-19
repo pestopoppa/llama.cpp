@@ -205,6 +205,7 @@ struct server_task {
         std::string selector   = "expected_attention";
         float beta             = 0.1f;  // constant beta set on every kept cell (needs LLAMA_KV_AM_BETA=1 to act)
         int   keep_last        = 15;    // trailing positions always kept
+        bool  keep_last_set    = false; // EA only: protect the trailing keep_last positions when the request names it
     };
     slot_action slot_action;
 

@@ -383,7 +383,9 @@ int llama_kv_compress_evict(
     const int n_kv = (int)scores.size();
 
     // Find eviction threshold
-    std::vector<float> sorted(scores.begin() + params.n_sink, scores.end());
+    const int n_protect_end = std::max(params.n_sink, n_kv - std::max(0, params.n_recent)); // [n_protect_end, n_kv) is protected
+    if (n_protect_end <= params.n_sink) return 0;
+    std::vector<float> sorted(scores.begin() + params.n_sink, scores.begin() + n_protect_end);
     std::sort(sorted.begin(), sorted.end());
     int n_evict_target = (int)(sorted.size() * params.compression_ratio);
     if (n_evict_target <= 0) return 0;
@@ -391,7 +393,7 @@ int llama_kv_compress_evict(
 
     // Mark positions for eviction
     std::vector<bool> evict(n_kv, false);
-    for (int p = params.n_sink; p < n_kv; p++) {
+    for (int p = params.n_sink; p < n_protect_end; p++) {
         if (scores[p] < threshold) {
             evict[p] = true;
         }

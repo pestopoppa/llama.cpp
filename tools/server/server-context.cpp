@@ -7444,6 +7444,7 @@ static llama_kv_compress_params make_server_expected_attention_params(const serv
     ea_params.n_future          = task.slot_action.n_future;
     ea_params.use_covariance    = task.slot_action.use_covariance;
     ea_params.layer_weights     = task.slot_action.layer_weights;
+    ea_params.n_recent          = task.slot_action.keep_last_set ? task.slot_action.keep_last : 0;
 
     // Server slot prompt/checkpoint state tracks logical positions independently.
     // Keep Expected Attention in gapped-eviction mode until the server can compact
@@ -7485,6 +7486,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
     }
     task.slot_action.beta      = body.is_object() && body.contains("beta")      ? body["beta"].get<float>()    : 0.1f;
     task.slot_action.keep_last = body.is_object() && body.contains("keep_last") ? body["keep_last"].get<int>() : 15;
+    task.slot_action.keep_last_set = body.is_object() && body.contains("keep_last");
 
     // Layer-adaptive weights for autopilot tuning. Pass "layer_weights": [..] to emphasize
     // specific attention layers. If omitted, uniform weighting across all attention layers.

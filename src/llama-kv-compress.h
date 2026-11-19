@@ -16,6 +16,9 @@ struct llama_kv_compress_params {
     float compression_ratio = 0.50f;  // fraction of KV entries to REMOVE
     int   n_future          = 128;    // future positions for RoPE averaging
     int   n_sink            = 4;      // sink tokens to protect (never evicted)
+    int   n_recent          = 0;      // trailing positions to protect (never evicted); 0 = legacy behaviour. Without it the
+                                      // last prompt position can be evicted and the next decode fails the "consecutive
+                                      // positions" check (seen with a 5x ratio on a 3K prompt).
     bool  use_covariance    = true;   // include covariance term (more accurate, slower)
 
     // If true, shift remaining positions to close gaps after eviction via seq_add.
