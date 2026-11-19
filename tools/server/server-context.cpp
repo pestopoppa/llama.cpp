@@ -8,6 +8,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-chunk-store.h"
+#include "speculative-tree.h"
 #include "server-chunk-recompute.h"
 
 #include "build-info.h"
@@ -334,7 +335,7 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
-    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq * params.speculative.tree_seqs_per_slot();
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
@@ -461,6 +462,19 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // AK-DTREE-1 (--draft-tree-nodes, path-row tree verify after Infernix): alternative draft paths of this
+    // round, each verified as its own target sequence spec_tree_seq0 + k in the same decode
+    std::vector<llama_tokens> spec_tree_alts;
+    std::vector<std::vector<int32_t>> spec_tree_i_batch;
+    llama_seq_id spec_tree_seq0 = -1;  // first alternative sequence id (-1: tree verify off)
+    bool    spec_tree_live = false;    // alternative sequences were forked this iteration (cleanup pending)
+    int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
+    int64_t t_spec_tree_round = 0;
+    common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
+    int32_t n_tree_rounds    = 0;      // rounds verified with >= 1 alternative path
+    int32_t n_tree_alt_wins  = 0;      // rounds an alternative path was accepted
+    int32_t n_tree_alt_extra = 0;      // tokens gained over the main path in those rounds
 
     // the target refused a partial rollback: its memory for this sequence was cleared and must be rebuilt
     // from prompt.tokens before the next decode (see rs_rebuild_slots)
@@ -638,6 +652,9 @@ struct server_slot {
             spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_tree_alts.clear();
+            spec_tree_i_batch.clear();
+            spec_tree_arm = -1;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -649,6 +666,9 @@ struct server_slot {
         n_draft_verif_steps = 0;
         n_spec_exact_extra = 0;
         n_accepted_per_pos.clear();
+        n_tree_rounds    = 0;
+        n_tree_alt_wins  = 0;
+        n_tree_alt_extra = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -805,6 +825,28 @@ struct server_slot {
                 for (auto token : spec_draft) {
                     add_ok &= batch.add(this->id, token, pos0++, true);
                 }
+            }
+
+            // AK-DTREE-1: every alternative path is its own sequence, forked (KV + recurrent state, incl. a
+            // pending rollback) from this slot's sequence, with the same anchor and positions
+            spec_tree_i_batch.clear();
+            if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_seq0 >= 0) {
+                spec_tree_i_batch.resize(spec_tree_alts.size());
+                for (size_t a = 0; a < spec_tree_alts.size(); ++a) {
+                    const llama_seq_id seq = spec_tree_seq0 + (llama_seq_id) a;
+                    common_dtree_fork(ctx_tgt, id, seq);
+                    spec_tree_live = true;
+
+                    llama_pos pos1 = prompt.tokens.pos_next();
+                    spec_tree_i_batch[a].push_back(batch.size());
+                    add_ok &= batch.add(seq, sampled, pos1++, true);
+                    for (auto token : spec_tree_alts[a]) {
+                        spec_tree_i_batch[a].push_back(batch.size());
+                        add_ok &= batch.add(seq, token, pos1++, true);
+                    }
+                }
+            } else {
+                spec_tree_alts.clear();
             }
         }
 
@@ -976,6 +1018,14 @@ struct server_slot {
                 SLT_INF(*this,
                     "spec_exact extra target tokens = %5d (re-decoded after %5d verification steps)\n",
                     n_spec_exact_extra, n_draft_verif_steps);
+            }
+            if (spec_tree_seq0 >= 0) {
+                SLT_INF(*this,
+                    "draft tree: %5d of %5d rounds verified a tree, alternative accepted in %5d (+%d tokens); "
+                    "auto rate chain/w5/w9 = %.1f/%.1f/%.1f tok/s (n %d/%d/%d)\n",
+                    n_tree_rounds, n_draft_verif_steps, n_tree_alt_wins, n_tree_alt_extra,
+                    spec_tree_auto.rate[0], spec_tree_auto.rate[1], spec_tree_auto.rate[2],
+                    spec_tree_auto.n_obs[0], spec_tree_auto.n_obs[1], spec_tree_auto.n_obs[2]);
             }
         }
 
@@ -1398,6 +1448,20 @@ private:
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
+        if (params_base.speculative.draft_tree_nodes != 0) {
+            if (params_base.speculative.draft_tree_mode != COMMON_DTREE_MODE_PATHS) {
+                // AK-DTREE-2 owns the tree-batch verify (parent-index tensor + tree mask kernels)
+                SRV_ERR("%s", "--draft-tree-mode batch needs the AK-DTREE-2 tree kernels, not in this build\n");
+                return false;
+            }
+            params_base.kv_unified = true; // matches common_context_params_to_llama
+            SRV_INF("draft tree verify: nodes = %d (%s), mode = paths, %d sequences per slot (n_seq_max = %d)\n",
+                    params_base.speculative.draft_tree_nodes,
+                    params_base.speculative.draft_tree_nodes < 0 ? "auto" : "fixed",
+                    params_base.speculative.tree_seqs_per_slot(),
+                    params_base.n_parallel * params_base.speculative.tree_seqs_per_slot());
+        }
+
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -1734,6 +1798,9 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
+            slot.spec_tree_seq0 = params_base.speculative.tree_seqs_per_slot() > 1
+                ? params_base.n_parallel + i * (params_base.speculative.tree_seqs_per_slot() - 1)
+                : -1;
             slot.ctx_dft = ctx_dft;
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
@@ -4504,6 +4571,17 @@ private:
                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
+                        // AK-DTREE-1: tree width of this round (0 = chain)
+                        slot.spec_tree_alts.clear();
+                        slot.spec_tree_arm     = -1;
+                        slot.t_spec_tree_round = ggml_time_us();
+                        const int32_t tree_nodes = spec_tree_nodes_for(slot);
+                        if (tree_nodes > 0) {
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dp.tree_nodes = tree_nodes;
+                            dp.tree_alts  = &slot.spec_tree_alts;
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }
@@ -4521,6 +4599,25 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.n_draft_total += draft.size();
+
+            // AK-DTREE-1: alternatives follow the (possibly truncated) main draft's length; duplicates of the
+            // main path after truncation are dropped
+            {
+                common_speculative_get_draft_params(spec.get(), slot.id).tree_alts = nullptr;
+                std::vector<llama_tokens> keep;
+                if (!draft.empty() && !use_serial_speculative_verify(slot)) {
+                    for (auto & a : slot.spec_tree_alts) {
+                        if (a.size() < draft.size()) {
+                            continue;
+                        }
+                        a.resize(draft.size());
+                        if (a != draft && std::find(keep.begin(), keep.end(), a) == keep.end()) {
+                            keep.push_back(std::move(a));
+                        }
+                    }
+                }
+                slot.spec_tree_alts = std::move(keep);
+            }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -5311,6 +5408,136 @@ private:
         return n_rows == batch_view.n_tokens;
     }
 
+    // AK-DTREE-1: tree columns for this slot's next round (0 = verify the chain). Greedy rows that read no
+    // probabilities, on the batched verify path with an in-memory rollback, only.
+    int32_t spec_tree_nodes_for(server_slot & slot) {
+        const int32_t cfg = params_base.speculative.draft_tree_nodes;
+        if (cfg == 0 || slot.spec_tree_seq0 < 0 || !slot.task ||
+            params_base.speculative.draft_tree_mode != COMMON_DTREE_MODE_PATHS) {
+            return 0;
+        }
+        if (slot.task->params.sampling.temp > 0.0f || slot.task->params.sampling.n_probs > 0 ||
+            spec_exact != SPEC_EXACT_OFF || use_serial_speculative_verify(slot) ||
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            return 0;
+        }
+        const int32_t D = params_base.speculative.draft.n_max;
+        if (cfg > 0) {
+            return cfg >= D + 2 ? cfg : 0;
+        }
+        slot.spec_tree_arm = slot.spec_tree_auto.choose();
+        return common_dtree_auto::arm_nodes(slot.spec_tree_arm, D);
+    }
+
+    // AK-DTREE-1: after the target decode of a view, choose each tree slot's winning path by greedy match
+    // length, promote it to the slot's sequence (spec_draft / spec_i_batch then describe the winner, so the
+    // unchanged accept path below samples and rolls back the winner), and drop the other paths. proc_view is
+    // the view the drafter's process() sees: when an alternative won, its rows are relabelled to the slot's
+    // sequence and the main path's rows to -1 (skipped), so the drafter is fed the accepted path's features.
+    // Returns true when a tree was verified in this view (the overlapped process path is then not used).
+    std::vector<llama_seq_id>   tree_seq_store;
+    std::vector<llama_seq_id *> tree_seq_ptrs;
+
+    bool spec_tree_resolve(int32_t off, const llama_batch & batch_view, llama_batch & proc_view) {
+        bool any = false;
+        bool relabel = false;
+
+        for (auto & slot : slots) {
+            if (slot.spec_tree_i_batch.empty()) {
+                continue;
+            }
+            any = true;
+
+            auto inside = [&](const std::vector<int32_t> & rows) {
+                for (const int32_t i : rows) {
+                    if (i < off || i >= off + batch_view.n_tokens) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            bool ok = off == 0 && inside(slot.spec_i_batch) && slot.spec_i_batch.size() == slot.spec_draft.size() + 1;
+            for (const auto & rows : slot.spec_tree_i_batch) {
+                ok = ok && inside(rows);
+            }
+
+            int32_t best = -1;
+            int32_t best_n = 0;
+            if (ok) {
+                best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
+                    const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a]);
+                    if (n > best_n) {
+                        best   = (int32_t) a;
+                        best_n = n;
+                    }
+                }
+                slot.n_tree_rounds++;
+            }
+
+            if (best >= 0) {
+                const int32_t n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const llama_seq_id seq_win = slot.spec_tree_seq0 + best;
+
+                common_dtree_promote(ctx_tgt, seq_win, slot.id);
+
+                if (!relabel) {
+                    tree_seq_store.assign(batch_view.seq_id[0] ? batch_view.n_tokens : 0, 0);
+                    tree_seq_ptrs.assign(batch_view.n_tokens, nullptr);
+                    for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                        tree_seq_store[i] = batch_view.seq_id[i][0];
+                    }
+                    relabel = true;
+                }
+                for (const int32_t i : slot.spec_i_batch) {
+                    tree_seq_store[i - off] = -1;
+                }
+                for (const int32_t i : slot.spec_tree_i_batch[best]) {
+                    tree_seq_store[i - off] = slot.id;
+                }
+
+                slot.spec_draft   = slot.spec_tree_alts[best];
+                slot.spec_i_batch = slot.spec_tree_i_batch[best];
+                slot.n_tree_alt_wins++;
+                slot.n_tree_alt_extra += best_n - n_main;
+            }
+
+            for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
+                if ((int32_t) a != best) {
+                    common_dtree_drop(ctx_tgt, slot.spec_tree_seq0 + (llama_seq_id) a);
+                }
+            }
+            slot.spec_tree_alts.clear();
+            slot.spec_tree_i_batch.clear();
+        }
+
+        if (relabel) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                tree_seq_ptrs[i] = &tree_seq_store[i];
+            }
+            proc_view.seq_id = tree_seq_ptrs.data();
+        }
+
+        return any;
+    }
+
+    // AK-DTREE-1: no alternative sequence outlives the iteration (a view split can leave alternative rows that
+    // were decoded after their slot was resolved)
+    void spec_tree_cleanup() {
+        for (auto & slot : slots) {
+            if (!slot.spec_tree_live) {
+                continue;
+            }
+            for (int32_t a = 0; a < params_base.speculative.tree_seqs_per_slot() - 1; ++a) {
+                common_dtree_drop(ctx_tgt, slot.spec_tree_seq0 + a);
+            }
+            slot.spec_tree_alts.clear();
+            slot.spec_tree_i_batch.clear();
+            slot.spec_tree_live = false;
+        }
+    }
+
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -5412,10 +5639,14 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        // AK-DTREE-1: pick the winning path and promote it before the drafter consumes the target features
+        llama_batch proc_view = batch_view;
+        const bool tree_round = spec_tree_resolve(off, batch_view, proc_view);
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (zos2.overlap_process && zos2_overlap_eligible(off, batch_view)) {
+        if (!tree_round && zos2.overlap_process && zos2_overlap_eligible(off, batch_view)) {
             // GPU-ZOS-2 C3: logits and extracted hidden states to the host first, then the drafter's feature
             // injection runs on the worker while post_decode samples the verification rows; post_decode joins it
             // (and rethrows its failure) before anything reads or writes ctx_dft or the speculative state.
@@ -5427,7 +5658,7 @@ private:
             zos2_worker.submit(spec.get(), batch_view);
         } else {
             scoped_timer t_process(t_zos2_process, n_zos2_process);
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!common_speculative_process(spec.get(), proc_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -6035,6 +6266,12 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+
+            // AK-DTREE-1 auto: time of the whole round (draft + verify + accept) and the tokens it emitted
+            if (slot.spec_tree_arm >= 0) {
+                slot.spec_tree_auto.observe(slot.spec_tree_arm, (int32_t) ids.size(), t_now - slot.t_spec_tree_round);
+                slot.spec_tree_arm = -1;
+            }
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);

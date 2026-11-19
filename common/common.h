@@ -391,6 +391,19 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    // AK-DTREE-1 (--draft-tree-nodes, port of Infernix): tree verification of the DFlash2 drafter, path-row form.
+    // 0 = off (linear chain, byte-identical to before), -1 = auto, N > 0 = a fixed tree of N columns incl. the anchor
+    // (valid: draft n_max + 2 .. 32). Greedy rows only; other rows verify the chain.
+    int32_t draft_tree_nodes = 0;
+    // verify plumbing of the tree (common_dtree_mode): 0 = paths (one sequence per path), 1 = batch (AK-DTREE-2)
+    int32_t draft_tree_mode  = 0;
+
+    // sequences per server slot needed by the tree verify (main + alternatives)
+    int32_t tree_seqs_per_slot() const {
+        // the batch mode verifies the whole tree in the slot's own sequence
+        return draft_tree_nodes != 0 && draft_tree_mode == 0 ? 3 : 1;
+    }
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;

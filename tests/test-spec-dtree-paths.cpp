@@ -146,6 +146,20 @@ int main() {
         CHECK(common_dtree_auto::arm_nodes(2, 7) == 16);
     }
 
+    // flatten (the BATCH-mode view of the same paths): columns == common_dtree_n_columns, parents precede children
+    {
+        const std::vector<std::vector<llama_token>> p = { { 10, 11, 12 }, { 20, 21, 22 }, { 10, 11, 30 } };
+        const auto t = common_dtree_flatten(5, p);
+        CHECK(t.tokens.size() == 8);
+        CHECK((t.leaf_col == std::vector<int32_t>{ 3, 6, 7 }));
+        CHECK(t.parent[7] == 2 && t.depth[7] == 3 && t.parent[4] == 0);
+        for (size_t c = 1; c < t.tokens.size(); ++c) {
+            CHECK(t.parent[c] >= 0 && t.parent[c] < (int32_t) c && t.depth[c] == t.depth[t.parent[c]] + 1);
+        }
+        const std::vector<std::vector<int32_t>> pi = { { 0, 0, 0 }, { 1, 1, 1 }, { 0, 0, 2 } };
+        CHECK(common_dtree_n_columns(pi) == (int32_t) t.tokens.size());
+    }
+
     printf("test-spec-dtree-paths: OK (%d cases)\n", n_cases);
     return 0;
 }
