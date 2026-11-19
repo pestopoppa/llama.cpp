@@ -291,6 +291,14 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+
+        // AK-DTREE-1: a pending partial rollback of src (rs_idx set by seq_rm, consumed by the next graph's
+        // s_copy) is part of src's logical state. The copy must read the same snapshot row, otherwise dst
+        // continues from src's un-rolled-back state. s_copy picks the rollback index of the cell's owner, so dst
+        // carries src's index; each is consumed when its own cell is next gathered.
+        if (n_rs_seq > 0 && (size_t) seq_id_src < rs_idx.size() && (size_t) seq_id_dst < rs_idx.size()) {
+            rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
+        }
     }
 }
 
