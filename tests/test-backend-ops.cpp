@@ -14118,6 +14118,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
 
+    // [AK-DTREE-0] Q8_0 skinny GEMMs at tree-verify widths n = 2..16 on 27B-sized weights (> 6 MiB, so the gfx90a
+    // wvSplitK route q8wv_mul_mat<M> is eligible for M in GGML_HIP_Q8_WVSK_MIN..MAX; odd M > 8 runs M + 1).
+    for (int64_t n = 2; n <= 16; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, n, 5120, {1, 1}, {1, 1}));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
