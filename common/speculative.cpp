@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-tree.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1821,10 +1822,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (dp.tree_alts) {
+                    dp.tree_alts->clear();
+                }
+                if (dp.tree_alts && dp.tree_nodes > 0 && dp.temperature <= 0.0f && n_block_tokens > 1) {
+                    // AK-DTREE-1: alternative root-to-leaf paths over the same lattice (path 0 == result)
+                    const int32_t D = n_block_tokens - 1;
+                    const common_dtree_scores_fn scores = [&](int32_t j, int32_t pred) {
+                        return lattice + (size_t) (beg + j + 1) * n_embd_dec + selector_top_k + (size_t) pred * selector_top_k;
+                    };
+                    const auto paths = common_dtree_build_paths(D, selector_top_k, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                    for (size_t p = 1; p < paths.size(); ++p) {
+                        llama_tokens alt;
+                        alt.reserve(D);
+                        for (int32_t j = 0; j < D; ++j) {
+                            alt.push_back((llama_token) lattice[(size_t) (beg + j + 1) * n_embd_dec + paths[p][j]]);
+                        }
+                        dp.tree_alts->push_back(std::move(alt));
+                    }
+                }
+
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                     if (dp.dists) {
                         dp.dists->clear();
+                    }
+                    if (dp.tree_alts) {
+                        dp.tree_alts->clear();
                     }
                 }
                 continue;
@@ -2191,31 +2215,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
+            // rows of sequences this drafter does not track (AK-DTREE-1 alternative tree paths, or rows
+            // relabelled to -1 after an alternative won) are skipped. A kept row reads the target hidden state
+            // of the previous batch row of its own sequence (each sequence is contiguous in the batch), the first
+            // row of a sequence reads the pending state of the previous run. With every row kept this is exactly
+            // the former right-shift-by-one copy followed by the pending overwrite.
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id s = batch_in.seq_id[k][0];
+                    if (s < 0 || s >= (llama_seq_id) n_seq) {
+                        continue;
+                    }
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { s }, 0);
+                    const float * h_row = k == i_batch_beg[s] ? pending_h[s].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
-
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -2279,6 +2294,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+
+        // AK-DTREE-1: per seq, per drafted position, the top candidates (id, logit) of the MTP head
+        std::vector<std::vector<std::vector<std::pair<llama_token, float>>>> tree_cands(n_seq);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -2354,6 +2372,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                {
+                    const auto & dpt = dparams.at(seq_id);
+                    if (dpt.tree_alts && dpt.tree_nodes > 0 && dpt.temperature <= 0.0f && cur_p->size >= 2) {
+                        std::vector<std::pair<llama_token, float>> c;
+                        for (int k = 0; k < std::min(4, (int) cur_p->size); ++k) {
+                            c.emplace_back(cur_p->data[k].id, cur_p->data[k].logit);
+                        }
+                        tree_cands[seq_id].push_back(std::move(c));
+                    }
+                }
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -2416,8 +2445,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (dp.tree_alts) {
+                dp.tree_alts->clear();
+            }
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                continue;
+            }
+
+            // AK-DTREE-1: MTP drafts one path autoregressively, so an alternative can only take a rank-1/2
+            // candidate of the MTP head at its branch position; the scores are not conditioned on the branch
+            // (the head never saw it), so its continuation is the main path's suffix. Verification is exact
+            // either way; this only bounds how good the alternatives are.
+            const int32_t D = (int32_t) dp.result->size();
+            auto & tc = tree_cands[seq_id];
+            if (dp.tree_alts && dp.tree_nodes > 0 && D > 0 && (int32_t) tc.size() >= D) {
+                int32_t K = 1 << 30;
+                for (int32_t j = 0; j < D; ++j) {
+                    K = std::min(K, (int32_t) tc[j].size());
+                }
+                std::vector<float> sc((size_t) D * K);
+                for (int32_t j = 0; j < D; ++j) {
+                    for (int32_t k = 0; k < K; ++k) {
+                        sc[(size_t) j * K + k] = tc[j][k].second;
+                    }
+                }
+                const common_dtree_scores_fn scores = [&](int32_t j, int32_t) { return sc.data() + (size_t) j * K; };
+                const auto paths = common_dtree_build_paths(D, K, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                for (size_t p = 1; p < paths.size(); ++p) {
+                    llama_tokens alt;
+                    for (int32_t j = 0; j < D; ++j) {
+                        alt.push_back(tc[j][paths[p][j]].first);
+                    }
+                    dp.tree_alts->push_back(std::move(alt));
+                }
             }
         }
     }
@@ -3032,6 +3093,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+    // the drafter context never sees the tree's alternative sequences (AK-DTREE-1)
+    result.speculative.draft_tree_nodes = 0;
 
     if (has_draft) {
         result.devices               = params_spec.devices;

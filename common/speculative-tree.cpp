@@ -124,6 +124,34 @@ int32_t common_dtree_n_columns(const std::vector<std::vector<int32_t>> & paths) 
     return n;
 }
 
+common_dtree_flat common_dtree_flatten(llama_token anchor, const std::vector<std::vector<llama_token>> & paths) {
+    common_dtree_flat t;
+    t.tokens.push_back(anchor);
+    t.parent.push_back(-1);
+    t.depth.push_back(0);
+    for (const auto & p : paths) {
+        int32_t cur = 0;
+        for (size_t d = 0; d < p.size(); ++d) {
+            int32_t next = -1;
+            for (size_t c = 1; c < t.tokens.size(); ++c) {
+                if (t.parent[c] == cur && t.tokens[c] == p[d]) {
+                    next = (int32_t) c;
+                    break;
+                }
+            }
+            if (next < 0) {
+                next = (int32_t) t.tokens.size();
+                t.tokens.push_back(p[d]);
+                t.parent.push_back(cur);
+                t.depth.push_back((int32_t) d + 1);
+            }
+            cur = next;
+        }
+        t.leaf_col.push_back(cur);
+    }
+    return t;
+}
+
 int32_t common_dtree_greedy_accept_len(
         llama_context * ctx, const std::vector<int32_t> & rows, const std::vector<llama_token> & draft) {
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
