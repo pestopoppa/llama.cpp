@@ -517,6 +517,7 @@ struct server_slot {
     std::vector<int32_t> spec_tree_cols_pending; // [AK-DTREE-2] winner's tree columns, committed after sampling
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
+    int32_t spec_tree_emit[common_dtree_auto::N_ARMS] = { -1, -1, -1 };  // DTREE-B: per-arm emitted tokens of this round
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
     int32_t n_tree_rounds    = 0;      // rounds verified with >= 1 alternative path
     int32_t n_tree_alt_wins  = 0;      // rounds an alternative path was accepted
@@ -5633,8 +5634,17 @@ private:
             }
             return cfg >= D + 2 ? cfg : 0;
         }
-        slot.spec_tree_arm = slot.spec_tree_auto.choose();
+        slot.spec_tree_arm = slot.spec_tree_auto.choose(spec_tree_n_active(), slot.prompt.n_tokens());
         return common_dtree_auto::arm_nodes(slot.spec_tree_arm, D);
+    }
+
+    // DTREE-B: batch size bucket of the controller = slots currently generating
+    int32_t spec_tree_n_active() const {
+        int32_t n = 0;
+        for (const auto & s : slots) {
+            n += s.is_processing() ? 1 : 0;
+        }
+        return std::max<int32_t>(1, n);
     }
 
     // AK-DTREE-1: after the target decode of a view, choose each tree slot's winning path by greedy match
@@ -5679,6 +5689,7 @@ private:
             if (ok) {
                 // DTREE-DEVICE-TREE-ACCEPT: device picks only for a provably greedy sampler (else host scan, unchanged)
                 dev_ok = common_sampler_device_greedy_eligible(slot.smpl.get());
+                int32_t best_by_arm[common_dtree_auto::N_ARMS] = { 0, 0, 0 };
                 if (slot.task->params.sampling.temp > 0.0f && common_dtree_sampled_enabled()) {
                     // SPEC-DTREE-DICE V2: replay the accept pass on a clone of the slot's sampler (same RNG state, or
                     // the (seed, position) keyed draw with --rng-poskey), so the winner chosen here is exactly the path
@@ -5715,8 +5726,25 @@ private:
                     slot.spec_tree_rrs_smpl = std::move(probe);
                 } else {
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
+                // DTREE-B: what each narrower arm would have emitted. Paths are added best first, so arm a's tree is
+                // the main path plus the alternatives whose cumulative extra columns fit arm a's budget.
+                const int32_t D = (int32_t) slot.spec_draft.size();
+                int32_t used_cols = 0;
+                for (int32_t k = 0; k < common_dtree_auto::N_ARMS; ++k) {
+                    best_by_arm[k] = best_n;
+                }
                 for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
                     const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a], dev_ok);
+                    int32_t j = 0;
+                    while (j < D && j < (int32_t) slot.spec_tree_alts[a].size() && slot.spec_tree_alts[a][j] == slot.spec_draft[j]) {
+                        ++j;
+                    }
+                    used_cols += D - j;
+                    for (int32_t k = 1; k < common_dtree_auto::N_ARMS; ++k) {
+                        if (used_cols <= common_dtree_auto::arm_nodes(k, D) - (D + 1)) {
+                            best_by_arm[k] = std::max(best_by_arm[k], n);
+                        }
+                    }
                     if (n > best_n) {
                         best   = (int32_t) a;
                         best_n = n;
@@ -5724,6 +5752,11 @@ private:
                 }
                 }
                 slot.n_tree_rounds++;
+                if (slot.spec_tree_arm >= 0) {
+                    for (int32_t k = 0; k < common_dtree_auto::N_ARMS; ++k) {
+                        slot.spec_tree_emit[k] = k <= slot.spec_tree_arm ? 1 + best_by_arm[k] : -1;
+                    }
+                }
             }
 
             if (slot.spec_tree_batch) {
@@ -6590,8 +6623,19 @@ private:
 
             // AK-DTREE-1 auto: time of the whole round (draft + verify + accept) and the tokens it emitted
             if (slot.spec_tree_arm >= 0) {
-                slot.spec_tree_auto.observe(slot.spec_tree_arm, (int32_t) ids.size(), t_now - slot.t_spec_tree_round);
+                // the used arm's count is the real emission; narrower arms come from spec_tree_resolve (chain
+                // rounds have no alternatives: only arm 0 is known)
+                int32_t emit[common_dtree_auto::N_ARMS] = { -1, -1, -1 };
+                for (int32_t k = 0; k < common_dtree_auto::N_ARMS; ++k) {
+                    emit[k] = k < slot.spec_tree_arm ? slot.spec_tree_emit[k] : -1;
+                }
+                emit[slot.spec_tree_arm] = (int32_t) ids.size();
+                slot.spec_tree_auto.observe(slot.spec_tree_arm, emit, t_now - slot.t_spec_tree_round,
+                                            spec_tree_n_active(), slot.prompt.n_tokens());
                 slot.spec_tree_arm = -1;
+                for (auto & e : slot.spec_tree_emit) {
+                    e = -1;
+                }
             }
 
             if (slot.n_accepted_per_pos.empty()) {
