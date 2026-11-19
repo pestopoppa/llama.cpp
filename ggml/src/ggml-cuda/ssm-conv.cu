@@ -123,17 +123,74 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// [AK-DTREE-2] tree-verification SSM_CONV: token t's window is its d_conv-1 nearest ancestors (walking
+// parent links; conv history columns once the walk passes the root) then t. One thread per channel,
+// taps summed in the chain kernel's order. parent: I32 [n_t, n_s].
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_tree_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+                                         const float * __restrict__ bias, const int32_t * __restrict__ parent,
+                                         const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                         float * __restrict__ dst, const int dst_nb0, const int dst_nb1, const int dst_nb2,
+                                         const int64_t n_t) {
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+
+    const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    float *       y_block = (float *) ((char *) dst + bidx * dst_nb2 + bidy * split_d_inner * dst_nb0);
+    const int32_t * par   = parent + bidx * n_t;
+
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+    const float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
+
+    for (int64_t i = 0; i < n_t; i++) {
+        int widx[d_conv];
+        int pos = (int) i + (int) d_conv - 1;
+        widx[d_conv - 1] = pos;
+#pragma unroll
+        for (int j = (int) d_conv - 2; j >= 0; j--) {
+            if (pos >= (int) d_conv - 1) {
+                const int p = par[pos - ((int) d_conv - 1)];
+                pos = p >= 0 ? p + (int) d_conv - 1 : (int) d_conv - 2;
+            } else {
+                pos = pos - 1;
+            }
+            widx[j] = pos;
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x_block[tid * stride_x + widx[j]] * w[j];
+        }
+        sumf += b;
+        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
-                              const int64_t n_s, cudaStream_t stream) {
+                              const int64_t n_s, cudaStream_t stream, const int32_t * parent = nullptr) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
-        if (n_t <= 32) {
+        if (parent != nullptr) {
+            const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
+            ssm_conv_tree_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
+                src0, src1, bias, parent, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+        } else if (n_t <= 32) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
@@ -196,11 +253,17 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(ggml_nelements(bias) == nr);
     }
 
+    // [AK-DTREE-2] tree variant: parent links in src[2]
+    const int32_t * parent_d = dst->src[2] != nullptr ? (const int32_t *) dst->src[2]->data : nullptr;
+    if (parent_d != nullptr) {
+        GGML_ASSERT(dst->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(dst->src[2]));
+    }
+
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, parent_d);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, parent_d);
     }
 }
