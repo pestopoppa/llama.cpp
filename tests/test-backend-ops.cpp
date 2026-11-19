@@ -5857,6 +5857,98 @@ struct test_ssm_conv : public test_case {
     std::vector<ggml_tensor *> autokernel_final_state_outputs() override { return { final_state }; }
 };
 
+// [AK-DTREE-2] tree-verification ops (parent-indexed SSM_CONV / GATED_DELTA_NET record mode).
+// Parent arrays: tree_kind 0 = chain, 1 = Infernix layout (main chain 0..K, side columns after it),
+// 2 = bushy (several root children). Every sequence gets the same tree, shifted per seq.
+static std::vector<int32_t> dtree_parents(int kind, int64_t T, int64_t seq) {
+    std::vector<int32_t> p(T);
+    for (int64_t t = 0; t < T; ++t) {
+        if (kind == 0 || t == 0) {
+            p[t] = (int32_t) t - 1;
+        } else if (kind == 1) {
+            const int64_t K = (T + 1) / 2;   // main chain 0..K-1, side columns hang off it
+            p[t] = t < K ? (int32_t) (t - 1) : (int32_t) ((t * 7 + seq) % K);
+        } else {
+            p[t] = (t % 3 == 0) ? -1 : (int32_t) ((t * 5 + seq) % t);
+        }
+    }
+    return p;
+}
+
+static void dtree_set_parents(ggml_tensor * t, int kind) {
+    std::vector<int32_t> all;
+    for (int64_t s = 0; s < t->ne[1]; ++s) {
+        auto p = dtree_parents(kind, t->ne[0], s);
+        all.insert(all.end(), p.begin(), p.end());
+    }
+    ggml_backend_tensor_set(t, all.data(), 0, all.size() * sizeof(int32_t));
+}
+
+struct test_ssm_conv_tree : public test_case {
+    const int64_t d_conv, d_inner, n_t, n_s;
+    const int tree_kind;
+    std::string vars() override { return VARS_TO_STR5(d_conv, d_inner, n_t, n_s, tree_kind); }
+    test_ssm_conv_tree(int64_t d_conv = 4, int64_t d_inner = 1024, int64_t n_t = 8, int64_t n_s = 1, int tree_kind = 1)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s), tree_kind(tree_kind) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + n_t, d_inner, n_s);
+        ggml_tensor * c   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * par = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_t, n_s);
+        ggml_set_name(par, "parent");
+        ggml_tensor * out = ggml_ssm_conv_tree(ctx, a, c, par);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                dtree_set_parents(t, tree_kind);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_gated_delta_net_tree : public test_case {
+    const int64_t head_count, head_size, n_tokens, n_seqs;
+    const int v_repeat;
+    const bool kda;
+    const int tree_kind;
+    std::string vars() override { return VARS_TO_STR7(head_count, head_size, n_tokens, n_seqs, v_repeat, kda, tree_kind); }
+    test_gated_delta_net_tree(int64_t head_count = 4, int64_t head_size = 64, int64_t n_tokens = 8, int64_t n_seqs = 1,
+            int v_repeat = 1, bool kda = false, int tree_kind = 1)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), kda(kda), tree_kind(tree_kind) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hv = head_count * v_repeat;
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, hv, n_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, hv, n_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, hv, n_tokens, n_seqs);
+        ggml_tensor * st   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, hv, n_seqs);
+        ggml_tensor * par  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tokens, n_seqs);
+        ggml_set_name(par, "parent");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        beta = ggml_sigmoid(ctx, beta);
+        g = ggml_neg(ctx, ggml_softplus(ctx, g));
+        ggml_tensor * out = ggml_gated_delta_net_tree(ctx, q, k, v, g, beta, st, par);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                dtree_set_parents(t, tree_kind);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -13983,6 +14075,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, vr, false, false, 4));
+    }
+    // [AK-DTREE-2] tree-verification ops at 27B (16 k-heads x3 -> 48 v-heads) and A3B (16 x2 -> 32) GDN
+    // dims and conv widths (27B 10240, A3B 8192 channels), W in {8, 12, 16}, chain/layout/bushy trees.
+    for (int kind : {0, 1, 2}) {
+        for (int64_t W : {8, 12, 16}) {
+            test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, W, 1, 3, false, kind));
+            test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, W, 1, 2, false, kind));
+            test_cases.emplace_back(new test_ssm_conv_tree(4, 10240, W, 1, kind));
+            test_cases.emplace_back(new test_ssm_conv_tree(4, 8192, W, 1, kind));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_tree(4, 64, 12, 3, 1, false, kind));
+        test_cases.emplace_back(new test_gated_delta_net_tree(4, 32, 12, 2, 1, true, kind));
+        test_cases.emplace_back(new test_ssm_conv_tree(4, 1024, 12, 3, kind));
     }
     // S_v=64 snapshot tails and the 64 < n_tokens <= 64+K edges
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, 4));

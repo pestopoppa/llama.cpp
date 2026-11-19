@@ -5814,6 +5814,21 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent) {
+    struct ggml_tensor * result = ggml_ssm_conv(ctx, sx, c);
+    GGML_ASSERT(parent->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent));
+    GGML_ASSERT(parent->ne[0] == result->ne[1]); // n_t
+    GGML_ASSERT(parent->ne[1] == result->ne[2]); // n_s
+    GGML_ASSERT(parent->ne[2] == 1 && parent->ne[3] == 1);
+    result->src[2] = parent;
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6550,6 +6565,26 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent) {
+    const int64_t n_tokens = v->ne[2];
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, n_tokens);
+    GGML_ASSERT(parent->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent));
+    GGML_ASSERT(parent->ne[0] == n_tokens);
+    GGML_ASSERT(parent->ne[1] == v->ne[3]);
+    GGML_ASSERT(parent->ne[2] == 1 && parent->ne[3] == 1);
+    result->src[6] = parent;
     return result;
 }
 

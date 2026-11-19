@@ -10958,6 +10958,21 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
+// [AK-DTREE-2] one token of SSM_CONV over `ir` rows: window tap i0 of row i1 is s[i0 + i1*ncs].
+// Chain and tree paths share this single (non-inlined) body so their FMA contraction is identical
+// and a tree path is bit-identical to the chain op.
+static __attribute__((noinline)) void ggml_ssm_conv_rows_f32(
+        const float * s, int ncs, const float * c, int nc, float * x, int ir) {
+    for (int i1 = 0; i1 < ir; ++i1) {
+        // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
+        float sumf = 0.0f;
+        for (int i0 = 0; i0 < nc; ++i0) {
+            sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+        }
+        x[i1] = sumf;
+    }
+}
+
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10986,6 +11001,44 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int ir1 = MIN(ir0 + dr, nr);
     const int ir  = ir1 - ir0;
 
+    // [AK-DTREE-2] tree mode: src[2] = parent [n_t, n_s] (I32). Window of token t = its nc-1
+    // nearest ancestors (then conv history) + t, in the chain's summation order.
+    const ggml_tensor * src2 = dst->src[2];
+    if (src2 != nullptr) {
+        GGML_ASSERT(src2->type == GGML_TYPE_I32);
+        GGML_ASSERT(nc <= 16);
+        int widx[16];
+        std::vector<float> win((size_t) nc * (ir > 0 ? ir : 0));
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            const int32_t * par = (const int32_t *) ((const char *) src2->data + i3*src2->nb[1]);
+            for (int i2 = 0; i2 < n_t; ++i2) {
+                // sx column index of each window tap, oldest first
+                int pos = i2 + nc - 1;
+                widx[nc - 1] = pos;
+                for (int w = nc - 2; w >= 0; --w) {
+                    if (pos >= nc - 1) {
+                        const int p = par[pos - (nc - 1)];
+                        GGML_ASSERT(p < pos - (nc - 1));
+                        pos = p >= 0 ? p + nc - 1 : nc - 2;
+                    } else {
+                        pos = pos - 1;
+                    }
+                    widx[w] = pos;
+                }
+                const float * s = (const float *) ((const char *) src0->data + ir0*(src0->nb[1]) + i3*(src0->nb[2]));
+                const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1]));
+                float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2]));
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        win[i0 + i1*nc] = s[widx[i0] + i1*ncs];
+                    }
+                }
+                ggml_ssm_conv_rows_f32(win.data(), nc, c, nc, x, ir);
+            }
+        }
+        return;
+    }
+
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {
             // {d_conv - 1 + n_t, d_inner, n_seqs}
@@ -10995,18 +11048,7 @@ static void ggml_compute_forward_ssm_conv_f32(
             float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
 
             // TODO: transpose the output for smaller strides for big batches?
-            // d_inner
-            for (int i1 = 0; i1 < ir; ++i1) {
-                // rowwise dot product
-                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
-                float sumf = 0.0f;
-
-                // d_conv
-                for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
-                }
-                x[i1] = sumf;
-            }
+            ggml_ssm_conv_rows_f32(s, ncs, c, nc, x, ir);
         }
     }
 }
@@ -12268,6 +12310,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float * state_in_base = (const float *)src_state->data;
 
+    // [AK-DTREE-2] optional parent links (tree verification); requires K == n_tokens.
+    const ggml_tensor * src_parent = dst->src[6];
+    const int32_t * par_d = src_parent ? (const int32_t *) src_parent->data : nullptr;
+    GGML_ASSERT(par_d == nullptr || K == n_tokens);
+
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
     const int64_t rq3 = nev3 / neq3;
@@ -12300,6 +12347,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
         for (int64_t t = 0; t < n_tokens; t++) {
+            // [AK-DTREE-2] tree walk: column t continues from its parent's state. A chain parent
+            // (t-1) keeps the working state untouched, so a chain tree is the chain code path.
+            if (par_d != nullptr) {
+                const int32_t p = par_d[iv3 * n_tokens + t];
+                GGML_ASSERT(p >= -1 && p < t);
+                if (p != t - 1) {
+                    const float * src_s = p < 0 ? s_in
+                        : state_out_base + (n_tokens - 1 - p) * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
+                    memcpy(s_out, src_s, S_v * S_v * sizeof(float));
+                }
+            }
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);

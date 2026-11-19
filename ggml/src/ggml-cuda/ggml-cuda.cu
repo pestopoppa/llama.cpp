@@ -5382,6 +5382,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
+            // [AK-DTREE-2] tree variant (parent links in src[2]) has no device kernel yet
+            if (op->src[2] != nullptr) {
+                return false;
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
@@ -5450,6 +5454,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+            // [AK-DTREE-2] tree-walk variant (parent links in src[6]) has no device kernel yet
+            if (op->src[6] != nullptr) {
+                return false;
+            }
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;
