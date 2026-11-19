@@ -311,6 +311,66 @@ std::vector<float> llama_kv_compress_score(
     return scores;
 }
 
+// Selection mirrors the L4 heuristic of 81c9ad1ec: first N + last M + evenly strided middle.
+static std::vector<bool> select_uniform_l4(int n, float keep_ratio, int keep_first, int keep_last) {
+    std::vector<bool> keep(n, false);
+    int n_keep = 0;
+    for (int i = 0; i < std::min(keep_first, n); i++) { keep[i] = true; n_keep++; }
+    for (int i = std::max(keep_first, n - keep_last); i < n; i++) { keep[i] = true; n_keep++; }
+
+    const int target       = std::max(n_keep, (int) (n * keep_ratio));
+    const int middle_start = std::min(keep_first, n);
+    const int middle_end   = std::max(middle_start, n - keep_last);
+    if (middle_end > middle_start && target > n_keep) {
+        const int step = std::max(1, (middle_end - middle_start) / (target - n_keep));
+        for (int i = middle_start; i < middle_end && n_keep < target; i += step) {
+            keep[i] = true;
+            n_keep++;
+        }
+    }
+    return keep;
+}
+
+int llama_kv_compress_uniform_l4(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        float           keep_ratio,
+        int             keep_first,
+        int             keep_last,
+        float           beta,
+        int           * n_beta_set) {
+    if (n_beta_set) *n_beta_set = 0;
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem || keep_ratio <= 0.0f || keep_ratio > 1.0f) return -1;
+
+    const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
+    if (pos_max < 0) return -1;
+    const int n = (int) pos_max + 1;
+
+    const std::vector<bool> keep = select_uniform_l4(n, keep_ratio, keep_first, keep_last);
+
+    int evicted = 0;
+    int range_start = -1;
+    for (int p = 0; p <= n; p++) {
+        const bool should_evict = (p < n) && !keep[p];
+        if (should_evict && range_start < 0) {
+            range_start = p;
+        } else if (!should_evict && range_start >= 0) {
+            if (llama_memory_seq_rm(mem, seq_id, range_start, p)) {
+                evicted += p - range_start;
+            }
+            range_start = -1;
+        }
+    }
+
+    for (int p = 0; p < n; p++) {
+        if (keep[p] && llama_memory_set_beta(mem, seq_id, p, beta) && n_beta_set) {
+            (*n_beta_set)++;
+        }
+    }
+    return evicted;
+}
+
 int llama_kv_compress_evict(
         llama_context * ctx,
         llama_seq_id    seq_id,

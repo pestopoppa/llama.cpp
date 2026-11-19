@@ -787,6 +787,15 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Attention Matching (arxiv:2602.16284): set the per-token additive attention bias (beta) of the KV cell
+    // at `pos`. It is added to the KQ scores only when the env knob LLAMA_KV_AM_BETA=1 is set (default off,
+    // otherwise a pure no-op). Returns false if the memory type does not support it or `pos` is not cached.
+    LLAMA_API bool llama_memory_set_beta(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos pos,
+                     float beta);
+
     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

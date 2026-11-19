@@ -181,6 +181,11 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+bool llama_memory_hybrid::set_beta(llama_seq_id seq_id, llama_pos pos, float beta) {
+    // only the attention cache carries KV rows; the recurrent cache has no per-position bias
+    return mem_attn->set_beta(seq_id, pos, beta);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {

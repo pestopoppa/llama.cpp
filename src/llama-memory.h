@@ -116,6 +116,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // Attention Matching: set the per-token additive attention bias of the cell at `pos`
+    // (only consumed when LLAMA_KV_AM_BETA=1); false = unsupported memory type or position not found
+    virtual bool set_beta(llama_seq_id /*seq_id*/, llama_pos /*pos*/, float /*beta*/) { return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

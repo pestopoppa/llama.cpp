@@ -1619,7 +1619,10 @@ json server_task_result_slot_erase::to_json() {
 json server_task_result_slot_compact::to_json() {
     return json {
         { "id_slot",                    id_slot },
-        { "scorer",                     "expected_attention" },
+        { "scorer",                     scorer },
+        { "beta",                       beta },
+        { "n_beta_set",                 n_beta_set },
+        { "am_beta_env",                (getenv("LLAMA_KV_AM_BETA") != nullptr && std::string(getenv("LLAMA_KV_AM_BETA")) == "1") },
         { "n_evicted",                  n_evicted },
         { "keep_ratio",                 keep_ratio },
         { "pos_max_after",              pos_max_after },

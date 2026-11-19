@@ -689,6 +689,25 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+bool llama_kv_cache::set_beta(llama_seq_id seq_id, llama_pos pos, float beta) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.pos_get(i) != pos) {
+            continue;
+        }
+
+        llama_kv_cell_ext ext = cells.ext_get(i);
+        ext.beta = beta;
+        cells.ext_set(i, ext);
+        return true;
+    }
+
+    return false; // position not found
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -1615,6 +1634,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
 
+    const bool am_beta = llama_kv_am_beta_enabled(); // default off: mask_keep stays 0.0f
+
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
@@ -1738,7 +1759,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (alibi) {
                     data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = mask_keep;
+                    data[idst + j] = am_beta ? llama_cast<T>(llama_kv_am_mask_value(cells.ext_get(j), true)) : mask_keep;
                 }
 
                 continue;
@@ -2353,7 +2374,7 @@ bool llama_kv_cache::chunk_inject(llama_io_read_i & io, llama_seq_id seq_id, lla
 
         if (has_cell_ext()) {
             llama_kv_cell_ext ext;
-            io.read(&ext, sizeof(ext));
+            io.read(&ext, LLAMA_KV_CELL_EXT_WIRE_SIZE);
 
             // like seq_add(), only the base text position moves; the 2D (x, y) positions are text-equal for text chunks
             if (hparams.n_pos_per_embd() > 1) {
@@ -2819,7 +2840,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 
             if (has_cell_ext()) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
-                io.write(&ext, sizeof(ext));
+                io.write(&ext, LLAMA_KV_CELL_EXT_WIRE_SIZE);
             }
 
             for (const auto & seq_id : seq_ids) {
@@ -2969,7 +2990,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
-                io.read(&ext, sizeof(ext));
+                io.read(&ext, LLAMA_KV_CELL_EXT_WIRE_SIZE);
 
                 if (hparams.n_pos_per_embd() > 1) {
                     ubatch.pos[i + ubatch.n_tokens]   = ext.y;
@@ -3065,7 +3086,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
-                io.read(&ext, sizeof(ext));
+                io.read(&ext, LLAMA_KV_CELL_EXT_WIRE_SIZE);
                 cells.ext_set(i, ext);
             }
 

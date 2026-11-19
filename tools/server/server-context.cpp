@@ -3882,9 +3882,18 @@ private:
 
                     llama_kv_compress_params ea_params = make_server_expected_attention_params(task);
 
-                    const int n_evicted = llama_kv_compress_evict(ctx_tgt, id_slot, ea_params);
+                    int n_evicted   = 0;
+                    int n_beta_set  = 0;
+                    const bool l4   = task.slot_action.selector == "uniform_l4";
+                    if (l4) {
+                        // Attention Matching L4 lower bound: uniform subsample + constant beta (no refit)
+                        n_evicted = llama_kv_compress_uniform_l4(ctx_tgt, id_slot, task.slot_action.keep_ratio,
+                                task.slot_action.keep_first, task.slot_action.keep_last, task.slot_action.beta, &n_beta_set);
+                    } else {
+                        n_evicted = llama_kv_compress_evict(ctx_tgt, id_slot, ea_params);
+                    }
                     if (n_evicted < 0) {
-                        send_error(task, "Expected Attention compression failed", ERROR_TYPE_SERVER);
+                        send_error(task, l4 ? "Attention Matching L4 compaction failed" : "Expected Attention compression failed", ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -3898,6 +3907,9 @@ private:
                     res->pos_max_after = new_pos_max;
                     res->compact_positions = ea_params.compact_positions;
                     res->logical_context_reclaimed = false;
+                    res->scorer        = l4 ? "am_l4_uniform" : "expected_attention";
+                    res->beta          = l4 ? task.slot_action.beta : 0.0f;
+                    res->n_beta_set    = n_beta_set;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -7462,6 +7474,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
     task.slot_action.keep_first     = body.is_object() && body.contains("keep_first")     ? body["keep_first"].get<int>()      : 8;
     task.slot_action.n_future       = body.is_object() && body.contains("n_future")       ? body["n_future"].get<int>()        : 128;
     task.slot_action.use_covariance = body.is_object() && body.contains("use_covariance") ? body["use_covariance"].get<bool>() : true;
+    // "selector":"uniform_l4" -> Attention Matching L4 lower bound (uniform subsample + constant "beta", "keep_last");
+    // beta only acts when the server runs with LLAMA_KV_AM_BETA=1. Default stays Expected Attention.
+    if (body.is_object() && body.contains("selector") && body["selector"].is_string()) {
+        task.slot_action.selector = body["selector"].get<std::string>();
+    }
+    if (task.slot_action.selector != "expected_attention" && task.slot_action.selector != "uniform_l4") {
+        res->error(format_error_response("selector must be 'expected_attention' or 'uniform_l4'", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    task.slot_action.beta      = body.is_object() && body.contains("beta")      ? body["beta"].get<float>()    : 0.1f;
+    task.slot_action.keep_last = body.is_object() && body.contains("keep_last") ? body["keep_last"].get<int>() : 15;
 
     // Layer-adaptive weights for autopilot tuning. Pass "layer_weights": [..] to emphasize
     // specific attention layers. If omitted, uniform weighting across all attention layers.

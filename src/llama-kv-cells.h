@@ -5,6 +5,8 @@
 
 #include <bitset>
 #include <cassert>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -19,6 +21,11 @@ struct llama_kv_cell_ext {
     // use case: n-gram embeddings hash
     llama_token tok = LLAMA_TOKEN_NULL;
 
+    // Attention Matching (arxiv:2602.16284) per-cell additive attention bias. Consumed by the KQ mask
+    // only when LLAMA_KV_AM_BETA=1 (default OFF); never serialized, so it MUST stay the last member
+    // (state files carry the first LLAMA_KV_CELL_EXT_WIRE_SIZE bytes only).
+    float beta = 0.0f;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -30,6 +37,20 @@ struct llama_kv_cell_ext {
         *this = llama_kv_cell_ext{};
     }
 };
+
+// bytes of llama_kv_cell_ext written to / read from state buffers (everything before `beta`)
+static constexpr size_t LLAMA_KV_CELL_EXT_WIRE_SIZE = offsetof(llama_kv_cell_ext, beta);
+
+// default-off knob: inject llama_kv_cell_ext::beta into the KQ mask (read per mask build, not cached)
+static inline bool llama_kv_am_beta_enabled() {
+    const char * e = getenv("LLAMA_KV_AM_BETA");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+
+// value written into the KQ mask for a kept (unmasked) cell
+static inline float llama_kv_am_mask_value(const llama_kv_cell_ext & ext, bool am_beta) {
+    return am_beta ? ext.beta : 0.0f;
+}
 
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests

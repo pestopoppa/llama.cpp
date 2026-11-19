@@ -148,6 +148,13 @@ llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
 }
 
+bool llama_kv_cache_iswa::set_beta(llama_seq_id seq_id, llama_pos pos, float beta) {
+    // the SWA cache only holds the window; a position outside it is legitimately absent there
+    const bool base = kv_base->set_beta(seq_id, pos, beta);
+    kv_swa->set_beta(seq_id, pos, beta);
+    return base;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown();
     for (const auto & buft_size : kv_swa->memory_breakdown()) {

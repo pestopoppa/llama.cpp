@@ -43,6 +43,20 @@ std::vector<float> llama_kv_compress_score(
         llama_seq_id    seq_id,
         const llama_kv_compress_params & params);
 
+// Attention Matching L4 "lower bound" selector (uniform subsample + constant beta, NO NNLS/OLS refit):
+// keep the first `keep_first` and last `keep_last` positions plus an evenly strided sample of the middle until
+// `keep_ratio` of the sequence is kept, evict the rest (gapped, via llama_memory_seq_rm) and set `beta` on every
+// kept position through llama_memory_set_beta (consumed only with LLAMA_KV_AM_BETA=1).
+// Returns the number of evicted entries, or -1 on error; *n_beta_set (optional) = positions that took a beta.
+int llama_kv_compress_uniform_l4(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        float           keep_ratio,
+        int             keep_first,
+        int             keep_last,
+        float           beta,
+        int           * n_beta_set);
+
 // Score and evict low-importance KV entries in one call.
 // Evicts the bottom `compression_ratio` fraction of non-sink entries.
 // Returns number of entries evicted, or -1 on error.

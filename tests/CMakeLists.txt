@@ -416,6 +416,8 @@ llama_build_and_test(test-moe-fused-upgate.cpp) # CH-19 Q8_0 opt-in; external ga
 llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
+# [AM-PORT-1] Attention Matching beta injection (default-off LLAMA_KV_AM_BETA), model-free vs numpy reference
+llama_build_and_test(test-am-beta-injection.cpp)
 
 if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     llama_test(test-backend-ops NAME test-backend-ops-iqk

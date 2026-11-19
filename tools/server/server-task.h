@@ -200,6 +200,11 @@ struct server_task {
         int   n_future         = 128;   // RoPE averaging window
         bool  use_covariance   = true;  // include covariance term (more accurate)
         std::vector<float> layer_weights; // per-attention-layer scoring weights (empty = uniform)
+
+        // Attention Matching L4 lower bound (selector "uniform_l4"): uniform subsample + constant beta, no refit
+        std::string selector   = "expected_attention";
+        float beta             = 0.1f;  // constant beta set on every kept cell (needs LLAMA_KV_AM_BETA=1 to act)
+        int   keep_last        = 15;    // trailing positions always kept
     };
     slot_action slot_action;
 
@@ -603,6 +608,9 @@ struct server_task_result_slot_compact : server_task_result {
     llama_pos  pos_max_after = 0;
     bool       compact_positions = false;
     bool       logical_context_reclaimed = false;
+    std::string scorer       = "expected_attention";
+    float      beta          = 0.0f;
+    int        n_beta_set    = 0;
 
     virtual json to_json() override;
 };
