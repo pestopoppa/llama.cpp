@@ -99,6 +99,8 @@ add_library(${TARGET}
     sampling.cpp
     sampling.h
     speculative.cpp
+    speculative-tree.cpp
+    speculative-tree.h
     speculative.h
     unicode.cpp
     unicode.h
