@@ -58,7 +58,7 @@ static llama_context * make_ctx(llama_model * model, int n_threads) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 2048; cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = 1;
     cp.n_threads = n_threads; cp.n_threads_batch = n_threads;
-    cp.n_rs_seq = 15; // up to 16 tree columns
+    cp.n_rs_seq = getenv("DTREE_NRS") ? (uint32_t) atoi(getenv("DTREE_NRS")) : 15; // up to 16 tree columns
     llama_context * ctx = llama_init_from_model(model, cp);
     CHECK(ctx);
     return ctx;
@@ -74,6 +74,7 @@ int main(int argc, char ** argv) {
     const int n_gpu     = argc > 4 ? atoi(argv[4]) : 0;
     g_rate = argc > 5 && std::string(argv[5]) == "rate";
 
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = n_gpu;
