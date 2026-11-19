@@ -557,7 +557,7 @@ static bool gdn_chunked_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     return true;
 }
 
-template <int S_v, bool KDA, bool keep_rs_t, typename state_t>
+template <int S_v, bool KDA, bool keep_rs_t, typename state_t, bool tree_t = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -583,7 +583,8 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
-                                     int           K) {
+                                     int           K,
+                                     const int32_t * parent = nullptr) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -617,6 +618,20 @@ gated_delta_net_cuda(const float * q,
     }
 
     for (int t = 0; t < n_tokens; t++) {
+        if constexpr (tree_t) {
+            // [AK-DTREE-2] tree walk (record mode): column t continues from its parent's state. Each warp owns one
+            // state column and reloads only the shard its own lanes stored into the parent's snapshot slot, so no
+            // cross-thread synchronisation is needed. F32 state only: the reload is exact.
+            const int p = parent[sequence * n_tokens + t];
+            if (p != t - 1) {
+                const state_t * src_s = p < 0 ? curr_state
+                    : state + ((int64_t) n_tokens - 1 - p) * state_slot_stride + col * S_v;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[r] = gdn_load(src_s[r * warp_size + lane]);
+                }
+            }
+        }
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -732,7 +747,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream, const int32_t * parent = nullptr) {
     // prefill with n_tokens >= GGML_CUDA_GDN_CHUNKED_MIN_TOKENS on CDNA takes gdn_chunked_try (above) instead
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -745,29 +760,65 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
+            if constexpr (keep_rs_t) {
+                if (parent != nullptr) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, true, state_t, true>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, state_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, (const int32_t *) nullptr);
             break;
         case 32:
+            if constexpr (keep_rs_t) {
+                if (parent != nullptr) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, true, state_t, true>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, state_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, (const int32_t *) nullptr);
             break;
         case 64: {
+            if constexpr (keep_rs_t) {
+                if (parent != nullptr) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, true, state_t, true>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, state_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, (const int32_t *) nullptr);
             break;
         }
         case 128: {
+            if constexpr (keep_rs_t) {
+                if (parent != nullptr) {
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, true, state_t, true>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, state_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, (const int32_t *) nullptr);
             break;
         }
         default:
@@ -785,11 +836,12 @@ static void gdn_dispatch(bool kda, bool keep_rs,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
-        int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
+        const int32_t * parent = nullptr) {
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, parent);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
@@ -797,7 +849,7 @@ static void gdn_dispatch(bool kda, bool keep_rs,
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, parent);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
@@ -880,6 +932,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
             state_slot_stride = cache->slot_stride;
         }
 
+        // [AK-DTREE-2] tree-walk variant: recurrent kernel only (never chunked), F32 state.
+        if (dst->src[6] != nullptr) {
+            GGML_ASSERT(keep_rs && K == n_tokens);
+            GGML_ASSERT(dst->src[6]->type == GGML_TYPE_I32 && ggml_is_contiguous(dst->src[6]));
+            gdn_dispatch<float>(kda, true, q_d, k_d, v_d, g_d, b_d,
+                (const float *) src_state->data, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream,
+                (const int32_t *) dst->src[6]->data);
+            return;
+        }
         if (gdn_chunked_try<float>(ctx, src_q, src_k, q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride)) {
             return;
@@ -889,6 +951,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
     } else {
         GGML_ASSERT(cache == nullptr);
+        GGML_ASSERT(dst->src[6] == nullptr); // [AK-DTREE-2] tree walk is F32-state only
         nv_bfloat16 * dst_d       = (nv_bfloat16 *) dst->data;
         nv_bfloat16 * state_d     = dst_d + S_v * H * n_tokens * n_seqs;
         int64_t state_slot_stride = S_v * S_v * H * n_seqs;
