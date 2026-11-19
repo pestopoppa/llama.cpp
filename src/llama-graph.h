@@ -961,6 +961,8 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    // DTREE-A: per-output-row argmax of t_logits computed on the device (LLAMA_DEVICE_ARGMAX=1), I32 [n_outputs]
+    ggml_tensor * t_argmax      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     // [n_embd, n_outputs] architecture-defined hidden state used to seed NextN/MTP decoders.

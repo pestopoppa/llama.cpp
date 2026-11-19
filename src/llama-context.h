@@ -91,6 +91,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    llama_token get_argmax_ith(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -355,6 +356,9 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    // DTREE-A: device argmax per output row (LLAMA_DEVICE_ARGMAX=1); empty / -1 when not computed
+    std::vector<int32_t> argmax_out;
+    bool                 argmax_valid = false;
 
     struct swap_info {
         uint32_t i0;

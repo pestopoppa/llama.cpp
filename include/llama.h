@@ -1173,6 +1173,10 @@ extern "C" {
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
+    // DTREE-A: argmax of output row i computed on the device (env LLAMA_DEVICE_ARGMAX=1; first maximum on ties).
+    // LLAMA_TOKEN_NULL when it was not computed for the last decode.
+    LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
+
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().
     // Returns NULL if no probabilities were generated.
