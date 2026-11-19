@@ -159,6 +159,15 @@ int32_t common_dtree_greedy_accept_len(
 
     int32_t n = 0;
     for (size_t i = 0; i < draft.size() && i < rows.size(); ++i) {
+        // DTREE-A: the device argmax when the graph computed it (no n_vocab scan on the host)
+        const llama_token dam = llama_get_argmax_ith(ctx, rows[i]);
+        if (dam != LLAMA_TOKEN_NULL) {
+            if (dam != draft[i]) {
+                break;
+            }
+            ++n;
+            continue;
+        }
         const float * l = llama_get_logits_ith(ctx, rows[i]);
         if (l == nullptr) {
             break;
@@ -197,47 +206,81 @@ int32_t common_dtree_auto::arm_nodes(int32_t arm, int32_t D) {
     }
 }
 
-int32_t common_dtree_auto::choose() const {
-    // initial timing: widest first, 3 rounds each
+int32_t common_dtree_auto::bucket(int32_t n_batch, int32_t n_ctx) {
+    const int32_t b = n_batch <= 1 ? 0 : (n_batch == 2 ? 1 : 2);
+    const int32_t c = n_ctx <= 8192 ? 0 : (n_ctx <= 32768 ? 1 : (n_ctx <= 65536 ? 2 : 3));
+    return b * N_CTX_B + c;
+}
+
+int32_t common_dtree_auto::choose(int32_t n_batch, int32_t n_ctx) {
+    if (n_batch > 4) {
+        return 0;
+    }
+    const int32_t b = bucket(n_batch, n_ctx);
+    // timing first: 3 rounds per arm in this bucket, widest first
     for (int32_t a = N_ARMS - 1; a >= 0; --a) {
-        if (n_obs[a] < 3) {
+        if (n_t[b][a] < 3) {
             return a;
         }
     }
-    int32_t best = 0;
-    for (int32_t a = 1; a < N_ARMS; ++a) {
-        if (rate[a] > rate[best]) {
-            best = a;
+    // gain data: the widest arm's rounds measure every arm
+    for (int32_t a = 0; a < N_ARMS; ++a) {
+        if (n_gain[a] < GAIN_MIN) {
+            return N_ARMS - 1;
         }
     }
-    // periodic re-timing of the other arms: one round in 32, cycling through them
-    if (n_round % 32 == 31) {
-        const int32_t k = (int32_t) ((n_round / 32) % (N_ARMS - 1));
-        int32_t other = 0, seen = 0;
-        for (int32_t a = 0; a < N_ARMS; ++a) {
-            if (a == best) {
-                continue;
-            }
-            if (seen++ == k) {
-                other = a;
-                break;
-            }
+    int32_t best = 0;
+    double  best_r = -1.0;
+    for (int32_t a = 0; a < N_ARMS; ++a) {
+        const double r = gain(a) * 1e6 / t_us[b][a];
+        rate[a]  = r;
+        n_obs[a] = n_t[b][a];
+        if (r > best_r) {
+            best_r = r;
+            best   = a;
         }
-        return other;
+    }
+    // re-timing: the widest arm every RETIME_WIDE rounds (it also refreshes every gain), stale arms
+    if (best != N_ARMS - 1 && n_round - t_last[b][N_ARMS - 1] >= RETIME_WIDE) {
+        return N_ARMS - 1;
+    }
+    for (int32_t a = 0; a < N_ARMS; ++a) {
+        if (a != best && n_round - t_last[b][a] >= STALE) {
+            return a;
+        }
     }
     return best;
 }
 
-void common_dtree_auto::observe(int32_t arm, int32_t n_emit, int64_t t_us) {
+void common_dtree_auto::observe(int32_t arm, const int32_t * emit_by_arm, int64_t t_us_round, int32_t n_batch, int32_t n_ctx) {
     ++n_round;
-    if (arm < 0 || arm >= N_ARMS || t_us <= 0) {
+    if (arm < 0 || arm >= N_ARMS || t_us_round <= 0 || n_batch > 4) {
         return;
     }
-    const double r = (double) n_emit * 1e6 / (double) t_us;
-    if (n_obs[arm] == 0) {
-        rate[arm] = r;
-    } else {
-        rate[arm] += (r - rate[arm]) / 8.0;
+    for (int32_t a = 0; a <= arm; ++a) {
+        if (emit_by_arm == nullptr || emit_by_arm[a] < 0) {
+            continue;
+        }
+        gsum[a] = gsum[a] * (1.0 - 1.0 / 512.0) + (double) emit_by_arm[a];
+        gw[a]   = gw[a]   * (1.0 - 1.0 / 512.0) + 1.0;
+        ++n_gain[a];
     }
-    ++n_obs[arm];
+    const int32_t b = bucket(n_batch, n_ctx);
+    const double  x = (double) t_us_round;
+    double &      t = t_us[b][arm];
+    if (n_t[b][arm] < 3) {
+        t = n_t[b][arm] == 0 ? x : std::min(t, x);
+    } else {
+        t += (std::min(std::max(x, t * 0.5), t * 2.0) - t) / 8.0;
+    }
+    ++n_t[b][arm];
+    t_last[b][arm] = n_round;
+}
+
+void common_dtree_auto::observe(int32_t arm, int32_t n_emit, int64_t t_us_round) {
+    int32_t e[N_ARMS] = { -1, -1, -1 };
+    if (arm >= 0 && arm < N_ARMS) {
+        e[arm] = n_emit;
+    }
+    observe(arm, e, t_us_round, 1, 0);
 }
