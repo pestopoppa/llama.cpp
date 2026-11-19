@@ -258,6 +258,13 @@ extern "C" {
     //               - if embeddings: all tokens are output
     //               - if not:        only the last token is output
     //            )
+    // - parent : [AK-DTREE-2] tree verification (NULL = ordinary chain batch). parent[i] is the batch index of
+    //            token i's parent (parent[i] < i, same single seq_id), or -1 for a child of the committed context.
+    //            pos[i] must be pos[parent[i]] + 1 (roots: the next position of the seq), so siblings share a
+    //            position. Token i attends to the committed context plus its own ancestors only; a recurrent
+    //            layer runs each token from its parent's state and keeps the committed state read-only.
+    //            A tree must fit one ubatch. Commit the accepted root path with llama_memory_tree_accept().
+    //            Caller-owned (llama_batch_init does not allocate it, llama_batch_free does not free it).
     //
     typedef struct llama_batch {
         int32_t n_tokens;
@@ -268,6 +275,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        int32_t      *  parent;   // [AK-DTREE-2] optional tree parents (see above)
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -771,6 +779,16 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1);
+
+    // [AK-DTREE-2] commit the accepted root path of the last tree batch of seq_id.
+    // cols: batch-relative indices (within that seq's tree, in tree order) of the accepted tokens, root first,
+    // each the parent of the next (n_cols == 0 accepts nothing). Rejected tokens leave the KV cache and the
+    // recurrent state becomes the state after cols[n_cols-1]. Returns false if the memory cannot do it.
+    LLAMA_API bool llama_memory_tree_accept(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+            const int32_t * cols,
+                   int32_t n_cols);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

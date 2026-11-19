@@ -176,6 +176,24 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// [AK-DTREE-2] tree-verification inputs for recurrent layers (tree ubatch only):
+//   parent   I32 [n_seq_tokens, n_seqs]          parent column within the seq set (-1 = root)
+//   conv_idx I32 [(d_conv-1)*n_seq_tokens, n_seqs] conv_input column of each tap of the conv state after column c
+class llm_graph_input_tree : public llm_graph_input_i {
+public:
+    llm_graph_input_tree(int64_t d_conv) : d_conv(d_conv) {}
+    virtual ~llm_graph_input_tree() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * parent   = nullptr;
+    ggml_tensor * conv_idx = nullptr;
+
+    const int64_t d_conv;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -807,6 +825,7 @@ struct llm_graph_params {
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
         bool can_reuse_ubatch =
+            (ubatch.parent == nullptr) == (other.ubatch.parent == nullptr) && // [AK-DTREE-2] tree vs chain graphs differ
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
@@ -1144,6 +1163,10 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+
+    // [AK-DTREE-2] tree-verification inputs (created once per graph; nullptr unless ubatch.parent)
+    llm_graph_input_tree * build_inp_tree(int64_t d_conv) const;
+    mutable llm_graph_input_tree * inp_tree = nullptr;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

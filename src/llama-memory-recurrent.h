@@ -6,6 +6,7 @@
 
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -44,6 +45,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) override; // [AK-DTREE-2]
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -75,6 +77,9 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // [AK-DTREE-2] per-seq positions of the columns of the last tree ubatch (tree column order)
+    std::unordered_map<llama_seq_id, std::vector<llama_pos>> tree_pos;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 

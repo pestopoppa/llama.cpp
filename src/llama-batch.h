@@ -62,10 +62,16 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
 
         std::vector<llama_seq_id> seq_id_data;
+
+        std::vector<int32_t>      parent;      // [AK-DTREE-2] tree parents, ubatch-absolute (-1 = root)
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // [AK-DTREE-2] tree verification: parent[i] = ubatch index of token i's parent (-1 = child of the committed
+    // context), always within token i's own sequence set. nullptr for an ordinary chain ubatch.
+    int32_t * parent = nullptr;  // [n_tokens]
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
