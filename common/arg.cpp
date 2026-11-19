@@ -4079,6 +4079,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--draft-tree-nodes"}, "N|auto",
+        "draft-dflash (DFlash2) and draft-mtp: verify a small tree of alternative drafts (AK-DTREE-1, after Infernix).\n"
+        "N = a fixed tree of N columns incl. the anchor (draft n-max + 2 .. 32), decomposed into <= 3 root-to-leaf\n"
+        "paths verified as separate sequences in one target decode; auto = choose chain, n-max+5 or n-max+9 per\n"
+        "round from measured round time and emitted tokens. Greedy requests only. Reserves 3 sequences per slot\n"
+        "(n_seq_max = 3 x -np) and forces a unified KV cache. (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.draft_tree_nodes = -1;
+            } else if (value == "off" || value == "0") {
+                params.speculative.draft_tree_nodes = 0;
+            } else {
+                const int n = std::stoi(value);
+                if (n < 0 || n > 32) {
+                    throw std::invalid_argument("--draft-tree-nodes takes auto, off or 0..32");
+                }
+                params.speculative.draft_tree_nodes = n;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_TREE_NODES"));
+    add_opt(common_arg(
+        {"--draft-tree-mode"}, "paths|batch",
+        "how --draft-tree-nodes verifies the tree: paths = each root-to-leaf path as its own sequence (no new kernel);\n"
+        "batch = one tree batch with a parent-index tensor + tree mask (AK-DTREE-2 kernels; not in this build) (default: paths)",
+        [](common_params & params, const std::string & value) {
+            if (value == "paths") {
+                params.speculative.draft_tree_mode = 0;
+            } else if (value == "batch") {
+                params.speculative.draft_tree_mode = 1;
+            } else {
+                throw std::invalid_argument("--draft-tree-mode takes paths or batch");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_TREE_MODE"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
