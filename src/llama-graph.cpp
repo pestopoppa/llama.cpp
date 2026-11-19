@@ -1617,6 +1617,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_argmax      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -4345,7 +4346,26 @@ void llm_graph_context::build_pooling(
     ggml_build_forward_expand(gf, cur);
 }
 
+// DTREE-A: device-side greedy acceptance. With LLAMA_DEVICE_ARGMAX=1 every graph that outputs logits also
+// outputs their per-row argmax (ggml_argmax: first maximum, the greedy sampler's tie rule), so greedy
+// verification of a W-row draft tree reads W int32 ids instead of scanning W x n_vocab floats on the host.
+static bool llama_device_argmax_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_DEVICE_ARGMAX");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
 void llm_graph_context::build_sampling() const {
+    if (res->t_logits && llama_device_argmax_enabled() && res->t_logits->type == GGML_TYPE_F32 &&
+            ggml_n_dims(res->t_logits) <= 2) {
+        ggml_tensor * am = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(am, "result_argmax");
+        ggml_set_output(am);
+        ggml_build_forward_expand(gf, am);
+        res->t_argmax = am;
+    }
     if (samplers.empty() || !res->t_logits) {
         return;
     }

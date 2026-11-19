@@ -898,6 +898,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
             llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
             const auto tm = gsmpl->tm();
 
+            // DTREE-A: device argmax == the greedy chain's pick when the sampler is provably greedy and adds no
+            // logit bias (common_sampler_greedy_fast_select's eligibility is a function of params alone here)
+            if (gsmpl->params.logit_bias.empty() && greedy_fast_params_ok(gsmpl->params)) {
+                const llama_token dam = llama_get_argmax_ith(ctx, idx);
+                if (dam != LLAMA_TOKEN_NULL) {
+                    if (n_fast) {
+                        (*n_fast)++;
+                    }
+                    return dam;
+                }
+            }
+
             const llama_token id = common_sampler_greedy_fast_select(gsmpl->params, llama_get_logits_ith(ctx, idx), n_vocab);
             if (id != LLAMA_TOKEN_NULL) {
                 if (n_fast) {
