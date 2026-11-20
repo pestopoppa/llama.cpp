@@ -641,12 +641,14 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_min_step = 1024;  // minimum spacing between context checkpoints (PFXC-A1: 8192 -> 1024 for agentic tool loops)
+    bool    checkpoint_after_gen = true; // PFXC-A1: checkpoint the slot state at the end of each generation (hybrid/recurrent/SWA)
     int32_t prefill_budget_decoding  = 0; // max prompt tokens per server iteration while any slot is generating (0 = off: fill up to n_batch)
     int32_t prefill_budget_target_ms = 0; // adaptive prefill budget: size it so an iteration with decoding slots takes about this long (0 = off)
     bool    prefill_order_srpf       = false; // fill pending prompts shortest-remaining first instead of by slot index
     int32_t prefill_contend_cap      = 512;   // with prefill_order_srpf: max prompt tokens per iteration while >= 2 prompts are pending (0 = off)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_ram_copy_min  = 512;   // PFXC-A2: copy-load a cache entry below f_keep 0.25 when its LCP >= N tokens (0 = off)
     int32_t chunk_store_mib     = 0;     // chunk-KV reuse store budget in MiB (experimental, attention-only memory); 0 = feature off
     int32_t chunk_max_tokens    = 8192;  // chunk-KV reuse: longest chunk the isolated encoder accepts (its context size)
 

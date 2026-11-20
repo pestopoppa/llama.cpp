@@ -705,6 +705,9 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // PFXC-A2: copy-load threshold (absolute LCP tokens) for entries rejected by the f_keep >= 0.25 rule, 0 = off
+    int32_t copy_min_lcp = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;

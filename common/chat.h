@@ -180,6 +180,16 @@ struct common_chat_msg_spans {
         return false;
     }
 
+    // PFXC-A1: checkpoint boundaries = user AND tool-result message starts (agentic tool loops)
+    bool is_ckpt_start(int32_t pos) const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if ((it->role == COMMON_CHAT_ROLE_USER || it->role == COMMON_CHAT_ROLE_TOOL) && pos == (int32_t) it->pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     int32_t last_user_message_pos() const {
         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
             if (it->role == COMMON_CHAT_ROLE_USER) {

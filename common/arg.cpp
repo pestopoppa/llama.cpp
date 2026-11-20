@@ -1552,6 +1552,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-after-gen"},
+        {"--no-checkpoint-after-gen"},
+        string_format("create a context checkpoint at the end of each generation, so the next request reuses the generated turn "
+            "on hybrid/recurrent/SWA models (default: %s)", params.checkpoint_after_gen ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.checkpoint_after_gen = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_AFTER_GEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--prefill-budget-decoding"}, "N",
         string_format("max prompt tokens added per server iteration while any slot is generating, so decoding slots are not "
             "stalled behind a full n_batch prefill chunk (Sarathi-style chunked prefill). With no slot generating, prompts "
@@ -1632,6 +1641,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-ram-copy-min"}, "N",
+        string_format("when no prompt-cache entry keeps >= 25%% of itself, copy-load (without consuming) the entry with the "
+            "longest common prefix if it is >= N tokens (default: %d, 0 = disable)", params.cache_ram_copy_min),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ram-copy-min must be non-negative");
+            }
+            params.cache_ram_copy_min = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM_COPY_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
