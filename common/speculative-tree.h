@@ -34,6 +34,21 @@ using common_dtree_scores_fn = std::function<const float *(int32_t j, int32_t pr
 std::vector<std::vector<int32_t>> common_dtree_build_paths(
         int32_t D, int32_t K, const common_dtree_scores_fn & scores, int32_t n_nodes, int32_t max_paths);
 
+// DTREE-TREE-QUALITY (LLAMA_DTREE_POLICY=greedy): probability-greedy best-first tree (SpecInfer/Sequoia-style).
+// Starting from the anchor, the frontier node with the highest cumulative selector probability (product of the
+// per-position softmax of the scores along its path) joins the tree until n_nodes - 1 draft nodes are used; any
+// node may take children, there is no path cap and no depth below D is forced. Ties go to the lexicographically
+// smaller index path. branch_follows_main (MTP): a node off the greedy chain has one child only, candidate 0 of the
+// next position (the head never saw the branch, so the continuation is the main chain's suffix).
+// Returns index paths: path 0 is the greedy chain's prefix inside the tree (length >= 1 when n_nodes >= 2, may be
+// shorter than D), paths 1.. are the other leaves' root paths (any length <= D), in insertion order of the leaves.
+// The tree is the prefix closure of the returned paths; it exactly matches tree_sim.py grow(r, W) (raw probs).
+std::vector<std::vector<int32_t>> common_dtree_build_greedy(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, int32_t n_nodes, bool branch_follows_main);
+
+// LLAMA_DTREE_POLICY: 0 = static paths (default, common_dtree_build_paths), 1 = greedy (common_dtree_build_greedy)
+int32_t common_dtree_policy();
+
 // number of distinct tree columns (anchor included) of a path set returned by common_dtree_build_paths
 int32_t common_dtree_n_columns(const std::vector<std::vector<int32_t>> & paths);
 
