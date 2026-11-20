@@ -6,7 +6,11 @@ from utils import *
 #  A1  post-generation checkpoint + tool-result checkpoint boundaries + checkpoint_min_step 1024
 #  A2  copy-load of a prompt-cache entry rejected by the f_keep >= 0.25 rule + the prefix-anchor checkpoint is never FIFO-evicted
 # Correctness: a state resumed from a checkpoint / copy-loaded cache entry must reproduce the fresh-prefill logits.
-# Set LLAMA_TEST_HYBRID_GGUF to a small hybrid/recurrent GGUF with a chat template (e.g. LFM2.5-1.2B, Qwen3.5-0.8B).
+# Set LLAMA_TEST_HYBRID_GGUF to a small hybrid/recurrent GGUF whose chat template has message-span delimiters (ChatML /
+# Qwen3.5-0.8B; LFM2 has none, so user/tool checkpoints and the copy-load anchor are not exercised there).
+# Tolerance: a resumed state is prefilled in different batch splits than a fresh one and CPU matmuls are not
+# split-invariant: on LFM2.5-1.2B Q8_0 (ak-pfxc-diag-20261120) fresh -b 512 vs fresh -b 64 differ by up to 0.28 top-5
+# logprob, the same size as resumed-vs-fresh on C14 and on this branch. TOL sits above that noise floor.
 
 HYBRID = os.environ.get("LLAMA_TEST_HYBRID_GGUF")
 
@@ -46,11 +50,16 @@ def _top(body):
     return [[(t["token"], t["logprob"]) for t in c["top_logprobs"]] for c in body["choices"][0]["logprobs"]["content"]]
 
 
-def _assert_same(a, b, tol=1e-3):
+TOL = 0.5
+
+
+def _assert_same(a, b, tol=TOL):
     ta, tb = _top(a), _top(b)
     assert len(ta) == len(tb)
     for sa, sb in zip(ta, tb):
-        assert sa[0][0] == sb[0][0], (sa, sb)  # identical greedy token
+        if sa[0][0] != sb[0][0]:  # a near-tie flip inside the noise floor ends the comparison
+            assert abs(sa[0][1] - sb[0][1]) < tol, (sa, sb)
+            break
         da, db = dict(sa), dict(sb)
         for tok in set(da) & set(db):
             assert abs(da[tok] - db[tok]) < tol, (tok, da[tok], db[tok])
