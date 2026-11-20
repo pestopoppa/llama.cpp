@@ -2956,6 +2956,12 @@ common_chat_msg common_chat_parse(const std::string &               input,
     return common_chat_peg_parse(params.parser, input, is_partial, params);
 }
 
+// PFXC-TOOLPARSE: start of the first tool call in the generated text (npos if none)
+static size_t pfxc_tool_call_start(const std::string & s) {
+    size_t a = s.find("<tool_call>"), b = s.find("<function=");
+    return std::min(a, b);
+}
+
 common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_parser,
                                       const std::string &               input,
                                       bool                              is_partial,
@@ -3004,6 +3010,14 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             return msg;
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+        {
+            // PFXC-TOOLPARSE: a grammar failure inside a tool call is a retryable tool-call parse error
+            const size_t tc = pfxc_tool_call_start(effective_input);
+            if (tc != std::string::npos) {
+                throw common_chat_tool_parse_error(std::string("The model produced a malformed tool call that does not match the expected ") +
+                                                   common_chat_format_name(params.format) + " format", effective_input.substr(tc, 256));
+            }
+        }
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
     }
@@ -3025,7 +3039,12 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
 
     if (!is_partial) {
-        common_chat_validate_tool_markup(msg);
+        try {
+            common_chat_validate_tool_markup(msg);
+        } catch (const common_chat_tool_parse_error & e) {
+            const size_t tc = pfxc_tool_call_start(effective_input);
+            throw common_chat_tool_parse_error(e.what(), effective_input.substr(tc == std::string::npos ? 0 : tc, 256));
+        }
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
     }
     return msg;
@@ -3107,7 +3126,7 @@ void common_chat_validate_tool_markup(common_chat_msg & msg) {
         } catch (const std::exception &) {
             // final (non-partial) arguments that are not JSON and still carry tool markup are the verbatim-garbage case
             if (pfxc_has_tool_markup(tc.arguments) || tc.arguments.find("</parameter>") != std::string::npos) {
-                throw std::runtime_error("The model produced a malformed tool call: unterminated arguments of '" + tc.name + "' contain tool-call markup");
+                throw common_chat_tool_parse_error("The model produced a malformed tool call: unterminated arguments of '" + tc.name + "' contain tool-call markup");
             }
             continue; // not JSON for another reason: leave it to the existing checks
         }
@@ -3117,13 +3136,13 @@ void common_chat_validate_tool_markup(common_chat_msg & msg) {
         for (auto it = args.begin(); it != args.end(); ++it) {
             if (it.value().is_string() && pfxc_has_tool_markup(it.value().get<std::string>())) {
                 if (!pfxc_split_value(it.key(), it.value().get<std::string>(), fixed)) {
-                    throw std::runtime_error("The model produced a malformed tool call: argument '" + it.key() + "' of '" + tc.name +
+                    throw common_chat_tool_parse_error("The model produced a malformed tool call: argument '" + it.key() + "' of '" + tc.name +
                                              "' contains nested tool-call markup");
                 }
                 changed = true;
             } else {
                 if (fixed.contains(it.key())) {
-                    throw std::runtime_error("The model produced a malformed tool call: duplicate argument '" + it.key() + "' of '" + tc.name + "'");
+                    throw common_chat_tool_parse_error("The model produced a malformed tool call: duplicate argument '" + it.key() + "' of '" + tc.name + "'");
                 }
                 fixed[it.key()] = it.value();
             }

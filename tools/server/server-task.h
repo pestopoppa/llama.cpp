@@ -149,6 +149,10 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
+    // PFXC-TOOLPARSE: the message as already streamed to the client. Partial parses never expose tool calls (each call is
+    // buffered until the final parse succeeds), so a malformed call never leaks a partial tool_calls delta.
+    common_chat_msg chat_msg_visible;
+
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
