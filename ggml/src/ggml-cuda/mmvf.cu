@@ -2,6 +2,8 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+
+#include <cstdlib>
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -811,6 +813,17 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // AK-DTREE-0: on CDNA2 (MI210) the fp32 MFMA mul_mat_f route costs ~4.5 ms per A3B decode step at 4 rows
+                // vs ~0.6 ms for mul_mat_vec_f at 3 rows (ak-dtree0-a3b-trace-gpu-20261120), a cliff right at the MTP/tree
+                // verify widths. GGML_HIP_MMVF_F32_MAX_CDNA2 (default 3 = unchanged) moves the MMVF limit on CDNA2 only.
+                if (GGML_CUDA_CC_IS_CDNA2(cc)) {
+                    static const int mmvf_f32_max_cdna2 = [] {
+                        const char * e = getenv("GGML_HIP_MMVF_F32_MAX_CDNA2");
+                        const int v = (e && *e) ? atoi(e) : 3;
+                        return v < 1 ? 1 : (v > MMVF_MAX_BATCH_SIZE ? MMVF_MAX_BATCH_SIZE : v);
+                    }();
+                    return ne11 <= mmvf_f32_max_cdna2;
+                }
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
