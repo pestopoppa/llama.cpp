@@ -95,6 +95,8 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <cstring>
+#include <vector>
 
 #define Q8MF_MAXM    16
 #define Q8MF5_KC     16                          // V4: Q8_0 blocks per LDS activation chunk (512 k)
@@ -1017,6 +1019,268 @@ static const char * q8mf_get_packed(ggml_backend_cuda_context & ctx, const ggml_
     return P;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-0-Q8MF-REPACK-INPLACE (GGML_HIP_Q8_MF_INPLACE=1|2, needs GGML_HIP_Q8_MF=3|4): the HBM-CEILING stage-contiguous
+// layout applied IN PLACE once, when a weight's upload completes. No cached copy, no persistent extra VRAM.
+//   Packed layout [tile][k-stage][64 rows][272 B] is a permutation INSIDE each 64-row tile: a tile is 64*nb01 contiguous
+//   bytes in both layouts (nb01 = S*272), so with N % 64 == 0 the packed tensor has exactly ggml_nbytes bytes.
+//   Upload: after the write that completes the tensor (offset + size == nbytes; the llama loader writes chunks in order)
+//   the tiles are permuted on device, batch by batch, through a transient <= 16 MiB cudaMalloc scratch that is freed
+//   before returning (not the pool, which would keep it).
+//   Consumers: MUL_MAT src0 at n <= 16 -> V3 reads the packed layout directly (n1 included, overriding MF_MIN);
+//   every other consumer (MMQ prefill n > 16, MMVQ / fusions, get_rows, cpy, ...) gets a transient natural copy in a
+//   pool buffer (ggml_cuda_q8ip_substitute) - correct for every op, cost one extra weight pass on that op only;
+//   fusions involving a packed weight are disabled; get_tensor unpacks on the host (CPU fallback / state save read the
+//   natural layout); buffer cpy_tensor refuses (generic get/set path); a write into a packed tensor first unpacks it.
+//   =1 packs only tensors in GGML_BACKEND_BUFFER_USAGE_WEIGHTS buffers (model weights), =2 any buffer (test-backend-ops).
+//   token_embd* is never packed (its consumer is get_rows).
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8ip_build_marker[] __attribute__((used)) =
+    "ggml-cuda: Q8_0 in-place stage-contiguous load-time repack (GGML_HIP_Q8_MF_INPLACE)";
+
+static int q8ip_mode() {
+    static const int m = [] {
+        const int v = q8mf_env_int("GGML_HIP_Q8_MF_INPLACE", 0);
+        const int variant = q8mf_get_cfg().variant;
+        if (v <= 0 || (variant != 3 && variant != 4)) {
+            return 0;
+        }
+        GGML_LOG_INFO("ggml_cuda_q8ip: in-place Q8_0 stage-contiguous repack enabled (GGML_HIP_Q8_MF_INPLACE=%d, MF=%d)\n",
+            v, variant);
+        return std::min(v, 2);
+    }();
+    return m;
+}
+
+static std::mutex                               q8ip_mu;
+static std::map<const void *, size_t>           q8ip_packed;   // data -> nbytes
+static std::map<const void *, size_t>           q8ip_progress; // data -> bytes written in order since offset 0
+static std::atomic<int>                         q8ip_count{0};
+
+bool ggml_cuda_q8ip_any() {
+    return q8ip_count.load(std::memory_order_relaxed) > 0;
+}
+
+bool ggml_cuda_q8ip_is_packed(const ggml_tensor * t) {
+    if (!ggml_cuda_q8ip_any() || t == nullptr || t->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(q8ip_mu);
+    return q8ip_packed.count(t->data) != 0;
+}
+
+// a view of a packed tensor (e.g. a weight slice) - returns the packed base or nullptr
+static const ggml_tensor * q8ip_packed_base(const ggml_tensor * t) {
+    if (!ggml_cuda_q8ip_any() || t == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * b = t->view_src ? t->view_src : t;
+    return ggml_cuda_q8ip_is_packed(b) ? b : nullptr;
+}
+
+static bool q8ip_shape_ok(const ggml_tensor * t) {
+    const q8mf_cfg & cfg = q8mf_get_cfg();
+    const int64_t nbytes = (int64_t) ggml_nbytes(t);
+    return t->type == GGML_TYPE_Q8_0 && t->view_src == nullptr && t->ne[2] == 1 && t->ne[3] == 1 &&
+        ggml_is_contiguous(t) && t->ne[0] % 256 == 0 && t->ne[1] % Q8MF_RT == 0 && ((uintptr_t) t->data) % 16 == 0 &&
+        nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096 && strncmp(t->name, "token_embd", 10) != 0;
+}
+
+bool ggml_cuda_q8ip_want(const ggml_tensor * t, bool weights_buffer) {
+    const int mode = q8ip_mode();
+    if (mode == 0 || (mode == 1 && !weights_buffer)) {
+        return false;
+    }
+    return q8ip_shape_ok(t);
+}
+
+// natural <-> packed, chunk q of the packed range [tile0 ..): packed q*16 <-> natural row*nb01 + ks*272 + (c%17)*16
+template <bool TO_PACKED>
+static __global__ void q8ip_permute(const char * __restrict__ src, char * __restrict__ dst, const int64_t nb01, const int S,
+                                    const int64_t nchunk) {
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < nchunk; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t st  = q / Q8MF_NCHUNK;
+        const int     c   = (int) (q % Q8MF_NCHUNK);
+        const int64_t t   = st / S;
+        const int     ks  = (int) (st % S);
+        const int64_t row = t * Q8MF_RT + c / 17;
+        const int64_t nat = row * nb01 + (int64_t) ks * Q8MF_ROWB + (c % 17) * 16;
+        if (TO_PACKED) {
+            *(int4 *) (dst + q * 16) = *(const int4 *) (src + nat);
+        } else {
+            *(int4 *) (dst + nat) = *(const int4 *) (src + q * 16);
+        }
+    }
+}
+
+// in place, through a transient scratch (<= 16 MiB, whole tiles), synchronous on `stream`
+static void q8ip_permute_inplace(char * data, const int64_t N, const int64_t K, bool to_packed, cudaStream_t stream) {
+    const int64_t nb01  = K / 32 * 34;
+    const int     S     = (int) (K / 256);
+    const int64_t tileb = Q8MF_RT * nb01;
+    const int64_t ntile = N / Q8MF_RT;
+    const int64_t bt    = std::max<int64_t>(1, std::min<int64_t>(ntile, (16ll << 20) / tileb));
+    char * scratch = nullptr;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMalloc((void **) &scratch, (size_t) (bt * tileb)));
+    for (int64_t t0 = 0; t0 < ntile; t0 += bt) {
+        const int64_t nt  = std::min(bt, ntile - t0);
+        char *        dst = data + t0 * tileb;
+        CUDA_CHECK(cudaMemcpyAsync(scratch, dst, (size_t) (nt * tileb), cudaMemcpyDeviceToDevice, stream));
+        const int64_t nchunk = nt * tileb / 16;
+        const int     grid   = (int) std::min<int64_t>((nchunk + 255) / 256, 65535);
+        if (to_packed) {
+            q8ip_permute<true><<<grid, 256, 0, stream>>>(scratch, dst, nb01, S, nchunk);
+        } else {
+            q8ip_permute<false><<<grid, 256, 0, stream>>>(scratch, dst, nb01, S, nchunk);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(scratch));
+}
+
+void ggml_cuda_q8ip_before_write(ggml_tensor * t, size_t offset, size_t size, cudaStream_t stream) {
+    if (!ggml_cuda_q8ip_any()) {
+        return;
+    }
+    const ggml_tensor * b = q8ip_packed_base(t);
+    if (b == nullptr) {
+        return;
+    }
+    const size_t boff = (size_t) ((const char *) t->data - (const char *) b->data) + offset;
+    const bool whole = boff == 0 && size >= ggml_nbytes(b);
+    if (!whole) {   // keep the bytes outside the write: back to natural first
+        q8ip_permute_inplace((char *) b->data, b->ne[1], b->ne[0], false, stream);
+    }
+    std::lock_guard<std::mutex> lk(q8ip_mu);
+    q8ip_packed.erase(b->data);
+    q8ip_count.fetch_sub(1);
+}
+
+void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, bool weights_buffer, cudaStream_t stream) {
+    if (!ggml_cuda_q8ip_want(t, weights_buffer)) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    {
+        std::lock_guard<std::mutex> lk(q8ip_mu);
+        size_t & p = q8ip_progress[t->data];
+        if (offset == 0) {
+            p = 0;
+        }
+        if (offset != p) {   // out-of-order chunking: never pack this tensor (stays natural, always correct)
+            q8ip_progress.erase(t->data);
+            return;
+        }
+        p += size;
+        if (p < nbytes) {
+            return;
+        }
+        q8ip_progress.erase(t->data);
+    }
+    q8ip_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
+    std::lock_guard<std::mutex> lk(q8ip_mu);
+    if (q8ip_packed.emplace(t->data, nbytes).second) {
+        q8ip_count.fetch_add(1);
+    }
+    static std::atomic<int64_t> n_packed{0};
+    static std::atomic<int64_t> b_packed{0};
+    const int64_t n = n_packed.fetch_add(1) + 1;
+    const int64_t bb = b_packed.fetch_add((int64_t) nbytes) + (int64_t) nbytes;
+    if (n == 1 || (n & (n - 1)) == 0) {
+        GGML_LOG_INFO("ggml_cuda_q8ip: packed %lld Q8_0 tensors in place (%.1f MiB; last %s %lldx%lld)\n",
+            (long long) n, bb / 1048576.0, t->name, (long long) t->ne[0], (long long) t->ne[1]);
+    }
+}
+
+void ggml_cuda_q8ip_forget_range(const void * base, size_t size) {
+    if (!ggml_cuda_q8ip_any()) {
+        std::lock_guard<std::mutex> lk(q8ip_mu);
+        q8ip_progress.clear();
+        return;
+    }
+    std::lock_guard<std::mutex> lk(q8ip_mu);
+    const char * lo = (const char *) base;
+    const char * hi = lo + size;
+    for (auto it = q8ip_packed.lower_bound(lo); it != q8ip_packed.end() && (const char *) it->first < hi; ) {
+        it = q8ip_packed.erase(it);
+        q8ip_count.fetch_sub(1);
+    }
+    for (auto it = q8ip_progress.lower_bound(lo); it != q8ip_progress.end() && (const char *) it->first < hi; ) {
+        it = q8ip_progress.erase(it);
+    }
+}
+
+// host-side read of a (view of a) packed tensor in the natural layout
+bool ggml_cuda_q8ip_get(const ggml_tensor * t, void * data, size_t offset, size_t size) {
+    const ggml_tensor * b = q8ip_packed_base(t);
+    if (b == nullptr) {
+        return false;
+    }
+    const size_t  nbytes = ggml_nbytes(b);
+    const int64_t nb01   = b->nb[1];
+    const int     S      = (int) (b->ne[0] / 256);
+    std::vector<char> pk(nbytes), nat(nbytes);
+    CUDA_CHECK(cudaMemcpy(pk.data(), b->data, nbytes, cudaMemcpyDeviceToHost));
+    const int64_t nchunk = (int64_t) nbytes / 16;
+    for (int64_t q = 0; q < nchunk; ++q) {
+        const int64_t st = q / Q8MF_NCHUNK;
+        const int     c  = (int) (q % Q8MF_NCHUNK);
+        const int64_t row = (st / S) * Q8MF_RT + c / 17;
+        memcpy(nat.data() + row * nb01 + (st % S) * Q8MF_ROWB + (c % 17) * 16, pk.data() + q * 16, 16);
+    }
+    const size_t boff = (size_t) ((const char *) t->data - (const char *) b->data) + offset;
+    memcpy(data, nat.data() + boff, size);
+    return true;
+}
+
+bool ggml_cuda_q8ip_mf_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_q8ip_is_packed(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= Q8MF_MAXM && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
+        dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0;
+}
+
+// any other consumer: point dst->src[i] at a transient natural copy (pool) for the duration of the op
+void ggml_cuda_q8ip_substitute(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_q8ip_subst & s) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        ggml_tensor * src = dst->src[i];
+        const ggml_tensor * b = q8ip_packed_base(src);
+        if (b == nullptr) {
+            continue;
+        }
+        if (dst->op == GGML_OP_MUL_MAT && i == 0 && src == b && ggml_cuda_q8ip_mf_handles(src, dst->src[1], dst)) {
+            continue;
+        }
+        static std::atomic<int64_t> n_sub{0};
+        if (n_sub.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8ip: op %s (%s) reads packed %s -> transient natural copy\n",
+                ggml_op_desc(dst), dst->name, b->name);
+        }
+        const size_t nbytes = ggml_nbytes(b);
+        char * nat = s.buf[i].alloc(ctx.pool(), nbytes);
+        const int64_t nchunk = (int64_t) nbytes / 16;
+        const int     grid   = (int) std::min<int64_t>((nchunk + 255) / 256, 65535);
+        q8ip_permute<false><<<grid, 256, 0, ctx.stream()>>>((const char *) b->data, nat, (int64_t) b->nb[1], (int) (b->ne[0] / 256), nchunk);
+        CUDA_CHECK(cudaGetLastError());
+        s.copy[i]          = *src;
+        s.copy[i].data     = nat + ((const char *) src->data - (const char *) b->data);
+        s.copy[i].view_src = nullptr;
+        s.orig[i]          = src;
+        dst->src[i]        = &s.copy[i];
+    }
+}
+
+void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (s.orig[i]) {
+            dst->src[i] = s.orig[i];
+            s.orig[i]   = nullptr;
+        }
+    }
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     if (cfg.variant == 5) {
@@ -1085,7 +1349,11 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
     int      kstride   = Q8MF_ROWB;
     uint32_t tstride   = (uint32_t) Q8MF_RT * (uint32_t) nb01;
     ggml_cuda_pool_alloc<char> ptmp;
-    if (v3 && cfg.repack > 0) {
+    if (v3 && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-REPACK-INPLACE: weight already packed in place
+        rowstride = Q8MF_ROWB;
+        kstride   = Q8MF_WSTAGE;
+        tstride   = (uint32_t) S * Q8MF_WSTAGE;
+    } else if (v3 && cfg.repack > 0) {
         size_t pbytes = 0;
         W         = q8mf_get_packed(ctx, src0, cfg.repack, ptmp, pbytes);
         wbytes    = (uint32_t) pbytes;

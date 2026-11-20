@@ -12326,6 +12326,21 @@ static void dtree_add_q8mf_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     }
 }
 
+// DTREE-0-Q8MF-REPACK-INPLACE: run with GGML_HIP_Q8_MF=3 GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_MIN_BYTES=0 so every Q8_0
+// src0 with N % 64 == 0, K % 256 == 0 is packed in place at upload. n 1..16 exercise the V3 packed read (n1 included),
+// n 17 / 64 / 512 the transient-natural-copy route into MMQ, GET_ROWS the generic consumer substitution; 6000 x 5120
+// (N % 64 != 0) is never packed (stays natural). Off by default these are ordinary MUL_MAT / GET_ROWS cases.
+static void dtree_add_q8ip_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> sh[] = {{1024, 512}, {6144, 5120}, {5120, 17408}, {6000, 5120}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 2, 8, 12, 16, 17, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512, 1024, 7));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 5120, 128, 3));
+}
+
 // DTREE-0-Q8MF-V2 roofline table: the 27B Q8_0 verify shapes {m = rows, k} at M (= n) 1/8/12/16. Run with
 // GGML_HIP_Q8_MF=1|2 GGML_HIP_Q8_MF_MIN=1 to time the MF kernels at every M (GB/s = m * k * 34/32 / (us/op)).
 static void dtree_add_q8mf_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -12406,6 +12421,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
+    dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
