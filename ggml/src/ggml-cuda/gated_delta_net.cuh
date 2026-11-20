@@ -18,3 +18,6 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
 uint64_t ggml_cuda_gdn_chunked_n_calls();
 int32_t  ggml_cuda_gdn_chunked_min_tokens();
 bool     ggml_cuda_gdn_chunked_usable(int device);
+
+// [DTREE-0-GDN-ROWS] few-row verify kernel (GGML_HIP_GDN_ROWS=1): launches since process start. Test witness.
+uint64_t ggml_cuda_gdn_rows_n_calls();
