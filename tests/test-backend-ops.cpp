@@ -12231,6 +12231,27 @@ static void akh1_add_q8_skinny_eval_cases(std::vector<std::unique_ptr<test_case>
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, 8, 256, {1, 1}, {1, 1}));  // ksplit == 1, row tail
 }
 
+// DTREE-0-Q8MF: Q8_0 x F32 at M (= n here) 9..16 for the gfx90a MFMA i8 small-M path (GGML_HIP_Q8_MF=1), over the
+// box's weight rows m {1024, 6144, 10240, 17408} x k {5120, 6144, 17408}, plus the 27B LM head (248320 x 5120) and the
+// remaining real 27B shapes (attn_q 12288 x 5120, attn_output 5120 x 6144, ffn_down 5120 x 17408). The LM head runs at its
+// real k only: 248320 x 6144 / 17408 Q8_0 would be 1.6 / 4.6 GB (past the path's INT32 V# range, and CPU-impractical).
+// 1024 x 5120 / 6144 are <= 6 MiB, i.e. route witnesses that the size floor keeps them off the MF path.
+static void dtree_add_q8mf_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t m : {1024, 6144, 10240, 17408}) {
+        for (int64_t k : {5120, 6144, 17408}) {
+            for (int64_t n = 9; n <= 16; ++n) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    static const std::array<int64_t, 2> extra[] = {{248320, 5120}, {12288, 5120}, {5120, 6144}, {5120, 17408}};
+    for (const auto & sh : extra) {
+        for (int64_t n = 9; n <= 16; ++n) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+}
+
 static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
     for (const auto & sh : akh1_q38_27b_shapes) {
         for (int64_t n : {5, 8, 16}) {
@@ -12299,6 +12320,7 @@ static void add_near_f16_max_mul_mat_cases(std::vector<std::unique_ptr<test_case
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
+    dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
