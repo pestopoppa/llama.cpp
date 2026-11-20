@@ -5560,6 +5560,22 @@ private:
                 if (ok && !llama_memory_tree_accept(llama_get_memory(ctx_tgt), slot.id, cols.data(), (int32_t) cols.size())) {
                     SLT_ERR(slot, "%s", "llama_memory_tree_accept failed\n");
                 }
+            
+                // the drafter's process() sees only the winner's rows as this slot's chain (the other tree columns share
+                // the sequence and repeat positions): hide every non-winner column
+                if (!relabel) {
+                    tree_seq_store.assign(batch_view.n_tokens, 0);
+                    tree_seq_ptrs.assign(batch_view.n_tokens, nullptr);
+                    for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                        tree_seq_store[i] = batch_view.seq_id[i][0];
+                    }
+                    relabel = true;
+                }
+                for (const int32_t i : slot_rows) {
+                    if (std::find(win_rows.begin(), win_rows.end(), i) == win_rows.end()) {
+                        tree_seq_store[i - off] = -1;
+                    }
+                }
             }
 
             if (best >= 0) {
@@ -5606,6 +5622,8 @@ private:
             }
             proc_view.seq_id = tree_seq_ptrs.data();
         }
+        // [AK-DTREE-2] the drafter consumes a chain view: never forward the target's tree parents
+        proc_view.parent = nullptr;
 
         return any;
     }
