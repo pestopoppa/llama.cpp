@@ -177,6 +177,7 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-multiseq-ubatch.cpp)
 llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
 llama_build(test-recurrent-rollback-guards.cpp get-model.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
