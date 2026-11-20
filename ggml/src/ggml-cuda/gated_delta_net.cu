@@ -1,10 +1,12 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 // [TAG_GDN_STATE_BF16] recurrent-state precision helpers.
 // The recurrent SSM state (curr_state / dst state region) may be stored as F32 (default,
@@ -737,6 +739,336 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// =====================================================================================================
+// [DTREE-0-GDN-ROWS] few-row (verify) gated delta-net: W = n_tokens in 1..16, one launch per op, all W rows of a
+// (head, seq, 32-column slab) in one 512-thread block. The recurrent state is read from HBM once per verify; q/k
+// of all W rows, exp(g), beta, v and the parent indices are staged in LDS up front, so the serial per-row chain
+// carries no global-memory latency (the recurrent kernel pays one q/k/v/g/beta round trip per row, which is
+// the ~0.155 ms/row the 27B verify measured). 16 lanes own one state column (8 rows each for S_v = 128) and
+// reduce with 4 DPP butterfly steps (xor 1, 2 inside a quad, half-mirror, mirror: every lane ends with the
+// bit-identical sum). The q-side dot (attention output) is off the serial chain: per-row partials stay in
+// registers and are reduced after the walk. Snapshots (keep_rs) and the final state are written exactly as the
+// recurrent kernel writes them (same slot mapping). Tree batches (AK-DTREE-2 record mode, parent[] I32): column t
+// continues from its parent's state; a parent of -1 restores s0 from registers, any other non-chain parent
+// reloads the parent's snapshot slot, which this same thread stored earlier (F32: exact), and that reload is
+// issued one column ahead so its latency overlaps the previous column's compute. Non-KDA, S_v 64/128 only.
+// GGML_HIP_GDN_ROWS=1 enables it (default off = the recurrent kernel, byte-identical dispatch);
+// GGML_HIP_GDN_ROWS_MIN (default 1) and GGML_HIP_GDN_ROWS_MAX (default 16, max 16) bound the n_tokens range.
+// =====================================================================================================
+#define GDN_ROWS_WMAX    16
+#define GDN_ROWS_LPC     16
+#define GDN_ROWS_THREADS 512
+#define GDN_ROWS_CPB     (GDN_ROWS_THREADS / GDN_ROWS_LPC)
+
+static std::atomic<uint64_t> g_gdn_rows_n_calls{0};
+
+uint64_t ggml_cuda_gdn_rows_n_calls() {
+    return g_gdn_rows_n_calls.load();
+}
+
+static int gdn_rows_env_int(const char * name, int def) {
+    const char * s = getenv(name);
+    return s != nullptr && s[0] != '\0' ? atoi(s) : def;
+}
+
+// [min, max] n_tokens routed to the rows kernel; {1, 0} (empty) when GGML_HIP_GDN_ROWS is unset/0 or not HIP
+static void gdn_rows_range(int & lo, int & hi) {
+    static const int v_lo = [] { return std::max(1, gdn_rows_env_int("GGML_HIP_GDN_ROWS_MIN", 1)); }();
+    static const int v_hi = [] {
+#if defined(GGML_USE_HIP)
+        if (gdn_rows_env_int("GGML_HIP_GDN_ROWS", 0) != 1) {
+            return 0;
+        }
+        return std::min(GDN_ROWS_WMAX, gdn_rows_env_int("GGML_HIP_GDN_ROWS_MAX", GDN_ROWS_WMAX));
+#else
+        return 0;
+#endif
+    }();
+    lo = v_lo;
+    hi = v_hi;
+}
+
+// sum over the 16 lanes of a DPP row; every lane gets the bit-identical result
+static __device__ __forceinline__ float gdn_rows_sum16(float x) {
+#if defined(GGML_USE_HIP)
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1,  0xF, 0xF, true)); // quad_perm [1,0,3,2]
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x4E,  0xF, 0xF, true)); // quad_perm [2,3,0,1]
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x141, 0xF, 0xF, true)); // row_half_mirror
+    x += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x140, 0xF, 0xF, true)); // row_mirror
+    return x;
+#else
+    return warp_reduce_sum<GDN_ROWS_LPC>(x);
+#endif
+}
+
+// wave-uniform int (the parent index depends on (seq, t) only): scalar register on AMD
+static __device__ __forceinline__ int gdn_rows_uniform(int x) {
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_readfirstlane(x);
+#else
+    return x;
+#endif
+}
+
+template <typename state_t>
+static __device__ __forceinline__ void gdn_rows_ld4(const state_t * p, float * o) {
+    if constexpr (std::is_same_v<state_t, float>) {
+        const float4 x = *(const float4 *) p;
+        o[0] = x.x; o[1] = x.y; o[2] = x.z; o[3] = x.w;
+    } else {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            o[e] = gdn_load(p[e]);
+        }
+    }
+}
+
+template <typename state_t>
+static __device__ __forceinline__ void gdn_rows_st4(state_t * p, const float * o) {
+    if constexpr (std::is_same_v<state_t, float>) {
+        *(float4 *) p = make_float4(o[0], o[1], o[2], o[3]);
+    } else {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            p[e] = gdn_store<state_t>(o[e]);
+        }
+    }
+}
+
+template <int S_v, bool keep_rs_t, typename state_t, bool tree_t>
+__global__ void __launch_bounds__(GDN_ROWS_THREADS, 1)
+gdn_rows_cuda(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+              const float * __restrict__ g, const float * __restrict__ beta,
+              const state_t * curr_state, state_t * dst, state_t * state,
+              const int64_t H, const int n_tokens,
+              const int64_t sq1, const int64_t sq2, const int64_t sq3,
+              const int64_t sv1, const int64_t sv2, const int64_t sv3,
+              const int64_t sb1, const int64_t sb2, const int64_t sb3,
+              const uint3 neqk1_magic, const uint3 rq3_magic, const float scale,
+              const int64_t state_slot_stride, const int K, const int32_t * __restrict__ parent) {
+    constexpr int LPC = GDN_ROWS_LPC;
+    constexpr int CPB = GDN_ROWS_CPB;
+    constexpr int RPL = S_v / LPC;   // state rows per lane
+    constexpr int NCH = RPL / 4;     // float4 chunks per lane: row i = c*4*LPC + 4*lane + e
+    static_assert(RPL % 4 == 0, "S_v must be a multiple of 4*LPC");
+
+    __shared__ float q_s[GDN_ROWS_WMAX][S_v];
+    __shared__ float k_s[GDN_ROWS_WMAX][S_v];
+    __shared__ float v_s[GDN_ROWS_WMAX][CPB];
+    __shared__ float eg_s[GDN_ROWS_WMAX];
+    __shared__ float b_s[GDN_ROWS_WMAX];
+    __shared__ int   p_s[GDN_ROWS_WMAX];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      tid      = threadIdx.x;
+    const int      lane     = tid % LPC;
+    const int      cl       = tid / LPC;
+    const int      col0     = blockIdx.z * CPB;
+    const int      col      = col0 + cl;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t state_head = ((int64_t) sequence * H + h_idx) * S_v * S_v;   // in == out per-(seq, head) offset
+    curr_state += state_head + (int64_t) col * S_v;
+    state      += state_head + (int64_t) col * S_v;
+    dst        += ((int64_t) sequence * n_tokens * H + h_idx) * S_v + col;
+
+    ggml_cuda_pdl_sync();
+
+    float s[RPL];
+#pragma unroll
+    for (int c = 0; c < NCH; c++) {
+        gdn_rows_ld4(curr_state + c * 4 * LPC + 4 * lane, s + 4 * c);
+    }
+
+    const float * qh = q + iq3 * sq3 + iq1 * sq1;
+    const float * kh = k + iq3 * sq3 + iq1 * sq1;
+    for (int idx = tid; idx < n_tokens * S_v; idx += GDN_ROWS_THREADS) {
+        const int t = idx / S_v;
+        const int i = idx % S_v;
+        q_s[t][i] = qh[t * sq2 + i];
+        k_s[t][i] = kh[t * sq2 + i];
+    }
+    const float * vh = v + sequence * sv3 + h_idx * sv1 + col0;
+    for (int idx = tid; idx < n_tokens * CPB; idx += GDN_ROWS_THREADS) {
+        const int t = idx / CPB;
+        const int c = idx % CPB;
+        v_s[t][c] = vh[t * sv2 + c];
+    }
+    if (tid < n_tokens) {
+        const int64_t gb = sequence * sb3 + tid * sb2 + h_idx * sb1;
+        eg_s[tid] = expf(g[gb]);
+        b_s[tid]  = beta[gb];
+        if constexpr (tree_t) {
+            p_s[tid] = parent[(int64_t) sequence * n_tokens + tid];
+        }
+    }
+    __syncthreads();
+
+    float s0[tree_t ? RPL : 1];
+    float pre[tree_t ? RPL : 1];
+    if constexpr (tree_t) {
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            s0[r]  = s[r];
+            pre[r] = 0.0f;
+        }
+    }
+
+    float part[GDN_ROWS_WMAX];
+#pragma unroll
+    for (int t = 0; t < GDN_ROWS_WMAX; t++) {
+        if (t >= n_tokens) {
+            break;
+        }
+        if constexpr (tree_t) {
+            const int p = gdn_rows_uniform(p_s[t]);
+            if (p != t - 1) {
+                if (p < 0) {
+#pragma unroll
+                    for (int r = 0; r < RPL; r++) {
+                        s[r] = s0[r];
+                    }
+                } else {
+#pragma unroll
+                    for (int r = 0; r < RPL; r++) {
+                        s[r] = pre[r];
+                    }
+                }
+            }
+            // prefetch the next column's parent snapshot (stored by this thread at column pn <= t - 1)
+            if (t + 1 < n_tokens) {
+                const int pn = gdn_rows_uniform(p_s[t + 1]);
+                if (pn >= 0 && pn != t) {
+                    const state_t * src = state + (int64_t) (n_tokens - 1 - pn) * state_slot_stride;
+#pragma unroll
+                    for (int c = 0; c < NCH; c++) {
+                        gdn_rows_ld4(src + c * 4 * LPC + 4 * lane, pre + 4 * c);
+                    }
+                }
+            }
+        }
+
+        float kr[RPL];
+        float qr[RPL];
+#pragma unroll
+        for (int c = 0; c < NCH; c++) {
+            const float4 k4 = *(const float4 *) &k_s[t][c * 4 * LPC + 4 * lane];
+            const float4 q4 = *(const float4 *) &q_s[t][c * 4 * LPC + 4 * lane];
+            kr[4 * c + 0] = k4.x; kr[4 * c + 1] = k4.y; kr[4 * c + 2] = k4.z; kr[4 * c + 3] = k4.w;
+            qr[4 * c + 0] = q4.x; qr[4 * c + 1] = q4.y; qr[4 * c + 2] = q4.z; qr[4 * c + 3] = q4.w;
+        }
+
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            kv += s[r] * kr[r];
+        }
+        kv = gdn_rows_sum16(kv);
+
+        const float g_val = eg_s[t];
+        const float delta = (v_s[t][cl] - g_val * kv) * b_s[t];
+
+        float ap = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            s[r] = g_val * s[r] + kr[r] * delta;
+            ap  += s[r] * qr[r];
+        }
+        part[t] = ap;
+
+        if constexpr (keep_rs_t) {
+            const int slot = n_tokens - 1 - t;
+            if (slot < K) {
+                state_t * snap = state + (int64_t) slot * state_slot_stride;
+#pragma unroll
+                for (int c = 0; c < NCH; c++) {
+                    gdn_rows_st4(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
+                }
+            }
+        }
+    }
+
+    // q-side reductions, off the serial chain (independent: they pipeline)
+#pragma unroll
+    for (int t = 0; t < GDN_ROWS_WMAX; t++) {
+        if (t >= n_tokens) {
+            break;
+        }
+        const float a = gdn_rows_sum16(part[t]);
+        if (lane == 0) {
+            dst[(int64_t) t * S_v * H] = gdn_store<state_t>(a * scale);
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < NCH; c++) {
+            gdn_rows_st4(state + c * 4 * LPC + 4 * lane, s + 4 * c);
+        }
+    }
+}
+
+// Returns true when the rows kernel handled the op.
+template <typename state_t>
+static bool gdn_rows_try(const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
+        const state_t * s_d, state_t * dst_d, state_t * state_d,
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, bool kda, int K,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3, int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride,
+        cudaStream_t stream, const int32_t * parent) {
+    int lo, hi;
+    gdn_rows_range(lo, hi);
+    if (n_tokens < lo || n_tokens > hi) {
+        return false;
+    }
+    if (kda || (S_v != 64 && S_v != 128) || n_seqs > 65535) {
+        return false;
+    }
+    // vector state access: 16-byte aligned base and slot stride (always true for ggml/cache buffers)
+    if (std::is_same_v<state_t, float> &&
+            (((uintptr_t) s_d) % 16 != 0 || ((uintptr_t) state_d) % 16 != 0 || state_slot_stride % 4 != 0)) {
+        return false;
+    }
+    const bool keep_rs = K > 1;
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+    const dim3  grid(H, n_seqs, S_v / GDN_ROWS_CPB);
+    const dim3  block(GDN_ROWS_THREADS, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+#define GDN_ROWS_ARGS lp, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, (int) n_tokens, sq1, sq2, sq3, \
+        sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent
+    if (parent != nullptr) {
+        GGML_ASSERT(keep_rs);
+        if (S_v == 128) {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<128, true, state_t, true>, GDN_ROWS_ARGS);
+        } else {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<64, true, state_t, true>, GDN_ROWS_ARGS);
+        }
+    } else if (keep_rs) {
+        if (S_v == 128) {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<128, true, state_t, false>, GDN_ROWS_ARGS);
+        } else {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<64, true, state_t, false>, GDN_ROWS_ARGS);
+        }
+    } else {
+        if (S_v == 128) {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<128, false, state_t, false>, GDN_ROWS_ARGS);
+        } else {
+            ggml_cuda_kernel_launch(gdn_rows_cuda<64, false, state_t, false>, GDN_ROWS_ARGS);
+        }
+    }
+#undef GDN_ROWS_ARGS
+    // route witness (gate packets grep it; also the build's strings content marker)
+    if (g_gdn_rows_n_calls.fetch_add(1) == 0) {
+        GGML_LOG_WARN("GDN_ROWS: ggml_cuda_gdn_rows DTREE-0-GDN-ROWS few-row gated delta-net ran (call 1, n_tokens %d, K %d, tree %d,"
+                      " GGML_HIP_GDN_ROWS range %d..%d)\n", (int) n_tokens, K, (int) (parent != nullptr), lo, hi);
+    }
+    return true;
+}
+
 template <bool KDA, bool keep_rs_t, typename state_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -936,6 +1268,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (dst->src[6] != nullptr) {
             GGML_ASSERT(keep_rs && K == n_tokens);
             GGML_ASSERT(dst->src[6]->type == GGML_TYPE_I32 && ggml_is_contiguous(dst->src[6]));
+            if (gdn_rows_try<float>(q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data, dst_d, state_d,
+                    S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                    state_slot_stride, stream, (const int32_t *) dst->src[6]->data)) {
+                return;
+            }
             gdn_dispatch<float>(kda, true, q_d, k_d, v_d, g_d, b_d,
                 (const float *) src_state->data, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream,
@@ -944,6 +1281,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
         if (gdn_chunked_try<float>(ctx, src_q, src_k, q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride)) {
+            return;
+        }
+        if (gdn_rows_try<float>(q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                state_slot_stride, stream, nullptr)) {
             return;
         }
         gdn_dispatch<float>(kda, keep_rs, q_d, k_d, v_d, g_d, b_d,
@@ -959,6 +1301,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (gdn_chunked_try<nv_bfloat16>(ctx, src_q, src_k, q_d, k_d, v_d, g_d, b_d, (const nv_bfloat16 *) src_state->data,
                 dst_d, state_d, S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                 state_slot_stride)) {
+            return;
+        }
+        if (gdn_rows_try<nv_bfloat16>(q_d, k_d, v_d, g_d, b_d, (const nv_bfloat16 *) src_state->data, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                state_slot_stride, stream, nullptr)) {
             return;
         }
         gdn_dispatch<nv_bfloat16>(kda, keep_rs, q_d, k_d, v_d, g_d, b_d,
