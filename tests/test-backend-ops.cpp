@@ -12331,9 +12331,11 @@ static void dtree_add_q8mf_eval_cases(std::vector<std::unique_ptr<test_case>> & 
 // n 17 / 64 / 512 the transient-natural-copy route into MMQ, GET_ROWS the generic consumer substitution; 6000 x 5120
 // (N % 64 != 0) is never packed (stays natural). Off by default these are ordinary MUL_MAT / GET_ROWS cases.
 static void dtree_add_q8ip_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
-    static const std::array<int64_t, 2> sh[] = {{1024, 512}, {6144, 5120}, {5120, 17408}, {6000, 5120}};
+    // DTREE-0-Q8MF-PACKED-CONSUMERS: K % 1024 != 0 (768, 1280: partial last MMVQ stage group), n 3/4 (packed MMVQ at
+    // GGML_HIP_Q8IP_MMVQ_MAX=4), n 33/100 (MMQ partial column tiles on the packed loader)
+    static const std::array<int64_t, 2> sh[] = {{1024, 512}, {6144, 5120}, {5120, 17408}, {6000, 5120}, {512, 768}, {256, 1280}};
     for (const auto & s : sh) {
-        for (int64_t n : {1, 2, 8, 12, 16, 17, 64, 512}) {
+        for (int64_t n : {1, 2, 3, 4, 8, 12, 16, 17, 33, 64, 100, 512}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
         }
     }

@@ -2057,6 +2057,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q8_mf(ctx, src0, src1, dst);
         return;
     }
+    // DTREE-0-Q8MF-PACKED-CONSUMERS: prefill MMQ reads the packed layout (compute_forward skipped the natural copy)
+    if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_mmq_handles(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("MMQ_Q8_INPLACE", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_log_mul_mat_route("CUBLAS_PRECHECK", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
