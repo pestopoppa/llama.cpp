@@ -206,7 +206,50 @@ static __device__ __forceinline__ void gv_compute_chunk(
 }
 #endif
 
-template <bool KV_Q8, bool PIPE, bool LATE = false>
+// DTREE-ATTN-ROUTE (GGML_HIP_TREE_FA): tail width in KV columns. 32 = one uint32 ancestor word per query row and covers a
+// W <= 16 tree whose cells were scattered into the holes a previous round's tree_accept left (span <= 2W).
+#define TFA_T       32
+#define TFA_MIN_NQ  4
+#define TFA_MAX_NQ  16
+#define TFA_AN_COLS 256 // mask columns per tfa_analyze block
+
+// Fold the tfa_analyze per-block records into the tree verdict. Block-uniform; contains __syncthreads().
+//   blk[3*b + 0] = 1 + last column of block b with a non -inf value in any query row (0 = none)
+//   blk[3*b + 1] = first column of block b whose query rows are not all equal (n_kv = none)
+//   blk[3*b + 2] = 1 if block b holds a value other than 0 / -0 / -inf
+// ok = binary mask, some live column, and every column below t0 = max(0, last_live + 1 - TFA_T) identical across the rows.
+static __device__ __forceinline__ void tfa_status_read(const int * __restrict__ blk, const int nblk, const int n_kv,
+        int & ok, int & t0) {
+    __shared__ int s_e;
+    __shared__ int s_f;
+    __shared__ int s_b;
+    if (threadIdx.x == 0) {
+        s_e = 0;
+        s_f = n_kv;
+        s_b = 0;
+    }
+    __syncthreads();
+    int e = 0, f = n_kv, b = 0;
+    for (int i = threadIdx.x; i < nblk; i += blockDim.x) {
+        e = max(e, blk[3 * i + 0]);
+        f = min(f, blk[3 * i + 1]);
+        b |= blk[3 * i + 2];
+    }
+    if (e > 0) {
+        atomicMax(&s_e, e);
+    }
+    if (f < n_kv) {
+        atomicMin(&s_f, f);
+    }
+    if (b) {
+        atomicOr(&s_b, b);
+    }
+    __syncthreads();
+    t0 = max(0, s_e - TFA_T);
+    ok = s_b == 0 && s_e > 0 && s_f >= t0;
+}
+
+template <bool KV_Q8, bool PIPE, bool LATE = false, bool TREE = false>
 static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
@@ -215,7 +258,9 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
-        const int64_t nb31, const int64_t nb33, const int ne33) {
+        const int64_t nb31, const int64_t nb33, const int ne33,
+        const int * __restrict__ tree_blk, const int tree_nblk, const int n_kv) {
+    static_assert(!TREE || PIPE, "the tree prefix mode exists for the pipelined kernel only");
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
     extern __shared__ char gv_smem[];
     _Float16 * sK   = (_Float16 *) gv_smem;
@@ -278,6 +323,16 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         l_run[v] = 0.0f;
     }
 
+    // DTREE-ATTN-ROUTE prefix mode: a tree-shaped mask is identical across the query rows below t0, so one mask row is
+    // read per chunk (broadcast to every row) and the chunk loop stops at t0; the tail kernel owns [t0, t0 + TFA_T).
+    // A mask that is not tree-shaped (tree_ok = 0) runs the unchanged dense loop below over all columns.
+    int tree_ok = 0;
+    int tree_t0 = 0;
+    if constexpr (TREE) {
+        tfa_status_read(tree_blk, tree_nblk, n_kv, tree_ok, tree_t0);
+    }
+    const int mrows = TREE && tree_ok ? 1 : n_q; // mask rows read per chunk
+
     // row -> query index for the mask, per accumulator row v
     int row_q[4];
     bool row_ok[4];
@@ -285,11 +340,14 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
     for (int v = 0; v < 4; ++v) {
         const int r = 16 * w + 4 * kq + v;
         row_ok[v] = tile_active && r < R;
-        row_q[v]  = row_ok[v] ? r % n_q : 0;
+        row_q[v]  = row_ok[v] && !(TREE && tree_ok) ? r % n_q : 0;
     }
 
     int c_begin = split * chunks_per_split;
     int c_end   = min(c_begin + chunks_per_split, n_chunks);
+    if (TREE && tree_ok) {
+        c_end = min(c_end, (tree_t0 + GV_KC - 1) / GV_KC);
+    }
 
     if (n_grp > 1) {
         // live-range trim: [first, last] chunk of this split with a non -inf mask value in this group's rows
@@ -347,11 +405,11 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                 const int i = tid + s * nthreads;
                 if constexpr (LATE) {
                     // no select against a default: store_raw reads rm[s] only under this same condition
-                    if (i < n_q * GV_KC) {
+                    if (i < mrows * GV_KC) {
                         rm[s] = *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half));
                     }
                 } else {
-                rm[s] = i < n_q * GV_KC ?
+                rm[s] = i < mrows * GV_KC ?
                     *(const uint16_t *) (Mb + (i / GV_KC) * nb31 + (int64_t) (kbase + i % GV_KC) * sizeof(half)) : (uint16_t) 0xFC00;
                 }
             }
@@ -409,7 +467,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             }
         };
 
-        auto store_raw = [&]() __attribute__((always_inline)) -> int {
+        auto store_raw = [&](const int c) __attribute__((always_inline)) -> int {
             int any = 0;
             if constexpr (LATE) {
                 // opaque point of first use of the raw halfwords: without it the scheduler hoists `tail >> 8` beside the load.
@@ -420,8 +478,13 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 const int i = tid + s * nthreads;
-                if (i < n_q * GV_KC) {
-                    const float mv = __half2float(__ushort_as_half(rm[s]));
+                if (i < mrows * GV_KC) {
+                    float mv = __half2float(__ushort_as_half(rm[s]));
+                    if constexpr (TREE) {
+                        if (tree_ok && c * GV_KC + i >= tree_t0) {
+                            mv = -INFINITY; // tail column: owned by tfa_tail_kernel
+                        }
+                    }
                     smask[i] = mv;
                     any |= mv != -INFINITY;
                 }
@@ -471,7 +534,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             load_raw(c_begin);
         }
         for (int c = c_begin; c < c_end; ++c) {
-            const int live = __syncthreads_or(store_raw());
+            const int live = __syncthreads_or(store_raw(c));
             if (c + 1 < c_end) {
                 load_raw(c + 1); // in flight during the MFMA work below
             }
@@ -571,7 +634,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q_tot, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-        nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33);
+        nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33, tree_blk, tree_nblk, n_kv);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 }
@@ -780,20 +843,20 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            mask->nb[1], mask->nb[3], ne33, nullptr, 0, n_kv);
     } else if (pipe) {
         if (q8) {
             gv_fattn_kernel<true, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            mask->nb[1], mask->nb[3], ne33, nullptr, 0, n_kv);
         } else {
             gv_fattn_kernel<false, true><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            mask->nb[1], mask->nb[3], ne33, nullptr, 0, n_kv);
         }
     } else {
         if (q8) {
@@ -801,13 +864,13 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            mask->nb[1], mask->nb[3], ne33, nullptr, 0, n_kv);
         } else {
             gv_fattn_kernel<false, false><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            mask->nb[1], mask->nb[3], ne33, nullptr, 0, n_kv);
         }
     }
     CUDA_CHECK(cudaGetLastError());
@@ -836,5 +899,519 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     if (gv_debug() && n_calls <= 8) {
         GGML_LOG_WARN("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
             __func__, dst->name, n_q, gqa, n_head_kv, n_kv, n_seq, ggml_type_name(K->type), n_splits, nwaves, smem, (int) pipe);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-ATTN-ROUTE: tree-verify attention (GGML_HIP_TREE_FA=1). See fattn-gqa-verify.cuh for the stage list.
+//
+// A llama tree batch (llama_batch.parent, llama_kv_cache::set_input_kq_mask_tree) gives the KQ mask this shape: the
+// committed context is 0 for every query row (holes left by an earlier tree_accept are -inf for every row), the W tree
+// cells carry the ancestor-or-self pattern, and the KV padding after them is -inf. The tree cells are normally the last
+// W live columns; after a tree_accept they can also fill that round's holes, so the tail window is TFA_T = 32 columns
+// ending at the last live column. The ancestor structure is read from the mask itself, on the device.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static bool tfa_enabled() {
+    static const bool v = gv_env_int("GGML_HIP_TREE_FA", 0) != 0;
+    return v;
+}
+
+static int tfa_splits_env() {
+    static const int v = gv_env_int("GGML_HIP_TREE_FA_SPLITS", 0);
+    return v;
+}
+
+static bool tfa_debug() {
+    static const bool v = gv_env_int("GGML_HIP_TREE_FA_DEBUG", 0) != 0;
+    return v;
+}
+
+static __device__ __forceinline__ uint16_t tfa_norm(const uint16_t u) {
+    return u == 0x8000 ? (uint16_t) 0 : u; // -0 == 0
+}
+
+// stage 0: one thread per mask column, one record per TFA_AN_COLS columns (no atomics on global memory, no memset)
+static __global__ void tfa_analyze_kernel(const char * __restrict__ mask, const int64_t nb31, const int n_q, const int n_kv,
+        int * __restrict__ blk) {
+    __shared__ int s_e;
+    __shared__ int s_f;
+    __shared__ int s_b;
+    if (threadIdx.x == 0) {
+        s_e = 0;
+        s_f = n_kv;
+        s_b = 0;
+    }
+    __syncthreads();
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n_kv) {
+        const uint16_t u0 = tfa_norm(*(const uint16_t *) (mask + (int64_t) j * sizeof(half)));
+        bool live = u0 != 0xFC00;
+        bool uni  = true;
+        bool bin  = u0 == 0 || u0 == 0xFC00;
+        for (int q = 1; q < n_q; ++q) {
+            const uint16_t u = tfa_norm(*(const uint16_t *) (mask + q * nb31 + (int64_t) j * sizeof(half)));
+            live |= u != 0xFC00;
+            uni  &= u == u0;
+            bin  &= u == 0 || u == 0xFC00;
+        }
+        if (live) {
+            atomicMax(&s_e, j + 1);
+        }
+        if (!uni) {
+            atomicMin(&s_f, j);
+        }
+        if (!bin) {
+            atomicOr(&s_b, 1);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        blk[3 * blockIdx.x + 0] = s_e;
+        blk[3 * blockIdx.x + 1] = s_f;
+        blk[3 * blockIdx.x + 2] = s_b;
+    }
+}
+
+// stage 2: the tree block. One workgroup per KV head; rows r = h_local * n_q + q (as gv), wave w owns rows [16w, 16w+16).
+// The 32 tail keys are two 16-column MFMA tiles of S = Q K^T; the ancestor word of each accumulator row lives in a VGPR and
+// masks S in registers. Writes the unnormalized O and (m, l) of the tail, l = 0 when the mask is not tree-shaped.
+template <bool KV_Q8>
+static __global__ void __launch_bounds__(64 * GV_PIPE_MAX_WAVES, 1) tfa_tail_kernel(
+        const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
+        const char * __restrict__ mask, float * __restrict__ Otail, float2 * __restrict__ MLtail,
+        const int * __restrict__ tree_blk, const int tree_nblk,
+        const float scale, const int n_q, const int gqa, const int n_kv,
+        const int64_t nb01, const int64_t nb02, const int64_t nb11, const int64_t nb12,
+        const int64_t nb21, const int64_t nb22, const int64_t nb31) {
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+    static_assert(TFA_T == GV_KC, "the tail tile reuses the gv chunk layout");
+    extern __shared__ char gv_smem[];
+    _Float16 * sK  = (_Float16 *) gv_smem;
+    _Float16 * sVt = sK + GV_KC * GV_KSTR;
+    _Float16 * sP0 = sVt + GV_D * GV_VTSTR;
+    __shared__ uint32_t s_bits[TFA_MAX_NQ];
+
+    const int hkv      = blockIdx.x;
+    const int nthreads = blockDim.x;
+    const int tid      = threadIdx.x;
+    const int w        = tid / 64;
+    const int l        = tid % 64;
+    const int li       = l % 16;
+    const int kq       = l / 16;
+    const int R        = gqa * n_q;
+    const int ntiles   = (R + 15) / 16;
+    const bool tile_active = w < ntiles;
+    _Float16 * sP = sP0 + w * 16 * GV_PSTR;
+
+    int ok = 0;
+    int t0 = 0;
+    tfa_status_read(tree_blk, tree_nblk, n_kv, ok, t0);
+
+    float2 * ML = MLtail + (int64_t) hkv * R;
+    if (!ok) {
+        for (int r = tid; r < R; r += nthreads) {
+            ML[r] = make_float2(-FLT_MAX / 2.0f, 0.0f);
+        }
+        return; // block-uniform
+    }
+
+    // ancestor words: bit j of s_bits[q] = query row q sees tail column t0 + j (the mask is binary when ok)
+    if (tid < TFA_MAX_NQ) {
+        s_bits[tid] = 0;
+    }
+    __syncthreads();
+    for (int i = tid; i < n_q * TFA_T; i += nthreads) {
+        const int q = i / TFA_T;
+        const int j = i % TFA_T;
+        const uint16_t u = *(const uint16_t *) (mask + q * nb31 + (int64_t) (t0 + j) * sizeof(half));
+        if (u != 0xFC00) {
+            atomicOr(&s_bits[q], 1u << j);
+        }
+    }
+
+    // tail K -> sK [key][d], V -> sVt [d][key]
+    const char * Kb = K + hkv * nb12;
+    const char * Vb = V + hkv * nb22;
+    if constexpr (KV_Q8) {
+        for (int i = tid; i < TFA_T * (GV_D / QK8_0); i += nthreads) {
+            const int b   = i / TFA_T;
+            const int key = i % TFA_T;
+            {
+                const char * bk = Kb + (int64_t) (t0 + key) * nb11 + b * (int64_t) sizeof(block_q8_0);
+                const float d = __half2float(*(const half *) bk);
+                const uint16_t * qs = (const uint16_t *) (bk + sizeof(half));
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    _Float16 tmp[8];
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const uint16_t u = qs[4 * g + t];
+                        tmp[2 * t + 0] = (_Float16) (d * (float) (int8_t) (u & 0xFF));
+                        tmp[2 * t + 1] = (_Float16) (d * (float) (int8_t) (u >> 8));
+                    }
+                    *(uint4 *) (sK + key * GV_KSTR + b * QK8_0 + 8 * g) = *(const uint4 *) tmp;
+                }
+            }
+            {
+                const char * bv = Vb + (int64_t) (t0 + key) * nb21 + b * (int64_t) sizeof(block_q8_0);
+                const float d = __half2float(*(const half *) bv);
+                const uint16_t * qs = (const uint16_t *) (bv + sizeof(half));
+#pragma unroll
+                for (int t = 0; t < QK8_0 / 2; ++t) {
+                    const uint16_t u = qs[t];
+                    sVt[(b * QK8_0 + 2 * t + 0) * GV_VTSTR + key] = (_Float16) (d * (float) (int8_t) (u & 0xFF));
+                    sVt[(b * QK8_0 + 2 * t + 1) * GV_VTSTR + key] = (_Float16) (d * (float) (int8_t) (u >> 8));
+                }
+            }
+        }
+    } else {
+        for (int i = tid; i < TFA_T * (GV_D / 8); i += nthreads) {
+            const int cc  = i / TFA_T;
+            const int key = i % TFA_T;
+            const uint4 kv = *(const uint4 *) (Kb + (int64_t) (t0 + key) * nb11 + cc * 16);
+            *(uint4 *) (sK + key * GV_KSTR + cc * 8) = kv;
+            const uint4 vv = *(const uint4 *) (Vb + (int64_t) (t0 + key) * nb21 + cc * 16);
+            const _Float16 * vh = (const _Float16 *) &vv;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                sVt[(cc * 8 + t) * GV_VTSTR + key] = vh[t];
+            }
+        }
+    }
+    __syncthreads();
+
+    // per accumulator row v of this lane: query index and ancestor word (registers)
+    bool     row_ok[4];
+    uint32_t row_bits[4];
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        const int r = 16 * w + 4 * kq + v;
+        row_ok[v]   = tile_active && r < R;
+        row_bits[v] = row_ok[v] ? s_bits[r % n_q] : 0u;
+    }
+
+    float m_r[4];
+    float l_r[4];
+    if (tile_active) {
+        gv_halfx4 qa[GV_D / 16];
+        {
+            const int r = 16 * w + li;
+            const bool valid = r < R;
+            const int h = valid ? r / n_q : 0;
+            const int q = valid ? r % n_q : 0;
+            const float * Qr = (const float *) (Q + (int64_t) (hkv * gqa + h) * nb02 + (int64_t) q * nb01);
+#pragma unroll
+            for (int s = 0; s < GV_D / 16; ++s) {
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    qa[s][t] = valid ? (_Float16) Qr[16 * s + 4 * kq + t] : (_Float16) 0.0f;
+                }
+            }
+        }
+
+        gv_floatx4 S[TFA_T / 16];
+#pragma unroll
+        for (int nb = 0; nb < TFA_T / 16; ++nb) {
+            S[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int s = 0; s < GV_D / 16; ++s) {
+                const gv_halfx4 kb = *(const gv_halfx4 *) (sK + (nb * 16 + li) * GV_KSTR + 16 * s + 4 * kq);
+                S[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S[nb], 0, 0, 0);
+            }
+        }
+
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            float rmax = -FLT_MAX / 2.0f;
+#pragma unroll
+            for (int nb = 0; nb < TFA_T / 16; ++nb) {
+                const bool keep = (row_bits[v] >> (nb * 16 + li)) & 1u; // D[i][j]: j = li within N-tile nb
+                S[nb][v] = keep ? S[nb][v] * scale : -INFINITY;
+                rmax = fmaxf(rmax, S[nb][v]);
+            }
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                rmax = fmaxf(rmax, __shfl_xor(rmax, off, 64));
+            }
+            float rsum = 0.0f;
+#pragma unroll
+            for (int nb = 0; nb < TFA_T / 16; ++nb) {
+                const float p = __expf(S[nb][v] - rmax);
+                rsum += p;
+                sP[(4 * kq + v) * GV_PSTR + nb * 16 + li] = (_Float16) p;
+            }
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) {
+                rsum += __shfl_xor(rsum, off, 64);
+            }
+            m_r[v] = rmax;
+            l_r[v] = rsum;
+        }
+    }
+    __syncthreads();
+
+    if (tile_active) {
+        gv_floatx4 o[GV_D / 16];
+#pragma unroll
+        for (int nb = 0; nb < GV_D / 16; ++nb) {
+            o[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+        }
+#pragma unroll
+        for (int t = 0; t < TFA_T / 16; ++t) {
+            const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * GV_PSTR + 16 * t + 4 * kq);
+#pragma unroll
+            for (int nb = 0; nb < GV_D / 16; ++nb) {
+                const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * GV_VTSTR + 16 * t + 4 * kq);
+                o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            if (!row_ok[v]) {
+                continue;
+            }
+            const int r = 16 * w + 4 * kq + v;
+            float * Or = Otail + ((int64_t) hkv * R + r) * GV_D;
+#pragma unroll
+            for (int nb = 0; nb < GV_D / 16; ++nb) {
+                Or[nb * 16 + li] = o[nb][v];
+            }
+            if (li == 0) {
+                ML[r] = make_float2(m_r[v], l_r[v]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, Otail, MLtail, tree_blk, tree_nblk, scale, n_q, gqa, n_kv,
+        nb01, nb02, nb11, nb12, nb21, nb22, nb31);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+}
+
+// stage 3: LSE merge of the n_splits prefix partials and the tail partial. One block per (row r, kv head), one thread per d.
+// A part with l == 0 (empty split, or the tail of a mask that is not tree-shaped) contributes nothing; a row with no live
+// part writes 0 (INF48-FA-ALLMASK-NAN convention).
+static __global__ void tfa_merge_kernel(
+        const float * __restrict__ Opart, const float2 * __restrict__ MLpart,
+        const float * __restrict__ Otail, const float2 * __restrict__ MLtail, float * __restrict__ dst,
+        const int n_splits, const int n_q, const int gqa, const int n_head_kv) {
+    const int r   = blockIdx.x;
+    const int hkv = blockIdx.y;
+    const int d   = threadIdx.x;
+    const int R   = gqa * n_q;
+
+    const int64_t trow = (int64_t) hkv * R + r;
+    const float2 mlt = MLtail[trow];
+    float M = mlt.y > 0.0f ? mlt.x : -FLT_MAX;
+    for (int s = 0; s < n_splits; ++s) {
+        const float2 ml = MLpart[((int64_t) s * n_head_kv + hkv) * R + r];
+        if (ml.y > 0.0f) {
+            M = fmaxf(M, ml.x);
+        }
+    }
+    float acc = 0.0f;
+    float L   = 0.0f;
+    if (mlt.y > 0.0f) {
+        const float f = __expf(mlt.x - M);
+        L   += f * mlt.y;
+        acc += f * Otail[trow * GV_D + d];
+    }
+    for (int s = 0; s < n_splits; ++s) {
+        const int64_t row = ((int64_t) s * n_head_kv + hkv) * R + r;
+        const float2 ml = MLpart[row];
+        if (ml.y > 0.0f) {
+            const float f = __expf(ml.x - M);
+            L   += f * ml.y;
+            acc += f * Opart[row * GV_D + d];
+        }
+    }
+    const int h = r / n_q;
+    const int q = r % n_q;
+    const int n_head = n_head_kv * gqa;
+    dst[((int64_t) q * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+bool ggml_cuda_fattn_tree_applicable(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    if (!tfa_enabled()) {
+        return false;
+    }
+    if (!amd_mfma_available(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (Q->ne[0] != GV_D || K->ne[0] != GV_D || V->ne[0] != GV_D) {
+        return false;
+    }
+    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || sinks != nullptr) {
+        return false;
+    }
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    const int64_t n_q = Q->ne[1];
+    if (n_q < TFA_MIN_NQ || n_q > TFA_MAX_NQ) {
+        return false;
+    }
+    if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2]) {
+        return false;
+    }
+    const int64_t gqa = Q->ne[2] / K->ne[2];
+    if (gqa * n_q > 16 * GV_PIPE_MAX_WAVES) {
+        return false; // pipelined prefix kernel and the tail kernel hold <= 8 tiles
+    }
+    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
+        return false; // one sequence: a tree batch is one seq set
+    }
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0 || K->ne[1] < TFA_T || V->ne[1] != K->ne[1] ||
+        mask->ne[0] < K->ne[1] || mask->ne[1] < n_q || mask->nb[1] % 2 != 0) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
+        return false;
+    }
+    if (K->type == GGML_TYPE_F16) {
+        if (K->nb[1] % 16 != 0 || V->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || V->nb[2] % 16 != 0 ||
+            (uintptr_t) K->data % 16 != 0 || (uintptr_t) V->data % 16 != 0) {
+            return false;
+        }
+    } else {
+        if (K->nb[1] % 2 != 0 || V->nb[1] % 2 != 0 || (uintptr_t) K->data % 2 != 0 || (uintptr_t) V->data % 2 != 0) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+void ggml_cuda_fattn_tree(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int n_q       = (int) Q->ne[1];
+    const int n_head_kv = (int) K->ne[2];
+    const int gqa       = (int) (Q->ne[2] / K->ne[2]);
+    const int n_kv      = (int) K->ne[1];
+    const int R         = gqa * n_q;
+    const int ntiles    = (R + 15) / 16;
+    const int nwaves    = std::max(ntiles, GV_MIN_WAVES);
+    GGML_ASSERT(ntiles <= GV_PIPE_MAX_WAVES);
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    cudaStream_t stream = ctx.stream();
+
+    // stage 0
+    const int nblk = (n_kv + TFA_AN_COLS - 1) / TFA_AN_COLS;
+    ggml_cuda_pool_alloc<int> blk(ctx.pool(), 3 * (size_t) nblk);
+    tfa_analyze_kernel<<<nblk, TFA_AN_COLS, 0, stream>>>((const char *) mask->data, mask->nb[1], n_q, n_kv, blk.get());
+    CUDA_CHECK(cudaGetLastError());
+
+    // stage 1: splits as gv (AK-DTREE-PB-OCC: GGML_HIP_TREE_FA_SPLITS overrides, for the occupancy sweep)
+    const int n_chunks = n_kv / GV_KC;
+    const int nsm      = ggml_cuda_info().devices[ctx.device].nsm;
+    int n_splits = tfa_splits_env();
+    if (n_splits <= 0) {
+        n_splits = (2 * nsm + n_head_kv - 1) / n_head_kv;
+        n_splits = std::min(n_splits, std::max(1, n_kv / 256));
+        n_splits = std::min(n_splits, 256);
+    }
+    n_splits = std::max(1, std::min(n_splits, n_chunks));
+    const int chunks_per_split = (n_chunks + n_splits - 1) / n_splits;
+    n_splits = (n_chunks + chunks_per_split - 1) / chunks_per_split;
+
+    const size_t n_rows_part = (size_t) n_splits * n_head_kv * R;
+    ggml_cuda_pool_alloc<float>  Opart(ctx.pool(), n_rows_part * GV_D);
+    ggml_cuda_pool_alloc<float2> MLpart(ctx.pool(), n_rows_part);
+
+    const dim3 grid(n_splits, n_head_kv, 1);
+    const dim3 block(64 * nwaves);
+    const size_t smem = gv_smem_bytes(nwaves);
+    const bool q8   = K->type == GGML_TYPE_Q8_0;
+    const bool late = q8 && gv_prefetch_late();
+#define TFA_PREFIX_ARGS \
+        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
+        Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, 1, n_q, chunks_per_split, n_chunks, \
+        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], \
+        mask->nb[1], mask->nb[3], 1, blk.get(), nblk, n_kv
+    if (late) {
+        gv_fattn_kernel<true, true, true, true><<<grid, block, smem, stream>>>(TFA_PREFIX_ARGS);
+    } else if (q8) {
+        gv_fattn_kernel<true, true, false, true><<<grid, block, smem, stream>>>(TFA_PREFIX_ARGS);
+    } else {
+        gv_fattn_kernel<false, true, false, true><<<grid, block, smem, stream>>>(TFA_PREFIX_ARGS);
+    }
+#undef TFA_PREFIX_ARGS
+    CUDA_CHECK(cudaGetLastError());
+
+    // stage 2
+    ggml_cuda_pool_alloc<float>  Otail(ctx.pool(), (size_t) n_head_kv * R * GV_D);
+    ggml_cuda_pool_alloc<float2> MLtail(ctx.pool(), (size_t) n_head_kv * R);
+    if (q8) {
+        tfa_tail_kernel<true><<<n_head_kv, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Otail.get(), MLtail.get(), blk.get(), nblk, scale, n_q, gqa, n_kv,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+    } else {
+        tfa_tail_kernel<false><<<n_head_kv, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Otail.get(), MLtail.get(), blk.get(), nblk, scale, n_q, gqa, n_kv,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // stage 3
+    tfa_merge_kernel<<<dim3(R, n_head_kv, 1), dim3(GV_D), 0, stream>>>(
+        Opart.get(), MLpart.get(), Otail.get(), MLtail.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv);
+    CUDA_CHECK(cudaGetLastError());
+
+    // path witness, once per process
+    static int n_calls = 0;
+    if (n_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_tree: GGML_HIP_TREE_FA tree-verify attention ran (call 1: n_q=%d gqa=%d n_kv=%d %s splits=%d)\n",
+            n_q, gqa, n_kv, ggml_type_name(K->type), n_splits);
+    }
+    // GGML_HIP_TREE_FA_DEBUG=1: the device verdict (tree-shaped or dense fallback) of the first 16 calls. Synchronizes the
+    // stream, so it is skipped while a graph is being captured.
+    if (tfa_debug() && n_calls <= 16) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (cap == cudaStreamCaptureStatusNone) {
+            std::vector<int> h(3 * (size_t) nblk);
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), blk.get(), h.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int e = 0, f = n_kv, b = 0;
+            for (int i = 0; i < nblk; ++i) {
+                e = std::max(e, h[3 * i + 0]);
+                f = std::min(f, h[3 * i + 1]);
+                b |= h[3 * i + 2];
+            }
+            const int t0 = std::max(0, e - TFA_T);
+            GGML_LOG_WARN("ggml_cuda_fattn_tree: %s n_q=%d n_kv=%d last_live=%d first_nonuniform=%d nonbinary=%d t0=%d -> %s\n",
+                dst->name, n_q, n_kv, e, f, b, t0, (b == 0 && e > 0 && f >= t0) ? "tree" : "dense fallback");
+        }
     }
 }

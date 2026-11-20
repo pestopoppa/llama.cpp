@@ -9759,6 +9759,121 @@ struct test_flash_attn_ext_hs256_nomask : public test_flash_attn_ext {
                               GGML_TYPE_F16, GGML_TYPE_F16) {}
 };
 
+// [DTREE-ATTN-ROUTE] GGML_OP_FLASH_ATTN_EXT with the KQ mask of a llama tree batch (llama_kv_cache::set_input_kq_mask_tree):
+// every query row sees the committed prefix, its own ancestors-or-self among the nb tree cells, and nothing after them
+// (KV padding). Parents are seeded random (parent[i] in [-1, i-1]). Exercises the HIP GGML_HIP_TREE_FA path
+// (fattn-gqa-verify.cu: unmasked-prefix split-KV + 32-column ancestor-word tail tile + LSE merge); default-off it runs the
+// stock selection. Modes:
+//   TREE   : prefix [0, L) = 0, tree cells [L, L + nb), -inf after (L = kv - nb - 77)
+//   CAUSAL : the same with parent[i] = i - 1 (a chain: the causal tail of a linear verify)
+//   HOLES  : uniform -inf hole columns every 97 cells of the prefix (cells an earlier tree_accept dropped), and the tree
+//            cells scattered over a 30-column window whose other columns alternate committed (0) / hole (-inf)
+//   SPREAD : the tree cells spread over more than 32 columns, so the device verdict is "not tree-shaped" and the HIP path
+//            must take its dense-mask fallback
+//   SPARSE : TREE with a prefix visible only on every 256th column, so the tree tail carries a large share of the softmax
+//            mass and one wrong ancestor bit moves the output far past the NMSE limit (the mask-correctness detector)
+// NMSE limit 5e-4, except 1.5e-3 for the dense-prefix modes with f16 V at n_kv > 4096: the CPU reference accumulates an
+// f16 V in f16 and splits the KV across threads in a timing-dependent order, so over 32k near-uniform keys it fails
+// against ITSELF at 6.4e-4..7.3e-4 (CPU-vs-CPU run, 2026-11-20). Those modes check numerics and the fast-path / fallback
+// plumbing; SPARSE (5e-4 everywhere) is the mask-correctness check.
+enum fa_tree_mode { FA_TREE, FA_TREE_CAUSAL, FA_TREE_HOLES, FA_TREE_SPREAD, FA_TREE_SPARSE };
+
+struct test_flash_attn_ext_tree : public test_flash_attn_ext {
+    const fa_tree_mode tmode;
+
+    std::string vars() override {
+        static const char * names[] = { "tree", "causal", "holes", "spread", "sparse" };
+        return test_flash_attn_ext::vars() + ",treemask=" + names[tmode];
+    }
+
+    test_flash_attn_ext_tree(int64_t nh_kv, int64_t gqa, int64_t kv, int64_t nb, ggml_type type_KV, fa_tree_mode tmode)
+        : test_flash_attn_ext(256, 256, nh_kv, {gqa, 1}, kv, nb, /*mask*/ true, /*sinks*/ false, 0.0f, 0.0f, GGML_PREC_F32,
+                              type_KV, type_KV),
+          tmode(tmode) {}
+
+    double max_nmse_err() override {
+        return type_V == GGML_TYPE_F16 && kv > 4096 && tmode != FA_TREE_SPARSE ? 1.5e-3 : 5e-4;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16 && ggml_is_contiguous(m));
+        const int64_t ne0  = m->ne[0];
+        const int64_t rows = m->ne[1];
+        GGML_ASSERT(m->ne[2] == 1 && m->ne[3] == 1 && rows >= nb);
+
+        std::mt19937 rng((uint32_t) (1234 + 131 * nb + kv + 7 * tmode));
+        std::vector<int> parent(nb);
+        for (int64_t i = 0; i < nb; ++i) {
+            if (tmode == FA_TREE_CAUSAL) {
+                parent[i] = (int) i - 1;
+            } else {
+                parent[i] = i == 0 ? -1 : std::uniform_int_distribution<int>(-1, (int) i - 1)(rng);
+            }
+        }
+        auto is_anc = [&](int a, int c) {
+            for (int x = c; x >= 0; x = parent[x]) {
+                if (x == a) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // column -> tree node (-1 = not a tree cell), and the visibility of the non-tree columns
+        std::vector<int>  node(ne0, -1);
+        std::vector<char> vis(ne0, 0);
+        const int64_t L = ne0 - nb - 77;
+        GGML_ASSERT(L > 64);
+        for (int64_t j = 0; j < L; ++j) {
+            vis[j] = tmode == FA_TREE_SPARSE ? j % 256 == 5 : !(tmode == FA_TREE_HOLES && j % 97 == 13);
+        }
+        if (tmode == FA_TREE || tmode == FA_TREE_CAUSAL || tmode == FA_TREE_SPARSE) {
+            for (int64_t i = 0; i < nb; ++i) {
+                node[L + i] = (int) i;
+            }
+        } else {
+            const int64_t width = tmode == FA_TREE_HOLES ? 30 : 48;
+            const int64_t ws    = L - 16;          // window [ws, ws + width) straddles the end of the prefix
+            std::vector<int64_t> cols(width);
+            for (int64_t c = 0; c < width; ++c) {
+                cols[c] = ws + c;
+            }
+            std::shuffle(cols.begin() + 1, cols.end() - 1, rng);
+            // SPREAD: the first and last window columns are tree cells, so the tree spans `width` > 32 columns
+            std::vector<int64_t> pick(cols.begin(), cols.begin() + nb - 1);
+            pick.push_back(ws + width - 1);
+            std::sort(pick.begin(), pick.end());
+            for (int64_t c = 0; c < width; ++c) {
+                vis[ws + c] = (c % 2) == 0; // non-tree window columns alternate committed / hole
+            }
+            for (int64_t i = 0; i < nb; ++i) {
+                node[pick[i]] = (int) i;
+            }
+        }
+
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> data(ne0*rows);
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t j = 0; j < ne0; ++j) {
+                bool keep;
+                if (r >= nb) {
+                    keep = false; // mask padding rows
+                } else if (node[j] >= 0) {
+                    keep = is_anc(node[j], (int) r);
+                } else {
+                    keep = vis[j];
+                }
+                data[r*ne0 + j] = keep ? zero : ninf;
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // [AK-ASM-H5-PORT] GGML_OP_FLASH_ATTN_EXT cases for the gfx90a FA-v3 hd128 bf16 asm fast path
 // (ggml/src/ggml-cuda/fattn-asm-gfx90a.cu), with llama.cpp-shaped masks instead of init_tensor_kq_mask's noise:
 //   mask_mode CAUSAL_PAD : bottom-right causal over the first L = kv - pad cells, -INF on the trailing pad cells
@@ -14231,6 +14346,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 75, true));
     test_cases.emplace_back(new test_flash_attn_ext_hs256_nomask({4, 1},  512, 32, false));
 
+    // [DTREE-ATTN-ROUTE] tree-verify masks, D=256: 27B (4 KV heads, GQA 6, q8_0 KV) and A3B (2 KV heads, GQA 8, f16 KV),
+    // n_kv 4096 / 32768, n_q 4/8/12/16; plus one spread (dense-fallback) case per model and context.
+    for (auto mdl : std::vector<std::pair<std::array<int64_t, 2>, ggml_type>>{{{4, 6}, GGML_TYPE_Q8_0}, {{2, 8}, GGML_TYPE_F16}}) {
+        for (int64_t kv : {4096, 32768}) {
+            for (int64_t nb : {4, 8, 12, 16}) {
+                for (fa_tree_mode tm : {FA_TREE, FA_TREE_CAUSAL, FA_TREE_HOLES, FA_TREE_SPARSE}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_tree(mdl.first[0], mdl.first[1], kv, nb, mdl.second, tm));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_tree(mdl.first[0], mdl.first[1], kv, 12, mdl.second, FA_TREE_SPREAD));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14251,6 +14379,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], kv, nb, 1, type_KV, 0));
                 }
             }
+        }
+    }
+
+    // DTREE-ATTN-ROUTE: tree-verify attention, A/B GGML_HIP_TREE_FA=1 vs unset (27B q8_0 KV, A3B f16 KV)
+    for (int64_t kv : {4096, 32768}) {
+        for (int64_t nb : {8, 12, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_tree(4, 6, kv, nb, GGML_TYPE_Q8_0, FA_TREE));
+            test_cases.emplace_back(new test_flash_attn_ext_tree(2, 8, kv, nb, GGML_TYPE_F16,  FA_TREE));
         }
     }
 

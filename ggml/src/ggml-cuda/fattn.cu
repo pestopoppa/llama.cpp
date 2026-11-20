@@ -750,6 +750,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (ggml_cuda_fattn_asm_gfx90a_try(ctx, dst)) {
         return;
     }
+    // DTREE-ATTN-ROUTE: tree-verify attention (fattn-gqa-verify.cu), GGML_HIP_TREE_FA=1 only; default off = unchanged.
+    // Needs no f16 K/V copy, so the allocation sized by ggml_cuda_flash_attn_ext_get_alloc_size stays sufficient.
+    if (ggml_cuda_fattn_tree_applicable(ggml_cuda_get_device(), dst)) {
+        ggml_cuda_fattn_tree(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
