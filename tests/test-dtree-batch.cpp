@@ -88,13 +88,14 @@ int main(int argc, char ** argv) {
     llama_context * path = make_ctx(model, n_threads);
     llama_context * lin  = make_ctx(model, n_threads); // linear verify of the main draft from the committed state
 
-    const std::string prompt = "The history of the printing press begins in the fifteenth century, when";
+    const std::string prompt = getenv("DTREE_PROMPT") ? getenv("DTREE_PROMPT")
+                                                      : "The history of the printing press begins in the fifteenth century, when";
     std::vector<llama_token> ptoks(256);
     const int np = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), ptoks.data(), (int) ptoks.size(), true, false);
     CHECK(np > 0);
     ptoks.resize(np);
 
-    batch_t B(64);
+    batch_t B(4096); // the fresh-prefill oracle re-decodes the whole committed context each column
 
     // reference greedy stream
     const int n_ref = n_rounds * 8 + 16;
@@ -178,8 +179,11 @@ int main(int argc, char ** argv) {
             tree_mis += mis; tree_n++;
             if (c <= 3) oracle_main[c] = argmax(l);
             if (mis) {
-                fprintf(stderr, "round %d col %d: tree argmax %d != path argmax %d (max|dlogit| %.4g)\n",
-                        r, c, argmax(tl[c].data()), argmax(l), d);
+                // oracle margin between its own top-1 and the tree's choice (a near-tie flip has a small margin)
+                const double margin = (double) l[argmax(l)] - (double) l[argmax(tl[c].data())];
+                fprintf(stderr, "round %d col %d: tree argmax %d != path argmax %d (max|dlogit| %.4g, oracle margin %.4g, %s column)\n",
+                        r, c, argmax(tl[c].data()), argmax(l), d, margin, c <= 3 ? "main" : "side");
+                printf("DTREE_MIS round=%d col=%d main=%d margin=%.5f\n", r, c, c <= 3 ? 1 : 0, margin);
                 CHECK(g_rate);
             }
         }
