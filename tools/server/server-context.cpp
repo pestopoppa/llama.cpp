@@ -512,6 +512,8 @@ struct server_slot {
     llama_seq_id spec_tree_seq0 = -1;  // first alternative sequence id (-1: tree verify off)
     bool    spec_tree_live = false;    // alternative sequences were forked this iteration (cleanup pending)
     bool    spec_tree_batch = false;   // [AK-DTREE-2] verify the tree as one batch in this slot's sequence
+    int32_t spec_tree_cols  = 0;       // [AK-DTREE-2] tree columns budgeted this round (batch mode pads to it)
+    bool    spec_tree_batch_round = false; // [AK-DTREE-2] this round's verify was emitted as a tree batch
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -873,7 +875,9 @@ struct server_slot {
             // AK-DTREE-1: every alternative path is its own sequence, forked (KV + recurrent state, incl. a
             // pending rollback) from this slot's sequence, with the same anchor and positions
             spec_tree_i_batch.clear();
-            if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_batch) {
+            spec_tree_batch_round = false;
+            if (!serial_speculative_verify && spec_tree_batch && spec_tree_cols > 0) {
+                spec_tree_batch_round = true;
                 // [AK-DTREE-2] the alternatives' unique columns join this slot's own sequence with explicit tree
                 // parents; a shared prefix with the main draft reuses the main rows
                 spec_tree_i_batch.resize(spec_tree_alts.size());
@@ -891,6 +895,21 @@ struct server_slot {
                         rows.push_back(batch.size());
                         add_ok &= batch.add(id, alt[j], pa + 1 + (llama_pos) j, true, par);
                     }
+                }
+                // a constant verify width keeps the target graph (and its HIP graph) reusable across rounds whose
+                // alternatives differ in number or length: pad to the round's column budget with dummy children of the
+                // anchor (Infernix: "columns past the live count repeat the anchor"); they belong to no path
+                const int32_t n_cols = (int32_t) (spec_draft.size() + 1) + [&] {
+                    int32_t n = 0;
+                    for (size_t a = 0; a < spec_tree_i_batch.size(); ++a) {
+                        for (const int32_t r : spec_tree_i_batch[a]) {
+                            n += std::find(spec_i_batch.begin(), spec_i_batch.end(), r) == spec_i_batch.end() ? 1 : 0;
+                        }
+                    }
+                    return n;
+                }();
+                for (int32_t c = n_cols; c < spec_tree_cols; ++c) {
+                    add_ok &= batch.add(id, sampled, pa + 1, true, spec_i_batch[0]);
                 }
             } else if (!serial_speculative_verify && !spec_tree_alts.empty() && spec_tree_seq0 >= 0) {
                 spec_tree_i_batch.resize(spec_tree_alts.size());
@@ -4637,6 +4656,7 @@ private:
                         slot.spec_tree_arm     = -1;
                         slot.t_spec_tree_round = ggml_time_us();
                         const int32_t tree_nodes = spec_tree_nodes_for(slot);
+                        slot.spec_tree_cols = tree_nodes;
                         if (tree_nodes > 0) {
                             auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
                             dp.tree_nodes = tree_nodes;
@@ -5507,9 +5527,10 @@ private:
         bool relabel = false;
 
         for (auto & slot : slots) {
-            if (slot.spec_tree_i_batch.empty()) {
+            if (slot.spec_tree_i_batch.empty() && !slot.spec_tree_batch_round) {
                 continue;
             }
+            slot.spec_tree_batch_round = false;
             any = true;
 
             auto inside = [&](const std::vector<int32_t> & rows) {
