@@ -164,6 +164,9 @@ struct common_chat_msg_span {
     }
 };
 
+// PFXC-TOOLPARSE: repair or reject nested tool-call markup inside string arguments (throws std::runtime_error)
+void common_chat_validate_tool_markup(struct common_chat_msg & msg);
+
 struct common_chat_msg_spans {
     std::vector<common_chat_msg_span> spans;
 

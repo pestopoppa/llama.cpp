@@ -3025,9 +3025,114 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
 
     if (!is_partial) {
+        common_chat_validate_tool_markup(msg);
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
     }
     return msg;
+}
+
+// PFXC-TOOLPARSE: Qwen-style XML tool calls. A model sometimes emits nested / malformed markup inside a string argument
+// (e.g. `X</parameter></function><parameter=path>y`), which `until(value_suffix)` copies verbatim into the value. Never pass
+// that through: split it into the arguments it names when that is unambiguous, otherwise fail the parse so the client can retry.
+static bool pfxc_has_tool_markup(const std::string & v) {
+    return v.find("<parameter=") != std::string::npos || v.find("</function>") != std::string::npos ||
+           v.find("<tool_call>") != std::string::npos || v.find("</tool_call>") != std::string::npos ||
+           v.find("<function=") != std::string::npos;
+}
+
+static std::string pfxc_trim(const std::string & s) {
+    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+
+// returns false when the value is malformed and cannot be split unambiguously
+static bool pfxc_split_value(const std::string & key, const std::string & v, nlohmann::ordered_json & out) {
+    if (v.find("<tool_call>") != std::string::npos || v.find("</tool_call>") != std::string::npos || v.find("<function=") != std::string::npos) {
+        return false;
+    }
+    const size_t first = v.find("<parameter=");
+    if (first == std::string::npos) {
+        return false; // a stray </function> with no further argument: not recoverable
+    }
+    // head = the current argument's value, terminated by </parameter> (optionally followed by a stray </function>)
+    std::string head = v.substr(0, first);
+    std::string h    = pfxc_trim(head);
+    const std::string fclose = "</function>", pclose = "</parameter>";
+    if (h.size() >= fclose.size() && h.compare(h.size() - fclose.size(), fclose.size(), fclose) == 0) {
+        h = pfxc_trim(h.substr(0, h.size() - fclose.size()));
+    }
+    if (h.size() < pclose.size() || h.compare(h.size() - pclose.size(), pclose.size(), pclose) != 0) {
+        return false;
+    }
+    h = h.substr(0, h.size() - pclose.size());
+    if (pfxc_has_tool_markup(h) || h.find(pclose) != std::string::npos) {
+        return false;
+    }
+    // keep the original leading/trailing newline convention of the template (value_prefix/suffix are newlines)
+    if (!h.empty() && h.front() == '\n') h.erase(0, 1);
+    if (!h.empty() && h.back() == '\n') h.pop_back();
+    out[key] = h;
+    // tail = one or more <parameter=K>B[</parameter>] segments
+    size_t pos = first;
+    while (pos != std::string::npos) {
+        const size_t name_b = pos + std::string("<parameter=").size();
+        const size_t name_e = v.find('>', name_b);
+        if (name_e == std::string::npos) return false;
+        const std::string k = v.substr(name_b, name_e - name_b);
+        if (k.empty() || k.find_first_of("<>\n \t") != std::string::npos || out.contains(k)) return false;
+        const size_t next = v.find("<parameter=", name_e);
+        std::string b = v.substr(name_e + 1, next == std::string::npos ? std::string::npos : next - name_e - 1);
+        std::string bt = pfxc_trim(b);
+        if (bt.size() >= pclose.size() && bt.compare(bt.size() - pclose.size(), pclose.size(), pclose) == 0) {
+            bt = bt.substr(0, bt.size() - pclose.size());
+            if (!bt.empty() && bt.back() == '\n') bt.pop_back();
+        } else if (next != std::string::npos) {
+            return false; // a middle segment must be closed
+        }
+        if (!bt.empty() && bt.front() == '\n') bt.erase(0, 1);
+        if (pfxc_has_tool_markup(bt) || bt.find(pclose) != std::string::npos) return false;
+        out[k] = bt;
+        pos = next;
+    }
+    return true;
+}
+
+// Validates / repairs every tool call's string arguments; throws on unrecoverable markup.
+void common_chat_validate_tool_markup(common_chat_msg & msg) {
+    for (auto & tc : msg.tool_calls) {
+        if (tc.arguments.find('<') == std::string::npos) continue;
+        nlohmann::ordered_json args;
+        try {
+            args = nlohmann::ordered_json::parse(tc.arguments);
+        } catch (const std::exception &) {
+            // final (non-partial) arguments that are not JSON and still carry tool markup are the verbatim-garbage case
+            if (pfxc_has_tool_markup(tc.arguments) || tc.arguments.find("</parameter>") != std::string::npos) {
+                throw std::runtime_error("The model produced a malformed tool call: unterminated arguments of '" + tc.name + "' contain tool-call markup");
+            }
+            continue; // not JSON for another reason: leave it to the existing checks
+        }
+        if (!args.is_object()) continue;
+        bool changed = false;
+        nlohmann::ordered_json fixed = nlohmann::ordered_json::object();
+        for (auto it = args.begin(); it != args.end(); ++it) {
+            if (it.value().is_string() && pfxc_has_tool_markup(it.value().get<std::string>())) {
+                if (!pfxc_split_value(it.key(), it.value().get<std::string>(), fixed)) {
+                    throw std::runtime_error("The model produced a malformed tool call: argument '" + it.key() + "' of '" + tc.name +
+                                             "' contains nested tool-call markup");
+                }
+                changed = true;
+            } else {
+                if (fixed.contains(it.key())) {
+                    throw std::runtime_error("The model produced a malformed tool call: duplicate argument '" + it.key() + "' of '" + tc.name + "'");
+                }
+                fixed[it.key()] = it.value();
+            }
+        }
+        if (changed) {
+            LOG_WRN("%s: repaired nested tool-call markup in '%s' arguments\n", __func__, tc.name.c_str());
+            tc.arguments = fixed.dump();
+        }
+    }
 }
 
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates) {
