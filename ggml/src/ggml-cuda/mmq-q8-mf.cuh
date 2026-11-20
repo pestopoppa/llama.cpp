@@ -1,6 +1,7 @@
 #pragma once
 // DTREE-0-Q8MF-V2: gfx90a small-M (ne11 = 9..16 by default) Q8_0 x F32 MUL_MAT, LARGE weights only (> 6 MiB by default).
 // OPT-IN: GGML_HIP_Q8_MF=1 (int8 v_mfma_i32_16x16x16i8) or =2 (f16 v_mfma_f32_32x32x8f16, in-register Q8_0 dequant);
+// V3 (DTREE-0-Q8MF-V3, 2 WGs/CU, 3 register stages): =3 (int8 16x16x16i8) or =4 (f16 16x16x16f16, in-register dequant);
 // default off -> wvsk / skinny / C6 route unchanged. Design note + roofline accounting: mmq-q8-mf.cu.
 #include "common.cuh"
 
