@@ -10,6 +10,7 @@
 #ifdef GGML_IQK_FLASH_ATTENTION
 #include "iqk/iqk_mul_mat.h" // AKX-ALL-LB4: iqk_flash_attn_noalibi
 #include <atomic>
+#include <functional>
 #include <climits>
 #endif
 
@@ -24,6 +25,7 @@
 // it -- not the counters, not their headers, not their strings.
 #ifdef GGML_CPU_PROF
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 // gather_rows_e4m3_e8m0 level-2 profiling attributes page faults to the op through per-thread
@@ -9273,51 +9275,108 @@ static void ggml_compute_forward_top_k_f32(
 
     const int top_k = ne0;
 
-    // [TAG_TOPK_PAR] GGML_CPU_TOPK_PAR=1 (default off): when there are fewer rows than threads (the QSA
-    // indexer's n_kv x n_tokens score rows at decode/verify), split each long row over nth/nr threads:
-    // every thread selects its chunk's local top-k with nth_element, then one thread per row selects
-    // the final top-k from the candidates. The set is the top-k under (value desc, index asc), which
-    // is the partial_sort set whenever the k-th value is not tied; the output order is unspecified.
-    static const bool topk_par = [] {
-        const char * e = getenv("GGML_CPU_TOPK_PAR");
+    // [TAG_TOPK_EXACT] GGML_CPU_TOPK_EXACT=1 (default off): a row-split TOP_K that returns exactly the
+    // serial path's output (same index set, same order), for few long rows (the QSA indexer's score rows
+    // at decode/verify). The serial path is std::partial_sort = __heap_select + __sort_heap. __heap_select
+    // makes a heap of the first k indices, then for each later i does `if (comp(i, top)) pop_heap(.., i)`;
+    // a non-entering i is a pure no-op. By induction the heap's VALUE multiset after the prefix [0,i) is the
+    // top-k values of that prefix, so its min is L(i) = k-th largest value of [0,i), non-decreasing in i,
+    // and i enters only if data[i] > L(i) >= L(c0) for any c0 <= i. So: (1) in parallel, each thread takes
+    // the sorted top-k values of its chunk of [k, n); (2) each thread computes L(c0) of its chunk start by
+    // merging the prefix lists and keeps only the indices with data[i] > L(c0) (a superset of the entering
+    // ones, in scan order); (3) one thread per row runs the same std::partial_sort over
+    // [0..k-1] ++ candidates. Every dropped index would have been a no-op, so the heap sees the identical
+    // operation sequence, and the result (set and order) is bit-identical to the serial path.
+    static const bool topk_exact = [] {
+        const char * e = getenv("GGML_CPU_TOPK_EXACT");
         return e != nullptr && atoi(e) != 0;
     }();
-    if (topk_par && nr < nth && ne00 >= 4096 && top_k < ne00) {
-        const int tpr = nth / (int) nr;
+    const int64_t tpr_e = nr > 0 ? nth / nr : 0;
+    if (topk_exact && 2*nr <= nth && ne00 >= 4096 && top_k > 0 && top_k < ne00 &&
+        (tpr_e + 1) * (int64_t) top_k + tpr_e + 1 <= ne00) {
+        const int64_t tpr = tpr_e;
         const int64_t row = ith / tpr;
-        const int     sub = ith % tpr;
-        const auto cmp = [](const float * d) {
-            return [d](int32_t a, int32_t b) { return d[a] > d[b] || (d[a] == d[b] && a < b); };
-        };
-        int32_t * rbuf = nullptr;
+        const int64_t sub = ith % tpr;
+        const int64_t k   = top_k;
+        const int64_t span = ne00 - k;
+        // region A (row): chunk scratch, then candidate lists at their chunk offsets, then the final buffer
+        // region B (nr + row): sorted top-k value lists (slot t = chunk t, slot tpr = the first k), counts
+        int32_t * ra = nullptr;
+        float   * rb = nullptr;
+        int32_t * cnt = nullptr;
         const float * src_data = nullptr;
+        int64_t c0 = 0, c1 = 0;
         if (row < nr) {
             src_data = (const float *)((const char *) src0->data + row*nb01);
-            rbuf = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * row;
-            const int64_t c0 = (ne00 * sub) / tpr;
-            const int64_t c1 = (ne00 * (sub + 1)) / tpr;
-            for (int64_t j = c0; j < c1; ++j) {
-                rbuf[j] = (int32_t) j;
+            ra  = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * row;
+            rb  = (float   *) ((int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * (nr + row));
+            cnt = (int32_t *) (rb + (tpr + 1) * k);
+            c0 = k + (span * sub) / tpr;
+            c1 = k + (span * (sub + 1)) / tpr;
+            float * fs = (float *) (ra + c0);
+            const int64_t len = c1 - c0;
+            std::copy(src_data + c0, src_data + c1, fs);
+            const int64_t m = std::min<int64_t>(k, len);
+            if (len > m) {
+                std::nth_element(fs, fs + m, fs + len, std::greater<float>());
             }
-            if (c1 - c0 > top_k) {
-                std::nth_element(rbuf + c0, rbuf + c0 + top_k, rbuf + c1, cmp(src_data));
+            std::sort(fs, fs + m, std::greater<float>());
+            float * slot = rb + sub * k;
+            std::copy(fs, fs + m, slot);
+            std::fill(slot + m, slot + k, -INFINITY); // short chunk: pad (never selected over real prefix values)
+            cnt[sub] = (int32_t) m;
+            if (sub == 0) {
+                float * s0 = rb + tpr * k;
+                std::copy(src_data, src_data + k, s0);
+                std::sort(s0, s0 + k, std::greater<float>());
             }
         }
         ggml_barrier(params->threadpool);
+        if (row < nr) {
+            // L = k-th largest value of [0, c0): k-way merge of slot tpr and slots 0..sub-1
+            int64_t pos[GGML_MAX_N_THREADS + 1];
+            const int64_t nl = sub + 1;
+            for (int64_t l = 0; l < nl; ++l) pos[l] = 0;
+            float L = -INFINITY;
+            for (int64_t taken = 0; taken < k; ++taken) {
+                int64_t best = -1;
+                float bv = 0.0f;
+                for (int64_t l = 0; l < nl; ++l) {
+                    const int64_t sl = l == 0 ? tpr : l - 1;
+                    const int64_t lim = sl == tpr ? k : cnt[sl];
+                    if (pos[l] < lim) {
+                        const float v = rb[sl * k + pos[l]];
+                        if (best < 0 || v > bv) { best = l; bv = v; }
+                    }
+                }
+                pos[best]++;
+                L = bv;
+            }
+            ggml_barrier(params->threadpool); // every thread has read cnt[] before it is overwritten
+            int32_t n = 0;
+            for (int64_t j = c0; j < c1; ++j) {
+                if (src_data[j] > L) {
+                    ra[c0 + n++] = (int32_t) j;
+                }
+            }
+            cnt[sub] = n;
+        } else {
+            ggml_barrier(params->threadpool);
+        }
+        ggml_barrier(params->threadpool);
         if (row < nr && sub == 0) {
-            int64_t n_cand = 0;
-            for (int t = 0; t < tpr; ++t) {
-                const int64_t c0 = (ne00 * t) / tpr;
-                const int64_t c1 = (ne00 * (t + 1)) / tpr;
-                const int64_t n  = std::min<int64_t>(top_k, c1 - c0);
-                std::copy(rbuf + c0, rbuf + c0 + n, rbuf + n_cand); // dest <= src: forward copy is safe
-                n_cand += n;
+            for (int64_t j = 0; j < k; ++j) {
+                ra[j] = (int32_t) j;
             }
-            if (n_cand > top_k) {
-                std::nth_element(rbuf, rbuf + top_k, rbuf + n_cand, cmp(src_data));
+            int64_t n_buf = k;
+            for (int64_t t = 0; t < tpr; ++t) {
+                const int64_t t0 = k + (span * t) / tpr;
+                std::copy(ra + t0, ra + t0 + cnt[t], ra + n_buf); // dest <= src: forward copy is safe
+                n_buf += cnt[t];
             }
+            std::partial_sort(ra, ra + k, ra + n_buf, cmp_top_k{src_data});
             int32_t * dst_data = (int32_t *)((char *) dst->data + row*nb1);
-            std::copy(rbuf, rbuf + top_k, dst_data);
+            std::copy(ra, ra + k, dst_data);
             if (top_k > 1) {
                 std::swap(dst_data[0], dst_data[1]);
             }
