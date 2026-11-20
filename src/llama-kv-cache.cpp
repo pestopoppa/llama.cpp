@@ -1834,7 +1834,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                     continue;
                 }
                 const llama_pos p0 = cells.pos_get(j);
-                if (llama_hparams::is_masked_draft_window(draft_window, draft_sink, p0, p1)) {
+                if (p1 >= (llama_pos) draft_min_pos && llama_hparams::is_masked_draft_window(draft_window, draft_sink, p0, p1)) {
                     if (dst->type == GGML_TYPE_F16) {
                         ((ggml_fp16_t *) dst->data)[idst + j] = ggml_fp32_to_fp16(-INFINITY);
                     } else {
