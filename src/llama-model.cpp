@@ -2531,9 +2531,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             const long w = w_env ? strtol(w_env, nullptr, 10) : 0;
                             const long k = s_env ? strtol(s_env, nullptr, 10) : 0;
                             if (w > 0) {
-                                static_cast<llama_kv_cache *>(res)->set_draft_window((uint32_t) w, (uint32_t) std::max(0L, k));
-                                LLAMA_LOG_INFO("%s: LLAMA_MTP_DRAFT_WINDOW=%ld LLAMA_MTP_DRAFT_SINK=%ld (MTP draft head sink+window mask)\n",
-                                        __func__, w, std::max(0L, k));
+                                // [TAG_MTP_DRAFT_WINDOW_ADAPT] LLAMA_MTP_DRAFT_WINDOW_MIN_POS: dense below this query position
+                                const char * m_env = getenv("LLAMA_MTP_DRAFT_WINDOW_MIN_POS");
+                                const long mp = m_env ? std::max(0L, strtol(m_env, nullptr, 10)) : 0;
+                                static_cast<llama_kv_cache *>(res)->set_draft_window((uint32_t) w, (uint32_t) std::max(0L, k), (uint32_t) mp);
+                                LLAMA_LOG_INFO("%s: LLAMA_MTP_DRAFT_WINDOW=%ld LLAMA_MTP_DRAFT_SINK=%ld LLAMA_MTP_DRAFT_WINDOW_MIN_POS=%ld (MTP draft head sink+window mask)\n",
+                                        __func__, w, std::max(0L, k), mp);
                             }
                         }
                     }
