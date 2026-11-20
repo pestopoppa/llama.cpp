@@ -50,8 +50,42 @@
 //    (x ^ 0x80 | 0x6400 as f16 = 1152 + x, v_perm_b32) then (h - 1152) * d_w in packed f16; 4 MFMA per block.
 //    At M <= 16 half of each 32x32x8 MFMA is padding: its per-byte MFMA cost is 2x MF=1's (still ~1.9x the HBM share).
 //  * odd M / M < 16: zero activation columns, only columns < M are stored. Rows >= N clamp to N-1 at load, dropped at store.
-//  Env: GGML_HIP_Q8_MF=1|2 (default 0 = off), GGML_HIP_Q8_MF_MIN / _MAX (M range, default 9..16),
-//       GGML_HIP_Q8_MF_MIN_BYTES (default 6 MiB: only weights strictly larger), GGML_HIP_Q8_MF_WG (WG count, default #CU).
+//  Env: GGML_HIP_Q8_MF=1|2 (V2) or 3|4 (V3, below) (default 0 = off), GGML_HIP_Q8_MF_MIN / _MAX (M range, default 9..16),
+//       GGML_HIP_Q8_MF_MIN_BYTES (default 6 MiB: only weights strictly larger), GGML_HIP_Q8_MF_WG (WG count, default #CU
+//       for V2, 2 x #CU for V3), GGML_HIP_Q8_MF_SLC (V3 only: 1 = slc/nontemporal weight loads, default 0).
+//
+// DTREE-0-Q8MF-V3 (speculative-decoding.md): V3 memory path. Gate V2 (ak-dtree0-q8mf2-gate-gpu-20261120) was flat in M but
+// its op rate topped out at 0.75-0.95 TB/s (head 248320x5120 n1: 949 GB/s = 9.1 GB/s/CU, 1.9 us per 17 KB stage).
+//  Why (Little's law, offline): V2 keeps 1 WG of 4 waves per CU (LDS-bound) and 2 register stages; the commit of stage u+1
+//  waits until it lands, so the bytes in flight per CU oscillate between ~1 stage (17 KB, just before a commit returns)
+//  and 2 stages (35 KB, just after the next issue): ~26 KB average. 9.1 GB/s/CU x L = 26 KB -> loaded latency L ~ 2.8 us,
+//  i.e. V2 is latency-bound. 1.25 TB/s needs 12 GB/s/CU x ~3 us (latency rises with load) ~ 36 KB in flight AT ALL TIMES
+//  per CU; wvsk (1.15-1.24 TB/s at small M) keeps ~70 KB/CU in flight (16 waves x 4 rows x 1088 B).
+//  Second V2 cost: every boundary (stream-K partial) tile ran __threadfence + __syncthreads mid-stream, which drains vmcnt
+//  (gfx9 has one in-order vmcnt for loads and stores): a full pipeline drain (~1 latency) per WG in the middle of ~16-19
+//  stages (~5-8 %). Third: partition L = ceil(T/G) idles CUs (N=5120, K=6144: 19 x 102 WGs, 2 CUs idle).
+//  V3 (GGML_HIP_Q8_MF=3: int8 v_mfma_i32_16x16x16i8, same fragments as MF=1; =4: f16 v_mfma_f32_16x16x16f16 with the
+//  in-register magic-number dequant, f32 accumulation over all K - 16x16x16 instead of MF=2's 32x32x8 because at M <= 16
+//  half of a 32-wide MFMA is padding: half the MFMA cycles per byte, no cross-wave K-half reduction, no LDS scratch):
+//  * TWO 4-wave WGs per CU (__launch_bounds__(256, 2): <= 256 VGPR+AGPR per wave; LDS per WG = ONE stage buffer, 23 / 26
+//    KB, so 2 x <= 64 KB): the two WGs run their barriers independently, one computes / syncs while the other streams.
+//  * THREE register stages per WG (prefetch distance 3): at the commit of stage u the WG still has u+1, u+2 fully in
+//    flight -> >= 2 stages x 17.4 KB x 2 WGs = 70 KB in flight per CU at the minimum, up to 104 KB (2-3x Little's 36 KB,
+//    the wvsk operating point). Per wave 21 x dwordx4 outstanding (vmcnt cap 63). Single LDS buffer: 2 LDS-only barriers
+//    per stage (after the commit; after the compute), neither waits on vmcnt.
+//  * stream-K with a balanced split: WG g streams stages [floor(gT/G), floor((g+1)T/G)) (+-1 stage between WGs, owner of
+//    stage u = floor(((u+1)G - 1)/T)); G = 2 x #CU (all 208 WG slots, each CU gets 2).
+//  * boundary tiles: the first partial tile's accumulator is HELD in 4 VGPRs and written together with the last one AFTER
+//    the stream (the only fence/syncthreads of the kernel run with nothing useful in flight) -> no mid-stream drain.
+//  * rows >= N and stages past the WG's range: full offset in voffset (soffset 0), so the raw-buffer range check returns 0
+//    with no memory traffic (no row clamp multiply, no clamped re-reads of the last stage at the tail).
+//  * activation chunks whose columns are all >= M are pointed out of range too: activation L2 traffic scales with M
+//    (MF=3 26 % / MF=4 47 % of the weight bytes at M = 16, 1/16 of that at M = 1), which is what routes n 1..8 here.
+//  * weight loads default to NOT slc: a 272 B row segment of a stage shares its first / last 128 B L2 line with the
+//    neighbouring k-stage, read one stage (~3 us) later; with slc that line may be evicted and refetched (up to ~23-47 %
+//    HBM overfetch, offline line accounting); GGML_HIP_Q8_MF_SLC=1 restores slc for an A/B.
+//  MFMA load per CU per 2 stages (one per WG): 2 x 4 waves x 16 MFMA x 32 clk on 4 SIMDs = 1024 clk per 34.8 KB -> cap
+//  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
 
 #include <atomic>
@@ -75,16 +109,17 @@ static int q8mf_env_int(const char * name, int def) {
 }
 
 struct q8mf_cfg {
-    int variant; int mmin; int mmax; int wg; int64_t min_bytes;
+    int variant; int mmin; int mmax; int wg; int slc; int64_t min_bytes;
 };
 
 static const q8mf_cfg & q8mf_get_cfg() {
     static const q8mf_cfg cfg = [] {
         q8mf_cfg c;
         c.variant = q8mf_env_int("GGML_HIP_Q8_MF", 0);
-        if (c.variant != 1 && c.variant != 2) {
+        if (c.variant < 1 || c.variant > 4) {
             c.variant = 0;
         }
+        c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", 0) != 0 ? 1 : 0;
         c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", 9));
         c.mmax    = std::min(Q8MF_MAXM, q8mf_env_int("GGML_HIP_Q8_MF_MAX", 16));
         c.wg      = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_WG", 0));
@@ -165,6 +200,21 @@ static __global__ void q8mf_pre_f16(const float * __restrict__ y, const int64_t 
     }
     const float x = c < M ? y[c * s1 + (int64_t) blk * 32 + i] : 0.0f;
     ((__half *) act)[(((int64_t) blk * 2 + i / 16) * 16 + c) * 16 + (i % 16)] = __float2half(x);
+}
+
+// MF=4 (V3) pre-pass. y -> act [nblk][4 g][16 col][8 k] f16 (k = 32 blk + 8 g + e): lane (col, g) of the 16x16x16 MFMA A
+// fragment reads its 8 values of a block as one 16 B ds_read. Columns >= M are zero.
+static __global__ void q8mf_pre_f16x16(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
+                                       char * __restrict__ act, int * __restrict__ cnt, const int ncnt) {
+    q8mf_zero_counters(cnt, ncnt);
+    const int c   = blockIdx.y;
+    const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int i   = threadIdx.x % 32;
+    if (blk >= nblk) {
+        return;
+    }
+    const float x = c < M ? y[c * s1 + (int64_t) blk * 32 + i] : 0.0f;
+    ((__half *) act)[(((int64_t) blk * 4 + i / 8) * 16 + c) * 8 + (i % 8)] = __float2half(x);
 }
 
 #if defined(GGML_USE_HIP)
@@ -325,6 +375,56 @@ static __device__ __forceinline__ void q8mf_compute_f16(const char * __restrict_
         acc = __builtin_amdgcn_mfma_f32_32x32x8f16(A1, q8mf_dequant4(wq[1], d2), acc, 0, 0, 0);
         acc = __builtin_amdgcn_mfma_f32_32x32x8f16(A2, q8mf_dequant4(wq[2], d2), acc, 0, 0, 0);
         acc = __builtin_amdgcn_mfma_f32_32x32x8f16(A3, q8mf_dequant4(wq[3], d2), acc, 0, 0, 0);
+    }
+}
+
+typedef float q8mf_v4f __attribute__((ext_vector_type(4)));
+
+// MF=4 (V3): one stage, wave w = rows 16w..16w+15, all 8 blocks; lane l: weight row j = l%16, k group g = l/16 holding qs
+// bytes 8g..8g+7 of each block (MF=1's weight fragment), dequantised to f16 (scale folded in), 2 x 16x16x16 f16 MFMA per
+// block: srcA = activations (16 columns x 16 k), srcB = weights, D[col][row] as MF=1, f32 accumulation over all of K.
+static __device__ __forceinline__ void q8mf_compute_f16x16(const char * __restrict__ lds, const int w, const int lane,
+                                                           q8mf_v4f & acc) {
+    const int j = lane & 15;
+    const int g = lane >> 4;
+    const char * lw = lds + (16 * w + j) * Q8MF_ROWB;
+    const char * la = lds + Q8MF_WSTAGE;
+#pragma unroll
+    for (int i = 0; i < Q8MF_KS; ++i) {
+        int w0, w1;
+        if (i % 2 == 0) {
+            const int * p = (const int *) (lw + 34 * i + 8 * g);
+            const int d0 = p[0], d1 = p[1], d2 = p[2];
+            w0 = (int) __builtin_amdgcn_alignbyte((uint32_t) d1, (uint32_t) d0, 2);
+            w1 = (int) __builtin_amdgcn_alignbyte((uint32_t) d2, (uint32_t) d1, 2);
+        } else {
+            const int * p = (const int *) (lw + 34 * i + 2 + 8 * g);
+            w0 = p[0];
+            w1 = p[1];
+        }
+        const _Float16 dw = *(const _Float16 *) (lw + 34 * i);
+        const q8mf_v2h d2 = {dw, dw};
+        const q8mf_v4i a  = *(const q8mf_v4i *) (la + i * 1024 + lane * 16);   // [blk][g][col][8 f16], lane = 16 g + col
+        const q8mf_v4h A0 = __builtin_bit_cast(q8mf_v4h, int2{a[0], a[1]});    // k 8g + 0..3
+        const q8mf_v4h A1 = __builtin_bit_cast(q8mf_v4h, int2{a[2], a[3]});    // k 8g + 4..7
+        acc = __builtin_amdgcn_mfma_f32_16x16x16f16(A0, q8mf_dequant4(w0, d2), acc, 0, 0, 0);
+        acc = __builtin_amdgcn_mfma_f32_16x16x16f16(A1, q8mf_dequant4(w1, d2), acc, 0, 0, 0);
+    }
+}
+
+// V3 stage registers / issue: full byte offset in voffset (soffset 0), so out-of-range lanes (rows >= N, the 5th weight
+// chunk of waves 1..3, activation chunks of columns >= M, stages past the WG's range) read 0 with no memory traffic.
+template <int AUX>
+static __device__ __forceinline__ void q8mf3_issue(q8mf_regs & R, const uint32_t (&vb)[Q8MF_NLD], const uint32_t (&ab)[2],
+                                                   const uint32_t sw, const uint32_t sa,
+                                                   const q8mf_v4i wrsrc, const q8mf_v4i arsrc) {
+#pragma unroll
+    for (int i = 0; i < Q8MF_NLD; ++i) {
+        R.w[i] = q8mf_buf_x4(wrsrc, (int) (sw + vb[i]), 0, AUX);
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        R.a[i] = q8mf_buf_x4(arsrc, (int) (sa + ab[i]), 0, 0);
     }
 }
 #endif // defined(GGML_USE_HIP)
@@ -504,17 +604,235 @@ q8mf2_mul_mat(const char * __restrict__ W, const int nb01, const int N, const ui
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+// V3: grid = G persistent WGs (2 per CU), block = 256 (4 waves). WG g streams stages [u0, u1) = [floor(gT/G),
+// floor((g+1)T/G)) of the flattened (tile, stage) space; owner(u) = floor(((u+1)G - 1)/T). Three register stages in
+// flight, one LDS stage buffer. V = 3 (int8) or 4 (f16); AUX = weight-load cache bits (0, or 2 = slc).
+#define Q8MF3_P 3
+static __device__ __forceinline__ int q8mf3_u0(const int g, const int T, const int G) {
+    return (int) (((int64_t) g * T) / G);
+}
+static __device__ __forceinline__ int q8mf3_owner(const int u, const int T, const int G) {
+    return (int) ((((int64_t) u + 1) * G - 1) / T);
+}
+
+template <int V, int AUX>
+static __global__ void __launch_bounds__(Q8MF_NT, 2)
+q8mf3_mul_mat(const char * __restrict__ W, const int nb01, const uint32_t wbytes, const char * __restrict__ act,
+              const uint32_t abytes, const int S, const int T, const int G, const int M, const int N,
+              float * __restrict__ out, const int64_t out_s1, float * __restrict__ part, int * __restrict__ cnt) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    constexpr int ASTAGE = V == 3 ? Q8MF_A1 : Q8MF_A2;   // MF=3: MF=1's int8 + scale stage; MF=4: [8][4 g][16 col][8] f16
+    __shared__ __attribute__((aligned(16))) char lds[Q8MF_WSTAGE + ASTAGE + 64 * 16];   // + per-lane dummy commit slot
+    __shared__ int s_last[2];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 63;
+    const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
+    const int g    = blockIdx.x;
+    const int u0   = q8mf3_u0(g, T, G);
+    const int u1   = q8mf3_u0(g + 1, T, G);   // > u0 since G <= T
+
+    constexpr uint32_t OOB = 0x80000000u;      // > any wbytes / abytes (< INT32_MAX - 4096); sum with a base stays < 2^32
+    uint32_t vb[Q8MF_NLD];
+#pragma unroll
+    for (int i = 0; i < Q8MF_NLD; ++i) {
+        const int q = tid + i * Q8MF_NT;
+        vb[i] = q < Q8MF_NCHUNK ? (uint32_t) ((q / 17) * nb01 + (q % 17) * 16) : OOB;
+    }
+    uint32_t ab[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int q = tid + i * Q8MF_NT;
+        bool ok;
+        if constexpr (V == 3) {   // int8 part [8][4 g][16 col][8 B]: chunk = 2 columns; scales [8][16 col] f32: chunk = 4 columns
+            ok = q < 256 ? 2 * (q % 8) < M : (q < 288 && 4 * ((q - 256) % 4) < M);
+        } else {                  // [8][4 g][16 col][16 B]: chunk = 1 column
+            ok = q < 512 && (q % 16) < M;
+        }
+        ab[i] = ok ? (uint32_t) (q * 16) : OOB;
+    }
+    const q8mf_v4i wrsrc = q8mf_make_rsrc(W, wbytes);
+    const q8mf_v4i arsrc = q8mf_make_rsrc(act, abytes);
+    const uint32_t tstride = (uint32_t) Q8MF_RT * (uint32_t) nb01;
+
+    // issue pointer: stage ui = (it, iks); stages >= u1 go fully out of range
+    int ui = u0, it = u0 / S, iks = u0 - (u0 / S) * S;
+    auto issue_next = [&](q8mf_regs & R) {
+        const bool live = ui < u1;
+        const uint32_t sw = live ? (uint32_t) it * tstride + (uint32_t) (iks * Q8MF_ROWB) : wbytes;
+        const uint32_t sa = live ? (uint32_t) (iks * ASTAGE) : abytes;
+        q8mf3_issue<AUX>(R, vb, ab, sw, sa, wrsrc, arsrc);
+        ++ui;
+        if (++iks == S) {
+            iks = 0;
+            ++it;
+        }
+    };
+
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // MF=3
+    q8mf_v4f acc4 = {0.0f, 0.0f, 0.0f, 0.0f};    // MF=4
+    float pacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};    // held first partial tile (slot 0)
+    bool  have_p  = false;                       // uniform
+    const int rl  = 16 * w + (lane & 15);        // D lane l reg r = D[col 4*(l/16) + r][row-in-tile l%16]
+    const int c0  = 4 * (lane >> 4);
+
+    // compute pointer: stage uc = (ct, cks)
+    int ct = u0 / S, cks = u0 - (u0 / S) * S;
+    auto end_of_stage = [&](const int uc) {   // tile flush when uc is the tile's last stage in this WG's range
+        if (cks == S - 1 || uc == u1 - 1) {
+            float v[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                v[r] = V == 3 ? acc1[r] : acc4[r];
+            }
+            const int  ts      = ct * S;
+            const bool partial = ts < u0 || ts + S > u1;
+            if (!partial) {
+                const int row = ct * Q8MF_RT + rl;
+                if (row < N) {
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        if (c0 + r < M) {
+                            out[(int64_t) (c0 + r) * out_s1 + row] = v[r];
+                        }
+                    }
+                }
+            } else if (uc != u1 - 1) {   // first partial tile (starts before u0, ends inside the range): hold to the end
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    pacc[r] = v[r];
+                }
+                have_p = true;
+            }
+            if (uc != u1 - 1) {   // the last tile's accumulator stays live for the epilogue
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    acc1[r] = 0.0f;
+                    acc4[r] = 0.0f;
+                }
+            }
+        }
+        if (++cks == S) {
+            cks = 0;
+            ++ct;
+        }
+    };
+
+    char * dummy = lds + Q8MF_WSTAGE + ASTAGE;
+    q8mf_regs R[Q8MF3_P];
+#pragma unroll
+    for (int j = 0; j < Q8MF3_P; ++j) {
+        issue_next(R[j]);
+        asm volatile("" ::: "memory");   // keep R[0], R[1], R[2] in issue order (vmcnt retires in order)
+    }
+    // invariant at the top of step j of an iteration: R[j] holds stage u + j, R[j+1..] the next ones (in flight).
+    // ONE loop exit at the bottom (a mid-body exit makes the waitcnt pass drain the prefetch, see V2); a stage count that
+    // is not a multiple of 3 runs up to 2 extra (out-of-range, zero-traffic) commit / issue / barrier steps.
+    int u = u0;
+    do {
+#pragma unroll
+        for (int j = 0; j < Q8MF3_P; ++j) {
+            q8mf_commit<ASTAGE>(R[j], lds, dummy, tid);
+            issue_next(R[j]);
+            Q8MF_LDS_BARRIER();
+            if (u + j < u1) {
+                if constexpr (V == 3) {
+                    q8mf_compute_i8(lds, w, lane, acc1);
+                } else {
+                    q8mf_compute_f16x16(lds, w, lane, acc4);
+                }
+                end_of_stage(u + j);
+            }
+            Q8MF_LDS_BARRIER();   // every wave is done reading the buffer before the next commit overwrites it
+        }
+        u += Q8MF3_P;
+    } while (u < u1);
+
+    // epilogue: <= 2 partial tiles. A = held first partial (slot 0, tile u0 / S); B = last tile if partial.
+    const int  tA  = u0 / S;
+    const int  tB  = (u1 - 1) / S;
+    const bool pB  = tB * S < u0 || tB * S + S > u1;
+    const int  sB  = tB * S < u0 ? 0 : 1;
+    if (!have_p && !pB) {
+        return;
+    }
+    float * pg = part + (int64_t) g * 2 * (Q8MF_MAXM * Q8MF_RT);
+    if (have_p) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            pg[(c0 + r) * Q8MF_RT + rl] = pacc[r];
+        }
+    }
+    if (pB) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            pg[sB * (Q8MF_MAXM * Q8MF_RT) + (c0 + r) * Q8MF_RT + rl] = V == 3 ? acc1[r] : acc4[r];
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        s_last[0] = 0;
+        s_last[1] = 0;
+        if (have_p) {
+            const int ts = tA * S;
+            s_last[0] = atomicAdd(cnt + tA, 1) == q8mf3_owner(ts + S - 1, T, G) - q8mf3_owner(ts, T, G);
+        }
+        if (pB) {
+            const int ts = tB * S;
+            s_last[1] = atomicAdd(cnt + tB, 1) == q8mf3_owner(ts + S - 1, T, G) - q8mf3_owner(ts, T, G);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        if (!s_last[k]) {
+            continue;
+        }
+        __threadfence();
+        const int t  = k == 0 ? tA : tB;
+        const int ts = t * S;
+        const int g0 = q8mf3_owner(ts, T, G);
+        const int g1 = q8mf3_owner(ts + S - 1, T, G);
+        for (int e = tid; e < Q8MF_MAXM * Q8MF_RT; e += Q8MF_NT) {
+            const int col = e / Q8MF_RT;
+            const int r   = e % Q8MF_RT;
+            const int row = t * Q8MF_RT + r;
+            if (col < M && row < N) {
+                float s = 0.0f;
+                for (int gg = g0; gg <= g1; ++gg) {   // WG order: deterministic
+                    const int sl = ts < q8mf3_u0(gg, T, G) ? 0 : 1;
+                    s += __builtin_nontemporal_load(part + ((int64_t) gg * 2 + sl) * (Q8MF_MAXM * Q8MF_RT) + e);
+                }
+                out[(int64_t) col * out_s1 + row] = s;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(W); GGML_UNUSED(nb01); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S);
+    GGML_UNUSED(T); GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(N); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    GGML_UNUSED(part); GGML_UNUSED(cnt);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     {
         // Path witness (gate packets grep it; also a content marker of the build).
         static std::atomic<int64_t> n_calls{0};
         if (n_calls.fetch_add(1) == 0) {
-            GGML_LOG_INFO("ggml_cuda_q8_mf: V2 stream-K small-M Q8_0 path ran (call 1, GGML_HIP_Q8_MF=%d, %s)\n",
-                cfg.variant, cfg.variant == 1 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_32x32x8f16 in-register dequant");
+            if (cfg.variant <= 2) {
+                GGML_LOG_INFO("ggml_cuda_q8_mf: V2 stream-K small-M Q8_0 path ran (call 1, GGML_HIP_Q8_MF=%d, %s)\n",
+                    cfg.variant, cfg.variant == 1 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_32x32x8f16 in-register dequant");
+            } else {
+                GGML_LOG_INFO("ggml_cuda_q8_mf: V3 2-WG/CU 3-stage stream-K small-M Q8_0 path ran (call 1, GGML_HIP_Q8_MF=%d, %s, "
+                    "slc=%d)\n", cfg.variant, cfg.variant == 3 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_16x16x16f16 in-register dequant",
+                    cfg.slc);
+            }
         }
     }
-    GGML_ASSERT(cfg.variant == 1 || cfg.variant == 2);
+    GGML_ASSERT(cfg.variant >= 1 && cfg.variant <= 4);
     cudaStream_t stream = ctx.stream();
 
     const int     N       = (int) src0->ne[1];
@@ -528,33 +846,49 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int     ncu     = ggml_cuda_info().devices[ctx.device].nsm;
     GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0);
 
-    const int G0 = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : ncu, T));
-    const int L  = (T + G0 - 1) / G0;
-    const int G  = (T + L - 1) / L;
+    const bool v3 = cfg.variant >= 3;
+    int G, L = 0;
+    if (v3) {   // balanced split, 2 WGs per CU (every WG gets >= 1 stage)
+        G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 2 * ncu, T));
+    } else {
+        const int G0 = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : ncu, T));
+        L = (T + G0 - 1) / G0;
+        G = (T + L - 1) / L;
+    }
 
-    const int  astage = cfg.variant == 1 ? Q8MF_A1 : Q8MF_A2;
+    const int  astage = cfg.variant == 1 || cfg.variant == 3 ? Q8MF_A1 : Q8MF_A2;
     const size_t abytes = (size_t) S * astage;
     ggml_cuda_pool_alloc<char>  act(ctx.pool(), abytes);
     ggml_cuda_pool_alloc<int>   cnt(ctx.pool(), (size_t) n_tiles);
     ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) G * 2 * Q8MF_MAXM * Q8MF_RT);
     {
         const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
-        if (cfg.variant == 1) {
+        if (cfg.variant == 1 || cfg.variant == 3) {
             q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), cnt.get(), n_tiles);
-        } else {
+        } else if (cfg.variant == 2) {
             q8mf_pre_f16<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), cnt.get(), n_tiles);
+        } else {
+            q8mf_pre_f16x16<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), cnt.get(), n_tiles);
         }
     }
 
     const char *   W      = (const char *) src0->data;
     const int      nb01   = (int) src0->nb[1];
-    const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-    if (cfg.variant == 1) {
-        q8mf2_mul_mat<1><<<G, Q8MF_NT, 0, stream>>>(W, nb01, N, wbytes, act.get(), (uint32_t) abytes, S, T, L, M,
-            (float *) dst->data, dst_s1, part.get(), cnt.get());
-    } else {
-        q8mf2_mul_mat<2><<<G, Q8MF_NT, 0, stream>>>(W, nb01, N, wbytes, act.get(), (uint32_t) abytes, S, T, L, M,
-            (float *) dst->data, dst_s1, part.get(), cnt.get());
+    const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);   // = N * nb01 (contiguous): rows >= N are out of range
+    float *        d      = (float *) dst->data;
+    switch (cfg.variant * 2 + cfg.slc) {
+        case 2: case 3:
+            q8mf2_mul_mat<1><<<G, Q8MF_NT, 0, stream>>>(W, nb01, N, wbytes, act.get(), (uint32_t) abytes, S, T, L, M, d, dst_s1, part.get(), cnt.get());
+            break;
+        case 4: case 5:
+            q8mf2_mul_mat<2><<<G, Q8MF_NT, 0, stream>>>(W, nb01, N, wbytes, act.get(), (uint32_t) abytes, S, T, L, M, d, dst_s1, part.get(), cnt.get());
+            break;
+#define Q8MF3_CASE(c, v, aux) case c: \
+            q8mf3_mul_mat<v, aux><<<G, Q8MF_NT, 0, stream>>>(W, nb01, wbytes, act.get(), (uint32_t) abytes, S, T, G, M, N, d, dst_s1, part.get(), cnt.get()); \
+            break;
+        Q8MF3_CASE(6, 3, 0) Q8MF3_CASE(7, 3, 2) Q8MF3_CASE(8, 4, 0) Q8MF3_CASE(9, 4, 2)
+#undef Q8MF3_CASE
+        default: GGML_ABORT("q8_mf: bad variant %d", cfg.variant);
     }
     CUDA_CHECK(cudaGetLastError());
 }

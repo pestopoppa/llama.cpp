@@ -2040,6 +2040,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // DTREE-0-Q8MF-V2: stream-K MFMA small-M Q8_0 path (M 9..16, > 6 MiB, K % 256 == 0, CDNA2); OPT-IN
     // GGML_HIP_Q8_MF=1 (int8 mfma_i32_16x16x16i8) or =2 (f16 mfma_f32_32x32x8f16, in-register dequant), ahead of wvsk.
+    // DTREE-0-Q8MF-V3: =3 / =4 select the V3 memory path (int8 / f16 16x16x16 MFMA), same eligibility.
     if (ggml_cuda_q8_mf_eligible(src0, src1, dst, cc)) {
         ggml_cuda_log_mul_mat_route("Q8_MF", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q8_mf(ctx, src0, src1, dst);
