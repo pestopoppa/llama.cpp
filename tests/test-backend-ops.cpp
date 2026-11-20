@@ -9762,27 +9762,27 @@ struct test_flash_attn_ext_hs256_nomask : public test_flash_attn_ext {
 // [DTREE-ATTN-ROUTE] GGML_OP_FLASH_ATTN_EXT with the KQ mask of a llama tree batch (llama_kv_cache::set_input_kq_mask_tree):
 // every query row sees the committed prefix, its own ancestors-or-self among the nb tree cells, and nothing after them
 // (KV padding). Parents are seeded random (parent[i] in [-1, i-1]). Exercises the HIP GGML_HIP_TREE_FA path
-// (fattn-gqa-verify.cu: unmasked-prefix split-KV + 32-column ancestor-word tail tile + LSE merge); default-off it runs the
+// (fattn-gqa-verify.cu v2: KV-split kernel with per-chunk DEAD/OPEN/BITS/FLOAT mask modes + LSE merge); default-off it runs the
 // stock selection. Modes:
 //   TREE   : prefix [0, L) = 0, tree cells [L, L + nb), -inf after (L = kv - nb - 77)
 //   CAUSAL : the same with parent[i] = i - 1 (a chain: the causal tail of a linear verify)
 //   HOLES  : uniform -inf hole columns every 97 cells of the prefix (cells an earlier tree_accept dropped), and the tree
 //            cells scattered over a 30-column window whose other columns alternate committed (0) / hole (-inf)
-//   SPREAD : the tree cells spread over more than 32 columns, so the device verdict is "not tree-shaped" and the HIP path
-//            must take its dense-mask fallback
+//   SPREAD : the tree cells spread over more than 32 columns (crosses a 16/32-key chunk boundary: BITS chunks in a row)
 //   SPARSE : TREE with a prefix visible only on every 256th column, so the tree tail carries a large share of the softmax
 //            mass and one wrong ancestor bit moves the output far past the NMSE limit (the mask-correctness detector)
 // NMSE limit 5e-4, except 1.5e-3 for the dense-prefix modes with f16 V at n_kv > 4096: the CPU reference accumulates an
 // f16 V in f16 and splits the KV across threads in a timing-dependent order, so over 32k near-uniform keys it fails
 // against ITSELF at 6.4e-4..7.3e-4 (CPU-vs-CPU run, 2026-11-20). Those modes check numerics and the fast-path / fallback
 // plumbing; SPARSE (5e-4 everywhere) is the mask-correctness check.
-enum fa_tree_mode { FA_TREE, FA_TREE_CAUSAL, FA_TREE_HOLES, FA_TREE_SPREAD, FA_TREE_SPARSE };
+//   NOISE  : the base-class noise mask (non-binary values): the v2 kernel's FLOAT chunk mode (additive mask)
+enum fa_tree_mode { FA_TREE, FA_TREE_CAUSAL, FA_TREE_HOLES, FA_TREE_SPREAD, FA_TREE_SPARSE, FA_TREE_NOISE };
 
 struct test_flash_attn_ext_tree : public test_flash_attn_ext {
     const fa_tree_mode tmode;
 
     std::string vars() override {
-        static const char * names[] = { "tree", "causal", "holes", "spread", "sparse" };
+        static const char * names[] = { "tree", "causal", "holes", "spread", "sparse", "noise" };
         return test_flash_attn_ext::vars() + ",treemask=" + names[tmode];
     }
 
@@ -9797,6 +9797,9 @@ struct test_flash_attn_ext_tree : public test_flash_attn_ext {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext::initialize_tensors(ctx);
+        if (tmode == FA_TREE_NOISE) {
+            return; // keep the base-class noise mask
+        }
 
         ggml_tensor * m = ggml_get_tensor(ctx, "m");
         GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16 && ggml_is_contiguous(m));
@@ -14356,6 +14359,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
             test_cases.emplace_back(new test_flash_attn_ext_tree(mdl.first[0], mdl.first[1], kv, 12, mdl.second, FA_TREE_SPREAD));
+            test_cases.emplace_back(new test_flash_attn_ext_tree(mdl.first[0], mdl.first[1], kv, 12, mdl.second, FA_TREE_NOISE));
         }
     }
 
@@ -14387,6 +14391,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb : {8, 12, 16}) {
             test_cases.emplace_back(new test_flash_attn_ext_tree(4, 6, kv, nb, GGML_TYPE_Q8_0, FA_TREE));
             test_cases.emplace_back(new test_flash_attn_ext_tree(2, 8, kv, nb, GGML_TYPE_F16,  FA_TREE));
+            // chain verify (causal tail): the same kernel under GGML_HIP_TREE_FA=1
+            test_cases.emplace_back(new test_flash_attn_ext_tree(4, 6, kv, nb, GGML_TYPE_Q8_0, FA_TREE_CAUSAL));
+            test_cases.emplace_back(new test_flash_attn_ext_tree(2, 8, kv, nb, GGML_TYPE_F16,  FA_TREE_CAUSAL));
         }
     }
 
