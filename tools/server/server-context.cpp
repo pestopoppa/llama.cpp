@@ -6553,6 +6553,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // has next data, continue
                 return true;
 
+            } catch (const common_chat_tool_parse_error & e) {
+                // PFXC-TOOLPARSE: one SSE error event, then close WITHOUT "data: [DONE]"
+                output = format_error(res_type, format_tool_parse_error_response(e.what(), e.raw_excerpt));
+                return false;
             } catch (const std::exception & e) {
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);

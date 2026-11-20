@@ -160,6 +160,8 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
         // initialize chat_msg to avoid emitting a delta containing the assistant prefill
         chat_msg = common_chat_parse("", true, chat_parser_params);
+        chat_msg_visible = chat_msg;
+        chat_msg_visible.tool_calls.clear();
     }
 }
 
@@ -169,7 +171,7 @@ common_chat_msg task_result_state::update_chat_msg(
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
     generated_text += text_added;
-    auto msg_prv_copy = chat_msg;
+    auto msg_prv_copy = chat_msg_visible;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
         generated_text,
@@ -178,22 +180,28 @@ common_chat_msg task_result_state::update_chat_msg(
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        // PFXC-TOOLPARSE: buffer tool calls until the final parse (which validates them) succeeds
+        common_chat_msg visible = chat_msg;
+        if (is_partial) {
+            visible.tool_calls.clear();
+        }
+        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, visible);
+        chat_msg_visible = visible;
 
         if (!filter_tool_calls) {
             diffs = std::move(all_diffs);
         } else {
             for (auto & d : all_diffs) {
                 // If this is a new type of delta, flush all currently pending tool call names
-                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
-                    if (sent_tool_call_names.count(i) || chat_msg.tool_calls[i].name.empty()) {
+                for (size_t i = 0; i < chat_msg_visible.tool_calls.size(); ++i) {
+                    if (sent_tool_call_names.count(i) || chat_msg_visible.tool_calls[i].name.empty()) {
                         continue;
                     }
                     if (d.tool_call_index != i || !d.tool_call_delta.arguments.empty()) {
                         common_chat_msg_diff header;
                         header.tool_call_index      = i;
-                        header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
-                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.id   = chat_msg_visible.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg_visible.tool_calls[i].name;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }
@@ -212,8 +220,8 @@ common_chat_msg task_result_state::update_chat_msg(
                     } else {
                         // Not sent yet.
                         if (!d.tool_call_delta.arguments.empty() || !is_partial) {
-                            d.tool_call_delta.name = chat_msg.tool_calls[i].name;
-                            d.tool_call_delta.id   = chat_msg.tool_calls[i].id;
+                            d.tool_call_delta.name = chat_msg_visible.tool_calls[i].name;
+                            d.tool_call_delta.id   = chat_msg_visible.tool_calls[i].id;
                             diffs.push_back(std::move(d));
                             sent_tool_call_names.insert(i);
                         } else {
@@ -224,12 +232,12 @@ common_chat_msg task_result_state::update_chat_msg(
             }
             // Final check at EOF
             if (!is_partial) {
-                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
-                    if (!sent_tool_call_names.count(i) && !chat_msg.tool_calls[i].name.empty()) {
+                for (size_t i = 0; i < chat_msg_visible.tool_calls.size(); ++i) {
+                    if (!sent_tool_call_names.count(i) && !chat_msg_visible.tool_calls[i].name.empty()) {
                         common_chat_msg_diff header;
                         header.tool_call_index      = i;
-                        header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
-                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.id   = chat_msg_visible.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg_visible.tool_calls[i].name;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }

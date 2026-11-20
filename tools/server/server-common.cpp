@@ -19,6 +19,16 @@
 #include <fstream>
 #include <limits>
 
+json format_tool_parse_error_response(const std::string & message, const std::string & raw_excerpt) {
+    return json {
+        {"code",        500},
+        {"type",        "tool_call_parse_error"},
+        {"message",     message},
+        {"retryable",   true},
+        {"raw_excerpt", raw_excerpt.substr(0, 256)},
+    };
+}
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;

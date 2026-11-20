@@ -57,6 +57,12 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
         error_type error;
         try {
             return func(req);
+        } catch (const common_chat_tool_parse_error & e) {
+            auto res    = std::make_unique<server_http_res>();
+            res->status = 500;
+            res->data   = safe_json_to_str({{ "error", format_tool_parse_error_response(e.what(), e.raw_excerpt) }});
+            SRV_WRN("tool-call parse error: %s\n", res->data.c_str());
+            return res;
         } catch (const std::invalid_argument & e) {
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;

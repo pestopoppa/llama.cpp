@@ -164,7 +164,15 @@ struct common_chat_msg_span {
     }
 };
 
-// PFXC-TOOLPARSE: repair or reject nested tool-call markup inside string arguments (throws std::runtime_error)
+// PFXC-TOOLPARSE: a final tool-call parse that cannot be repaired. Retryable by the client; the server maps it to
+// {"error":{"code":500,"type":"tool_call_parse_error","message":...,"retryable":true,"raw_excerpt":...}}.
+struct common_chat_tool_parse_error : public std::runtime_error {
+    std::string raw_excerpt; // first 256 chars of the offending tool-call text
+    common_chat_tool_parse_error(const std::string & msg, std::string excerpt = "")
+        : std::runtime_error(msg), raw_excerpt(std::move(excerpt)) {}
+};
+
+// PFXC-TOOLPARSE: repair or reject nested tool-call markup inside string arguments (throws common_chat_tool_parse_error)
 void common_chat_validate_tool_markup(struct common_chat_msg & msg);
 
 struct common_chat_msg_spans {

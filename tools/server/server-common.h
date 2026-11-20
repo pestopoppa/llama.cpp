@@ -86,6 +86,9 @@ struct server_grammar_trigger {
 
 json format_error_response(const std::string & message, const enum error_type type);
 
+// PFXC-TOOLPARSE: {"code":500,"type":"tool_call_parse_error","message":...,"retryable":true,"raw_excerpt":...}
+json format_tool_parse_error_response(const std::string & message, const std::string & raw_excerpt);
+
 //
 // random string / id
 //
