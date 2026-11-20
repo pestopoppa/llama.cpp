@@ -121,7 +121,7 @@ int main(int argc, char ** argv) {
     B.clear();
     for (int i = 0; i < np; ++i) B.add(ptoks[i], i, false);
     CHECK(llama_decode(lin, B.b) == 0);
-    int tree_mis = 0, tree_n = 0, chain_mis = 0, chain_n = 0;
+    int tree_mis = 0, tree_n = 0, chain_mis = 0, chain_n = 0, chainw_mis = 0, chainw_n = 0;
     std::vector<llama_token> oracle_main(4);
 
     std::vector<llama_token> emitted = { refs[0] };
@@ -200,6 +200,32 @@ int main(int argc, char ** argv) {
             CHECK(llama_memory_seq_rm(llama_get_memory(lin), 0, pos + 1, -1));
         }
 
+        // width-matched control: the same W tokens as ONE linear chain (column order) from the same committed state,
+        // each column against a fresh prefill of that linear prefix. Separates "a W-wide verify block flips near-ties"
+        // (same rate as the tree) from "the tree structure is wrong" (tree rate above this one).
+        {
+            B.clear();
+            for (int c = 0; c < W; ++c) B.add(tok[c], pos + c, true);
+            CHECK(llama_decode(lin, B.b) == 0);
+            std::vector<llama_token> am(W);
+            for (int c = 0; c < W; ++c) am[c] = argmax(llama_get_logits_ith(lin, c));
+            CHECK(llama_memory_seq_rm(llama_get_memory(lin), 0, pos + 1, -1));
+            for (int c = 0; c < W; ++c) {
+                llama_memory_clear(llama_get_memory(path), true);
+                B.clear();
+                for (int i = 0; i < np; ++i) B.add(ptoks[i], i, false);
+                for (int i = 0; i + 1 < e; ++i) B.add(emitted[i], np + i, false);
+                for (int i = 0; i <= c; ++i) B.add(tok[i], pos + i, i == c);
+                CHECK(llama_decode(path, B.b) == 0);
+                const float * l = llama_get_logits_ith(path, -1);
+                const bool mis = argmax(l) != am[c];
+                chainw_mis += mis; chainw_n++;
+                if (mis) {
+                    printf("DTREE_CMIS round=%d col=%d margin=%.5f\n", r, c, (double) l[argmax(l)] - (double) l[am[c]]);
+                }
+            }
+        }
+
         // (b) greedy acceptance along the tree
         std::vector<int32_t> acc = { 0 };
         for (;;) {
@@ -241,6 +267,7 @@ int main(int argc, char ** argv) {
         }
     }
     printf("DTREE_RATE tree_mis=%d tree_n=%d chain_mis=%d chain_n=%d\n", tree_mis, tree_n, chain_mis, chain_n);
+    printf("DTREE_RATEW chainw_mis=%d chainw_n=%d\n", chainw_mis, chainw_n);
 
     printf("PASS: %zu tokens identical to greedy over %d rounds (%d cols, %d rounds used a side branch), "
            "max|tree-path dlogit| %.4g\n", emitted.size(), n_rounds, n_cols_total, n_alt, max_diff);
