@@ -1330,7 +1330,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    // AK-PROF-SCLK-ENERGY: GGML_CUDA_MMQ_STREAM_K=0 runs the stream-k kernel as plain tiling (one CUDA block per output tile,
+    // no fixup), the same mode NVIDIA takes at >= 90% tile efficiency. Unset or non-zero = unchanged decomposition.
+    static const bool stream_k_off_env = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_STREAM_K");
+        const bool off = e != nullptr && atoi(e) == 0;
+        if (off) {
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_STREAM_K=0 -> tiling (no stream-k, no fixup)\n", __func__);
+        }
+        return off;
+    }();
+    const dim3 block_nums_stream_k(
+        stream_k_off_env || (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 

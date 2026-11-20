@@ -44,3 +44,18 @@ for J in 16 32 48 64; do
     fi
 done
 echo "PASS GGML_CUDA_MMQ_J"
+
+# Knob 3: GGML_CUDA_MMQ_STREAM_K=0 runs MMQ as plain tiling; must stay correct (alone and with each forced J).
+for J in 0 16 64; do
+    run "sk0-j$J" GGML_CUDA_MMQ_FORCE=1 GGML_CUDA_MMQ_J=$J GGML_CUDA_MMQ_STREAM_K=0
+    if ! grep -Fq 'GGML_CUDA_MMQ_STREAM_K=0 -> tiling' "$out/sk0-j$J.err"; then
+        echo "FAIL sk0-j$J: stream-k off marker missing" >&2
+        exit 1
+    fi
+done
+if grep -Fq 'GGML_CUDA_MMQ_STREAM_K=0' "$out/force.err"; then
+    echo "FAIL force: stream-k marker without the knob" >&2
+    exit 1
+fi
+echo "PASS GGML_CUDA_MMQ_STREAM_K"
+echo "ALL PASS"
