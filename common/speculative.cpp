@@ -1592,11 +1592,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // [AK-DTREE-2] per-seq batch rows in order: in a single-tree-batch verify the accepted path's rows need not be
+        // contiguous (shared main prefix, then a side branch further down the batch); everything below indexes rows[]
+        std::vector<std::vector<int32_t>> seq_rows(n_seq);
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            const llama_seq_id s = batch_in.seq_id[k][0];
+            if (s >= 0 && s < (llama_seq_id) n_seq) {
+                seq_rows[s].push_back(k);
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const std::vector<int32_t> & rows = seq_rows[seq_id];
+            const int32_t n_rows = (int32_t) rows.size();
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
@@ -1613,7 +1624,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) (rows[offset + i]) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -1676,10 +1687,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // keep the projected rows of the last block_size + 1 positions: the next draft block
                     // reads the anchor's row (upstream reads the same rows back from its fused decode)
                     const size_t    seq_offset = (size_t) seq_id * lilicorr_rows;
-                    const llama_pos pos_last   = batch_in.pos[i_batch_beg[seq_id] + offset + n_chunk - 1];
+                    const llama_pos pos_last   = batch_in.pos[rows[offset + n_chunk - 1]];
                     const llama_pos pos_min    = std::max<llama_pos>(0, pos_last - block_size);
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        const llama_pos pos = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        const llama_pos pos = batch_in.pos[rows[offset + i]];
                         if (pos < pos_min) {
                             continue;
                         }
@@ -1695,7 +1706,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                    batch_inject.pos[i]       = batch_in.pos[rows[offset + i]];
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
@@ -2222,13 +2233,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the former right-shift-by-one copy followed by the pending overwrite.
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                // [AK-DTREE-2] previous row of the same sequence (not k-1: an accepted tree path is not contiguous)
+                std::vector<int32_t> prev_row(n_seq, -1);
                 for (int k = 0; k < n_tokens; ++k) {
                     const llama_seq_id s = batch_in.seq_id[k][0];
                     if (s < 0 || s >= (llama_seq_id) n_seq) {
                         continue;
                     }
                     common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { s }, 0);
-                    const float * h_row = k == i_batch_beg[s] ? pending_h[s].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                    const float * h_row = prev_row[s] < 0 ? pending_h[s].data() : h_tgt + (size_t) prev_row[s] * n_embd;
+                    prev_row[s] = k;
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
             }
@@ -2270,12 +2284,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            std::vector<int32_t> rows;
+            for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                if (batch_in.seq_id[k][0] == seq_id) {
+                    rows.push_back(k);
+                }
+            }
+            const int32_t n_rows = (int32_t) rows.size();
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, rows[i]);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
