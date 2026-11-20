@@ -1030,6 +1030,10 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // [TAG_FA_SPLIT_KV_OVERRIDE] stamped on every FLASH_ATTN_EXT node this graph builds
+    // (0 = follow GGML_FA_SPLIT_KV, 1 = force on, 2 = force off); set by the MTP draft graph only
+    int32_t fa_split_kv_override = 0;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

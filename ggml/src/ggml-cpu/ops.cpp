@@ -10602,7 +10602,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
 #ifdef GGML_IQK_FLASH_ATTENTION
     // AKX-ALL-LB4: iqk CPU flash attention (never under use_ref; falls back for anything it does not cover)
-    if (ggml_iqk_try_flash_attn_ext(params, dst)) {
+    // [TAG_FA_SPLIT_KV_OVERRIDE] a node forced onto the split-KV path (op_params[5] == 1) skips iqk so the path runs
+    if (ggml_get_op_params_i32(dst, 5) != 1 && ggml_iqk_try_flash_attn_ext(params, dst)) {
         return;
     }
 #endif
@@ -10619,7 +10620,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const char * e = getenv("GGML_FA_SPLIT_KV");
         return e ? (atoi(e) != 0) : true;
     }();
-    const bool use_split_kv_path = fa_split_kv_enabled && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // [TAG_FA_SPLIT_KV_OVERRIDE] per-node override (op_params[5]): 1 = force on, 2 = force off, else env
+    const int32_t split_kv_mode = ggml_get_op_params_i32(dst, 5);
+    const bool split_kv_on = split_kv_mode == 1 ? true : (split_kv_mode == 2 ? false : fa_split_kv_enabled);
+    const bool use_split_kv_path = split_kv_on && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;

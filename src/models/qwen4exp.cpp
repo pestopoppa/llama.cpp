@@ -535,9 +535,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    // [TAG_FA_SPLIT_KV_OVERRIDE] LLAMA_MTP_DRAFT_FA_SPLIT_KV (unset/0 = follow GGML_FA_SPLIT_KV, 1 = on,
+    // 2 = off): scope the CPU split-KV decode path to the draft head's attention only
+    {
+        static const int32_t draft_split_kv = [](){
+            const char * e = getenv("LLAMA_MTP_DRAFT_FA_SPLIT_KV");
+            const int v = e ? atoi(e) : 0;
+            return (int32_t) ((v == 1 || v == 2) ? v : 0);
+        }();
+        fa_split_kv_override = draft_split_kv;
+    }
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    fa_split_kv_override = 0;
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));

@@ -2504,6 +2504,16 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_get_n_seq(
             const struct ggml_tensor * a);
 
+    // [TAG_FA_SPLIT_KV_OVERRIDE] per-node override of the CPU split-across-KV decode path (op_params[5]):
+    // 0 = follow GGML_FA_SPLIT_KV (default), 1 = force on, 2 = force off. Lets one graph (e.g. an MTP draft
+    // head) choose the path without changing the process-wide env.
+    GGML_API void ggml_flash_attn_ext_set_split_kv(
+            struct ggml_tensor * a,
+            int32_t              mode);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_split_kv(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

@@ -5699,6 +5699,22 @@ int32_t ggml_flash_attn_ext_get_n_seq(
     return ggml_get_op_params_i32(a, 4);
 }
 
+void ggml_flash_attn_ext_set_split_kv(
+        struct ggml_tensor * a,
+        int32_t              mode) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(mode >= 0 && mode <= 2);
+
+    ggml_set_op_params_i32(a, 5, mode); // positions 0..4: scale, max_bias, logit_softcap, prec, n_seq
+}
+
+int32_t ggml_flash_attn_ext_get_split_kv(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

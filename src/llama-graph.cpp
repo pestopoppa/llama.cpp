@@ -2828,6 +2828,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        if (fa_split_kv_override != 0) {
+            ggml_flash_attn_ext_set_split_kv(cur, fa_split_kv_override); // [TAG_FA_SPLIT_KV_OVERRIDE]
+        }
 
         // A unified KV cache puts the tokens of all sequences of the ubatch into one stream. Tell the backend how many
         // sequences share the query rows, so that it can iterate the KV cells of each sequence separately. The hint is
