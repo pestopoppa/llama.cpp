@@ -1934,6 +1934,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->copy_min_lcp = params_base.cache_ram_copy_min;
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -3342,12 +3343,18 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // PFXC-A2: keep the oldest checkpoint (the shared system+tools prefix anchor, created at the first user
+            // message) and evict the second-oldest instead, so a new task sharing only that prefix can still roll back to it
+            auto victim = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() > 1 && params_base.n_ctx_checkpoints > 1) {
+                ++victim;
+            }
+            const auto & cur = *victim;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -3368,6 +3375,29 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // PFXC-A1: checkpoint the state at the end of a generation so the next request of a tool loop reuses the generated
+    // assistant turn instead of rolling back to the end-4 prompt checkpoint. Only for memories that need checkpoints, and
+    // only when the memory holds exactly the slot's tokens (no pending draft / unaccepted positions).
+    void checkpoint_after_generation(server_slot & slot) {
+        if (!params_base.checkpoint_after_gen || params_base.n_ctx_checkpoints <= 0 || !slot.task ||
+            slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_child() || slot.n_decoded <= 0) {
+            return;
+        }
+        if (!(ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0)) {
+            return;
+        }
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0 || pos_max + 1 != slot.prompt.n_tokens()) {
+            SLT_DBG(slot, "skip post-generation checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d)\n", pos_min, pos_max, slot.prompt.n_tokens());
+            return;
+        }
+        if (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.back().n_tokens >= slot.prompt.n_tokens()) {
+            return;
+        }
+        create_checkpoint(slot, 0, pos_min, pos_max);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -5265,7 +5295,7 @@ private:
                         slot.n_prompt_tokens_processed++;
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && spans.is_ckpt_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -5330,7 +5360,7 @@ private:
                         std::none_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                                      [&](const auto & ck) { return ck.n_tokens == (int64_t) n_tokens_start; });
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start) || is_junction;
+                    const bool is_user_start = spans.is_ckpt_start(n_tokens_start) || is_junction;
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
@@ -6147,6 +6177,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                checkpoint_after_generation(slot);
                 metrics.on_prediction(slot);
                 slot.release();
 
@@ -6499,6 +6530,7 @@ private:
                 if (!process_token(result, slot)) {
                     slot.print_timings();
                     send_final_response(slot);
+                    checkpoint_after_generation(slot);
                     metrics.on_prediction(slot);
                     slot.release();
 

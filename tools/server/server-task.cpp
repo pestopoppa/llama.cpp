@@ -1793,6 +1793,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
+    // PFXC-A2: best entry rejected only by the f_keep rule, by absolute LCP (copy-load candidate)
+    auto it_copy  = states.end();
+    int  lcp_copy = std::max(lcp_best, copy_min_lcp > 0 ? copy_min_lcp - 1 : 0);
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
@@ -1802,6 +1806,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
+            if (copy_min_lcp > 0 && lcp_cur > lcp_copy) {
+                lcp_copy = lcp_cur;
+                it_copy  = it;
+            }
             continue;
         }
 
@@ -1816,6 +1824,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 #ifdef LLAMA_LB7_PROBES
     lb7p_t_scan = ggml_time_us();
 #endif
+    // PFXC-A2: nothing passed the f_keep rule but an entry shares a long absolute prefix (typically the shared
+    // system+tools prefix of a new agent task): restore a COPY of its state, leaving the large entry in the cache, so the
+    // "don't trash large prompts" intent holds and the new request still reuses the prefix (hybrid memories then roll
+    // back to the entry's checkpoint at or before the divergence).
+    bool copy_load = false;
+    if (it_best == states.end() && it_copy != states.end()) {
+        it_best   = it_copy;
+        copy_load = true;
+        SRV_INF(" - copy-loading cached prompt with lcp = %d of %d tokens (f_keep < 0.25)\n", lcp_copy, it_copy->prompt.n_tokens());
+    }
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 #ifdef LLAMA_LB7_PROBES
@@ -1845,8 +1863,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!copy_load) {
+                data.clear();
+                data.shrink_to_fit();
+            }
 #ifdef LLAMA_LB7_PROBES
             lb7p_free_tgt_us = ggml_time_us() - lb7p_tb;
 #endif
@@ -1877,17 +1897,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!copy_load) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
 #ifdef LLAMA_LB7_PROBES
                 lb7p_free_dft_us = ggml_time_us() - lb7p_tb;
 #endif
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (copy_load) {
+            prompt = it_best->prompt.clone();
+        } else {
+            prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+            states.erase(it_best);
+        }
     }
 #ifdef LLAMA_LB7_PROBES
     lb7p_emit(1);
