@@ -515,6 +515,7 @@ struct server_slot {
     int32_t spec_tree_cols  = 0;       // [AK-DTREE-2] tree columns budgeted this round (batch mode pads to it)
     bool    spec_tree_batch_round = false; // [AK-DTREE-2] this round's verify was emitted as a tree batch
     std::vector<int32_t> spec_tree_cols_pending; // [AK-DTREE-2] winner's tree columns, committed after sampling
+    size_t  spec_draft_in_prompt = 0;  // main-draft tokens appended to prompt.tokens this round (a tree winner may differ in length)
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -951,6 +952,7 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+        spec_draft_in_prompt = spec_draft.size();
     }
 
     void release() {
@@ -6459,7 +6461,9 @@ private:
             }
 
             // add accepted tokens to the prompt
-            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            // DTREE-TREE-QUALITY: prompt.tokens holds the MAIN draft; after a tree round spec_draft is the winner, whose
+            // length a greedy tree does not tie to the main draft's, so drop what was actually appended
+            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - slot.spec_draft_in_prompt);
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
