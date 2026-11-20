@@ -815,6 +815,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_q8ip_forget_range(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -852,6 +853,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8ip_before_write(tensor, offset, size, cudaStreamPerThread);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -860,14 +862,20 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8ip_before_write(tensor, offset, size, cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_q8ip_after_write(tensor, offset, size,
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS, cudaStreamPerThread);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_q8ip_get(tensor, data, offset, size)) {   // packed in place: return the natural layout
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -877,6 +885,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8ip_before_write(tensor, offset, (n_copies - 1) * stride_tensor + size, cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -887,12 +896,22 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_q8ip_is_packed(tensor->view_src ? tensor->view_src : tensor)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_cuda_q8ip_get(tensor, (char *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
+                                 ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {
+        return false;   // in-place packed Q8_0: generic get_tensor / set_tensor path (layout-aware)
+    }
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -921,6 +940,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8ip_forget_range(ctx->dev_ptr, buffer->size);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1820,6 +1840,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
+    if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(ffn_up->src[0]) || ggml_cuda_q8ip_is_packed(ffn_gate->src[0]))) {
+        return false;   // in-place packed weight: no fused path reads the packed layout
+    }
+
     if (has_bias && (!ffn_up_bias || !ffn_gate_bias)) {
         return false;
     }
@@ -1906,6 +1930,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
+    if (ggml_cuda_q8ip_is_packed(src0)) {
+        return false;
+    }
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
@@ -1933,6 +1960,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
+    if (ggml_cuda_q8ip_is_packed(src0)) {
+        return false;
+    }
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
@@ -2020,6 +2050,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // DTREE-0-Q8MF-REPACK-INPLACE: an in-place packed weight is read directly by V3 at n <= 16 (any n >= 1);
+    // other shapes reach here only with a substituted natural copy (ggml_cuda_compute_forward).
+    if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_mf_handles(src0, src1, dst)) {
+        ggml_cuda_log_mul_mat_route("Q8_MF_INPLACE", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_mf(ctx, src0, src1, dst);
+        return;
+    }
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_log_mul_mat_route("CUBLAS_PRECHECK", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -2239,7 +2276,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static bool ggml_cuda_compute_forward_impl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
+// DTREE-0-Q8MF-REPACK-INPLACE: ops other than the V3 MUL_MAT read a transient natural copy of an in-place packed weight
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (!ggml_cuda_q8ip_any()) {
+        return ggml_cuda_compute_forward_impl(ctx, dst);
+    }
+    ggml_cuda_q8ip_subst s;
+    ggml_cuda_q8ip_substitute(ctx, dst, s);
+    const bool ok = ggml_cuda_compute_forward_impl(ctx, dst);
+    ggml_cuda_q8ip_restore(dst, s);
+    return ok;
+}
+
+static bool ggml_cuda_compute_forward_impl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2623,7 +2674,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_q8ip_before_write(tensor, offset, size, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_q8ip_after_write(tensor, offset, size, ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+        cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2632,6 +2686,11 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_q8ip_is_packed(tensor->view_src ? tensor->view_src : tensor)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_cuda_q8ip_get(tensor, data, offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2666,6 +2725,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
 
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+
+    if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
+                                 ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {
         return false;
     }
 
@@ -3205,6 +3269,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
+
+    if (ggml_cuda_q8ip_any()) {   // DTREE-0-Q8MF-REPACK-INPLACE: never fuse over an in-place packed weight
+        for (int j = node_idx; j < node_idx + (int) ops.size() && j < cgraph->n_nodes; ++j) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const ggml_tensor * sk = cgraph->nodes[j]->src[k];
+                if (sk && ggml_cuda_q8ip_is_packed(sk->view_src ? sk->view_src : sk)) {
+                    return false;
+                }
+            }
+        }
+    }
 
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
