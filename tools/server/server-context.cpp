@@ -514,6 +514,7 @@ struct server_slot {
     bool    spec_tree_batch = false;   // [AK-DTREE-2] verify the tree as one batch in this slot's sequence
     int32_t spec_tree_cols  = 0;       // [AK-DTREE-2] tree columns budgeted this round (batch mode pads to it)
     bool    spec_tree_batch_round = false; // [AK-DTREE-2] this round's verify was emitted as a tree batch
+    std::vector<int32_t> spec_tree_cols_pending; // [AK-DTREE-2] winner's tree columns, committed after sampling
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -5578,9 +5579,15 @@ private:
                     GGML_ASSERT(it != slot_rows.end());
                     cols.push_back((int32_t) (it - slot_rows.begin()));
                 }
-                if (ok && !llama_memory_tree_accept(llama_get_memory(ctx_tgt), slot.id, cols.data(), (int32_t) cols.size())) {
-                    SLT_ERR(slot, "%s", "llama_memory_tree_accept failed\n");
+                // commit later, once the sampler has decided how many of the winner's drafts it accepts (the greedy length
+                // above only picks the winner; the sampler is the authority): keep the winner's full column list
+                slot.spec_tree_cols_pending.clear();
+                for (size_t k = 0; ok && k < win_rows.size(); ++k) {
+                    const auto it = std::find(slot_rows.begin(), slot_rows.end(), win_rows[k]);
+                    GGML_ASSERT(it != slot_rows.end());
+                    slot.spec_tree_cols_pending.push_back((int32_t) (it - slot_rows.begin()));
                 }
+                (void) cols;
             
                 // the drafter's process() sees only the winner's rows as this slot's chain (the other tree columns share
                 // the sequence and repeat positions): hide every non-winner column
@@ -6328,6 +6335,15 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // [AK-DTREE-2] batch-mode tree round: commit exactly the anchor + the drafts the sampler accepted
+                if (!slot.spec_tree_cols_pending.empty()) {
+                    const size_t n_keep = std::min(accepted.size(), slot.spec_tree_cols_pending.size());
+                    if (!llama_memory_tree_accept(llama_get_memory(ctx_tgt), slot.id, slot.spec_tree_cols_pending.data(), (int32_t) n_keep)) {
+                        SLT_ERR(slot, "%s", "llama_memory_tree_accept failed\n");
+                    }
+                    slot.spec_tree_cols_pending.clear();
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
