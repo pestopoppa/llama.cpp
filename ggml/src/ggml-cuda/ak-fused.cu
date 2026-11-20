@@ -573,6 +573,23 @@ int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, 
         return ak_h15_reject(7, concat);
     }
 
+    // The kernel's outputs must not alias its own inputs: its blocks run concurrently, so a block that writes silu / l2q /
+    // l2k while another block still reads st / qkv corrupts the conv input. The allocator is free to place them there
+    // (in the unfused graph st and qkv die at CONCAT, before SSM_CONV / L2_NORM are born). Seen on multi-sequence
+    // ubatches (AK-DTREE path-row verify, 2-3 seqs): silu == st and l2q/l2k inside qkv; the result is a wrong conv
+    // state and a wrong token, 0.5-18 nat below a fresh prefill. Fall back to the unfused ops.
+    for (const ggml_tensor * w : { silu, l2q, l2k }) {
+        const char * w0 = (const char *) w->data;
+        const char * w1 = w0 + ggml_nbytes(w);
+        for (const ggml_tensor * r : { st, qkv, wt }) {
+            const char * r0 = (const char *) r->data;
+            const char * r1 = r0 + ggml_nbytes(r);
+            if (w0 < r1 && r0 < w1) {
+                return ak_h15_reject(14, concat);
+            }
+        }
+    }
+
     ak_h15_params p{};
     p.s0 = (const char *) st->data;  p.s0_nb0 = st->nb[0];  p.s0_nb1 = st->nb[1];  p.s0_nb2 = st->nb[2];
     p.s1 = (const char *) qkv->data; p.s1_nb0 = qkv->nb[0]; p.s1_nb1 = qkv->nb[1]; p.s1_nb2 = qkv->nb[2];
