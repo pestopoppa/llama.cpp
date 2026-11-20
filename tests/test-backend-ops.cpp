@@ -5910,6 +5910,57 @@ struct test_ssm_conv_tree : public test_case {
     }
 };
 
+// [DTREE-0-GDN-ROWS] route witness for the few-row GDN verify kernel: with GGML_HIP_GDN_ROWS=1 on a ROCm backend,
+// a non-KDA head_size 64/128 case with n_tokens in [GGML_HIP_GDN_ROWS_MIN (1), GGML_HIP_GDN_ROWS_MAX (16)] that the
+// chunked path does not take MUST run the rows kernel; with the knob off it must NOT run. Prints GDN_ROWS_WITNESS.
+struct gdn_rows_witness {
+    using n_calls_t = uint64_t (*)();
+    n_calls_t n_calls = nullptr;
+    bool      armed   = false;
+    bool      expect  = false;
+    bool      rocm    = false;
+    uint64_t  before  = 0;
+
+    static int env_int(const char * name, int def) {
+        const char * s = getenv(name);
+        return s != nullptr && s[0] != '\0' ? atoi(s) : def;
+    }
+
+    void begin(ggml_backend_t backend, bool eligible, int64_t n_tokens) {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_rows_n_calls");
+        if (n_calls == nullptr) {
+            return;
+        }
+        rocm = strncmp(ggml_backend_name(backend), "ROCm", 4) == 0;
+        const int lo = std::max(1, env_int("GGML_HIP_GDN_ROWS_MIN", 1));
+        const int hi = std::min(16, env_int("GGML_HIP_GDN_ROWS_MAX", 16));
+        expect = rocm && env_int("GGML_HIP_GDN_ROWS", 0) == 1 && eligible && n_tokens >= lo && n_tokens <= hi;
+        before = n_calls();
+        armed  = true;
+    }
+
+    std::string check(const char * what, int64_t n_tokens, int64_t K) {
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls() - before;
+        std::string reason;
+        if (expect && advanced == 0) {
+            reason = "GDN_ROWS_WITNESS: rows kernel did not run (silent recurrent fallback?)";
+        } else if (!expect && advanced != 0) {
+            reason = "GDN_ROWS_WITNESS: rows kernel ran where it must not";
+        }
+        fprintf(stderr, "GDN_ROWS_WITNESS op=%s n_tokens=%" PRId64 " K=%" PRId64 " expect=%s calls_advanced=%" PRIu64 " verdict=%s\n",
+                what, n_tokens, K, expect ? "rows" : "other", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 struct test_gated_delta_net_tree : public test_case {
     const int64_t head_count, head_size, n_tokens, n_seqs;
     const int v_repeat;
@@ -5920,6 +5971,14 @@ struct test_gated_delta_net_tree : public test_case {
             int v_repeat = 1, bool kda = false, int tree_kind = 1)
         : head_count(head_count), head_size(head_size), n_tokens(n_tokens), n_seqs(n_seqs),
           v_repeat(v_repeat), kda(kda), tree_kind(tree_kind) {}
+    gdn_rows_witness rows_witness;
+    void witness_begin(ggml_backend_t backend) override {
+        rows_witness.begin(backend, !kda && (head_size == 64 || head_size == 128), n_tokens);
+    }
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return rows_witness.check("GATED_DELTA_NET_TREE", n_tokens, n_tokens);
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hv = head_count * v_repeat;
         ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, n_seqs);
@@ -6298,6 +6357,7 @@ struct test_gated_delta_net : public test_case {
     using gdn_ch_min_tokens_t = int32_t (*)();
     using gdn_ch_usable_t     = bool (*)(int);
     gdn_ch_n_calls_t gdn_ch_n_calls = nullptr;
+    gdn_rows_witness rows_witness;
     bool     gdn_ch_armed  = false;
     bool     gdn_ch_expect = false;
     uint64_t gdn_ch_before = 0;
@@ -6325,6 +6385,7 @@ struct test_gated_delta_net : public test_case {
                         n_seq_tokens >= min_tokens() && n_seq_tokens > kt && kt <= 64;
         gdn_ch_before = gdn_ch_n_calls();
         gdn_ch_armed  = true;
+        rows_witness.begin(backend, !gdn_ch_expect && !kda && (head_size == 64 || head_size == 128), n_seq_tokens);
     }
 
     std::string witness_check(ggml_backend_t backend) override {
@@ -6332,6 +6393,7 @@ struct test_gated_delta_net : public test_case {
         if (!gdn_ch_armed) {
             return "";
         }
+        const std::string rows_reason = rows_witness.check("GATED_DELTA_NET", n_seq_tokens, K);
         const uint64_t advanced = gdn_ch_n_calls() - gdn_ch_before;
         std::string reason;
         if (gdn_ch_expect && advanced == 0) {
@@ -6342,7 +6404,7 @@ struct test_gated_delta_net : public test_case {
         fprintf(stderr, "GDN_CHUNKED_WITNESS H=%" PRId64 " S_v=%" PRId64 " n_tokens=%" PRId64 " n_seqs=%" PRId64 " K=%" PRId64
                 " kda=%d expect=%s calls_advanced=%" PRIu64 " verdict=%s\n", head_count * v_repeat, head_size, n_seq_tokens,
                 n_seqs, K, (int) kda, gdn_ch_expect ? "chunked" : "recurrent", advanced, reason.empty() ? "PASS" : "FAIL");
-        return reason;
+        return reason.empty() ? rows_reason : reason;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -14468,6 +14530,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_tree(4, 32, 12, 2, 1, true, kind));
         test_cases.emplace_back(new test_ssm_conv_tree(4, 1024, 12, 3, kind));
     }
+    // [DTREE-0-GDN-ROWS] few-row verify at the 27B (16 qk x3 = 48 v-heads) and A3B (x2 = 32) GDN dims, n_tokens 1..16:
+    // final-state only (K=1, llama-bench), snapshot every row (K=n, MTP/DFlash rollback), a short tail (K=4),
+    // two sequences, permuted q/k/v, BF16 state is in the opt-in set; tree batches (chain/layout/bushy) at every W.
+    for (int vr : { 3, 2 }) {
+        for (int64_t nt = 1; nt <= 16; ++nt) {
+            if (nt != 1 && nt != 9) {   // 1 and 9 are registered above
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr));
+            }
+            if (nt > 1) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr, false, false, nt));
+            }
+            if (vr == 3) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr, false, false, 4));
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 2, vr, false, false, nt));
+            }
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 12, 1, vr, true));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 16, 2, vr, true, false, 16));
+    }
+    for (int kind : {0, 1, 2}) {
+        for (int64_t W = 1; W <= 16; ++W) {
+            if (W == 8 || W == 12 || W == 16) {
+                continue;   // registered above
+            }
+            test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, W, 1, 3, false, kind));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, 16, 2, 3, false, kind));
+        test_cases.emplace_back(new test_gated_delta_net_tree(4, 64, 16, 2, 1, false, kind));
+    }
     // S_v=64 snapshot tails and the 64 < n_tokens <= 64+K edges
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 129, 2, 2, false, false, 4));
@@ -14495,6 +14586,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
+        // [DTREE-0-GDN-ROWS] BF16 state through the rows kernel (27B dims, K=1 and K=n)
+        for (int64_t nt : { 1, 8, 16 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, /*K=*/1, GGML_TYPE_BF16));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, /*K=*/nt, GGML_TYPE_BF16));
+        }
     }
 
     // [option R] opt-in set "iqk_q8_0_prefill" (kept out of the default corpus): Q8_0 x F32 at the
@@ -14996,6 +15092,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, vr));
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, vr, false, false, 9)); // keep_rs prefill
+    }
+    // [DTREE-0-GDN-ROWS] few-row verify op perf, 27B dims: n 1/4/8/12/16, K=1 (llama-bench), K=n (rollback), tree
+    for (int64_t nt : { 1, 4, 8, 12, 16 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3));
+        if (nt > 1) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, nt));
+            test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, nt, 1, 3, false, 1));
+        }
     }
 
     // lightning_indexer
