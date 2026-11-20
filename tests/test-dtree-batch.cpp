@@ -204,13 +204,15 @@ int main(int argc, char ** argv) {
         // each column against a fresh prefill of that linear prefix. Separates "a W-wide verify block flips near-ties"
         // (same rate as the tree) from "the tree structure is wrong" (tree rate above this one).
         {
+            // the root is already committed in `lin` (kept by the rollback above), so the chain is tok[1..W-1] and
+            // column c's logits are row c-1; column 0 (the root) was compared by the 4-wide control
             B.clear();
-            for (int c = 0; c < W; ++c) B.add(tok[c], pos + c, true);
+            for (int c = 1; c < W; ++c) B.add(tok[c], pos + c, true);
             CHECK(llama_decode(lin, B.b) == 0);
-            std::vector<llama_token> am(W);
-            for (int c = 0; c < W; ++c) am[c] = argmax(llama_get_logits_ith(lin, c));
+            std::vector<llama_token> am(W, -1);
+            for (int c = 1; c < W; ++c) am[c] = argmax(llama_get_logits_ith(lin, c - 1));
             CHECK(llama_memory_seq_rm(llama_get_memory(lin), 0, pos + 1, -1));
-            for (int c = 0; c < W; ++c) {
+            for (int c = 1; c < W; ++c) {
                 llama_memory_clear(llama_get_memory(path), true);
                 B.clear();
                 for (int i = 0; i < np; ++i) B.add(ptoks[i], i, false);
