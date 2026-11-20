@@ -173,6 +173,9 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // [TAG_QSA_IDXK_CACHE] stream index of a sequence (0 when unified)
+    uint32_t get_seq_stream(llama_seq_id seq_id) const { return seq_to_stream.at(seq_id); }
+
     // HSF-5.P host KV mirror (experimental). With no observer set (the default) nothing below changes behaviour.
     struct write_observer {
         virtual ~write_observer() = default;
@@ -508,6 +511,9 @@ public:
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const {
         return kv->get_cells(seq_id);
     }
+
+    // [TAG_QSA_IDXK_CACHE] first stream of the current ubatch (get_k/get_v view streams [s0, s1])
+    uint32_t get_s0() const { return sinfos.empty() ? 0 : sinfos[i_cur].s0; }
 
 private:
     llama_memory_status status;
