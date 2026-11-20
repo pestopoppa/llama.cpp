@@ -1833,6 +1833,37 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (common_dtree_dump_enabled() && dp.temperature <= 0.0f && n_block_tokens > 1) {
+                    // DTREE-TREE-QUALITY capture: the full DFlash2 lattice of this round
+                    const int32_t D = n_block_tokens - 1;
+                    std::string js = string_format("{\"k\":\"dflash2\",\"seq\":%d,\"n_past\":%d,\"id_last\":%d,\"D\":%d,\"K\":%d,\"tok\":[",
+                            seq_id, (int) dp.n_past, (int) dp.id_last, D, selector_top_k);
+                    for (int32_t j = 0; j < D; ++j) {
+                        const float * row = lattice + (size_t) (beg + j + 1) * n_embd_dec;
+                        js += j ? ",[" : "[";
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            js += string_format(k ? ",%d" : "%d", (int) row[k]);
+                        }
+                        js += "]";
+                    }
+                    js += "],\"sc\":[";
+                    for (int32_t j = 0; j < D; ++j) {
+                        const float * row = lattice + (size_t) (beg + j + 1) * n_embd_dec;
+                        js += j ? ",[" : "[";
+                        const int32_t n_pred = j == 0 ? 1 : selector_top_k;
+                        for (int32_t q = 0; q < n_pred; ++q) {
+                            js += q ? ",[" : "[";
+                            const float * sc = row + selector_top_k + (size_t) q * selector_top_k;
+                            for (int32_t k = 0; k < selector_top_k; ++k) {
+                                js += string_format(k ? ",%.4g" : "%.4g", sc[k]);
+                            }
+                            js += "]";
+                        }
+                        js += "]";
+                    }
+                    js += "]}";
+                    common_dtree_dump_line(js);
+                }
                 if (dp.tree_alts) {
                     dp.tree_alts->clear();
                 }
@@ -2394,7 +2425,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 {
                     const auto & dpt = dparams.at(seq_id);
-                    if (dpt.tree_alts && dpt.tree_nodes > 0 && dpt.temperature <= 0.0f && cur_p->size >= 2) {
+                    if (((dpt.tree_alts && dpt.tree_nodes > 0) || common_dtree_dump_enabled()) && dpt.temperature <= 0.0f && cur_p->size >= 2) {
                         std::vector<std::pair<llama_token, float>> c;
                         for (int k = 0; k < std::min(4, (int) cur_p->size); ++k) {
                             c.emplace_back(cur_p->data[k].id, cur_p->data[k].logit);
@@ -2471,6 +2502,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
                 continue;
+            }
+
+            if (common_dtree_dump_enabled() && !tree_cands[seq_id].empty()) {
+                // DTREE-TREE-QUALITY capture: per drafted position, the MTP head's top candidates (id, logit, p)
+                std::string js = string_format("{\"k\":\"mtp\",\"seq\":%d,\"n_past\":%d,\"id_last\":%d,\"D\":%d,\"cand\":[",
+                        seq_id, (int) dp.n_past, (int) dp.id_last, (int) dp.result->size());
+                for (size_t j = 0; j < tree_cands[seq_id].size(); ++j) {
+                    js += j ? ",[" : "[";
+                    for (size_t k = 0; k < tree_cands[seq_id][j].size(); ++k) {
+                        js += string_format(k ? ",[%d,%.4g]" : "[%d,%.4g]", (int) tree_cands[seq_id][j][k].first, tree_cands[seq_id][j][k].second);
+                    }
+                    js += "]";
+                }
+                js += "]}";
+                common_dtree_dump_line(js);
             }
 
             // AK-DTREE-1: MTP drafts one path autoregressively, so an alternative can only take a rank-1/2

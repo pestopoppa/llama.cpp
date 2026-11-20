@@ -4,6 +4,9 @@
 #include "speculative-tree.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <cmath>
 #include <limits>
 
@@ -240,4 +243,28 @@ void common_dtree_auto::observe(int32_t arm, int32_t n_emit, int64_t t_us) {
         rate[arm] += (r - rate[arm]) / 8.0;
     }
     ++n_obs[arm];
+}
+
+static FILE * common_dtree_dump_file() {
+    static FILE * f = [] {
+        const char * p = std::getenv("LLAMA_DTREE_DUMP");
+        return (p && *p) ? std::fopen(p, "a") : (FILE *) nullptr;
+    }();
+    return f;
+}
+
+bool common_dtree_dump_enabled() {
+    return common_dtree_dump_file() != nullptr;
+}
+
+void common_dtree_dump_line(const std::string & line) {
+    static std::mutex mtx;
+    FILE * f = common_dtree_dump_file();
+    if (!f) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    std::fwrite(line.data(), 1, line.size(), f);
+    std::fputc('\n', f);
+    std::fflush(f);
 }

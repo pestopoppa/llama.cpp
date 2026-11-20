@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 // Node budget convention (Infernix): `n_nodes` counts tree columns INCLUDING the anchor, so a chain of D draft
@@ -60,6 +61,12 @@ common_dtree_flat common_dtree_flatten(llama_token anchor, const std::vector<std
 
 // maximum number of paths (main + alternatives) verified per slot
 constexpr int32_t COMMON_DTREE_MAX_PATHS = 3;
+
+// DTREE-TREE-QUALITY capture: when LLAMA_DTREE_DUMP=<path> is set (default off), drafters append one JSON line per
+// draft round (per-position candidate tokens + scores) and the server one line per finished task (the slot's
+// token stream, the target's ground truth) to <path>. Thread-safe; a no-op when the env var is unset.
+bool common_dtree_dump_enabled();
+void common_dtree_dump_line(const std::string & line);
 
 // greedy acceptance length of `draft` given the target logits rows `rows` (rows.size() == draft.size() + 1,
 // rows[0] is the anchor's row): the number of draft tokens d such that argmax(rows[i]) == draft[i] for all i < d.

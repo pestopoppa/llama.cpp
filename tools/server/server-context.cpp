@@ -1112,6 +1112,17 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        if (common_dtree_dump_enabled()) {
+            // DTREE-TREE-QUALITY capture: the slot's token stream (prompt + generated) = target ground truth
+            const llama_tokens toks = prompt.tokens.get_text_tokens();
+            std::string js = string_format("{\"k\":\"task\",\"slot\":%d,\"task\":%d,\"n_tokens\":%zu,\"tokens\":[", id, task ? task->id : -1, toks.size());
+            for (size_t i = 0; i < toks.size(); ++i) {
+                js += string_format(i ? ",%d" : "%d", (int) toks[i]);
+            }
+            js += "]}";
+            common_dtree_dump_line(js);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
