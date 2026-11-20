@@ -88,11 +88,13 @@
 //  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
 
+#include "quantize.cuh"
 #include <atomic>
 #include <climits>
 #include <cstdlib>
 
 #define Q8MF_MAXM    16
+#define Q8MF5_KC     16                          // V4: Q8_0 blocks per LDS activation chunk (512 k)
 #define Q8MF_RT      64                          // weight rows per tile
 #define Q8MF_KS      8                           // Q8_0 blocks per stage (256 k)
 #define Q8MF_ROWB    (Q8MF_KS * 34)              // 272 B: one row of a stage = 17 aligned dwordx4
@@ -116,15 +118,15 @@ static const q8mf_cfg & q8mf_get_cfg() {
     static const q8mf_cfg cfg = [] {
         q8mf_cfg c;
         c.variant = q8mf_env_int("GGML_HIP_Q8_MF", 0);
-        if (c.variant < 1 || c.variant > 4) {
+        if (c.variant < 1 || c.variant > 5) {
             c.variant = 0;
         }
         c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", 0) != 0 ? 1 : 0;
-        c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", 9));
+        c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", c.variant == 5 ? 1 : 9));
         c.mmax    = std::min(Q8MF_MAXM, q8mf_env_int("GGML_HIP_Q8_MF_MAX", 16));
         c.wg      = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_WG", 0));
         const char * mb = getenv("GGML_HIP_Q8_MF_MIN_BYTES");
-        c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (6ll << 20);
+        c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (c.variant == 5 ? 0ll : (6ll << 20));
         return c;
     }();
     return cfg;
@@ -137,6 +139,15 @@ bool ggml_cuda_q8_mf_eligible(const ggml_tensor * src0, const ggml_tensor * src1
         return false;
     }
     const int64_t nbytes = (int64_t) ggml_nbytes(src0);
+    if (cfg.variant == 5) {   // V4 mmvq-multicol: any M in [mmin..mmax] <= 16, K % 512 == 0
+        return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src1->ne[1] >= cfg.mmin && src1->ne[1] <= cfg.mmax &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            ggml_is_contiguous(src0) && src0->ne[0] % (32 * Q8MF5_KC) == 0 &&
+            src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
+            dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0 &&
+            nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096;
+    }
     return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= cfg.mmin && src1->ne[1] <= cfg.mmax &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
@@ -816,8 +827,134 @@ q8mf3_mul_mat(const char * __restrict__ W, const int nb01, const uint32_t wbytes
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-0-Q8MF-V4 (GGML_HIP_Q8_MF=5) "V4 mmvq-multicol": MMVQ that serves up to 16 columns.
+//   Keeps MMVQ's Q8_0 weight access (4 lanes per 34-B block, 2 ints/lane via get_int_b2, one wave = 16 contiguous
+//   blocks of a row) and its occupancy (small register file: RPW x NC <= 32 f32 accumulators). Activations are
+//   quantised ONCE per call to q8_1 (quantize_row_q8_1_cuda, the MMVQ path) and the NC columns' q8_1 tile for the
+//   current 512-k chunk is staged in LDS (NC*16*36 B <= 9.2 KB) and shared by the 4 waves of the WG. int8 math via
+//   ggml_cuda_dp4a (v_dot4_i32_i8 on gfx90a). WG = 4 waves, each wave owns RPW rows; grid = ceil(N / (4*RPW)).
+//   NC buckets: 1, 2, 4, 8, 16 (M padded up to the bucket; padded columns are zero and never written).
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8mf5_build_marker[] __attribute__((used)) = "ggml-cuda: V4 mmvq-multicol Q8_0 small-M kernel (GGML_HIP_Q8_MF=5)";
+
+template <int NC, int RPW>
+static __global__ void __launch_bounds__(256, 2)
+q8mf5_mul_mat(const char * __restrict__ W, const int nb01, const int N, const block_q8_1 * __restrict__ Y,
+              const int s11, const int nchunk, const int M, float * __restrict__ dst, const int64_t dst_s1) {
+    __shared__ __align__(16) int   s_q[NC * Q8MF5_KC * 8];
+    __shared__               float s_d[NC * Q8MF5_KC];
+    const int tid  = threadIdx.x;
+    const int wave = tid / 64;
+    const int lane = tid % 64;
+    const int b    = lane / 4;       // block within the chunk
+    const int i    = lane % 4;       // int pair within the block
+    const int row0 = (blockIdx.x * 4 + wave) * RPW;
+
+    const block_q8_0 * wr[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        wr[r] = (const block_q8_0 *) (W + (int64_t) min(row0 + r, N - 1) * nb01);
+    }
+    float acc[RPW][NC];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+    for (int ch = 0; ch < nchunk; ++ch) {
+        const int kb = ch * Q8MF5_KC + b;
+        // issue the weight loads first so they overlap the LDS fill + barrier
+        int   w0[RPW], w1[RPW];
+        float dw[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const block_q8_0 * bw = wr[r] + kb;
+            w0[r] = get_int_b2(bw->qs, 2 * i + 0);
+            w1[r] = get_int_b2(bw->qs, 2 * i + 1);
+            dw[r] = __half2float(bw->d);
+        }
+        __syncthreads();
+        for (int e = tid; e < NC * Q8MF5_KC * 8; e += 256) {
+            const int c = e / (Q8MF5_KC * 8);
+            const int k = (e / 8) % Q8MF5_KC;
+            const int j = e % 8;
+            s_q[e] = c < M ? ((const int *) Y[(int64_t) c * s11 + ch * Q8MF5_KC + k].qs)[j] : 0;
+        }
+        for (int e = tid; e < NC * Q8MF5_KC; e += 256) {
+            const int c = e / Q8MF5_KC;
+            s_d[e] = c < M ? __low2float(Y[(int64_t) c * s11 + ch * Q8MF5_KC + e % Q8MF5_KC].ds) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int2  a  = *(const int2 *) &s_q[(c * Q8MF5_KC + b) * 8 + 2 * i];
+            const float da = s_d[c * Q8MF5_KC + b];
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const int sumi = ggml_cuda_dp4a(w1[r], a.y, ggml_cuda_dp4a(w0[r], a.x, 0));
+                acc[r][c] += dw[r] * da * (float) sumi;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float v = warp_reduce_sum<64>(acc[r][c]);
+            if (lane == ((r * NC + c) & 63) && c < M && row0 + r < N) {
+                dst[(int64_t) c * dst_s1 + row0 + r] = v;
+            }
+        }
+    }
+}
+
+static void ggml_cuda_mul_mat_q8_mf5(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    {
+        static std::atomic<int64_t> n_calls{0};
+        if (n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V4 mmvq-multicol small-M Q8_0 path ran (call 1, GGML_HIP_Q8_MF=5, %s)\n",
+                q8mf5_build_marker);
+        }
+    }
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne10 = src1->ne[0];
+    const int     M    = (int) src1->ne[1];
+    const int     N    = (int) src0->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> q(ctx.pool(), (size_t) M * ne10_padded * sizeof(block_q8_1) / QK8_1);
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q.get(), src0->type, ne10, s11, s11 * M, s11 * M,
+        ne10_padded, M, 1, 1, stream);
+    const block_q8_1 * Y = (const block_q8_1 *) q.get();
+    const int ys     = (int) (ne10_padded / QK8_1);
+    const int nchunk = (int) (ne10 / (32 * Q8MF5_KC));
+    const int nb01   = (int) src0->nb[1];
+    const int64_t dst_s1 = dst->nb[1] / sizeof(float);
+    const char * W = (const char *) src0->data;
+    float * d = (float *) dst->data;
+#define Q8MF5_LAUNCH(NC, RPW) \
+    q8mf5_mul_mat<NC, RPW><<<(N + 4 * RPW - 1) / (4 * RPW), 256, 0, stream>>>(W, nb01, N, Y, ys, nchunk, M, d, dst_s1)
+    if (M <= 1) {        Q8MF5_LAUNCH(1, 4);
+    } else if (M <= 2) { Q8MF5_LAUNCH(2, 4);
+    } else if (M <= 4) { Q8MF5_LAUNCH(4, 4);
+    } else if (M <= 8) { Q8MF5_LAUNCH(8, 4);
+    } else {             Q8MF5_LAUNCH(16, 2);
+    }
+#undef Q8MF5_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
+    if (cfg.variant == 5) {
+        ggml_cuda_mul_mat_q8_mf5(ctx, src0, src1, dst);
+        return;
+    }
     {
         // Path witness (gate packets grep it; also a content marker of the build).
         static std::atomic<int64_t> n_calls{0};
