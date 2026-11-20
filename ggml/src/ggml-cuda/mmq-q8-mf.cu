@@ -123,7 +123,7 @@ static const q8mf_cfg & q8mf_get_cfg() {
     static const q8mf_cfg cfg = [] {
         q8mf_cfg c;
         c.variant = q8mf_env_int("GGML_HIP_Q8_MF", 0);
-        if (c.variant < 1 || c.variant > 5) {
+        if (c.variant < 1 || c.variant > 6) {
             c.variant = 0;
         }
         c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", 0) != 0 ? 1 : 0;
@@ -183,8 +183,15 @@ static __device__ __forceinline__ void q8mf_zero_counters(int * __restrict__ cnt
 //   [8 blk][4 g][16 col][8 B] int8 (qs bytes 8g..8g+7 of the block) then [8 blk][16 col] f32 scale. Columns >= M are zero.
 // One 32-thread group per (block, column).
 static __global__ void q8mf_pre_i8(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
-                                   char * __restrict__ act, int * __restrict__ cnt, const int ncnt) {
+                                   char * __restrict__ act, int * __restrict__ cnt, const int ncnt,
+                                   float * __restrict__ z = nullptr, const int64_t zs1 = 0, const int zN = 0) {
     q8mf_zero_counters(cnt, ncnt);
+    if (z != nullptr) {   // V5: zero dst [M][zN] (row stride zs1) for the atomic partial-tile adds
+        const int nthr = gridDim.x * gridDim.y * blockDim.x;
+        for (int i = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x; i < M * zN; i += nthr) {
+            z[(int64_t) (i / zN) * zs1 + i % zN] = 0.0f;
+        }
+    }
     const int c   = blockIdx.y;
     const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int i   = threadIdx.x % 32;
@@ -1042,7 +1049,7 @@ static int q8ip_mode() {
     static const int m = [] {
         const int v = q8mf_env_int("GGML_HIP_Q8_MF_INPLACE", 0);
         const int variant = q8mf_get_cfg().variant;
-        if (v <= 0 || (variant != 3 && variant != 4)) {
+        if (v <= 0 || (variant != 3 && variant != 4 && variant != 6)) {
             return 0;
         }
         GGML_LOG_INFO("ggml_cuda_q8ip: in-place Q8_0 stage-contiguous repack enabled (GGML_HIP_Q8_MF_INPLACE=%d, MF=%d)\n",
@@ -1281,8 +1288,231 @@ void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s) {
     }
 }
 
-void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-0-Q8MF-V5 (GGML_HIP_Q8_MF=6, packed layout only; unpacked weights run V3 MF=3): 4 WGs/CU (<= 128 VGPR, 4
+// waves/SIMD) persistent balanced-range grid over HALF-TILE units. The in-place packed layout [tile][k-stage][64 rows]
+// [272 B] makes rows 0..31 / 32..63 of a stage two contiguous 8704 B blocks, so a unit (half-tile ht, k-stage ks) is one
+// contiguous 8704 B range: 544 dwordx4 chunks, thread t loads chunks t, t + 256 (+ t + 512 for t < 32) straight into an
+// identical LDS image (no row math). LDS = 8704 B weights + 4608 B q8_1-style int8 activation stage + 2 KiB (dummy commit
+// slot / kh-pair reduction) = 15 KiB -> 4 WGs fit the 64 KiB LDS. Wave w = (rg = w & 1: rows 16 rg.., kh = w >> 1: blocks
+// 4 kh..4 kh + 3); 2 x mfma_i32_16x16x16i8 per block. P = 2 register stages in flight (118 VGPR, 0 scratch; P = 3/4 hit the
+// 128-VGPR cap and spill 32/124 B/lane, so they are not instantiated).
+// Tail: no stream-K fixup pass. At a half-tile flush the kh = 1 waves hand their accumulators to kh = 0 through LDS; a
+// half-tile owned entirely by this WG is stored, a split one is added with global_atomic_add_f32 into dst, which the
+// pre-pass zeroes. Unit order = (ht, ks) flattened, so each WG's weight range is contiguous per half-tile.
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8mf6_build_marker[] __attribute__((used)) =
+    "ggml-cuda: V5 4-WG/CU half-tile packed Q8_0 small-M kernel (GGML_HIP_Q8_MF=6)";
+
+#define Q8MF6_HB    (32 * Q8MF_ROWB)   // 8704 B: half a packed stage
+#define Q8MF6_RED   2048
+
+template <int P, int AUX>
+static __global__ void __launch_bounds__(Q8MF_NT, 4)
+q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
+              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    __shared__ __attribute__((aligned(16))) char lds[Q8MF6_HB + Q8MF_A1 + Q8MF6_RED];
+    const int tid  = threadIdx.x;
+    const int lane = tid & 63;
+    const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
+    const int g    = blockIdx.x;
+    const int u0   = (int) (((int64_t) g * U) / G);
+    const int u1   = (int) (((int64_t) (g + 1) * U) / G);
+
+    constexpr uint32_t OOB = 0x80000000u;
+    const uint32_t vb2 = tid < 32 ? (uint32_t) ((tid + 512) * 16) : OOB;
+    uint32_t ab[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int q = tid + i * Q8MF_NT;
+        const bool ok = q < 256 ? 2 * (q % 8) < M : (q < 288 && 4 * ((q - 256) % 4) < M);
+        ab[i] = ok ? (uint32_t) (q * 16) : OOB;
+    }
+    const q8mf_v4i wrsrc = q8mf_make_rsrc(W, wbytes);
+    const q8mf_v4i arsrc = q8mf_make_rsrc(act, abytes);
+
+    struct regs { q8mf_v4i w[3]; q8mf_v4i a[2]; };
+    int ui = u0, iht = u0 / S, iks = u0 - (u0 / S) * S;
+    auto issue_next = [&](regs & R) {
+        const bool live = ui < u1;
+        // unit (ht, ks) at ((ht >> 1) * S + ks) * 17408 + (ht & 1) * 8704
+        const uint32_t sw = live ? ((uint32_t) ((iht >> 1) * S + iks) * Q8MF_WSTAGE + (uint32_t) (iht & 1) * Q8MF6_HB) : wbytes;
+        const uint32_t sa = live ? (uint32_t) (iks * Q8MF_A1) : abytes;
+        R.w[0] = q8mf_buf_x4(wrsrc, (int) (sw + tid * 16), 0, AUX);
+        R.w[1] = q8mf_buf_x4(wrsrc, (int) (sw + (tid + 256) * 16), 0, AUX);
+        R.w[2] = q8mf_buf_x4(wrsrc, (int) (sw + vb2), 0, AUX);
+        R.a[0] = q8mf_buf_x4(arsrc, (int) (sa + ab[0]), 0, 0);
+        R.a[1] = q8mf_buf_x4(arsrc, (int) (sa + ab[1]), 0, 0);
+        ++ui;
+        if (++iks == S) {
+            iks = 0;
+            ++iht;
+        }
+    };
+    char * red   = lds + Q8MF6_HB + Q8MF_A1;   // dummy commit slot (1 KiB) / kh reduction (2 KiB), never live together
+    auto commit = [&](const regs & R) {
+        *(q8mf_v4i *) (lds + tid * 16)         = R.w[0];
+        *(q8mf_v4i *) (lds + (tid + 256) * 16) = R.w[1];
+        *(q8mf_v4i *) (tid < 32 ? lds + (tid + 512) * 16 : red + lane * 16) = R.w[2];
+        *(q8mf_v4i *) (lds + Q8MF6_HB + tid * 16) = R.a[0];
+        *(q8mf_v4i *) (tid < 32 ? lds + Q8MF6_HB + (tid + 256) * 16 : red + lane * 16) = R.a[1];
+    };
+
+    const int rg = w & 1;
+    const int kh = w >> 1;
+    const int j  = lane & 15;
+    const int gq = lane >> 4;
+    const int c0 = 4 * gq;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto compute = [&]() {
+        const char * lw = lds + (16 * rg + j) * Q8MF_ROWB;
+        const char * la = lds + Q8MF6_HB;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+            const int i = 4 * kh + ii;   // parity of i == parity of ii
+            int w0, w1;
+            if (ii % 2 == 0) {
+                const int * p = (const int *) (lw + 34 * i + 8 * gq);
+                const int d0 = p[0], d1 = p[1], d2 = p[2];
+                w0 = (int) __builtin_amdgcn_alignbyte((uint32_t) d1, (uint32_t) d0, 2);
+                w1 = (int) __builtin_amdgcn_alignbyte((uint32_t) d2, (uint32_t) d1, 2);
+            } else {
+                const int * p = (const int *) (lw + 34 * i + 2 + 8 * gq);
+                w0 = p[0];
+                w1 = p[1];
+            }
+            const float  dw = __half2float(*(const __half *) (lw + 34 * i));
+            const int2   a  = *(const int2 *) (la + i * 512 + lane * 8);
+            const float4 da = *(const float4 *) (la + Q8MF_KS * 512 + i * 64 + gq * 16);
+            const q8mf_v4i z = {0, 0, 0, 0};
+            q8mf_v4i s = __builtin_amdgcn_mfma_i32_16x16x16i8(a.x, w0, z, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(a.y, w1, s, 0, 0, 0);
+            acc[0] += (float) s[0] * (dw * da.x);
+            acc[1] += (float) s[1] * (dw * da.y);
+            acc[2] += (float) s[2] * (dw * da.z);
+            acc[3] += (float) s[3] * (dw * da.w);
+        }
+    };
+
+    int cht = u0 / S, cks = u0 - (u0 / S) * S;
+    auto end_of_unit = [&](const int uc) {
+        if (cks == S - 1 || uc == u1 - 1) {   // uniform
+            float * rf = (float *) red;
+            if (kh == 1) {
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    rf[(rg * 4 + r) * 64 + lane] = acc[r];
+                }
+            }
+            Q8MF_LDS_BARRIER();
+            if (kh == 0) {
+                const int  ts   = cht * S;
+                const bool full = ts >= u0 && ts + S <= u1;
+                const int  row  = (cht >> 1) * Q8MF_RT + (cht & 1) * 32 + 16 * rg + j;   // packed => N % 64 == 0
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const float v = acc[r] + rf[(rg * 4 + r) * 64 + lane];
+                    if (c0 + r < M) {
+                        float * o = out + (int64_t) (c0 + r) * out_s1 + row;
+                        if (full) {
+                            *o = v;
+                        } else {
+                            unsafeAtomicAdd(o, v);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                acc[r] = 0.0f;
+            }
+        }
+        if (++cks == S) {
+            cks = 0;
+            ++cht;
+        }
+    };
+
+    regs R[P];
+#pragma unroll
+    for (int jj = 0; jj < P; ++jj) {
+        issue_next(R[jj]);
+        asm volatile("" ::: "memory");
+    }
+    int u = u0;
+    do {
+#pragma unroll
+        for (int jj = 0; jj < P; ++jj) {
+            commit(R[jj]);
+            issue_next(R[jj]);
+            Q8MF_LDS_BARRIER();
+            if (u + jj < u1) {
+                compute();
+                end_of_unit(u + jj);
+            }
+            Q8MF_LDS_BARRIER();
+        }
+        u += P;
+    } while (u < u1);
+#else
+    GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S); GGML_UNUSED(U);
+    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
+static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
+    constexpr int p = 2;
+    {
+        static std::atomic<int64_t> n_calls{0};
+        if (n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V5 4-WG/CU half-tile packed path ran (call 1, GGML_HIP_Q8_MF=6, P=%d, slc=%d, %s)\n",
+                p, cfg.slc, q8mf6_build_marker);
+        }
+    }
+    cudaStream_t stream = ctx.stream();
+    const int     N      = (int) src0->ne[1];
+    const int     M      = (int) src1->ne[1];
+    const int     nblk   = (int) (src0->ne[0] / 32);
+    const int64_t s1     = src1->nb[1] / sizeof(float);
+    const int64_t dst_s1 = dst->nb[1]  / sizeof(float);
+    const int     S      = nblk / Q8MF_KS;
+    const int     U      = (N / Q8MF_RT) * 2 * S;
+    const int     ncu    = ggml_cuda_info().devices[ctx.device].nsm;
+    GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
+    const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    const size_t abytes = (size_t) S * Q8MF_A1;
+    ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
+    float * d = (float *) dst->data;
+    {
+        const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
+        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+    }
+    const char *   W      = (const char *) src0->data;
+    const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
+#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+    if (cfg.slc) {
+        Q8MF6_L(2, 2);
+    } else {
+        Q8MF6_L(2, 0);
+    }
+#undef Q8MF6_L
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const q8mf_cfg & cfg0 = q8mf_get_cfg();
+    if (cfg0.variant == 6 && ggml_cuda_q8ip_is_packed(src0)) {
+        ggml_cuda_mul_mat_q8_mf6(ctx, src0, src1, dst);
+        return;
+    }
+    q8mf_cfg cfg = cfg0;
+    if (cfg.variant == 6) {   // V5 reads only the packed layout; natural-layout weights run V3 (MF=3)
+        cfg.variant = 3;
+    }
     if (cfg.variant == 5) {
         ggml_cuda_mul_mat_q8_mf5(ctx, src0, src1, dst);
         return;
