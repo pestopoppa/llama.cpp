@@ -334,7 +334,13 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    // [AK-DTREE-2] batch mode: every tree column is an output row of the slot's single sequence
+    if (params.speculative.draft_tree_nodes != 0 && params.speculative.draft_tree_mode == 1) {
+        const int32_t cols = params.speculative.draft_tree_nodes > 0 ? params.speculative.draft_tree_nodes
+                                                                     : params.speculative.draft.n_max + 10;
+        n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, (uint32_t) cols);
+    }
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq * params.speculative.tree_seqs_per_slot();
 
