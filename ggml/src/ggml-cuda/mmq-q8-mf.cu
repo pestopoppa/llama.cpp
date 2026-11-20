@@ -92,6 +92,9 @@
 #include <atomic>
 #include <climits>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 #define Q8MF_MAXM    16
 #define Q8MF5_KC     16                          // V4: Q8_0 blocks per LDS activation chunk (512 k)
@@ -111,7 +114,7 @@ static int q8mf_env_int(const char * name, int def) {
 }
 
 struct q8mf_cfg {
-    int variant; int mmin; int mmax; int wg; int slc; int64_t min_bytes;
+    int variant; int mmin; int mmax; int wg; int slc; int repack; int64_t min_bytes;
 };
 
 static const q8mf_cfg & q8mf_get_cfg() {
@@ -125,6 +128,9 @@ static const q8mf_cfg & q8mf_get_cfg() {
         c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", c.variant == 5 ? 1 : 9));
         c.mmax    = std::min(Q8MF_MAXM, q8mf_env_int("GGML_HIP_Q8_MF_MAX", 16));
         c.wg      = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_WG", 0));
+        // DTREE-0-Q8MF-HBM-CEILING: 1 = stage-contiguous repacked weight copy cached per (data, N, K) (perf), 2 = repack on
+        // every call (correctness: test buffers reuse addresses). V3 only.
+        c.repack  = std::max(0, std::min(2, q8mf_env_int("GGML_HIP_Q8_MF_REPACK", 0)));
         const char * mb = getenv("GGML_HIP_Q8_MF_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (c.variant == 5 ? 0ll : (6ll << 20));
         return c;
@@ -628,7 +634,8 @@ static __device__ __forceinline__ int q8mf3_owner(const int u, const int T, cons
 
 template <int V, int AUX>
 static __global__ void __launch_bounds__(Q8MF_NT, 2)
-q8mf3_mul_mat(const char * __restrict__ W, const int nb01, const uint32_t wbytes, const char * __restrict__ act,
+q8mf3_mul_mat(const char * __restrict__ W, const int nb01, const int kstride, const uint32_t tstride, const uint32_t wbytes,
+              const char * __restrict__ act,
               const uint32_t abytes, const int S, const int T, const int G, const int M, const int N,
               float * __restrict__ out, const int64_t out_s1, float * __restrict__ part, int * __restrict__ cnt) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
@@ -664,13 +671,12 @@ q8mf3_mul_mat(const char * __restrict__ W, const int nb01, const uint32_t wbytes
     }
     const q8mf_v4i wrsrc = q8mf_make_rsrc(W, wbytes);
     const q8mf_v4i arsrc = q8mf_make_rsrc(act, abytes);
-    const uint32_t tstride = (uint32_t) Q8MF_RT * (uint32_t) nb01;
 
     // issue pointer: stage ui = (it, iks); stages >= u1 go fully out of range
     int ui = u0, it = u0 / S, iks = u0 - (u0 / S) * S;
     auto issue_next = [&](q8mf_regs & R) {
         const bool live = ui < u1;
-        const uint32_t sw = live ? (uint32_t) it * tstride + (uint32_t) (iks * Q8MF_ROWB) : wbytes;
+        const uint32_t sw = live ? (uint32_t) it * tstride + (uint32_t) (iks * kstride) : wbytes;
         const uint32_t sa = live ? (uint32_t) (iks * ASTAGE) : abytes;
         q8mf3_issue<AUX>(R, vb, ab, sw, sa, wrsrc, arsrc);
         ++ui;
@@ -949,6 +955,68 @@ static void ggml_cuda_mul_mat_q8_mf5(ggml_backend_cuda_context & ctx, const ggml
     CUDA_CHECK(cudaGetLastError());
 }
 
+// DTREE-0-Q8MF-HBM-CEILING: stage-contiguous repack. Natural layout: a stage = 64 rows x 272 B segments at row stride nb01
+// (64 scattered 272 B pieces, each straddling 3-4 128 B lines shared with the neighbouring k-stages). Packed layout:
+// [tile][k-stage][64 rows][272 B] -> each stage is ONE contiguous, 128 B aligned 17408 B block and a WG's stream-K range
+// is one contiguous byte range. Block bytes are unchanged (pure permutation; rows >= N are zero), so the compute path is
+// identical. Grid-stride over 16 B chunks.
+static __global__ void q8mf_repack_stage(const char * __restrict__ W, const int64_t nb01, const int N, const int S,
+                                         const int64_t nchunk, char * __restrict__ P) {
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < nchunk; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t st  = q / Q8MF_NCHUNK;         // packed stage index = tile * S + ks
+        const int     c   = (int) (q % Q8MF_NCHUNK);
+        const int64_t t   = st / S;
+        const int     ks  = (int) (st % S);
+        const int     row = (int) (t * Q8MF_RT) + c / 17;
+        int4 v = make_int4(0, 0, 0, 0);
+        if (row < N) {
+            v = *(const int4 *) (W + row * nb01 + (int64_t) ks * Q8MF_ROWB + (c % 17) * 16);
+        }
+        *(int4 *) (P + q * 16) = v;
+    }
+}
+
+struct q8mf_pack_key {
+    const void * data; int64_t n; int64_t k; int dev;
+    bool operator<(const q8mf_pack_key & o) const {
+        return std::tie(data, n, k, dev) < std::tie(o.data, o.n, o.k, o.dev);
+    }
+};
+
+// returns the packed copy (cached for repack == 1, a pool buffer refreshed every call for repack == 2)
+static const char * q8mf_get_packed(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int repack,
+                                    ggml_cuda_pool_alloc<char> & tmp, size_t & pbytes) {
+    static std::map<q8mf_pack_key, char *> cache;
+    static std::mutex mu;
+    const int     N       = (int) src0->ne[1];
+    const int     S       = (int) (src0->ne[0] / 256);
+    const int64_t n_tiles = (N + Q8MF_RT - 1) / Q8MF_RT;
+    pbytes = (size_t) n_tiles * S * Q8MF_WSTAGE;
+    const int64_t nchunk = (int64_t) pbytes / 16;
+    cudaStream_t stream = ctx.stream();
+    auto launch = [&](char * P) {
+        const int grid = (int) std::min<int64_t>((nchunk + 255) / 256, 65535);
+        q8mf_repack_stage<<<grid, 256, 0, stream>>>((const char *) src0->data, (int64_t) src0->nb[1], N, S, nchunk, P);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (repack == 2) {
+        char * P = tmp.alloc(ctx.pool(), pbytes);
+        launch(P);
+        return P;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    const q8mf_pack_key key{src0->data, src0->ne[1], src0->ne[0], ctx.device};
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    char * P = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &P, pbytes));   // experiment: never freed (one copy per weight; op-perf / A/B only)
+    launch(P);
+    cache.emplace(key, P);
+    return P;
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     if (cfg.variant == 5) {
@@ -964,8 +1032,8 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     cfg.variant, cfg.variant == 1 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_32x32x8f16 in-register dequant");
             } else {
                 GGML_LOG_INFO("ggml_cuda_q8_mf: V3 2-WG/CU 3-stage stream-K small-M Q8_0 path ran (call 1, GGML_HIP_Q8_MF=%d, %s, "
-                    "slc=%d)\n", cfg.variant, cfg.variant == 3 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_16x16x16f16 in-register dequant",
-                    cfg.slc);
+                    "slc=%d, repack=%d)\n", cfg.variant, cfg.variant == 3 ? "int8 mfma_i32_16x16x16i8" : "f16 mfma_f32_16x16x16f16 in-register dequant",
+                    cfg.slc, cfg.repack);
             }
         }
     }
@@ -1011,7 +1079,20 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     const char *   W      = (const char *) src0->data;
     const int      nb01   = (int) src0->nb[1];
-    const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);   // = N * nb01 (contiguous): rows >= N are out of range
+    uint32_t       wbytes = (uint32_t) ggml_nbytes(src0);   // = N * nb01 (contiguous): rows >= N are out of range
+    // V3 addressing: chunk q of a stage at (q/17)*rowstride + (q%17)*16, stage (tile, ks) at tile*tstride + ks*kstride
+    int      rowstride = nb01;
+    int      kstride   = Q8MF_ROWB;
+    uint32_t tstride   = (uint32_t) Q8MF_RT * (uint32_t) nb01;
+    ggml_cuda_pool_alloc<char> ptmp;
+    if (v3 && cfg.repack > 0) {
+        size_t pbytes = 0;
+        W         = q8mf_get_packed(ctx, src0, cfg.repack, ptmp, pbytes);
+        wbytes    = (uint32_t) pbytes;
+        rowstride = Q8MF_ROWB;
+        kstride   = Q8MF_WSTAGE;
+        tstride   = (uint32_t) S * Q8MF_WSTAGE;
+    }
     float *        d      = (float *) dst->data;
     switch (cfg.variant * 2 + cfg.slc) {
         case 2: case 3:
@@ -1021,7 +1102,7 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
             q8mf2_mul_mat<2><<<G, Q8MF_NT, 0, stream>>>(W, nb01, N, wbytes, act.get(), (uint32_t) abytes, S, T, L, M, d, dst_s1, part.get(), cnt.get());
             break;
 #define Q8MF3_CASE(c, v, aux) case c: \
-            q8mf3_mul_mat<v, aux><<<G, Q8MF_NT, 0, stream>>>(W, nb01, wbytes, act.get(), (uint32_t) abytes, S, T, G, M, N, d, dst_s1, part.get(), cnt.get()); \
+            q8mf3_mul_mat<v, aux><<<G, Q8MF_NT, 0, stream>>>(W, rowstride, kstride, tstride, wbytes, act.get(), (uint32_t) abytes, S, T, G, M, N, d, dst_s1, part.get(), cnt.get()); \
             break;
         Q8MF3_CASE(6, 3, 0) Q8MF3_CASE(7, 3, 2) Q8MF3_CASE(8, 4, 0) Q8MF3_CASE(9, 4, 2)
 #undef Q8MF3_CASE
