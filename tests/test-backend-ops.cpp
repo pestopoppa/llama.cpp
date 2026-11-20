@@ -8686,6 +8686,70 @@ struct test_topk_moe_hold : public test_topk_moe {
     // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
     size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
 };
+// AK-ASM-H11-UNIQ: degenerate router rows (exact ties, -inf, NaN). The C14 MUL_MAT_ID helper silently drops duplicate
+// expert slots, so the router (topksoftmax asm or topk-moe fusion) must emit k DISTINCT ids in [0, n_expert) on every
+// row whatever the logits. Tie-break order may legitimately differ from CPU, so err() is order- and value-free and the
+// verdict is the witness: any duplicate or out-of-range id on any row fails the case and names the row pattern.
+struct test_topk_moe_degen : public test_topk_moe {
+    using test_topk_moe::test_topk_moe;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_DEGEN"; }
+
+    static const char * pattern_name(int64_t r) {
+        static const char * names[] = { "all_tie", "tie_levels", "half_neginf", "all_neginf", "one_nan", "all_nan", "tie_top_k" };
+        return names[r % 7];
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F32 || ggml_is_view_op(t->op)) { continue; }
+            const int64_t n_expert = t->ne[0];
+            const int64_t n_rows   = ggml_nrows(t);
+            std::vector<float> data(n_expert * n_rows);
+            for (int64_t r = 0; r < n_rows; ++r) {
+                float * row = data.data() + r * n_expert;
+                for (int64_t e = 0; e < n_expert; ++e) {
+                    switch (r % 7) {
+                        case 0: row[e] = 0.5f; break;                                        // every logit equal
+                        case 1: row[e] = (float) (e % 3); break;                             // 3 tie levels
+                        case 2: row[e] = (e % 2) ? -INFINITY : (float) (e % 5); break;      // half -inf, ties among rest
+                        case 3: row[e] = -INFINITY; break;                                   // softmax -> NaN row
+                        case 4: row[e] = (e == n_expert / 2) ? NAN : 0.25f * (float) (e % 4); break;
+                        case 5: row[e] = NAN; break;
+                        case 6: row[e] = (e < 2 * n_expert_used) ? 3.0f : -1.0f; break;     // tie across the k boundary
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override { GGML_UNUSED(a); GGML_UNUSED(b); GGML_UNUSED(n); return 0.0; }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        const int64_t k = selected_experts->ne[0], n_rows = selected_experts->ne[1], n_expert = ne[0];
+        std::vector<int32_t> ids(k * n_rows);
+        ggml_backend_tensor_get(selected_experts, ids.data(), 0, ids.size() * sizeof(int32_t));
+        std::string reason;
+        int64_t bad = 0;
+        for (int64_t r = 0; r < n_rows; ++r) {
+            std::vector<int32_t> row(ids.begin() + r * k, ids.begin() + (r + 1) * k);
+            bool range_ok = true;
+            for (int32_t v : row) { range_ok &= (v >= 0 && v < n_expert); }
+            std::sort(row.begin(), row.end());
+            const bool uniq = std::adjacent_find(row.begin(), row.end()) == row.end();
+            if (!uniq || !range_ok) {
+                if (bad++ == 0) {
+                    reason = std::string("TOPK_UNIQ_WITNESS: ") + (uniq ? "out-of-range" : "duplicate") + " id on row " +
+                             std::to_string(r) + " (" + pattern_name(r) + ")";
+                }
+            }
+        }
+        fprintf(stderr, "TOPK_UNIQ_WITNESS n_expert=%" PRId64 " k=%" PRId64 " rows=%" PRId64 " bad_rows=%" PRId64 " verdict=%s\n",
+                n_expert, k, n_rows, bad, bad ? "FAIL" : "PASS");
+        return reason;
+    }
+};
 // AK-ASM-H13b: one qwen4exp hyper-connection seam (src/models/qwen4exp.cpp build_hc_mix + build_hc_combine) with the
 // mixed stream standing in for the sub-layer output. Exercises the CUDA hc fusions (hc-fuse.cu) and device MEAN_D1
 // against the CPU unfused composition. Weights f32 (the fusions cover only the elementwise tail).
@@ -14863,6 +14927,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // wvSplitK route q8wv_mul_mat<M> is eligible for M in GGML_HIP_Q8_WVSK_MIN..MAX; odd M > 8 runs M + 1).
     for (int64_t n = 2; n <= 16; ++n) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, n, 5120, {1, 1}, {1, 1}));
+    }
+    // [AK-ASM-H11-UNIQ] degenerate router rows (tie / -inf / NaN), appended last (suite-seed stability). Every
+    // gfx90a topksoftmax (n_expert, k) plus Q38FN (512, 10); 7 rows = one row per pattern, 22 and 513 = multi-row and
+    // partial-workgroup paths. Selected with -o TOPK_MOE_DEGEN.
+    for (bool with_norm : { false, true }) {
+        for (auto ek : std::vector<std::pair<int64_t, int>>{ {128, 4}, {128, 8}, {256, 8}, {384, 8}, {640, 8}, {512, 10} }) {
+            for (int64_t n_tok : { 1, 7, 22, 513 }) {
+                test_cases.emplace_back(new test_topk_moe_degen({ek.first, n_tok, 1, 1}, ek.second, with_norm, false, GATING_FUNC_SOFTMAX, 0.0f));
+            }
+        }
     }
 
     return test_cases;
