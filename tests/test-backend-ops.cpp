@@ -12107,6 +12107,29 @@ static void dtree_add_q8mf_eval_cases(std::vector<std::unique_ptr<test_case>> & 
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
         }
     }
+    // DTREE-0-Q8MF-V2 edges: N % 64 != 0 (last stream-K tile clamps rows; 6000 = 93.75 tiles, 4100 = 64.06) and a short K
+    // (2048 = 8 stages, tiles split over several WGs); M 1/4/8 cover a GGML_HIP_Q8_MF_MIN=1 correctness run.
+    static const std::array<int64_t, 2> edge[] = {{6000, 5120}, {4100, 2048}};
+    for (const auto & sh : edge) {
+        for (int64_t n : {1, 4, 8, 9, 13, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+    }
+}
+
+// DTREE-0-Q8MF-V2 roofline table: the 27B Q8_0 verify shapes {m = rows, k} at M (= n) 1/8/12/16. Run with
+// GGML_HIP_Q8_MF=1|2 GGML_HIP_Q8_MF_MIN=1 to time the MF kernels at every M (GB/s = m * k * 34/32 / (us/op)).
+static void dtree_add_q8mf_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> shapes[] = {{5120, 17408}, {17408, 5120}, {12288, 5120}, {5120, 6144}, {248320, 5120}};
+    for (const auto & sh : shapes) {
+        for (int64_t n : {1, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
 }
 
 static void akh1_add_q8_skinny_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -14263,6 +14286,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
+    dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
