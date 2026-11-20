@@ -1,6 +1,10 @@
 // AK-DTREE-1: greedy token-identity test of the path-row tree verify on a real (hybrid) model.
 //
-//   test-spec-dtree-verify <model.gguf> [n_gen] [n_threads]
+//   test-spec-dtree-verify <model.gguf> [n_gen] [n_threads] [D] [n_paths]
+//
+// n_paths -1 = SCHEDULE (the varying 2/3-sequence verify of the 27B T9 server row; with DTREE_NGL=99 on gfx90a this is the
+// regression test of the AK-ASM-H15 input/output alias race), 0 = mixed 2/3 paths, 2..3 = fixed. D != 6 (or DTREE_ORACLE=1)
+// checks every emitted token against a fresh prefill instead of one no-spec run.
 //
 // Uses an ORACLE drafter (the no-spec greedy continuation) with a deterministic corruption per round, so the
 // round outcome is controlled: the main path is wrong at position c, alternative 1 is the oracle (right at c),
@@ -26,7 +30,8 @@
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
-static constexpr int32_t D = 6;
+static int32_t D = 6;        // draft length (argv[4])
+static int32_t N_PATHS = 3;  // main + alternatives in tree mode (argv[5], 2..3; 0 = mixed 2/3 per round)
 
 static llama_token argmax_row(llama_context * ctx, int32_t i) {
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
@@ -74,6 +79,42 @@ static std::vector<llama_token> run_ref(runner & r, const std::vector<llama_toke
     return out;
 }
 
+// ORACLE mode (DTREE_ORACLE=1, or the default for D != 6): instead of token identity with one no-spec run
+// (fragile: a near-tie, e.g. a 0.02 logit gap, flips between batch shapes), every round re-derives the drafts from a
+// FRESH prefill of prompt + emitted tokens in a second context and checks each emitted token against that fresh
+// prefill's logits: an emitted token whose fresh logit is more than ORACLE_MARGIN below the fresh argmax is a
+// verify bug, not GEMM noise. This is the fresh-prefill oracle gate of the AK-DTREE rows.
+static runner * g_orc = nullptr;
+static constexpr float ORACLE_MARGIN = 0.5f;
+static int32_t g_n_bad = 0;
+static float   g_max_margin = 0.0f;
+
+// greedy continuation of prompt + prefix by n tokens from a fresh prefill; rows[i] = logits predicting token i
+static std::vector<llama_token> orc_continue(const std::vector<llama_token> & prompt, const std::vector<llama_token> & prefix,
+                                             int32_t n, std::vector<std::vector<float>> & rows) {
+    runner & o = *g_orc;
+    std::vector<llama_token> all = prompt;
+    all.insert(all.end(), prefix.begin(), prefix.end());
+    llama_pos pos;
+    llama_token tok = o.prefill(all, &pos);
+    rows.clear();
+    {
+        const float * l = llama_get_logits_ith(o.ctx, o.batch.n_tokens - 1);
+        rows.emplace_back(l, l + o.n_vocab);
+    }
+    std::vector<llama_token> res = { tok };
+    while ((int32_t) res.size() < n) {
+        common_batch_clear(o.batch);
+        common_batch_add(o.batch, tok, pos++, { 0 }, true);
+        CHECK(llama_decode(o.ctx, o.batch) == 0);
+        const float * l = llama_get_logits_ith(o.ctx, 0);
+        rows.emplace_back(l, l + o.n_vocab);
+        tok = argmax_row(o.ctx, 0);
+        res.push_back(tok);
+    }
+    return res;
+}
+
 // mode 0 = linear, 1 = tree. Returns emitted tokens; *n_rounds / *n_alt_wins out.
 static std::vector<llama_token> run_spec(runner & r, const std::vector<llama_token> & prompt,
                                          const std::vector<llama_token> & ref, int32_t n_gen, int mode,
@@ -86,8 +127,16 @@ static std::vector<llama_token> run_spec(runner & r, const std::vector<llama_tok
 
     while ((int32_t) out.size() < n_gen) {
         const size_t k = out.size() - 1; // index of `sampled` in ref (valid while out == ref)
-        CHECK(k + D < ref.size());
-        std::vector<llama_token> oracle(ref.begin() + k + 1, ref.begin() + k + 1 + D);
+        std::vector<llama_token> oracle;
+        std::vector<std::vector<float>> orc_rows; // ORACLE mode: fresh logits predicting out[k + 1 + i]
+        if (g_orc) {
+            // the fresh prefill ends at `sampled`: its first prediction is the token after it
+            oracle = orc_continue(prompt, out, D + 1, orc_rows);
+            oracle.resize(D);
+        } else {
+            CHECK(k + D < ref.size());
+            oracle.assign(ref.begin() + k + 1, ref.begin() + k + 1 + D);
+        }
 
         // round script (round % 4), c = round % D:
         //   0: main wrong at c, alt 1 = oracle               -> alt 1 wins fully (promote, no rollback)
@@ -110,13 +159,43 @@ static std::vector<llama_token> run_spec(runner & r, const std::vector<llama_tok
         }
         if (mode == 1) {
             paths.push_back(oracle);
-            paths.push_back(oracle);
-            corrupt(paths[2], c, 2);
+            if (N_PATHS != 2) {
+                paths.push_back(oracle);
+                corrupt(paths[2], c, 2);
+            }
             if (kind == 1 && c + 2 < D) {
                 corrupt(paths[1], c + 2, 3);
             }
             if (kind == 2 || kind == 3) {
                 corrupt(paths[1], c, 3);
+            }
+            if (N_PATHS == 0) {
+                // MIXED (the server's fixed-width trees): the path count varies per round (2 or 3) and every other
+                // block of 4 rounds puts the winning alternative on the LAST sequence, so a round with fewer paths
+                // follows a round whose winner was the highest alternative sequence
+                if ((round / 4) % 2 == 1) {
+                    std::swap(paths[1], paths[2]);
+                }
+                if (round % 3 == 2) {
+                    paths.pop_back();
+                }
+            }
+        }
+
+        if (mode == 1 && N_PATHS < 0) {
+            // SCHEDULE (from the 27B T9 server trace): main partial (2 paths) -> the LAST alternative of a 3-path
+            // round wins fully -> main full win in a 2-path round -> main full win in a 2-path round
+            const int32_t ph = round % 4;
+            paths.assign(1, oracle);
+            if (ph <= 1) {
+                corrupt(paths[0], c, 1);
+            }
+            paths.push_back(oracle);
+            if (ph != 3) {
+                corrupt(paths[1], c, 3);
+            }
+            if (ph == 1) {
+                paths.push_back(oracle);
             }
         }
 
@@ -222,11 +301,27 @@ static std::vector<llama_token> run_spec(runner & r, const std::vector<llama_tok
         pos = keep_end;
         ++*n_rounds;
 
+        if (g_orc) {
+            for (int32_t i = 0; i <= best_n; ++i) {
+                const auto & L = orc_rows[i];
+                const llama_token t = out[k + 1 + i];
+                const float m = *std::max_element(L.begin(), L.end()) - L[t];
+                g_max_margin = std::max(g_max_margin, m);
+                if (m > ORACLE_MARGIN) {
+                    ++g_n_bad;
+                    fprintf(stderr, "mode %d round %d (kind %d, winner %d, n %d): emitted token %zu = %d is %.3f below the "
+                            "fresh-prefill argmax\n", mode, round, kind, best, best_n, k + 1 + i, t, m);
+                }
+            }
+            continue;
+        }
+
         // early exit with a precise report on the first divergence
         for (size_t i = 0; i < out.size() && i < ref.size(); ++i) {
             if (out[i] != ref[i]) {
                 fprintf(stderr, "mode %d: divergence at token %zu (round %d, winner %d, n %d): %d vs ref %d\n",
                         mode, i, round, best, best_n, out[i], ref[i]);
+
                 exit(1);
             }
         }
@@ -242,11 +337,15 @@ int main(int argc, char ** argv) {
     }
     const int32_t n_gen     = argc > 2 ? atoi(argv[2]) : 64;
     const int32_t n_threads = argc > 3 ? atoi(argv[3]) : 8;
+    D       = argc > 4 ? atoi(argv[4]) : 6;
+    N_PATHS = argc > 5 ? atoi(argv[5]) : 3;
+    CHECK(D >= 2 && (N_PATHS <= 0 || (N_PATHS >= 2 && N_PATHS <= COMMON_DTREE_MAX_PATHS)));
 
     llama_backend_init();
 
     auto mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;
+    // DTREE_NGL=99 runs the target on the GPU build (the AK-DTREE rows' backend); default CPU
+    mparams.n_gpu_layers = getenv("DTREE_NGL") ? atoi(getenv("DTREE_NGL")) : 0;
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
     CHECK(model);
 
@@ -259,6 +358,7 @@ int main(int argc, char ** argv) {
     cparams.kv_unified      = true;
     cparams.n_threads       = n_threads;
     cparams.n_threads_batch = n_threads;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     llama_context * ctx = llama_init_from_model(model, cparams);
     CHECK(ctx);
     if (llama_n_rs_seq(ctx) < (uint32_t) D) {
@@ -275,19 +375,43 @@ int main(int argc, char ** argv) {
 
     const auto ref = run_ref(r, prompt, n_gen);
 
+    const char * e_orc = getenv("DTREE_ORACLE");
+    const bool use_orc = e_orc ? atoi(e_orc) != 0 : D != 6;
+    runner orc { model, nullptr, llama_batch_init(2048, 0, 1), r.n_vocab };
+    if (use_orc) {
+        auto cp = cparams;
+        cp.n_seq_max = 1;
+        cp.n_batch   = 2048;
+        cp.n_ubatch  = 512;
+        orc.ctx = llama_init_from_model(model, cp);
+        CHECK(orc.ctx);
+        g_orc = &orc;
+    }
+
     int32_t rounds_lin = 0, wins_lin = 0, rounds_tree = 0, wins_tree = 0;
     const auto lin  = run_spec(r, prompt, ref, n_gen, 0, &rounds_lin,  &wins_lin);
     const auto tree = run_spec(r, prompt, ref, n_gen, 1, &rounds_tree, &wins_tree);
 
     const std::vector<llama_token> ref_n(ref.begin(), ref.begin() + n_gen);
-    CHECK(lin == ref_n);
-    CHECK(tree == ref_n);
+    if (use_orc) {
+        printf("oracle: %d emitted tokens more than %.2f below the fresh-prefill argmax (max %.3f), D=%d paths=%d\n",
+               g_n_bad, ORACLE_MARGIN, g_max_margin, D, N_PATHS);
+        CHECK(g_n_bad == 0);
+    } else {
+        CHECK(lin == ref_n);
+        CHECK(tree == ref_n);
+    }
     CHECK(wins_lin == 0);
     CHECK(wins_tree > 0);
     CHECK(rounds_tree < rounds_lin);
 
-    printf("test-spec-dtree-verify: OK  n_gen=%d  linear rounds=%d  tree rounds=%d (alt wins %d)  "
-           "token-identical to no-spec greedy\n", n_gen, rounds_lin, rounds_tree, wins_tree);
+    printf("test-spec-dtree-verify: OK  n_gen=%d  D=%d  paths=%d  linear rounds=%d  tree rounds=%d (alt wins %d)  %s\n",
+           n_gen, D, N_PATHS, rounds_lin, rounds_tree, wins_tree,
+           use_orc ? "every emitted token agrees with a fresh prefill" : "token-identical to no-spec greedy");
+    if (orc.ctx) {
+        llama_free(orc.ctx);
+    }
+    llama_batch_free(orc.batch);
 
     llama_batch_free(r.batch);
     llama_free(ctx);
