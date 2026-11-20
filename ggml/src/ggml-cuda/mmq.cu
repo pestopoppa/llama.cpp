@@ -2,7 +2,9 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmq-q8-mf.cuh"
 
+#include <atomic>
 #include <cstdint>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -116,7 +118,17 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    // DTREE-0-Q8MF-PACKED-CONSUMERS: a negative row stride tells the Q8_0 tile loader the weight is in the in-place
+    // packed [tile][k-stage][64 rows][272 B] layout (2D, no ids only).
+    const bool q8ip_packed = !ids && ggml_cuda_q8ip_is_packed(src0);
+    GGML_ASSERT(!q8ip_packed || (ne02 == 1 && ne03 == 1));
+    if (q8ip_packed) {
+        static std::atomic<int64_t> n_calls{0};
+        if (n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8ip: packed-layout MMQ ran (call 1, n=%lld)\n", (long long) ne11);
+        }
+    }
+    const int64_t s01 = (q8ip_packed ? -1 : 1) * (int64_t) (src0->nb[1] / ts_src0);
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;

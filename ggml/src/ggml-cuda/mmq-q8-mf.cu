@@ -89,6 +89,7 @@
 #include "mmq-q8-mf.cuh"
 
 #include "quantize.cuh"
+#include "mmq.cuh"
 #include <atomic>
 #include <climits>
 #include <cstdlib>
@@ -1253,6 +1254,10 @@ void ggml_cuda_q8ip_substitute(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         if (dst->op == GGML_OP_MUL_MAT && i == 0 && src == b && ggml_cuda_q8ip_mf_handles(src, dst->src[1], dst)) {
             continue;
         }
+        if (dst->op == GGML_OP_MUL_MAT && i == 0 && src == b &&
+            ggml_cuda_q8ip_mmq_handles(src, dst->src[1], dst, ggml_cuda_info().devices[ctx.device].cc)) {
+            continue;   // DTREE-0-Q8MF-PACKED-CONSUMERS: MMQ reads the packed layout
+        }
         static std::atomic<int64_t> n_sub{0};
         if (n_sub.fetch_add(1) == 0) {
             GGML_LOG_INFO("ggml_cuda_q8ip: op %s (%s) reads packed %s -> transient natural copy\n",
@@ -1281,8 +1286,151 @@ void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-0-Q8MF-PACKED-CONSUMERS: consumers that read the in-place packed layout directly (no natural copy).
+// (a) q8ip_mmvq: n 1..GGML_HIP_Q8IP_MMVQ_MAX (default 1, max 4) Q8_0 x q8_1 matvec. A WG (256 threads) owns Q8IPV_R = 8
+//     consecutive rows of one 64-row tile; in the packed layout those rows' segment of a k-stage is ONE contiguous,
+//     16 B aligned 8 x 272 = 2176 B run (136 dwordx4), so each iteration streams Q8IPV_U = 4 stages = 4 contiguous runs
+//     with fully used dwordx4 loads into LDS, then 2 threads per Q8_0 block (16 quants each, 4 dp4a per column) consume
+//     them. Low VGPR, 8.7 KB LDS, N/8 WGs (17408 rows -> 2176 WGs) -> high occupancy, no stream-K / atomics.
+// (b) MMQ prefill (n > 16): ggml_cuda_mul_mat_q is called with a NEGATIVE row stride (-K/32) for a packed weight; the
+//     Q8_0 tile loader decodes (row, block) from the natural index and reads the packed address (in-stage blocks stay
+//     contiguous because MMQ's 8-block k-iteration == one packed stage). See mmq-load-tiles.cuh.
+static const char q8ipc_build_marker[] __attribute__((used)) =
+    "ggml-cuda: Q8_0 packed-layout consumers MMVQ+MMQ (DTREE-0-Q8MF-PACKED-CONSUMERS)";
+
+#define Q8IPV_R  8
+#define Q8IPV_U  4
+#define Q8IPV_NT 256
+#define Q8IPV_CH (Q8IPV_R * Q8MF_ROWB / 16)   // 136 dwordx4 per (stage, 8-row group)
+
+template <int NC>
+static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __restrict__ W, const block_q8_1 * __restrict__ y,
+        const int S, const int sy, float * __restrict__ dst, const int dst_s1) {
+    __shared__ int4  lds[Q8IPV_U * Q8IPV_CH];
+    __shared__ float red[NC][Q8IPV_R];
+    const int tid  = threadIdx.x;
+    const int row0 = blockIdx.x * Q8IPV_R;
+    const char * base = W + (int64_t) (row0 >> 6) * S * Q8MF_WSTAGE + (row0 & 63) * Q8MF_ROWB;
+    const int r = (tid & 127) >> 4;   // row of the group
+    const int b = (tid & 15) >> 1;    // block of the stage row
+    const int h = tid & 1;            // half block (16 quants)
+    const int g = tid >> 7;           // stage parity
+    float acc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = 0.0f;
+    }
+    for (int ks0 = 0; ks0 < S; ks0 += Q8IPV_U) {
+        const int nu = min(Q8IPV_U, S - ks0);
+        const char * src = base + (int64_t) ks0 * Q8MF_WSTAGE;
+#pragma unroll
+        for (int i = 0; i < (Q8IPV_U * Q8IPV_CH + Q8IPV_NT - 1) / Q8IPV_NT; ++i) {
+            const int q = tid + i * Q8IPV_NT;
+            if (q < nu * Q8IPV_CH) {
+                const int u = q / Q8IPV_CH;
+                const int c = q - u * Q8IPV_CH;
+                lds[q] = ((const int4 *) (src + (int64_t) u * Q8MF_WSTAGE))[c];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int u0 = 0; u0 < Q8IPV_U; u0 += 2) {
+            const int u = u0 + g;
+            if (u < nu) {
+                const char * blk = (const char *) lds + u * (Q8IPV_CH * 16) + r * Q8MF_ROWB + b * 34;
+                const float dx = __half2float(*(const half *) blk);
+                const uint16_t * qx = (const uint16_t *) (blk + 2 + h * 16);
+                int xi[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    xi[k] = (int) ((uint32_t) qx[2*k] | ((uint32_t) qx[2*k + 1] << 16));
+                }
+                const int kb = (ks0 + u) * Q8MF_KS + b;
+#pragma unroll
+                for (int j = 0; j < NC; ++j) {
+                    const block_q8_1 * yb = y + j * sy + kb;
+                    const int * yq = (const int *) yb->qs + h * 4;
+                    int s = 0;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        s = ggml_cuda_dp4a(xi[k], yq[k], s);
+                    }
+                    acc[j] += dx * __low2float(yb->ds) * (float) s;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = warp_reduce_sum<16>(acc[j]);
+    }
+    if (g == 1 && (tid & 15) == 0) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            red[j][r] = acc[j];
+        }
+    }
+    __syncthreads();
+    if (g == 0 && (tid & 15) == 0) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            dst[j * dst_s1 + row0 + r] = acc[j] + red[j][r];
+        }
+    }
+}
+
+static int q8ip_mmvq_max() {
+    static const int v = std::max(0, std::min(4, q8mf_env_int("GGML_HIP_Q8IP_MMVQ_MAX", 1)));
+    return v;
+}
+
+static void q8ip_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static std::atomic<int64_t> n_calls{0};
+    if (n_calls.fetch_add(1) == 0) {
+        GGML_LOG_INFO("ggml_cuda_q8ip: packed-layout MMVQ ran (call 1, n=%lld, GGML_HIP_Q8IP_MMVQ_MAX=%d)\n",
+            (long long) src1->ne[1], q8ip_mmvq_max());
+    }
+    cudaStream_t stream = ctx.stream();
+    const int64_t K   = src0->ne[0];
+    const int     N   = (int) src0->ne[1];
+    const int     M   = (int) src1->ne[1];
+    const int64_t Kp  = GGML_PAD(K, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> yq(ctx.pool(), (size_t) M * Kp / QK8_1 * sizeof(block_q8_1));
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, yq.get(), GGML_TYPE_Q8_0, K, s11, s11 * M, s11 * M, Kp, M, 1, 1, stream);
+    const int S      = (int) (K / 256);
+    const int sy     = (int) (Kp / QK8_1);
+    const int dst_s1 = (int) (dst->nb[1] / sizeof(float));
+    const block_q8_1 * y = (const block_q8_1 *) yq.get();
+    float * d = (float *) dst->data;
+    const char * W = (const char *) src0->data;
+    const int grid = N / Q8IPV_R;
+    switch (M) {
+        case 1: q8ip_mmvq<1><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
+        case 2: q8ip_mmvq<2><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
+        case 3: q8ip_mmvq<3><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
+        case 4: q8ip_mmvq<4><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
+        default: GGML_ABORT("q8ip_mmvq: bad n %d", M);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// prefill (n > Q8MF_MAXM): MMQ reads the packed layout (GGML_HIP_Q8IP_MMQ=0 -> transient natural copy as before)
+bool ggml_cuda_q8ip_mmq_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    static const bool on = q8mf_env_int("GGML_HIP_Q8IP_MMQ", 1) != 0;
+    return on && ggml_cuda_q8ip_is_packed(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] > Q8MF_MAXM && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cuda_should_use_mmq(GGML_TYPE_Q8_0, cc, src1->ne[1], /*n_experts =*/ 0);
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
+    if (src1->ne[1] <= q8ip_mmvq_max() && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
+        q8ip_mul_mat_vec(ctx, src0, src1, dst);
+        return;
+    }
     if (cfg.variant == 5) {
         ggml_cuda_mul_mat_q8_mf5(ctx, src0, src1, dst);
         return;

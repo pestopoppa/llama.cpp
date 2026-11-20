@@ -379,6 +379,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// DTREE-0-Q8MF-PACKED-CONSUMERS: stride < 0 marks an in-place packed Q8_0 weight ([tile][k-stage][64 rows][8 blocks],
+// GGML_HIP_Q8_MF_INPLACE). v = b - row*nblk with b in [0, nblk) -> packed block index
+// (row & ~63)*nblk + (b/8)*512 + (row & 63)*8 + b%8. Natural layout (stride > 0): v unchanged.
+static __device__ __forceinline__ const block_q8_0 * ggml_cuda_mmq_q8_0_blk(const char * __restrict__ x, const int v, const int stride) {
+    if (stride >= 0) {
+        return (const block_q8_0 *) x + v;
+    }
+    const int nblk = -stride;
+    const int row  = (nblk - 1 - v) / nblk;
+    const int b    = v + row*nblk;
+    return (const block_q8_0 *) x + ((row & ~63)*nblk + (b >> 3)*512 + (row & 63)*8 + (b & 7));
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q8_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
@@ -410,7 +423,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
+        const block_q8_0 * bxi = ggml_cuda_mmq_q8_0_blk(x, kbx0 + i*stride + kbx, stride);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
@@ -433,7 +446,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
+        const block_q8_0 * bxi = ggml_cuda_mmq_q8_0_blk(x, kbx0 + i*stride + kbxd, stride);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + kbxd] = bxi->d;
