@@ -5664,6 +5664,8 @@ private:
                     tree_seq_store[i - off] = slot.id;
                 }
 
+                // the prompt holds anchor + MAIN draft; the accept path rolls back by the winner's length
+                common_dtree_swap_winner_draft(slot.prompt.tokens, slot.spec_draft.size(), slot.spec_tree_alts[best]);
                 slot.spec_draft   = slot.spec_tree_alts[best];
                 slot.spec_i_batch = slot.spec_tree_i_batch[best];
                 slot.n_tree_alt_wins++;

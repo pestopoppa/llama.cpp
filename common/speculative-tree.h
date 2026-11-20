@@ -49,6 +49,19 @@ std::vector<std::vector<int32_t>> common_dtree_build_greedy(
 // LLAMA_DTREE_POLICY: 0 = static paths (default, common_dtree_build_paths), 1 = greedy (common_dtree_build_greedy)
 int32_t common_dtree_policy();
 
+// A tree round appends the anchor and the MAIN draft to the slot's prompt tokens before the verify. When an
+// alternative wins, the accept path rolls the prompt back by the WINNER's draft length (keep_first(n - n_draft)),
+// so the main draft in the prompt must first be replaced by the winner: with the static paths every draft had the
+// same length D and the mismatch was invisible, but a greedy tree's alternatives are shorter or longer than its
+// main chain, and the prompt (hence pos_next) then drifted from the target memory by the length difference
+// (r3 rows: "root token ... has pos 144, expected 143", "inconsistent sequence positions"). T is any token
+// container with size() / keep_first(n) / insert(tokens) (server_tokens; a vector wrapper in the unit test).
+template <typename T, typename D>
+void common_dtree_swap_winner_draft(T & prompt_tokens, size_t n_main_draft, const D & winner) {
+    prompt_tokens.keep_first(prompt_tokens.size() - n_main_draft);
+    prompt_tokens.insert(winner);
+}
+
 // number of distinct tree columns (anchor included) of a path set returned by common_dtree_build_paths
 int32_t common_dtree_n_columns(const std::vector<std::vector<int32_t>> & paths);
 
