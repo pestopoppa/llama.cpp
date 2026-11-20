@@ -34,3 +34,13 @@ if [[ -z "$(big_mmq force)" ]]; then
     exit 1
 fi
 echo "PASS GGML_CUDA_MMQ_FORCE"
+
+# Knob 2: GGML_CUDA_MMQ_J=<J> forces the MMQ tile width; each J must stay correct and be reported as applied.
+for J in 16 32 48 64; do
+    run "j$J" GGML_CUDA_MMQ_FORCE=1 GGML_CUDA_MMQ_J=$J
+    if ! grep -Eq "GGML_CUDA_MMQ_J=$J -> J=$J " "$out/j$J.err"; then
+        echo "FAIL j$J: override not applied" >&2
+        exit 1
+    fi
+done
+echo "PASS GGML_CUDA_MMQ_J"

@@ -158,6 +158,26 @@ void ggml_cuda_mul_mat_q(
             }
         }
     }
+    // AK-PROF-SCLK-ENERGY: GGML_CUDA_MMQ_J=<J> forces the MMQ tile width (mmq_x) when this GPU/type/fallback has a config for
+    // that J and its shared memory fits; otherwise the heuristic J is kept. Unset or 0 = unchanged selection.
+    {
+        static const int J_env = [] {
+            const char * e = getenv("GGML_CUDA_MMQ_J");
+            return e != nullptr ? atoi(e) : 0;
+        }();
+        if (J_env > 0 && J_env != J_best && J_env % 8 == 0 && J_env <= 128) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J_env, fallback, cc);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best        = J_env;
+                nthreads_best = config.nthreads;
+            }
+        }
+        static bool logged = false;
+        if (J_env > 0 && J_best == J_env && !logged) { // logged once, the first time a GEMM runs at the forced J
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_MMQ_J=%d -> J=%d (type=%s)\n", __func__, J_env, J_best, ggml_type_name(src0->type));
+        }
+    }
     GGML_ASSERT(J_best > 0);
 
     // A tile of size J can read in at most J - 1 extra columns.
