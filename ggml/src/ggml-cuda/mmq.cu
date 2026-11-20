@@ -327,6 +327,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return true;
 #endif //GGML_CUDA_FORCE_MMQ
 
+    // AK-PROF-SCLK-ENERGY: GGML_CUDA_MMQ_FORCE=1 is the runtime twin of GGML_CUDA_FORCE_MMQ (measurement knob; unset or 0 =
+    // unchanged selection). It lets an op probe reach the MMQ kernel at batch sizes where the heuristics pick hipBLAS/cuBLAS.
+    static const bool force_mmq_env = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_FORCE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (force_mmq_env) {
+        return true;
+    }
+
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
