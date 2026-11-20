@@ -14179,7 +14179,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 16, 2, vr, true, false, 16));
     }
     for (int kind : {0, 1, 2}) {
-        for (int64_t W = 1; W <= 16; ++W) {
+        for (int64_t W = 2; W <= 16; ++W) {   // a tree op needs K = W > 1 (snapshot per column); W = 1 is the chain
             if (W == 8 || W == 12 || W == 16) {
                 continue;   // registered above
             }
