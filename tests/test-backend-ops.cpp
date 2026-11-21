@@ -14823,6 +14823,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 517, 2080, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 1023, 4128, {1, 1}, {1, 1}));
     }
+    // DTREE-A3B-MOE-ROOFLINE (opt-in, default corpus unchanged):
+    //   TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
+    // Qwen3.6-35B-A3B routed experts (256 experts, top-8, hidden 2048, expert ffn 512): ffn_gate_exps / ffn_up_exps
+    // (m=512, k=2048) and ffn_down_exps (m=2048, k=512), Q8_0, at 1..16 verify rows. Used to read achieved GB/s of the
+    // few-row expert GEMMs (the op's own byte count is all experts; the row scales it by the expected unique experts).
+    if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
+    // AK-MMID-SPLIT16 correctness (opt-in): A3B Q8_0 expert shapes at 9..16 rows plus the 7/8 boundary, and a
+    // Q4_K control. Run OFF and with GGML_CUDA_MMVQ_MOE_SPLIT16=1 (9..16 then route MMVQ_MMID in 8-column chunks).
+    if (test_backend_ops_extra_case_set("mmid_split16")) {
+        for (int64_t n : {7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 4, false, 256, n, 512));
+        }
+    }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
@@ -14965,6 +14985,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
+    // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
+    // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
+    if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
