@@ -7,6 +7,7 @@
 #include <immintrin.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -310,6 +311,105 @@ static void ik_write_op(ggml_tensor * dst, const ggml_tensor * idxs, const ggml_
         st.ik_pos[c] = st.cell_pos(c);
         ((int64_t *) dst->data)[t] = c;
     }
+}
+
+void project_query(const layer_state & st, const char * q, size_t nb0, size_t nb1, float * qhat) {
+    const int W = st.head_dim - st.rope_dim, G = st.q_heads/st.kv_heads, rows = st.kv_heads*W;
+    std::vector<float> x(rows, 0.0f);
+    for (int h = 0; h < st.q_heads; ++h) {
+        const char * qr = q + (size_t) h*nb1;
+        float * xg = x.data() + (size_t) (h/G)*W;
+        for (int d = 0; d < W; ++d) {
+            xg[d] += *(const float *) (qr + (size_t) (st.rope_dim + d)*nb0);
+        }
+    }
+    project(st.wq, rows, x.data(), qhat);
+}
+
+void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat, float * out) {
+    static_assert(index_dim == 64, "kernel assumes 64 index dims");
+#if defined(__AVX512F__)
+    __m512 qv[4];
+    for (int i = 0; i < 4; ++i) {
+        qv[i] = _mm512_loadu_ps(qhat + 16*i);
+    }
+    for (int64_t j = lo; j < hi; ++j) {
+        const uint16_t * r = ik + j*index_dim;
+        __m512 a = _mm512_setzero_ps();
+        for (int i = 0; i < 4; ++i) {
+            const __m512i w = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *) (r + 16*i))), 16);
+            a = _mm512_fmadd_ps(_mm512_castsi512_ps(w), qv[i], a);
+        }
+        out[j] = _mm512_reduce_add_ps(a);
+    }
+#else
+    for (int64_t j = lo; j < hi; ++j) {
+        const uint16_t * r = ik + j*index_dim;
+        float a = 0.0f;
+        for (int o = 0; o < index_dim; ++o) {
+            const uint32_t u = (uint32_t) r[o] << 16;
+            float f;
+            memcpy(&f, &u, 4);
+            a += f*qhat[o];
+        }
+        out[j] = a;
+    }
+#endif
+}
+
+static inline uint32_t bin_of(float s) {
+    s = std::min(1.0f, std::max(-1.0f, s));
+    return (uint32_t) ((s + 1.0f)*2047.999f);
+}
+
+int64_t select_topk(const float * score, int64_t n, int top_k, uint8_t * keep) {
+    std::vector<uint32_t> hist(4096, 0);
+    int64_t n_cand = 0, n_kept = 0;
+    for (int64_t j = 0; j < n; ++j) {
+        const float s = score[j];
+        keep[j] = 0;
+        if (std::isfinite(s)) {
+            hist[bin_of(s)]++;
+            n_cand++;
+        } else if (s > 0) {
+            keep[j] = 1;
+            n_kept++;
+        }
+    }
+    const int64_t want = std::min<int64_t>(top_k, n_cand);
+    if (want <= 0) {
+        return n_kept;
+    }
+    int cut = 4095;
+    int64_t above = 0;
+    for (; cut > 0; --cut) {
+        if (above + hist[cut] >= want) {
+            break;
+        }
+        above += hist[cut];
+    }
+    std::vector<int64_t> tie;
+    for (int64_t j = 0; j < n; ++j) {
+        const float s = score[j];
+        if (!std::isfinite(s)) {
+            continue;
+        }
+        const uint32_t b = bin_of(s);
+        if (b > (uint32_t) cut) {
+            keep[j] = 1;
+        } else if (b == (uint32_t) cut) {
+            tie.push_back(j);
+        }
+    }
+    const int64_t need = want - above;
+    GGML_ASSERT(need >= 0 && need <= (int64_t) tie.size());
+    std::partial_sort(tie.begin(), tie.begin() + need, tie.end(), [score](int64_t a, int64_t b) {
+        return score[a] > score[b] || (score[a] == score[b] && a < b);
+    });
+    for (int64_t i = 0; i < need; ++i) {
+        keep[tie[i]] = 1;
+    }
+    return n_kept + want;
 }
 
 ggml_tensor * build_ik_write(ggml_context * ctx, layer_state * st, ggml_tensor * k_cur, ggml_tensor * k_idxs) {

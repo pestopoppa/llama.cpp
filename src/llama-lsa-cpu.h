@@ -109,6 +109,19 @@ struct layer_state {
     int32_t cell_pos(int64_t cell) const;
 };
 
+// ---- decode scorer + exact top-k (exposed for tests) ----
+
+// qhat[64] = l2norm(Wq^T concat_kvh(sum_{g in group} q[h, rope:])), q row [head_dim, q_heads] with strides nb0/nb1
+void project_query(const layer_state & st, const char * q, size_t nb0, size_t nb1, float * qhat);
+
+// out[j] = qhat . ik[j] for j in [lo, hi), ik BF16 rows of 64 (AVX-512 when available)
+void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat, float * out);
+
+// Exact selection over score[0..n): +inf = forced keep (window / sink / stale), -inf = excluded,
+// finite = candidate. Keeps the top_k largest candidates (ties -> lower index) via a 4096-bin
+// histogram threshold + exact sort of the threshold bin. keep[j] = 1 for kept. Returns #kept.
+int64_t select_topk(const float * score, int64_t n, int top_k, uint8_t * keep);
+
 // Index-key write, run at K-store time for every ubatch:
 //   k_cur  F32 [head_dim, n_head_kv, n_tokens], k_idxs I64 [n_tokens] (cells, as for cpy_k)
 // returns an I64 copy of k_idxs that orders the write before any consumer.
