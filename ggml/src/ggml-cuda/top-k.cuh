@@ -7,6 +7,6 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // A per-row radix select (after AITER topk_per_row) lifts the limit. GGML_CUDA_TOPK_RADIX=0 restores it.
 bool ggml_cuda_top_k_radix_enabled();
 
-// AK-GAP-1-IDSORT: multi-block small-k (k <= 16) top-k for wide rows, GGML_HIP_TOPK_FAST=1 enables (default off).
+// AK-GAP-1-IDSORT: multi-block small-k (k <= 16) top-k for wide rows, default ON since C17, GGML_HIP_TOPK_FAST=0 disables.
 // Output sorted by value desc, ties by ascending index.
 bool ggml_cuda_top_k_fast_enabled();

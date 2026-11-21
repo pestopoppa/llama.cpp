@@ -149,7 +149,7 @@ static void top_k_radix_cuda(const float * src, int * dst, const int ncols, cons
 }
 
 // ---------------------------------------------------------------------------------------------
-// AK-GAP-1-IDSORT: multi-block small-k top-k (GGML_HIP_TOPK_FAST=1, default off). The radix select above
+// AK-GAP-1-IDSORT: multi-block small-k top-k (GGML_HIP_TOPK_FAST, default ON since C17; =0 disables). The radix select above
 // runs ONE workgroup per row, so a single vocab-wide row (A3B-MTP drafter backend top_k(10) over n_vocab)
 // occupies one CU for 5 full passes (~1.3 ms on MI210). Here each element is packed into a 64-bit key
 // (order-preserving float key << 32 | ~index): a strict total order in which ties go to the LOWEST index.
@@ -160,7 +160,7 @@ static void top_k_radix_cuda(const float * src, int * dst, const int ncols, cons
 bool ggml_cuda_top_k_fast_enabled() {
     static const bool v = [] {
         const char * s = getenv("GGML_HIP_TOPK_FAST");
-        return s != nullptr && atoi(s) != 0;
+        return s == nullptr || atoi(s) != 0;   // C17: default ON (=0 disables)
     }();
     return v;
 }
