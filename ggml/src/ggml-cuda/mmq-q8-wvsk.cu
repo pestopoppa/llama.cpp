@@ -146,11 +146,15 @@ __device__ short     q8wv_buf_s16(q8wv_int4 rsrc, int voffset, int soffset, int 
 
 // grid = #CUs, block = (64, wv); every wave runs the same number of row-tile iterations (n_rnd) so the WG-wide
 // barriers of the activation page restage are uniform.
-template <int M, int UN>
+// FQ (AK-GAP2-Q8WV-FUSEQ, GGML_HIP_Q8WV_FUSEQ=1): yq/yd are unused; the page restage quantizes the f32 activations
+// y (row stride ys1 floats) straight into LDS with q8wv_quantize's exact arithmetic, so the separate q8wv_quantize
+// launch (27B-dflash2: ~92 launches/step, 2.7% of decode wall in gap census 2) disappears. Bitwise-identical output.
+template <int M, int UN, bool FQ>
 static __global__ void __launch_bounds__(64 * Q8WV_MAXWAVE)
 q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const int N, const uint32_t wbytes,
              const int8_t * __restrict__ yq, const float * __restrict__ yd, const int P, const int n_tiles, const int n_rnd,
-             const int m_real, float * __restrict__ dst, const int64_t dst_s1) {
+             const int m_real, float * __restrict__ dst, const int64_t dst_s1,
+             const float * __restrict__ y = nullptr, const int64_t ys1 = 0) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     __shared__ q8wv_int4 lds[Q8WV_LDS_B / 16];
     float * lds_d = (float *) &lds[M * P * 2];
@@ -207,6 +211,28 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
             // 2) activation page restage (uniform across the WG: every wave has the same k1 sequence)
             if (k1 < page || k1 >= page + P) {
                 Q8WV_LDS_BARRIER();
+                if constexpr (FQ) {
+                    // one 32-lane half-wave per (column n, block b): lane i owns element i of the block
+                    int8_t * lds_q = (int8_t *) lds;
+                    const int i32  = tid & 31;
+                    for (int g = tid >> 5; g < M * P; g += nthr >> 5) {
+                        const int   n = g / P;
+                        const int   r = g - n * P;
+                        const int   b = k1 + r;
+                        const float x = (n < m_real && b < nblk) ? y[(int64_t) n * ys1 + (int64_t) b * 32 + i32] : 0.0f;
+                        float amax = fabsf(x);
+#pragma unroll
+                        for (int o = 16; o > 0; o >>= 1) {
+                            amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+                        }
+                        const float d = amax / 127.0f;
+                        const int   q = amax == 0.0f ? 0 : (int) roundf(x / d);
+                        lds_q[(int64_t) g * 32 + i32] = (int8_t) q;
+                        if (i32 == 0) {
+                            lds_d[g] = d;
+                        }
+                    }
+                } else {
                 for (int i = tid; i < M * P * 2; i += nthr) {
                     const int n = i / (2 * P);
                     const int r = i - n * 2 * P;
@@ -221,6 +247,7 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
                     const int n = i / P;
                     const int b = k1 + (i - n * P);
                     lds_d[i] = b < nblk ? yd[(int64_t) n * nblk + b] : 0.0f;
+                }
                 }
                 Q8WV_LDS_BARRIER();
                 page = k1;
@@ -294,7 +321,8 @@ q8wv_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 
 template <int M>
 static void q8wv_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int8_t * yq, const float * yd,
-                        int ncu, int max_waves, int m_real, float * dst, int64_t dst_s1, cudaStream_t stream) {
+                        int ncu, int max_waves, int m_real, float * dst, int64_t dst_s1, cudaStream_t stream,
+                        const float * y = nullptr, int64_t ys1 = 0) {
     constexpr int UN   = M <= 5 ? 2 : 1;   // UN=2 at M 6..8 spills under the 128-VGPR cap of 16 waves/CU
     constexpr int STEP = 32 * UN;
     int P = (Q8WV_LDS_B / (36 * M)) / STEP * STEP;
@@ -306,7 +334,11 @@ static void q8wv_launch(const char * W, int nb01, int nblk, int N, uint32_t wbyt
     const int n_rnd   = (n_tiles + ncu * max_waves - 1) / (ncu * max_waves);
     const int wv      = (n_tiles + ncu * n_rnd - 1) / (ncu * n_rnd);
     const dim3 block(64, wv, 1);
-    q8wv_mul_mat<M, UN><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, m_real, dst, dst_s1);
+    if (y != nullptr) {
+        q8wv_mul_mat<M, UN, true><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, m_real, dst, dst_s1, y, ys1);
+    } else {
+        q8wv_mul_mat<M, UN, false><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, m_real, dst, dst_s1);
+    }
 }
 
 void ggml_cuda_mul_mat_q8_wvsk(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -329,9 +361,17 @@ void ggml_cuda_mul_mat_q8_wvsk(ggml_backend_cuda_context & ctx, const ggml_tenso
 
     // odd M > 8 runs the M+1 instantiation with a zero column (odd 9..15 spill under the 128-VGPR cap; even do not)
     const int MK = (M > 8 && (M & 1)) ? M + 1 : M;
-    ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) MK * nblk * 32);
-    ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) MK * nblk);
-    {
+    static const bool fuseq = q8wv_env_int("GGML_HIP_Q8WV_FUSEQ", 0) != 0;   // AK-GAP2-Q8WV-FUSEQ, default off
+    const float * yf = fuseq ? (const float *) src1->data : nullptr;
+    if (fuseq) {
+        static std::atomic<int64_t> n_fq{0};
+        if (n_fq.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_wvsk: GGML_HIP_Q8WV_FUSEQ fused activation quantize ran (no q8wv_quantize launch)\n");
+        }
+    }
+    ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), fuseq ? 32 : (size_t) MK * nblk * 32);
+    ggml_cuda_pool_alloc<float>  yd(ctx.pool(), fuseq ? 1 : (size_t) MK * nblk);
+    if (!fuseq) {
         const dim3 grid((nblk + 7) / 8, MK, 1);
         q8wv_quantize<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get());
     }
@@ -341,7 +381,7 @@ void ggml_cuda_mul_mat_q8_wvsk(ggml_backend_cuda_context & ctx, const ggml_tenso
     const int      ncu    = ggml_cuda_info().devices[ctx.device].nsm;
     float *        d      = (float *) dst->data;
     switch (MK) {
-#define Q8WV_CASE(m) case m: q8wv_launch<m>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, M, d, dst_s1, stream); break;
+#define Q8WV_CASE(m) case m: q8wv_launch<m>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, M, d, dst_s1, stream, yf, s1); break;
         Q8WV_CASE(2)  Q8WV_CASE(3)  Q8WV_CASE(4)  Q8WV_CASE(5)  Q8WV_CASE(6)  Q8WV_CASE(7)  Q8WV_CASE(8)
         Q8WV_CASE(10) Q8WV_CASE(12) Q8WV_CASE(14) Q8WV_CASE(16)
 #undef Q8WV_CASE

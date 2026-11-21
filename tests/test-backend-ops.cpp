@@ -12637,6 +12637,12 @@ struct test_mul_mat_shared_q81 : public test_case {
     }
 };
 
+// AK-GAP2 op label (gap census 2), selected with -o.
+// MUL_MAT_Q8WV: large Q8_0 weight x M 5..11 (wvSplitK route), the GGML_HIP_Q8WV_FUSEQ in-kernel activation quantize.
+struct test_mul_mat_q8wv : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_Q8WV"; }
+};
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
@@ -14056,6 +14062,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q4_K, 1024, n, 2048));
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q6_K, 1024, n, 512));
     }
+    // AK-GAP2 (gap census 2, wv)
+    for (int64_t n : {5, 6, 7, 8, 9, 11}) {
+        test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 5120, {1, 1}, {1, 1}));   // 27B qkv-ish
+        test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));  // 27B ffn_down
+        test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3000, n, 2112, {1, 1}, {1, 1}));   // nblk not page-aligned
+    }
     // AK-GAP-1-IDSORT: A3B-MTP drafter backend top_k(10) over n_vocab 248320 (GGML_HIP_TOPK_FAST multi-block path, k <= 16)
     for (int k : {1, 2, 10, 16}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
@@ -15017,6 +15029,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // AK-GAP2 op perf A/B (sh)
     test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, 3, 2048));
+    // AK-GAP2 op perf A/B (wv)
+    test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 8, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 8, 5120, {1, 1}, {1, 1}));
     // AK-GAP-1-IDSORT: A3B-MTP drafter top_k(10) over n_vocab; A/B GGML_HIP_TOPK_FAST=1 vs unset (radix select)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 10));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, 10));
