@@ -14541,6 +14541,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, nb_tok, 1, 2800, 9488, 0.0f, 0.0f,
             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 0, 0, true, true));
     }
+    // KPF-41 FAROWS-INPLACE: run the kv_rows cases with GGML_CUDA_FA_ROWS_INPLACE=1 (in-place GQA-verify read) and =0
+    // (gather). Mixed K/V pairs (the #32520 review regression) must never take the in-place read; they are routed by the
+    // K==V dispatch check (and GQA-verify's own type check) to the gather/dense path and must still match the reference.
+    for (auto kv : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_F16}, {GGML_TYPE_F16, GGML_TYPE_Q8_0}}) {
+        for (int64_t nb : {4, 32, 36}) {
+            test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, nb, 4, 2048, 131072, 0.0f, 0.0f,
+                kv.first, kv.second, 4, 0, true, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 12288, 36, 4, 300, 1024, 0.0f, 0.0f,
+            kv.first, kv.second, 4, 0, true));
+    }
     // knob-off controls for the same served shapes (no row list): the dense path at these sizes
     test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, 163840, 32, 4, 2048, 512, 0.0f, 0.0f,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4, 0, false, true));

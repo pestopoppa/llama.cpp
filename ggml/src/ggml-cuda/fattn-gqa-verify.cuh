@@ -10,3 +10,6 @@
 bool ggml_cuda_fattn_gqa_verify_applicable(int device, const ggml_tensor * dst);
 
 void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// KPF-41 FAROWS-INPLACE (GGML_CUDA_FA_ROWS_INPLACE): K/V read in place through a device row list, see fattn.cu
+void ggml_cuda_fattn_gqa_verify_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int32_t * rows, int64_t rows_s1);
