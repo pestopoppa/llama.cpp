@@ -810,19 +810,43 @@ static bool greedy_fast_params_ok(const common_params_sampling & p) {
     return has_temp && has_top_k;
 }
 
+// AK-GAP-1-SAMPLE: the device argmax row is the greedy pick when the sampler is provably greedy and its logit
+// bias only bans tokens (bias == -inf, e.g. the EOG bans ignore_eos adds): a banned token can never be the
+// maximum of logit + bias, and when the unbiased first maximum is not banned it is also the first maximum of
+// the biased row. A banned (or missing) device pick returns LLAMA_TOKEN_NULL so the caller scans on the host.
+static llama_token device_argmax_pick(const common_params_sampling & p, llama_context * ctx, int idx) {
+    if (!greedy_fast_params_ok(p)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    for (const auto & lb : p.logit_bias) {
+        if (!(std::isinf(lb.bias) && lb.bias < 0.0f)) {
+            return LLAMA_TOKEN_NULL;
+        }
+    }
+    const llama_token dam = llama_get_argmax_ith(ctx, idx);
+    if (dam == LLAMA_TOKEN_NULL) {
+        return LLAMA_TOKEN_NULL;
+    }
+    for (const auto & lb : p.logit_bias) {
+        if (lb.token == dam) {
+            return LLAMA_TOKEN_NULL;
+        }
+    }
+    return dam;
+}
+
 llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
     static const bool dev_accept = [] {
         const char * e = getenv("LLAMA_DEVICE_ACCEPT");
         return e != nullptr && e[0] == '1';
     }();
-    if (dev_accept && gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr && gsmpl->params.logit_bias.empty() &&
-            greedy_fast_params_ok(gsmpl->params)) {
+    if (dev_accept && gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr) {
         llama_synchronize(ctx);
         if (llama_get_sampled_token_ith (ctx, idx) == LLAMA_TOKEN_NULL &&
             llama_get_sampled_probs_ith (ctx, idx) == nullptr &&
             llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
             const auto tm = gsmpl->tm();
-            const llama_token dam = llama_get_argmax_ith(ctx, idx);
+            const llama_token dam = device_argmax_pick(gsmpl->params, ctx, idx);
             if (dam != LLAMA_TOKEN_NULL) {
                 return dam;
             }
@@ -919,10 +943,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
             llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
             const auto tm = gsmpl->tm();
 
-            // DTREE-A: device argmax == the greedy chain's pick when the sampler is provably greedy and adds no
-            // logit bias (common_sampler_greedy_fast_select's eligibility is a function of params alone here)
-            if (gsmpl->params.logit_bias.empty() && greedy_fast_params_ok(gsmpl->params)) {
-                const llama_token dam = llama_get_argmax_ith(ctx, idx);
+            // DTREE-A: device argmax == the greedy chain's pick when the sampler is provably greedy and its bias
+            // only bans tokens (device_argmax_pick; eligibility is a function of params alone here)
+            {
+                const llama_token dam = device_argmax_pick(gsmpl->params, ctx, idx);
                 if (dam != LLAMA_TOKEN_NULL) {
                     if (n_fast) {
                         (*n_fast)++;
