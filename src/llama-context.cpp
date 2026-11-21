@@ -121,8 +121,11 @@ llama_context::llama_context(
     cparams.rs_replay = false;
     if (cparams.n_rs_seq > 0) {
         const char * env = getenv("LLAMA_RS_REPLAY");
-        const bool supported = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT ||
-                               model.arch == LLM_ARCH_QWEN4EXP; // [RS-REPLAY] fork: the KDA/Clover archs of the PR are not in this tree
+        // [RS-REPLAY] allowlist: qwen35 / qwen35moe only. qwen4exp is excluded: RS-REPLAY-GATE-CPU-R3 r4 (Q38FN, CPU) found ON != OFF on
+        // 2/4 single-slot prompts where OFF2 == OFF (fixed batching), a real replay-vs-snapshot difference on the qwen4exp path (suspect:
+        // the second, PLE conv-history row). qwen3next is excluded until it has its own identity gate. The PR's KDA/Clover archs are not
+        // in this tree.
+        const bool supported = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE;
         // [RS-REPLAY-AUTO] LLAMA_RS_REPLAY: unset/0 = off (snapshots); 1 = auto, on only when the context serves more than one
         // sequence slot (n_seq_max > 1: RS-REPLAY-GATE-R4 measured ms/round 0.931 at np4 but 1.024 at np1); 2 = force on.
         const int mode = env ? atoi(env) : 0;
