@@ -15,6 +15,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -1115,6 +1116,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
     return result;
 }
 
+static void spec_pit_record(const llama_token_data_array * p, llama_token id);
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
@@ -1163,6 +1166,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             ? (float) llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_ACC)
             : 0.0f;
         if (q_draft > 0.0f && (poskey ? u_acc : uniform(gsmpl->speculative_rng)) * q_draft <= p_draft) {
+            spec_pit_record(p, draft[i]);
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
 
@@ -1198,6 +1202,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
                 id = p->data[sample(gsmpl->speculative_rng)].id;
             }
         }
+        spec_pit_record(p, id);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
@@ -1211,6 +1216,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        spec_pit_record(&gsmpl->cur_p, id);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
@@ -1248,6 +1254,199 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// SPEC-PIT.1 diagnostic
+static FILE * spec_pit_file() {
+    static FILE * f = [] () -> FILE * {
+        const char * e = getenv("LLAMA_SPEC_PIT_FILE");
+        if (e == nullptr || *e == '\0') {
+            return nullptr;
+        }
+        FILE * fp = fopen(e, "a");
+        if (fp == nullptr) {
+            LOG_ERR("%s: cannot open LLAMA_SPEC_PIT_FILE=%s\n", __func__, e);
+        }
+        return fp;
+    }();
+    return f;
+}
+
+bool common_sampler_pit_enabled() {
+    return spec_pit_file() != nullptr;
+}
+
+// p is the target's post-chain candidate array of the row that emitted `id` (probabilities in .p)
+static void spec_pit_record(const llama_token_data_array * p, llama_token id) {
+    FILE * f = spec_pit_file();
+    if (f == nullptr || p == nullptr) {
+        return;
+    }
+    double sum = 0.0;
+    double p_id = 0.0;
+    double ss = 0.0;
+    for (size_t j = 0; j < p->size; ++j) {
+        sum += p->data[j].p;
+        if (p->data[j].id == id) {
+            p_id = p->data[j].p;
+        }
+    }
+    for (size_t j = 0; j < p->size; ++j) {
+        if (p->data[j].p < p_id) {
+            ss += p->data[j].p;
+        }
+    }
+    if (sum > 0.0) {
+        ss /= sum;
+        p_id /= sum;
+    }
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    fprintf(f, "%.9g %.9g\n", ss, p_id);
+    fflush(f);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// DTREE-STOCH-VERIFY
+std::vector<llama_token> common_sampler_sample_and_accept_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<std::vector<int>> & rows,
+        const std::vector<llama_tokens> & drafts,
+        int32_t * out_path) {
+    GGML_ASSERT(!rows.empty() && rows.size() == drafts.size());
+    for (size_t p = 0; p < rows.size(); ++p) {
+        GGML_ASSERT(rows[p].size() == drafts[p].size() + 1);
+    }
+
+    const bool stoch  = gsmpl->params.temp > 0.0f;
+    const bool poskey = gsmpl->params.rng_poskey;
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    std::vector<int32_t> live(rows.size());
+    for (size_t p = 0; p < rows.size(); ++p) {
+        live[p] = (int32_t) p;
+    }
+
+    std::vector<llama_token> result;
+    std::vector<llama_token> children;
+    std::vector<float>       w;
+
+    for (size_t d = 0;; ++d) {
+        const int row = rows[live[0]][d];
+
+        children.clear();
+        for (const int32_t p : live) {
+            GGML_ASSERT(rows[p][d] == row && "paths sharing a draft prefix must share its rows");
+            if (d < drafts[p].size() &&
+                std::find(children.begin(), children.end(), drafts[p][d]) == children.end()) {
+                children.push_back(drafts[p][d]);
+            }
+        }
+
+        if (children.empty()) {
+            // every live path is exhausted: bonus token
+            const llama_token id = common_sampler_sample(gsmpl, ctx, row, false);
+            spec_pit_record(&gsmpl->cur_p, id);
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            break;
+        }
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        bool        matched = false;
+
+        if (!stoch) {
+            // greedy: sample-and-match == the greedy tree path (longest argmax match, lowest path index)
+            id = common_sampler_sample(gsmpl, ctx, row, false);
+            matched = std::find(children.begin(), children.end(), id) != children.end();
+        } else {
+            const llama_token fallback = common_sampler_sample(gsmpl, ctx, row, true);
+            const llama_token_data_array * p = &gsmpl->cur_p;
+
+            w.resize(p->size);
+            double mass = 0.0;
+            for (size_t j = 0; j < p->size; ++j) {
+                w[j] = p->data[j].p;
+                mass += w[j];
+            }
+
+            const uint64_t spec_pos = gsmpl->n_accepted;
+            for (size_t c = 0; c < children.size() && !matched; ++c) {
+                size_t jx = p->size;
+                for (size_t j = 0; j < p->size; ++j) {
+                    if (p->data[j].id == children[c]) {
+                        jx = j;
+                        break;
+                    }
+                }
+                const double px = jx < p->size ? (double) w[jx] : 0.0;
+                if (px <= 0.0) {
+                    continue;   // outside the chain's support: rejected with probability 1, residual unchanged
+                }
+                // sibling c draws its own uniform (role SPEC_ACC, sibling index folded into the key's high bits)
+                const double u = poskey
+                    ? llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos ^ ((uint64_t) c << 48), LLAMA_RNG_ROLE_SPEC_ACC)
+                    : (double) uniform(gsmpl->speculative_rng);
+                if (u * mass < px) {
+                    id = children[c];
+                    matched = true;
+                } else {
+                    mass -= px;
+                    w[jx] = 0.0f;   // residual of a point-mass proposal: remove the rejected sibling, renormalize
+                }
+            }
+
+            if (!matched) {
+                id = fallback;
+                double rs = 0.0;
+                for (size_t j = 0; j < p->size; ++j) {
+                    rs += w[j];
+                }
+                if (rs > 0.0) {
+                    const double tgt = (poskey
+                        ? llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_RES)
+                        : (double) uniform(gsmpl->speculative_rng)) * rs;
+                    double run = 0.0;
+                    size_t pick = p->size;
+                    for (size_t j = 0; j < p->size; ++j) {
+                        if (w[j] > 0.0f) {
+                            pick = j;   // last positive entry guards the rounding tail
+                            run += w[j];
+                            if (run > tgt) {
+                                break;
+                            }
+                        }
+                    }
+                    if (pick < p->size) {
+                        id = p->data[pick].id;
+                    }
+                }
+            }
+        }
+
+        spec_pit_record(&gsmpl->cur_p, id);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (!matched) {
+            break;
+        }
+
+        std::vector<int32_t> next;
+        for (const int32_t p : live) {
+            if (d < drafts[p].size() && drafts[p][d] == id) {
+                next.push_back(p);
+            }
+        }
+        live.swap(next);
+    }
+
+    if (out_path) {
+        *out_path = live[0];
+    }
+    return result;
 }
 
 // helpers

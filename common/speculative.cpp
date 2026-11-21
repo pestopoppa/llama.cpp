@@ -24,6 +24,15 @@
 #include <queue>
 #include <random>
 
+// DTREE-STOCH-VERIFY: LLAMA_DTREE_STOCH=1 lets temp > 0 rounds draft and verify a tree (default off)
+static bool dtree_stoch_env() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DTREE_STOCH");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1803,12 +1812,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     selector_reset[seq_id] = false;
                 }
 
+                // DTREE-STOCH-VERIFY (LLAMA_DTREE_STOCH=1, default off): a temp > 0 tree round drafts point-mass
+                // proposals -- the main path is the greedy selector walk (the alternatives below branch off it), each
+                // draft carrying a one-hot distribution, so both the tree accept and a chain fallback stay exact
+                const bool stoch_tree = dp.temperature > 0.0f && dp.tree_alts && dp.tree_nodes > 0 && dtree_stoch_env();
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
-                    if (dp.temperature > 0.0f) {
+                    if (stoch_tree) {
+                        predecessor = (int32_t) std::distance(scores,
+                                std::max_element(scores, scores + selector_top_k));
+                        common_speculative_token_dist dist;
+                        dist.ids.assign(1, (llama_token) row[predecessor]);
+                        dist.probs.assign(1, 1.0f);
+                        result.push_back((llama_token) row[predecessor]);
+                        dp.dists->push_back(std::move(dist));
+                    } else if (dp.temperature > 0.0f) {
                         common_speculative_token_dist dist;
                         dist.ids.resize(selector_top_k);
                         dist.probs.resize(selector_top_k);
@@ -1836,7 +1858,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (dp.tree_alts) {
                     dp.tree_alts->clear();
                 }
-                if (dp.tree_alts && dp.tree_nodes > 0 && dp.temperature <= 0.0f && n_block_tokens > 1) {
+                if (dp.tree_alts && dp.tree_nodes > 0 && (dp.temperature <= 0.0f || stoch_tree) && n_block_tokens > 1) {
                     // AK-DTREE-1: alternative root-to-leaf paths over the same lattice (path 0 == result)
                     const int32_t D = n_block_tokens - 1;
                     const common_dtree_scores_fn scores = [&](int32_t j, int32_t pred) {

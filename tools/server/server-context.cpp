@@ -515,6 +515,12 @@ struct server_slot {
     int32_t spec_tree_cols  = 0;       // [AK-DTREE-2] tree columns budgeted this round (batch mode pads to it)
     bool    spec_tree_batch_round = false; // [AK-DTREE-2] this round's verify was emitted as a tree batch
     std::vector<int32_t> spec_tree_cols_pending; // [AK-DTREE-2] winner's tree columns, committed after sampling
+    // DTREE-STOCH-VERIFY: a temp > 0 tree round is accepted in spec_tree_resolve (the walk picks the winner); the
+    // accept path then uses these instead of sampling the winner rows again
+    bool               spec_tree_stoch_valid = false;
+    llama_tokens       spec_tree_stoch_accepted;
+    common_sampler_ptr spec_tree_stoch_save;
+    int32_t n_tree_stoch_rounds = 0;
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -715,6 +721,10 @@ struct server_slot {
         n_tree_rounds    = 0;
         n_tree_alt_wins  = 0;
         n_tree_alt_extra = 0;
+        n_tree_stoch_rounds = 0;
+        spec_tree_stoch_valid = false;
+        spec_tree_stoch_accepted.clear();
+        spec_tree_stoch_save.reset();
 
         task_prev = std::move(task);
         task.reset();
@@ -1103,9 +1113,9 @@ struct server_slot {
             }
             if (spec_tree_seq0 >= 0 || spec_tree_batch) {
                 SLT_INF(*this,
-                    "draft tree: %5d of %5d rounds verified a tree, alternative accepted in %5d (+%d tokens); "
+                    "draft tree: %5d of %5d rounds verified a tree (%d stochastic), alternative accepted in %5d (+%d tokens); "
                     "auto rate chain/w5/w9 = %.1f/%.1f/%.1f tok/s (n %d/%d/%d)\n",
-                    n_tree_rounds, n_draft_verif_steps, n_tree_alt_wins, n_tree_alt_extra,
+                    n_tree_rounds, n_draft_verif_steps, n_tree_stoch_rounds, n_tree_alt_wins, n_tree_alt_extra,
                     spec_tree_auto.rate[0], spec_tree_auto.rate[1], spec_tree_auto.rate[2],
                     spec_tree_auto.n_obs[0], spec_tree_auto.n_obs[1], spec_tree_auto.n_obs[2]);
             }
@@ -5538,7 +5548,9 @@ private:
         if (slot.spec_tree_batch && !slot.task->params.sampling.grammar.grammar.empty()) {
             return 0;
         }
-        if (slot.task->params.sampling.temp > 0.0f || slot.task->params.sampling.n_probs > 0 ||
+        // DTREE-STOCH-VERIFY: LLAMA_DTREE_STOCH=1 admits temp > 0 rounds on the batch tree (exact tree acceptance)
+        const bool stoch_ok = slot.spec_tree_batch && dtree_stoch_enabled();
+        if ((slot.task->params.sampling.temp > 0.0f && !stoch_ok) || slot.task->params.sampling.n_probs > 0 ||
             spec_exact != SPEC_EXACT_OFF || use_serial_speculative_verify(slot) ||
             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             return 0;
@@ -5559,6 +5571,18 @@ private:
     // Returns true when a tree was verified in this view (the overlapped process path is then not used).
     std::vector<llama_seq_id>   tree_seq_store;
     std::vector<llama_seq_id *> tree_seq_ptrs;
+
+    static bool dtree_stoch_enabled() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_DTREE_STOCH");
+            const bool v = e != nullptr && e[0] == '1';
+            if (v) {
+                SRV_WRN("%s", "LLAMA_DTREE_STOCH=1: temp > 0 rounds verify the draft tree with exact multi-candidate rejection sampling\n");
+            }
+            return v;
+        }();
+        return on;
+    }
 
     bool spec_tree_resolve(int32_t off, const llama_batch & batch_view, llama_batch & proc_view) {
         bool any = false;
@@ -5587,7 +5611,26 @@ private:
 
             int32_t best = -1;
             int32_t best_n = 0;
-            if (ok) {
+            slot.spec_tree_stoch_valid = false;
+            if (ok && slot.spec_tree_batch && slot.task && slot.task->params.sampling.temp > 0.0f && dtree_stoch_enabled()) {
+                // DTREE-STOCH-VERIFY: exact tree acceptance decides the winner and the accepted tokens at once
+                std::vector<std::vector<int>> rows;
+                std::vector<llama_tokens>     drafts;
+                rows.push_back(slot.spec_i_batch);
+                drafts.push_back(slot.spec_draft);
+                for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
+                    rows.push_back(slot.spec_tree_i_batch[a]);
+                    drafts.push_back(slot.spec_tree_alts[a]);
+                }
+                slot.spec_tree_stoch_save.reset(common_sampler_clone(slot.smpl.get()));
+                int32_t win = 0;
+                slot.spec_tree_stoch_accepted = common_sampler_sample_and_accept_tree(slot.smpl.get(), ctx_tgt, rows, drafts, &win);
+                slot.spec_tree_stoch_valid = true;
+                best   = win - 1;
+                best_n = (int32_t) slot.spec_tree_stoch_accepted.size() - 1;
+                slot.n_tree_rounds++;
+                slot.n_tree_stoch_rounds++;
+            } else if (ok) {
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
                     const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a]);
@@ -5644,7 +5687,15 @@ private:
             }
 
             if (best >= 0) {
-                const int32_t n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                int32_t n_main = 0;
+                if (slot.spec_tree_stoch_valid) {
+                    // drafts of the main path the stochastic walk agreed with
+                    while (n_main < best_n && slot.spec_draft[n_main] == slot.spec_tree_stoch_accepted[n_main]) {
+                        n_main++;
+                    }
+                } else {
+                    n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 const llama_seq_id seq_win = slot.spec_tree_seq0 + best;
 
                 if (!slot.spec_tree_batch) {
@@ -6341,6 +6392,12 @@ private:
                         accepted = common_sampler_sample_and_accept_n_greedy_fast(
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 &n_zos2_gf_fast, &n_zos2_gf_fallback);
+                    } else if (slot.spec_tree_stoch_valid) {
+                        // DTREE-STOCH-VERIFY: spec_tree_resolve already accepted this round (winner rows); the sampler
+                        // state from before that walk is the checkpoint
+                        accepted  = std::move(slot.spec_tree_stoch_accepted);
+                        smpl_save = std::move(slot.spec_tree_stoch_save);
+                        slot.spec_tree_stoch_valid = false;
                     } else {
                     accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
                                     slot.spec_dists.size() == slot.spec_draft.size()

@@ -111,6 +111,31 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// DTREE-STOCH-VERIFY (LLAMA_DTREE_STOCH=1 in the server, default off): exact acceptance over a drafted token tree
+// given as root-to-leaf paths. rows[p].size() == drafts[p].size() + 1, rows[p][0] is the anchor's row and paths that
+// share a draft prefix share the rows of that prefix (path 0 = main draft). Every draft token is a deterministic
+// (point-mass) proposal. Walk from the anchor; at a node with distinct children x_1..x_m (path order) and target
+// distribution p (the full sampler chain at that row):
+//   temp > 0 : multi-candidate rejection sampling without replacement (SpecInfer / Sequoia): accept x_i with
+//              probability r(x_i) / sum(r), r = p with every earlier rejected sibling zeroed (the residual of a point-mass
+//              proposal); if all are rejected, emit a draw from the final residual and stop.
+//   temp <= 0: sample-and-match (the sampler's token, continue if it is a child), which is the greedy tree path.
+// When the walk passes the last draft of every live path, the bonus token is sampled at that row. Every emitted
+// token goes through common_sampler_accept. *out_path (optional) is the lowest-index path consistent with the
+// accepted drafts; result.size() - 1 drafts of it were accepted.
+std::vector<llama_token> common_sampler_sample_and_accept_tree(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<std::vector<int>> & rows,
+        const std::vector<llama_tokens> & drafts,
+        int32_t * out_path = nullptr);
+
+// SPEC-PIT.1 diagnostic: with LLAMA_SPEC_PIT_FILE=<path> set, every token emitted by the speculative accept functions
+// (chain with draft distributions, and the tree accept above) appends "<sum_smaller_probs> <p_token>\n" to <path>,
+// both read from the target's post-chain distribution at that row. A randomized PIT u = s + U * p is Uniform(0,1)
+// iff the emitted tokens follow the target law (KS gate). Returns true when the file is active.
+bool common_sampler_pit_enabled();
+
 // GPU-ZOS-2 C2a (`LLAMA_ZOS2=greedy-fast`, experimental): an exact greedy fast path for the
 // verification rows of speculative decoding. Returns exactly what
 //
