@@ -2139,11 +2139,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        // AK-MMID-SPLIT16: with GGML_CUDA_MMVQ_MOE_SPLIT16=1, quantized ne2 in 9..16 also takes MMVQ_MMID.
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE || (ggml_is_quantized(src0->type) && ne2 <= MMVQ_MOE_SPLIT16_MAX_BATCH &&
-                                           ggml_cuda_mmvq_mmid_effective_max_batch(src0->type, cc) >= ne2)) {
+        // AK-MMID-SPLIT16: only for ne2 in 9..16 with GGML_CUDA_MMVQ_MOE_SPLIT16=1; ne2 <= 8 dispatch below is the original.
+        if (ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_SPLIT16_MAX_BATCH && ggml_is_quantized(src0->type) &&
+                ggml_cuda_mmvq_moe_split16_enabled() && ggml_cuda_mmvq_mmid_effective_max_batch(src0->type, cc) >= ne2) {
+            ggml_cuda_log_mul_mat_route("MMVQ_MMID_SPLIT16", src0, src1, dst, cc, ne2);
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            return;
+        }
+        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = ggml_cuda_mmvq_mmid_effective_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     // CH-9: mul_mat_id was previously UNINSTRUMENTED, so on a MoE model
                     // every expert matmul was invisible to GGML_CUDA_LOG_MMVQ_ROUTE and
@@ -2857,7 +2862,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = ggml_cuda_mmvq_mmid_effective_max_batch(node->src[0]->type, cc);
+            // AK-MMID-SPLIT16: the raised cap applies only to ne2 > 8 (ne2 <= 8 keeps the original cap).
+            const int mmvq_mmid_max = node->ne[2] > MMVQ_MAX_BATCH_SIZE ?
+                ggml_cuda_mmvq_mmid_effective_max_batch(node->src[0]->type, cc) : get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
