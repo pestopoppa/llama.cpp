@@ -3,7 +3,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cells.h"
 
-#if defined(__AVX512F__)
+#if defined(__x86_64__)
 #include <immintrin.h>
 #endif
 
@@ -330,9 +330,11 @@ void project_query(const layer_state & st, const char * q, size_t nb0, size_t nb
     project(st.wq, rows, x.data(), qhat);
 }
 
-void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat, float * out) {
-    static_assert(index_dim == 64, "kernel assumes 64 index dims");
-#if defined(__AVX512F__)
+// libllama is not built with -march=native: compile the AVX-512 kernel by target attribute, dispatch at runtime
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define LSA_HAVE_AVX512_KERNEL 1
+__attribute__((target("avx512f")))
+static void score_bf16_avx512(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat, float * out) {
     __m512 qv[4];
     for (int i = 0; i < 4; ++i) {
         qv[i] = _mm512_loadu_ps(qhat + 16*i);
@@ -346,7 +348,18 @@ void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat,
         }
         out[j] = _mm512_reduce_add_ps(a);
     }
-#else
+}
+#endif
+
+void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat, float * out) {
+    static_assert(index_dim == 64, "kernel assumes 64 index dims");
+#ifdef LSA_HAVE_AVX512_KERNEL
+    static const bool has_avx512 = __builtin_cpu_supports("avx512f");
+    if (has_avx512) {
+        score_bf16_avx512(ik, lo, hi, qhat, out);
+        return;
+    }
+#endif
     for (int64_t j = lo; j < hi; ++j) {
         const uint16_t * r = ik + j*index_dim;
         float a = 0.0f;
@@ -358,7 +371,6 @@ void score_bf16(const uint16_t * ik, int64_t lo, int64_t hi, const float * qhat,
         }
         out[j] = a;
     }
-#endif
 }
 
 static inline uint32_t bin_of(float s) {
