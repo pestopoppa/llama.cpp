@@ -107,6 +107,12 @@ public:
         uint32_t rs_pend = 0;
         uint32_t rs_rep  = 0;
 
+        // [DTREE-REPLAY] tree verify + replay: the pending rows hold the W tree columns in column order, and
+        // tree_accept() records the accepted root-to-leaf columns; the next ubatch gathers them (in path order)
+        // before the replay. Empty = identity (chain: pending row t is token t).
+        std::vector<int32_t> pend_path; // pending rows of rs_pend, in replay order
+        std::vector<int32_t> rep_path;  // pending rows the current ubatch replays (rs_rep of them)
+
         std::set<llama_seq_id> seq_id;
 
         bool has_seq_id(const llama_seq_id & id) const {
@@ -205,6 +211,7 @@ public:
 
     bool     get_rs_replay() const;
     uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
+    const std::vector<int32_t> & get_rs_rep_path(int i) const; // [DTREE-REPLAY] their pending rows, empty = identity
 
 private:
     const llama_memory_status status;

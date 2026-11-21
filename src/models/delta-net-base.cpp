@@ -643,8 +643,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state_replay(
     ggml_tensor * conv_input = ggml_cont(ctx0, ggml_transpose(ctx0, cols));
     cb(conv_input, "conv_input", il);
 
-    // keep: the new tokens stay pending behind the committed window, else commit the last n_conv columns
-    const int64_t n_dst = rs_replay_keep(cparams, n_seq_tokens) ? n_conv + n_seq_tokens : n_conv;
+    // keep: the new tokens stay pending behind the committed window, else commit the last n_conv columns.
+    // [DTREE-REPLAY] a tree ubatch always keeps its W columns pending (column order); tree_accept() picks the path
+    const bool keep_cols = ubatch.parent ? true : rs_replay_keep(cparams, n_seq_tokens);
+    GGML_ASSERT(!ubatch.parent || n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1);
+    const int64_t n_dst = keep_cols ? n_conv + n_seq_tokens : n_conv;
 
     ggml_tensor * tail = ggml_view_3d(ctx0, cols, channels, n_dst, n_seqs, cols->nb[1], cols->nb[2],
             (n_conv + n_seq_tokens - n_dst)*cols->nb[1]);
@@ -702,7 +705,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_replay(
     ggml_tensor * pv  = gather(spv,  cv);
     ggml_tensor * pgb = gather(spgb, cgb);
 
-    const bool keep = rs_replay_keep(cparams, n_seq_tokens);
+    // [DTREE-REPLAY] after a tree accept the replayed tokens are the accepted path's pending rows: gather them in
+    // path order into rows 0..n_rep-1, so that the replay below is the unchanged chain replay
+    if (inp->rep_idx) {
+        const auto path_rows = [&](ggml_tensor * x, ggml_tensor * idx) {
+            ggml_tensor * x3 = ggml_reshape_3d(ctx0, x, x->ne[0]*x->ne[1], x->ne[2], n_seqs);
+            return ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, x3, idx), x->ne[0], x->ne[1], x->ne[2], n_seqs);
+        };
+        pk  = path_rows(pk,  inp->rep_idx);
+        pv  = path_rows(pv,  inp->rep_idx);
+        pgb = path_rows(pgb, inp->rep_idx_gb);
+        cb(pk, "rep_path_k", il);
+    }
+
+    const bool tree = ubatch.parent != nullptr;
+    const bool keep = tree || rs_replay_keep(cparams, n_seq_tokens);
 
     ggml_tensor * state_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1], kv_head*row_size);
 
@@ -723,19 +740,53 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_replay(
         store(b, cgb, n_pend);
     };
 
-    // the gdn op replays the kept pending tokens, then runs the new tokens
-    ggml_tensor * result = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, pk, pv, pgb, inp->rep_n, 1, keep);
+    ggml_tensor * output    = nullptr;
+    ggml_tensor * new_state = nullptr;
 
-    ggml_tensor * output = ggml_view_4d(ctx0, result, S_v, H_v, n_seq_tokens, n_seqs,
-            ggml_row_size(result->type, S_v),
-            ggml_row_size(result->type, S_v*H_v),
-            ggml_row_size(result->type, S_v*H_v*n_seq_tokens), 0);
+    if (!tree) {
+        // the gdn op replays the kept pending tokens, then runs the new tokens
+        ggml_tensor * result = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, pk, pv, pgb, inp->rep_n, 1, keep);
+
+        output = ggml_view_4d(ctx0, result, S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v*H_v),
+                ggml_row_size(result->type, S_v*H_v*n_seq_tokens), 0);
+
+        // keep: the state after the replay, else the final state
+        new_state = ggml_view_2d(ctx0, result, hparams.n_embd_s(), n_seqs,
+                ggml_row_size(result->type, hparams.n_embd_s()),
+                ggml_row_size(result->type, S_v*H_v*n_seq_tokens*n_seqs));
+    } else {
+        // [DTREE-REPLAY] tree verify: (1) the replay op commits the kept path (keep: its state output is the state
+        // after the replay), run with the root column only (parent -1, so its own output is unused); (2) the tree
+        // walk starts from that state. No snapshot slot is copied into the cache: the W columns stay pending as
+        // logs (store_inputs) and tree_accept() keeps the accepted path for the next ubatch's replay.
+        GGML_ASSERT(n_seq_tokens <= n_pend && "tree batch wider than the pending rows (raise n_rs_seq)");
+        const auto col0 = [&](ggml_tensor * x) {
+            return ggml_cont(ctx0, ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], 1, x->ne[3], x->nb[1], x->nb[2], x->nb[3], 0));
+        };
+        ggml_tensor * rep = ggml_gated_delta_net_ext(ctx0, col0(q), col0(k), col0(v), col0(g), col0(b), s,
+                pk, pv, pgb, inp->rep_n, 1, true);
+        ggml_tensor * s_root = ggml_view_4d(ctx0, rep, S_v, S_v, H_v, n_seqs,
+                ggml_row_size(rep->type, S_v),
+                ggml_row_size(rep->type, S_v*S_v),
+                ggml_row_size(rep->type, S_v*S_v*H_v),
+                ggml_row_size(rep->type, S_v*H_v*n_seqs));
+        cb(s_root, "tree_root_state", il);
+
+        ggml_tensor * gdn = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s_root, build_inp_tree(hparams.ssm_d_conv)->parent);
+
+        output = ggml_view_4d(ctx0, gdn, S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn->type, S_v),
+                ggml_row_size(gdn->type, S_v*H_v),
+                ggml_row_size(gdn->type, S_v*H_v*n_seq_tokens), 0);
+
+        new_state = ggml_view_2d(ctx0, rep, hparams.n_embd_s(), n_seqs,
+                ggml_row_size(rep->type, hparams.n_embd_s()),
+                ggml_row_size(rep->type, S_v*H_v*n_seqs));
+    }
     cb(output, "attn_output", il);
 
-    // keep: the state after the replay, else the final state
-    ggml_tensor * new_state = ggml_view_2d(ctx0, result, hparams.n_embd_s(), n_seqs,
-            ggml_row_size(result->type, hparams.n_embd_s()),
-            ggml_row_size(result->type, S_v*H_v*n_seq_tokens*n_seqs));
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
 
     store_inputs();

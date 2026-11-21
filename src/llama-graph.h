@@ -311,6 +311,15 @@ public:
     ggml_tensor * rep_cols_r = nullptr;
     ggml_tensor * rep_cols_p = nullptr;
 
+    // [DTREE-REPLAY] tree verify + replay: the pending rows to replay, gathered in path order before the replay
+    // (I32 [n_pend, n_seqs] for k and v, [2*n_pend, n_seqs] for the gates then the betas). Built for tree ubatches
+    // and for any ubatch whose cells replay an accepted tree path, nullptr otherwise (the linear replay graph).
+    bool          has_path   = false;
+    ggml_tensor * rep_idx    = nullptr;
+    ggml_tensor * rep_idx_gb = nullptr;
+
+    static bool want_path(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch);
+
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
 
     const llama_memory_recurrent_context * mctx;

@@ -409,17 +409,59 @@ void llm_graph_input_rs::set_input_rep(const llama_memory_recurrent_context * mc
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_n->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_cols->buffer));
 
+    int32_t * idx    = has_path ? (int32_t *) rep_idx->data    : nullptr;
+    int32_t * idx_gb = has_path ? (int32_t *) rep_idx_gb->data : nullptr;
+    if (has_path) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rep_idx->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(rep_idx_gb->buffer));
+    }
+
     for (int64_t s = 0; s < n_seqs; ++s) {
         const int64_t n_rep = mctx->get_rs_rep(s);
         GGML_ASSERT(n_rep <= n_pend);
 
         reps[s] = n_rep;
 
-        // the conv history is [window | pending]: the window after the kept tokens
+        // [DTREE-REPLAY] the pending row of replayed token t: path[t] after a tree accept, else t
+        const std::vector<int32_t> & path = mctx->get_rs_rep_path(s);
+        GGML_ASSERT(path.empty() || (int64_t) path.size() == n_rep);
+        GGML_ASSERT(path.empty() || has_path);
+        const auto row = [&](int64_t t) -> int32_t {
+            return t < (int64_t) path.size() ? path[t] : (int32_t) t;
+        };
+
+        if (has_path) {
+            for (int64_t t = 0; t < n_pend; ++t) {
+                const int32_t r = row(t);
+                GGML_ASSERT(r >= 0 && r < n_pend);
+                idx[s*n_pend + t]                = r;
+                idx_gb[s*2*n_pend + t]           = r;
+                idx_gb[s*2*n_pend + n_pend + t]  = (int32_t) n_pend + r;
+            }
+        }
+
+        // the conv history is [window | pending]: the window after the kept tokens, i.e. the last n_conv columns of
+        // the window followed by the replayed pending columns (in replay order)
         for (int64_t c = 0; c < n_conv; ++c) {
-            cols[s*n_conv + c] = n_rep + c;
+            const int64_t j = n_rep + c; // position in [window | replayed tokens]
+            cols[s*n_conv + c] = j < n_conv ? (int32_t) j : (int32_t) (n_conv + row(j - n_conv));
         }
     }
+}
+
+bool llm_graph_input_rs::want_path(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) {
+    if (!mctx->get_rs_replay()) {
+        return false;
+    }
+    if (ubatch.parent) {
+        return true;
+    }
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        if (!mctx->get_rs_rep_path(s).empty()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -436,6 +478,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    res &= has_path == want_path(mctx, params.ubatch);
 
     return res;
 }
@@ -1502,6 +1546,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    res &= inp_rs->has_path == llm_graph_input_rs::want_path(mctx->get_recr(), params.ubatch);
+
     return res;
 }
 
@@ -1546,6 +1592,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->has_path == llm_graph_input_rs::want_path(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1636,6 +1684,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->has_path == llm_graph_input_rs::want_path(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -4225,6 +4275,17 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->rep_n);
         ggml_set_name(inp->rep_n, "rs_rep_n");
+
+        inp->has_path = llm_graph_input_rs::want_path(mctx_cur, ubatch);
+        if (inp->has_path) {
+            inp->rep_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_pend, n_seqs);
+            ggml_set_input(inp->rep_idx);
+            ggml_set_name(inp->rep_idx, "rs_rep_idx");
+
+            inp->rep_idx_gb = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2*inp->n_pend, n_seqs);
+            ggml_set_input(inp->rep_idx_gb);
+            ggml_set_name(inp->rep_idx_gb, "rs_rep_idx_gb");
+        }
     }
 
     return inp;

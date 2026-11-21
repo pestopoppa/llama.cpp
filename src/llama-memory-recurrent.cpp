@@ -181,6 +181,8 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].rs_max = 0;
         cells[i].rs_pend = 0;
         cells[i].rs_rep = 0;
+        cells[i].pend_path.clear();
+        cells[i].rep_path.clear();
     }
 
     head = 0;
@@ -244,8 +246,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const bool pending = rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
                     if (rs_replay) {
+                        // [DTREE-REPLAY] an unaccepted tree ubatch keeps nothing pending (tree_accept() first)
+                        if ((uint32_t) rollback > cell.rs_pend) {
+                            return false;
+                        }
                         // the next ubatch replays only the kept pending tokens
                         cell.rs_pend -= rollback;
+                        if (!cell.pend_path.empty()) {
+                            cell.pend_path.resize(cell.rs_pend);
+                        }
                         cell.rs_max = 0;
                     } else {
                         set_rs_idx(seq_id, (uint32_t) rollback);
@@ -486,6 +495,31 @@ bool llama_memory_recurrent::tree_accept(llama_seq_id seq_id, const int32_t * co
     if (slot > cell.rs_max) {
         return false;
     }
+    if (rs_replay) {
+        // [DTREE-REPLAY] the W tree columns are pending in column order and the committed state is the tree's
+        // root state: keep the accepted root-to-leaf columns pending, in path order; the next ubatch gathers
+        // and replays them (the chain replay). Side branches are dropped because no path entry names them.
+        if (cols[0] != 0) {
+            return false;
+        }
+        bool ident = true;
+        for (int32_t i = 0; i < n_cols; ++i) {
+            if (cols[i] < 0 || cols[i] >= W || (i > 0 && cols[i] <= cols[i - 1])) {
+                return false;
+            }
+            ident = ident && cols[i] == i;
+        }
+        cell.rs_pend = (uint32_t) n_cols;
+        if (ident) {
+            cell.pend_path.clear();
+        } else {
+            cell.pend_path.assign(cols, cols + n_cols);
+        }
+        cell.rs_max = 0;
+        cell.pos = it->second[c];
+        tree_pos.erase(it);
+        return true;
+    }
     if (slot > 0) {
         set_rs_idx(seq_id, slot);
     }
@@ -697,6 +731,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
                 empty_cell.rs_pend = orig_cell.rs_pend;
+                empty_cell.pend_path = orig_cell.pend_path;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -729,6 +764,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.rs_pend, src_cell.rs_pend);
+            std::swap(dst_cell.pend_path, src_cell.pend_path);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
             // the cell moved out only gets its final state copied, its rollback snapshots stay behind
             if (!rs_replay) {
@@ -763,7 +799,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (ubatch.parent) {
             // [AK-DTREE-2] tree ubatch: each column's state lands in its own rollback slot; tree_accept() picks one
             GGML_ASSERT(n_seq_tokens <= n_rs_seq + 1 && "tree batch wider than the recurrent rollback slots (raise n_rs_seq)");
-            GGML_ASSERT(!rs_replay && "[RS-REPLAY] tree ubatches need snapshot slots: unset LLAMA_RS_REPLAY for tree verify");
+            // [DTREE-REPLAY] with rs_replay the columns are logged as pending rows instead (see tree_accept)
             auto & tp = tree_pos[ubatch.seq_id[i][0]];
             tp.assign(ubatch.pos + i, ubatch.pos + i + n_seq_tokens);
         } else if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
@@ -777,7 +813,13 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (rs_replay) {
             // replay what the last ubatch left pending, then keep this ubatch pending if it can be rolled back
             cell.rs_rep  = cell.src >= 0 ? cell.rs_pend : 0;
-            cell.rs_pend = cell.rs_max > 0 ? n_seq_tokens : 0;
+            cell.rep_path.clear();
+            if (cell.rs_rep > 0) {
+                cell.rep_path.swap(cell.pend_path);
+            }
+            cell.pend_path.clear();
+            // [DTREE-REPLAY] a tree ubatch keeps nothing pending until tree_accept() names the accepted path
+            cell.rs_pend = cell.rs_max > 0 && !ubatch.parent ? n_seq_tokens : 0;
         }
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
@@ -1506,6 +1548,11 @@ bool llama_memory_recurrent_context::get_rs_replay() const {
 
 uint32_t llama_memory_recurrent_context::get_rs_rep(int i) const {
     return is_full ? 0 : mem->cells[i + mem->head].rs_rep;
+}
+
+const std::vector<int32_t> & llama_memory_recurrent_context::get_rs_rep_path(int i) const {
+    static const std::vector<int32_t> none;
+    return is_full ? none : mem->cells[i + mem->head].rep_path;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
