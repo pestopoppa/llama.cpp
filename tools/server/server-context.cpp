@@ -4002,6 +4002,13 @@ private:
     int64_t t_zos2_join_wait   = 0; // main thread blocked in the worker join, per step
     int64_t n_zos2_join_wait   = 0;
     int64_t n_zos2_gf_fast     = 0; // greedy-fast rows taken by the fast path
+    // Q38FN-CPU-MTP-ROUND-HOST sub-timers (LLAMA_SERVER_ROUND_TRACE=1)
+    int64_t t_rh_draft         = 0; // common_speculative_draft (drafter model decodes + draft sampling), per step
+    int64_t n_rh_draft         = 0;
+    int64_t t_rh_ckpt_tgt      = 0; // target recurrent/KV checkpoint save (spec_ckpt.update_tgt), per slot-round
+    int64_t n_rh_ckpt_tgt      = 0;
+    int64_t t_rh_ckpt_dft      = 0; // draft-context checkpoint load/save + seq_rm (draft-context sync), per slot-round
+    int64_t n_rh_ckpt_dft      = 0;
     int64_t n_zos2_gf_fallback = 0; // greedy-fast rows routed to the chain (C2a fallback: tie, NaN, ineligible, ...)
 
     // decode-aware prefill budget (--prefill-budget-decoding / --prefill-budget-target-ms)
@@ -4084,25 +4091,40 @@ private:
 // #define DEBUG_TIMINGS
 // GPU-ZOS-1a: or configure with -DLLAMA_SERVER_DEBUG_TIMINGS=ON (tools/server/CMakeLists.txt, default OFF), which defines
 // DEBUG_TIMINGS for the server-context target only; every other target and the ggml/llama libraries are compiled as without it.
+// Q38FN-CPU-MTP-ROUND-HOST: LLAMA_SERVER_ROUND_TRACE=1 turns the DEBUG_TIMINGS timers (and the round-trace line, every
+// second) on at runtime without the compile flag. Default off: the timers are then a single predicted branch.
 #ifdef DEBUG_TIMINGS
+    static bool round_trace_on() { return true; }
+#else
+    static bool round_trace_on() {
+        static const bool on = [] {
+            const char * v = getenv("LLAMA_SERVER_ROUND_TRACE");
+            const bool r = v != nullptr && atoi(v) != 0;
+            if (r) {
+                SRV_INF("%s", "LLAMA_SERVER_ROUND_TRACE: on (per-round host/model timers, 1 s trace line)\n");
+            }
+            return r;
+        }();
+        return on;
+    }
+#endif
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
         int64_t t_start;
-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+        bool on;
+        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_), t_start(0), on(round_trace_on()) {
+            if (on) {
+                t_start = ggml_time_us();
+            }
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (on) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     int64_t n_rs_rebuild = 0;
 
@@ -4169,10 +4191,10 @@ private:
 #ifdef LLAMA_LB7_PROBES
         lb7p_t_iter_us = ggml_time_us();
 #endif
-#ifdef DEBUG_TIMINGS
+        if (round_trace_on()) {
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+        if (t_start - t_prev > 1 * 1000 * 1000) { // every second (was 5 s under DEBUG_TIMINGS)
             t_prev = t_start;
             SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
             SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
@@ -4204,14 +4226,19 @@ private:
                     " n_process=%" PRId64 " t_process_us=%" PRId64
                     " n_process_wrk=%" PRId64 " t_process_wrk_us=%" PRId64
                     " n_join_wait=%" PRId64 " t_join_wait_us=%" PRId64
-                    " n_gf_fast=%" PRId64 " n_gf_fallback=%" PRId64 "\n",
+                    " n_gf_fast=%" PRId64 " n_gf_fallback=%" PRId64
+                    " n_rh_draft=%" PRId64 " t_rh_draft_us=%" PRId64
+                    " n_rh_ckpt_tgt=%" PRId64 " t_rh_ckpt_tgt_us=%" PRId64
+                    " n_rh_ckpt_dft=%" PRId64 " t_rh_ckpt_dft_us=%" PRId64
+                    " n_rs_rebuild=%" PRId64 "\n",
                     t_wall_us, n_slots_gen,
                     n_pre_decode, t_pre_decode, n_decode, t_decode, n_post_decode, t_post_decode, n_sampl, t_sampl,
                     n_zos2_verify, t_zos2_verify, n_zos2_clone, t_zos2_clone, n_zos2_rollback, t_zos2_rollback,
                     n_zos2_emit, t_zos2_emit, n_zos2_process, t_zos2_process, n_zos2_process_wrk, t_zos2_process_wrk,
-                    n_zos2_join_wait, t_zos2_join_wait, n_zos2_gf_fast, n_zos2_gf_fallback);
+                    n_zos2_join_wait, t_zos2_join_wait, n_zos2_gf_fast, n_zos2_gf_fallback,
+                    n_rh_draft, t_rh_draft, n_rh_ckpt_tgt, t_rh_ckpt_tgt, n_rh_ckpt_dft, t_rh_ckpt_dft, n_rs_rebuild);
         }
-#endif
+        }
 
         // check if all slots are idle
         {
@@ -4279,9 +4306,9 @@ private:
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
-#ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
-#endif
+                if (round_trace_on()) {
+                    llama_synchronize(ctx_tgt);
+                }
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -4512,6 +4539,7 @@ private:
 
         // generate the actual drafts (if any)
         {
+            scoped_timer t_draft(t_rh_draft, n_rh_draft);
             common_speculative_draft(spec.get());
         }
 
@@ -4526,6 +4554,7 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                scoped_timer t_ckd(t_rh_ckpt_dft, n_rh_ckpt_dft);
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
@@ -4545,7 +4574,10 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    {
+                        scoped_timer t_ckt(t_rh_ckpt_tgt, n_rh_ckpt_tgt);
+                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -5827,12 +5859,10 @@ private:
                 scoped_timer t_join(t_zos2_join_wait, n_zos2_join_wait);
                 ok_process = zos2_worker.join(t_process_wrk);
             }
-#ifdef DEBUG_TIMINGS
-            t_zos2_process_wrk += t_process_wrk;
-            n_zos2_process_wrk += 1;
-#else
-            GGML_UNUSED(t_process_wrk);
-#endif
+            if (round_trace_on()) {
+                t_zos2_process_wrk += t_process_wrk;
+                n_zos2_process_wrk += 1;
+            }
             if (!ok_process) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
