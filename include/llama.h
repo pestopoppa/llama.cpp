@@ -1177,6 +1177,9 @@ extern "C" {
     // LLAMA_TOKEN_NULL when it was not computed for the last decode.
     LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
 
+    // AK-GAP-1-SAMPLE: LLAMA_DEVICE_ACCEPT=1 witness counters (deferred logits downloads skipped / later flushed by a reader)
+    LLAMA_API void llama_device_accept_stats(const struct llama_context * ctx, int64_t * lazy_skipped, int64_t * flushed);
+
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().
     // Returns NULL if no probabilities were generated.

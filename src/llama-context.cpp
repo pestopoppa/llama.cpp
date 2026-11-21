@@ -4473,6 +4473,15 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
     return ctx->set_sampler(seq_id, smpl);
 }
 
+void llama_device_accept_stats(const llama_context * ctx, int64_t * lazy_skipped, int64_t * flushed) {
+    if (lazy_skipped) {
+        *lazy_skipped = ctx->n_lazy_skipped();
+    }
+    if (flushed) {
+        *flushed = ctx->n_lazy_flushed();
+    }
+}
+
 llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
