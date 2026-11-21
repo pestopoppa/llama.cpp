@@ -176,6 +176,121 @@ static __global__ void ssm_conv_tree_f32(const float * __restrict__ src0, const 
     }
 }
 
+// [DTREE-ROUND-OVERHEAD-2] fused tree SSM_CONV: taps gathered by parent index straight from the conv history
+// h [nk, nr, n_s] (column-major per channel) and the token inputs x [nr, n_t, n_s] (no concat / transposes); the
+// conv state after column i (its window's last nk taps) is written to sd slot n_t-1-i. One thread per channel,
+// taps summed in the chain kernel's order (bit-identical to ssm_conv_tree_f32). The history is read into
+// registers before any state write, so the scatter may alias it.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_tree_fused_f32(const float * __restrict__ h, const float * __restrict__ x,
+                                               const float * __restrict__ src1, const float * __restrict__ bias,
+                                               const int32_t * __restrict__ parent,
+                                               const int64_t h_nb2, const int64_t x_nb1, const int64_t x_nb2,
+                                               const int src1_nb1,
+                                               float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+                                               float * sd, const int64_t sd_nb1, const int64_t sd_nb2,
+                                               const int64_t n_t) {
+    constexpr int nk = (int) d_conv - 1;
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int ch   = blockIdx.y * split_d_inner + tid;
+
+    const float * hb = (const float *) ((const char *) h + bidx * h_nb2) + (int64_t) ch * nk;
+    const char  * xb = (const char *) x + bidx * x_nb2 + (int64_t) ch * sizeof(float);
+    const float * w_row = (const float *) ((const char *) src1 + (int64_t) ch * src1_nb1);
+    float *       yb = (float *) ((char *) dst + bidx * dst_nb2) + ch;
+    char  *       sb = (char *) sd + bidx * sd_nb2 + (int64_t) ch * nk * sizeof(float);
+    const int32_t * par = parent + bidx * n_t;
+
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_row[j];
+    }
+    float hist[nk];
+#pragma unroll
+    for (int j = 0; j < nk; j++) {
+        hist[j] = hb[j];
+    }
+    const float b = bias != nullptr ? bias[ch] : 0.0f;
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    for (int64_t i = 0; i < n_t; i++) {
+        int widx[d_conv];
+        int pos = (int) i + nk;
+        widx[d_conv - 1] = pos;
+#pragma unroll
+        for (int j = (int) d_conv - 2; j >= 0; j--) {
+            if (pos >= nk) {
+                const int p = par[pos - nk];
+                pos = p >= 0 ? p + nk : nk - 1;
+            } else {
+                pos = pos - 1;
+            }
+            widx[j] = pos;
+        }
+        float tap[d_conv];
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            const int q = widx[j];
+            if (q < nk) {
+                float hv = hist[0];
+#pragma unroll
+                for (int m = 1; m < nk; m++) {
+                    hv = q == m ? hist[m] : hv;
+                }
+                tap[j] = hv;
+            } else {
+                tap[j] = *(const float *) (xb + (int64_t) (q - nk) * x_nb1);
+            }
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += tap[j] * w[j];
+        }
+        sumf += b;
+        yb[i * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+        float * st = (float *) (sb + (n_t - 1 - i) * sd_nb1);
+#pragma unroll
+        for (int j = 0; j < nk; j++) {
+            st[j] = tap[1 + j];
+        }
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_tree_fused_f32_cuda(const ggml_tensor * dst, const ggml_tensor * out, const float * bias,
+                                         cudaStream_t stream) {
+    const ggml_tensor * h   = dst->src[0];
+    const ggml_tensor * c   = dst->src[1];
+    const ggml_tensor * par = dst->src[2];
+    const ggml_tensor * x   = dst->src[3];
+    const ggml_tensor * sd  = dst->src[4];
+    const int64_t nc  = c->ne[0];
+    const int64_t nr  = c->ne[1];
+    const int64_t n_t = out->ne[1];
+    const int64_t n_s = out->ne[2];
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+    const dim3 blocks(n_s, nr / threads, 1);
+
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        ssm_conv_tree_fused_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
+            (const float *) h->data, (const float *) x->data, (const float *) c->data, bias, (const int32_t *) par->data,
+            h->nb[2], x->nb[1], x->nb[2], c->nb[1], (float *) out->data, out->nb[1], out->nb[2],
+            (float *) sd->data, sd->nb[1], sd->nb[2], n_t);
+    };
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        default: GGML_ABORT("fused tree SSM_CONV supports kernel sizes 3, 4, 5");
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -228,6 +343,16 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
     // When fusing, write to silu_dst (the node downstream references).
     const struct ggml_tensor * out = fuse_silu ? silu_dst : dst;
+
+    if (ggml_get_op_params_i32(dst, 0) == 1) {
+        GGML_ASSERT(out->type == GGML_TYPE_F32 && out->nb[0] == sizeof(float));
+        if (fuse_silu) {
+            ssm_conv_tree_fused_f32_cuda<true>(dst, out, bias != nullptr ? (const float *) bias->data : nullptr, ctx.stream());
+        } else {
+            ssm_conv_tree_fused_f32_cuda<false>(dst, out, nullptr, ctx.stream());
+        }
+        return;
+    }
 
     const int64_t nc  = src1->ne[0];                // d_conv
     const int64_t nr  = src0->ne[1];                // d_inner

@@ -244,6 +244,53 @@ static void test_conv(int64_t nc, int64_t nr, const std::vector<int32_t> & par) 
     }
     snprintf(buf, sizeof(buf), "SSM_CONV tree paths == chain  nc=%lld nr=%lld T=%lld", (long long) nc, (long long) nr, (long long) T);
     check(ok, buf);
+
+    // [DTREE-ROUND-OVERHEAD-2] fused tree conv: output bit-identical to ggml_ssm_conv_tree, and rollback slot
+    // T-1-c holds column c's window minus its oldest tap ([nc-1, nr] per slot), the history aliased into slot 0
+    {
+        ggml_context * ctx = new_ctx();
+        const int64_t nk = nc - 1;
+        const int64_t slots = T + 2;   // slot stride > T, as in the cache (mem_size rows per slot)
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nk * nr, slots);
+        memset(cache->data, 0, ggml_nbytes(cache));
+        memcpy(cache->data, hist.data(), hist.size() * sizeof(float));   // history = slot 0 (aliased)
+        ggml_tensor * cs = ggml_view_3d(ctx, cache, nk, nr, 1, nk * sizeof(float), cache->nb[1], 0);
+        ggml_tensor * xs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, T, 1);
+        memcpy(xs->data, x.data(), x.size() * sizeof(float));
+        ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, nr);
+        memcpy(c->data, w.data(), w.size() * sizeof(float));
+        ggml_tensor * pr = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, T, 1);
+        memcpy(pr->data, par.data(), T * sizeof(int32_t));
+        ggml_tensor * sd = ggml_view_3d(ctx, cache, nk * nr, T, 1, cache->nb[1], cache->nb[1], 0);
+        ggml_tensor * out = ggml_ssm_conv_tree_fused(ctx, cs, xs, c, pr, sd);
+        compute(ctx, out);
+        const bool same = memcmp(out->data, tree.data(), tree.size() * sizeof(float)) == 0;
+        snprintf(buf, sizeof(buf), "SSM_CONV fused == tree  nc=%lld nr=%lld T=%lld", (long long) nc, (long long) nr, (long long) T);
+        check(same, buf);
+        // expected states: walk the window of each column over [hist | x]
+        bool st_ok = true;
+        const float * cd = (const float *) cache->data;
+        for (int64_t col = 0; col < T; ++col) {
+            std::vector<int> widx(nc);
+            int pos = (int) (col + nk);
+            widx[nc - 1] = pos;
+            for (int j = (int) nc - 2; j >= 0; --j) {
+                if (pos >= nk) { const int p = par[pos - nk]; pos = p >= 0 ? p + (int) nk : (int) nk - 1; } else { pos = pos - 1; }
+                widx[j] = pos;
+            }
+            const int64_t slot = T - 1 - col;
+            for (int64_t r = 0; r < nr; ++r) {
+                for (int64_t j = 0; j < nk; ++j) {
+                    const int q = widx[1 + j];
+                    const float e = q < nk ? hist[r * nk + q] : x[(q - nk) * nr + r];
+                    st_ok &= cd[slot * nk * nr + r * nk + j] == e;
+                }
+            }
+        }
+        snprintf(buf, sizeof(buf), "SSM_CONV fused states == windows  nc=%lld nr=%lld T=%lld", (long long) nc, (long long) nr, (long long) T);
+        check(st_ok, buf);
+        ggml_free(ctx);
+    }
 }
 
 int main() {

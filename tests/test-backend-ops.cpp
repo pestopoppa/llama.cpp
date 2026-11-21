@@ -5865,6 +5865,11 @@ static std::vector<int32_t> dtree_parents(int kind, int64_t T, int64_t seq) {
     for (int64_t t = 0; t < T; ++t) {
         if (kind == 0 || t == 0) {
             p[t] = (int32_t) t - 1;
+        } else if (kind == 3) {
+            // [DTREE-ROUND-OVERHEAD-2] greedy layout: main chain 0..K-1, one alternative per distinct chain node
+            // (T/3 non-chain parents: 5 at T=16 exceeds the 4 GDN register save slots, exercising the fallback)
+            const int64_t K = T - T / 3;
+            p[t] = t < K ? (int32_t) (t - 1) : (int32_t) (((t - K) * 2) % K);
         } else if (kind == 1) {
             const int64_t K = (T + 1) / 2;   // main chain 0..K-1, side columns hang off it
             p[t] = t < K ? (int32_t) (t - 1) : (int32_t) ((t * 7 + seq) % K);
@@ -5898,6 +5903,43 @@ struct test_ssm_conv_tree : public test_case {
         ggml_tensor * out = ggml_ssm_conv_tree(ctx, a, c, par);
         ggml_set_name(out, "out");
         return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                dtree_set_parents(t, tree_kind);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [DTREE-ROUND-OVERHEAD-2] fused tree SSM_CONV (history + token inputs gathered by parent index, rollback conv
+// states scattered into a strided cache view). The output is concatenated with a copy of the cache read AFTER the
+// op (src0 visited first), so the scattered states are compared too.
+struct test_ssm_conv_tree_fused : public test_case {
+    const int64_t d_conv, d_inner, n_t, n_s;
+    const int tree_kind;
+    std::string vars() override { return VARS_TO_STR5(d_conv, d_inner, n_t, n_s, tree_kind); }
+    test_ssm_conv_tree_fused(int64_t d_conv = 4, int64_t d_inner = 1024, int64_t n_t = 8, int64_t n_s = 1, int tree_kind = 1)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s), tree_kind(tree_kind) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nk = d_conv - 1;
+        const int64_t mem = n_s + 3;                                   // rows per slot
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nk * d_inner, mem * n_t);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nk, d_inner, n_s);
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+        ggml_tensor * c    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * par  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_t, n_s);
+        ggml_set_name(par, "parent");
+        ggml_tensor * sd   = ggml_view_3d(ctx, cache, nk * d_inner, n_t, n_s, mem * cache->nb[1], cache->nb[1], cache->nb[1]);
+        ggml_tensor * out  = ggml_ssm_conv_tree_fused(ctx, hist, x, c, par, sd);
+        ggml_tensor * st   = ggml_cont(ctx, ggml_view_1d(ctx, cache, ggml_nelements(cache), 0));
+        ggml_tensor * res  = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), st, 0);
+        ggml_set_name(res, "out");
+        return res;
     }
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -14626,7 +14668,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_tree(4, 64, 12, 3, 1, false, kind));
         test_cases.emplace_back(new test_gated_delta_net_tree(4, 32, 12, 2, 1, true, kind));
         test_cases.emplace_back(new test_ssm_conv_tree(4, 1024, 12, 3, kind));
+        test_cases.emplace_back(new test_ssm_conv_tree_fused(4, 1024, 12, 3, kind));
+        test_cases.emplace_back(new test_ssm_conv_tree_fused(4, 10240, 16, 1, kind));
+        test_cases.emplace_back(new test_ssm_conv_tree_fused(4, 8192, 8, 1, kind));
     }
+    // [DTREE-ROUND-OVERHEAD-2] greedy-layout trees: GDN register save slots (<= 4 non-chain parents) and their
+    // snapshot-reload fallback (5 at W=16), cache-fused GDN scatter, fused conv
+    for (int64_t W : {8, 12, 13, 16}) {
+        test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, W, 1, 3, false, 3));
+        test_cases.emplace_back(new test_gated_delta_net_tree(16, 128, W, 1, 2, false, 3));
+        test_cases.emplace_back(new test_ssm_conv_tree_fused(4, 10240, W, 1, 3));
+        test_cases.emplace_back(new test_gdn_tree_cache(4, 128, W, 1, 3));
+    }
+    test_cases.emplace_back(new test_gdn_tree_cache(4, 128, 16, 3, 3));
     // [DTREE-0-GDN-ROWS] few-row verify at the 27B (16 qk x3 = 48 v-heads) and A3B (x2 = 32) GDN dims, n_tokens 1..16:
     // final-state only (K=1, llama-bench), snapshot every row (K=n, MTP/DFlash rollback), a short tail (K=4),
     // two sequences, permuted q/k/v, BF16 state is in the opt-in set; tree batches (chain/layout/bushy) at every W.

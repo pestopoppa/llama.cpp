@@ -5493,6 +5493,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->src[2] != nullptr && (op->src[2]->type != GGML_TYPE_I32 || op->src[1]->ne[0] > 15)) {
                 return false;
             }
+            // [DTREE-ROUND-OVERHEAD-2] fused tree layout
+            if (ggml_get_op_params_i32(op, 0) == 1 && (op->src[1]->ne[0] < 3 || op->src[1]->ne[0] > 5 || op->src[1]->ne[1] % 128 != 0)) {
+                return false;
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }

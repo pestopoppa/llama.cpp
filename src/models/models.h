@@ -82,6 +82,12 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // [AK-DTREE-2] ggml_ssm_conv, or ggml_ssm_conv_tree on a tree ubatch
     ggml_tensor * build_ssm_conv(ggml_tensor * conv_input, ggml_tensor * conv_kernel);
 
+    // [DTREE-ROUND-OVERHEAD-2] pending fused tree conv (set by build_conv_state on a tree ubatch, consumed by
+    // build_ssm_conv): conv history [nk, ch, n_s], token inputs [ch, T, n_s], rollback-slot scatter view
+    ggml_tensor * tree_conv_cs = nullptr;
+    ggml_tensor * tree_conv_x  = nullptr;
+    ggml_tensor * tree_conv_sd = nullptr;
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

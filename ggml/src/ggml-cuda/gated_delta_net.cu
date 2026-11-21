@@ -759,6 +759,7 @@ gated_delta_net_cuda(const float * q,
 #define GDN_ROWS_LPC     16
 #define GDN_ROWS_THREADS 512
 #define GDN_ROWS_CPB     (GDN_ROWS_THREADS / GDN_ROWS_LPC)
+#define GDN_ROWS_RSAVE   4
 
 static std::atomic<uint64_t> g_gdn_rows_n_calls{0};
 
@@ -858,6 +859,7 @@ gdn_rows_cuda(const float * __restrict__ q, const float * __restrict__ k, const 
     __shared__ float eg_s[GDN_ROWS_WMAX];
     __shared__ float b_s[GDN_ROWS_WMAX];
     __shared__ int   p_s[GDN_ROWS_WMAX];
+    __shared__ int   r_s[GDN_ROWS_WMAX];   // [DTREE-ROUND-OVERHEAD-2] register save slot of column t, -1 = none
 
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -905,10 +907,28 @@ gdn_rows_cuda(const float * __restrict__ q, const float * __restrict__ k, const 
             p_s[tid] = parent[(int64_t) sequence * n_tokens + tid];
         }
     }
+    if constexpr (tree_t) {
+        // [DTREE-ROUND-OVERHEAD-2] a column with a non-chain child (a child other than column t+1) keeps its state
+        // in one of GDN_ROWS_RSAVE register slots, so the child restores it without a global snapshot reload (on
+        // gfx90a vmcnt also counts the snapshot stores, so that reload serialised every pending store into the
+        // walk). Columns past the slot budget fall back to the prefetched snapshot reload.
+        __syncthreads();
+        if (tid == 0) {
+            int nslot = 0;
+            for (int t = 0; t < n_tokens; t++) {
+                bool need = false;
+                for (int u = t + 2; u < n_tokens; u++) {
+                    need |= p_s[u] == t;
+                }
+                r_s[t] = need && nslot < GDN_ROWS_RSAVE ? nslot++ : -1;
+            }
+        }
+    }
     __syncthreads();
 
     float s0[tree_t ? RPL : 1];
     float pre[tree_t ? RPL : 1];
+    float sv[tree_t ? GDN_ROWS_RSAVE : 1][tree_t ? RPL : 1];
     if constexpr (tree_t) {
 #pragma unroll
         for (int r = 0; r < RPL; r++) {
@@ -932,16 +952,29 @@ gdn_rows_cuda(const float * __restrict__ q, const float * __restrict__ k, const 
                         s[r] = s0[r];
                     }
                 } else {
+                    const int ks = gdn_rows_uniform(r_s[p]);
+                    if (ks < 0) {
 #pragma unroll
-                    for (int r = 0; r < RPL; r++) {
-                        s[r] = pre[r];
+                        for (int r = 0; r < RPL; r++) {
+                            s[r] = pre[r];
+                        }
+                    }
+#pragma unroll
+                    for (int kk = 0; kk < GDN_ROWS_RSAVE; kk++) {
+                        if (ks == kk) {
+#pragma unroll
+                            for (int r = 0; r < RPL; r++) {
+                                s[r] = sv[kk][r];
+                            }
+                        }
                     }
                 }
             }
-            // prefetch the next column's parent snapshot (stored by this thread at column pn <= t - 1)
+            // prefetch the next column's parent snapshot (stored by this thread at column pn <= t - 1) when that
+            // parent has no register slot
             if (t + 1 < n_tokens) {
                 const int pn = gdn_rows_uniform(p_s[t + 1]);
-                if (pn >= 0 && pn != t) {
+                if (pn >= 0 && pn != t && gdn_rows_uniform(r_s[pn]) < 0) {
                     const state_t * src = state + (int64_t) (n_tokens - 1 - pn) * state_slot_stride;
 #pragma unroll
                     for (int c = 0; c < NCH; c++) {
@@ -978,6 +1011,19 @@ gdn_rows_cuda(const float * __restrict__ q, const float * __restrict__ k, const 
             ap  += s[r] * qr[r];
         }
         part[t] = ap;
+
+        if constexpr (tree_t) {
+            const int ks = gdn_rows_uniform(r_s[t]);
+#pragma unroll
+            for (int kk = 0; kk < GDN_ROWS_RSAVE; kk++) {
+                if (ks == kk) {
+#pragma unroll
+                    for (int r = 0; r < RPL; r++) {
+                        sv[kk][r] = s[r];
+                    }
+                }
+            }
+        }
 
         if constexpr (keep_rs_t) {
             const int slot = n_tokens - 1 - t;

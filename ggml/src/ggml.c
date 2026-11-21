@@ -5864,6 +5864,41 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_tree_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cs,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent,
+        struct ggml_tensor  * state_dst) {
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(cs->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(cs->ne[0] == d_conv - 1 && cs->ne[1] == d_inner && cs->ne[2] == n_s);
+    GGML_ASSERT(cs->nb[0] == sizeof(float) && cs->nb[1] == cs->ne[0]*sizeof(float));
+    GGML_ASSERT(x->ne[0] == d_inner && x->nb[0] == sizeof(float));
+    GGML_ASSERT(state_dst->ne[0] == (d_conv - 1)*d_inner && state_dst->ne[1] == n_t && state_dst->ne[2] == n_s);
+    GGML_ASSERT(state_dst->nb[0] == sizeof(float));
+    GGML_ASSERT(parent->type == GGML_TYPE_I32 && ggml_is_contiguous(parent));
+    GGML_ASSERT(parent->ne[0] == n_t && parent->ne[1] == n_s);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    ggml_set_op_params_i32(result, 0, 1); // fused tree layout
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = cs;
+    result->src[1] = c;
+    result->src[2] = parent;
+    result->src[3] = x;
+    result->src[4] = state_dst;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
