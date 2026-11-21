@@ -2320,6 +2320,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    // [GPU-RESIDENT-ROUND-2e] device layer-input rows follow the host output reorder through this map (batch row -> device row)
+    if (!layer_inp_dev.empty()) {
+        layer_inp_dev_row.resize(n_tokens_all);
+        for (int64_t i = 0; i < (int64_t) n_tokens_all; ++i) {
+            layer_inp_dev_row[i] = (int32_t) i;
+        }
+    }
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -2847,6 +2855,44 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
+bool llama_context::set_layer_inp_device(bool enable) {
+    if (!enable) {
+        layer_inp_dev.clear();
+        layer_inp_dev_buf.reset();
+        layer_inp_dev_ctx.reset();
+        return true;
+    }
+    ggml_backend_t be = nullptr;
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            be = b.get();
+            break;
+        }
+    }
+    if (!be) {
+        be = backend_cpu; // CPU-only runs keep the same code path (tests)
+    }
+    const uint32_t n_layers = (uint32_t) cparams.embeddings_layer_inp.size();
+    ggml_init_params ip = { (n_layers + 1)*ggml_tensor_overhead(), nullptr, true };
+    layer_inp_dev_ctx.reset(ggml_init(ip));
+    layer_inp_dev.assign(n_layers, nullptr);
+    const int64_t n_embd = model.hparams.n_embd;
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        if (cparams.embeddings_layer_inp[il]) {
+            layer_inp_dev[il] = ggml_new_tensor_2d(layer_inp_dev_ctx.get(), GGML_TYPE_F32, n_embd, cparams.n_batch);
+            ggml_format_name(layer_inp_dev[il], "layer_inp_dev_%u", il);
+        }
+    }
+    layer_inp_dev_buf.reset(ggml_backend_alloc_ctx_tensors(layer_inp_dev_ctx.get(), be));
+    if (!layer_inp_dev_buf) {
+        layer_inp_dev.clear();
+        return false;
+    }
+    fprintf(stderr, "llama_context: LLAMA_DEVICE_DFLASH_GATHER: device layer-input features ENABLED (on %s)\n", ggml_backend_name(be));
+    return true;
+}
+
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
@@ -2871,6 +2917,24 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+
+        // [GPU-RESIDENT-ROUND-2e] device copy into the persistent layer-input tensor (no D2H)
+        if (il < layer_inp_dev.size() && layer_inp_dev[il]) {
+            ggml_tensor * dst = layer_inp_dev[il];
+            GGML_ASSERT((int64_t) row_floats == dst->ne[0] && (int64_t) (token_offset + n_tokens) <= dst->ne[1]);
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * vctx = ggml_init(ip);
+            ggml_tensor * view = ggml_view_2d(vctx, dst, dst->ne[0], (int64_t) n_tokens, dst->nb[1], token_offset*dst->nb[1]);
+            ggml_backend_view_init(view);
+            ggml_tensor * src = t;
+            if (!ggml_is_contiguous(t) || ggml_nbytes(t) != ggml_nbytes(view)) {
+                GGML_ABORT("layer input tensor is not a contiguous [n_embd, n_tokens] block");
+            }
+            ggml_backend_tensor_copy_async(backend, backend, src, view);
+            ggml_free(vctx);
+            continue;
+        }
+
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
 }
@@ -2915,6 +2979,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
+        }
+
+        if (i0 < layer_inp_dev_row.size() && i1 < layer_inp_dev_row.size()) {
+            std::swap(layer_inp_dev_row[i0], layer_inp_dev_row[i1]);
         }
 
         if (embd_layer_inp.size() > 0) {
@@ -4561,6 +4629,23 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_set_layer_inp_device(llama_context * ctx, bool enable) {
+    return ctx->set_layer_inp_device(enable);
+}
+
+const int32_t * llama_get_layer_inp_device_rows(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_layer_inp_device_rows();
+}
+
+ggml_tensor * llama_get_layer_inp_device(const llama_context * ctx, uint32_t lid) {
+    return ctx->get_layer_inp_device(lid);
+}
+
+void llama_set_dflash_gather(llama_context * ctx, ggml_tensor * const * feats, int32_t n_feats, const int32_t * rows, int32_t n_rows) {
+    ctx->set_dflash_gather(feats, n_feats, rows, n_rows);
 }
 
 bool llama_dflash_feed_enabled(const llama_context * ctx) {

@@ -332,8 +332,29 @@ private:
     // [GPU-RESIDENT-ROUND-2c] owner of cparams.dflash_feed
     ggml_context_ptr          dflash_feed_ctx;
     ggml_backend_buffer_ptr   dflash_feed_buf;
+
+    // [GPU-RESIDENT-ROUND-2e] target side: device copies of the extracted layer inputs [n_embd, n_batch] (index = layer id)
+    std::vector<ggml_tensor *> layer_inp_dev;
+    std::vector<int32_t>       layer_inp_dev_row;
+    ggml_context_ptr           layer_inp_dev_ctx;
+    ggml_backend_buffer_ptr    layer_inp_dev_buf;
+    // drafter side: gather inputs (cparams.dgather points here)
+    llama_dgather_inputs       dgather_inputs;
 public:
     bool dflash_feed_enabled() const { return cparams.dflash_feed != nullptr; }
+    bool set_layer_inp_device(bool enable);
+    const int32_t * get_layer_inp_device_rows() {
+        output_reorder();
+        return layer_inp_dev_row.empty() ? nullptr : layer_inp_dev_row.data();
+    }
+    ggml_tensor * get_layer_inp_device(uint32_t lid) const {
+        return lid < layer_inp_dev.size() ? layer_inp_dev[lid] : nullptr;
+    }
+    void set_dflash_gather(ggml_tensor * const * feats, int32_t n_feats, const int32_t * rows, int32_t n_rows) {
+        dgather_inputs.feats.assign(feats, feats + (feats ? n_feats : 0));
+        dgather_inputs.rows.assign(rows, rows + (rows ? n_rows : 0));
+        cparams.dgather = dgather_inputs.feats.empty() ? nullptr : &dgather_inputs;
+    }
     void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
         dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
         dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));

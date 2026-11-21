@@ -186,6 +186,19 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // the batch embd rows
 LLAMA_API bool llama_dflash_feed_enabled(const struct llama_context * ctx);
 
+// [GPU-RESIDENT-ROUND-2e] device target->drafter feature gather (LLAMA_DEVICE_DFLASH_GATHER=1 in common/speculative).
+// Target context: keep the extracted layer inputs (llama_set_embeddings_layer_inp) as device tensors [n_embd, n_batch]
+// instead of downloading them; returns false when no device backend exists. llama_get_embeddings_layer_inp is then
+// unavailable for those layers; llama_get_layer_inp_device returns the tensor (valid until the context is freed).
+LLAMA_API bool                 llama_set_layer_inp_device(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_get_layer_inp_device(const struct llama_context * ctx, uint32_t lid);
+// device row of each batch row of the last decode (applies the pending output reorder, like the host buffers)
+LLAMA_API const int32_t *      llama_get_layer_inp_device_rows(struct llama_context * ctx);
+// Drafter context (with the device feed): the next llama_encode reads its features as rows `rows` of `feats`
+// (concatenated in order) instead of the batch embd rows; n_feats == 0 restores the batch path.
+LLAMA_API void llama_set_dflash_gather(struct llama_context * ctx, struct ggml_tensor * const * feats, int32_t n_feats,
+                                       const int32_t * rows, int32_t n_rows);
+
 LLAMA_API void llama_set_dflash_select(struct llama_context * ctx, const float * inv_temp, int32_t n_blocks,
                                        const float * noise, int32_t n_noise);
 

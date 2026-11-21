@@ -681,8 +681,46 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
     };
 }
 
+// [GPU-RESIDENT-ROUND-2e] encoder features gathered on the device from the target context's layer-input tensors
+class llm_graph_input_dgather : public llm_graph_input_i {
+public:
+    llm_graph_input_dgather(const llama_dgather_inputs * src, std::vector<ggml_tensor *> feats) : src(src), feats(std::move(feats)) {}
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(src && (int64_t) src->rows.size() == (int64_t) ubatch->n_tokens);
+        ggml_backend_tensor_set(rows, src->rows.data(), 0, ggml_nbytes(rows));
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * g = params.cparams.dgather;
+        return g && g->feats == feats && rows->ne[0] == (int64_t) params.ubatch.n_tokens;
+    }
+    ggml_tensor * rows = nullptr; // I32 [n_tokens]
+    const llama_dgather_inputs * src;
+    std::vector<ggml_tensor *> feats;
+};
+
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
+    if (cparams.dgather && !cparams.dgather->feats.empty() && (int64_t) cparams.dgather->rows.size() == n_tokens) {
+        auto inp = std::make_unique<llm_graph_input_dgather>(cparams.dgather, cparams.dgather->feats);
+        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->rows);
+        ggml_set_name(inp->rows, "dflash_dgather_rows");
+        ggml_tensor * cur = nullptr;
+        for (ggml_tensor * f : cparams.dgather->feats) {
+            ggml_tensor * g = ggml_get_rows(ctx0, f, inp->rows); // [n_embd_tgt, n_tokens]
+            cur = cur ? ggml_concat(ctx0, cur, g, 0) : g;
+        }
+        GGML_ASSERT(cur->ne[0] == (int64_t) hparams.n_embd_inp_enc());
+        cb(cur, "inp_embd", -1);
+        res->add_input(std::move(inp));
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "dflash: LLAMA_DEVICE_DFLASH_GATHER: device target feature gather ENABLED (%zu layers)\n", cparams.dgather->feats.size());
+        }
+        return cur;
+    }
+
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
 
     inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);

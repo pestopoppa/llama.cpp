@@ -81,10 +81,20 @@ struct llama_cparams {
     // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1: persistent device tensor [n_embd, n_ubatch] the DFlash encoder
     // writes and the KV-injection decode reads, so the fused target features never round-trip through the host
     struct ggml_tensor * dflash_feed = nullptr;
+
+    // [GPU-RESIDENT-ROUND-2e] device target->drafter feature gather (owned by the drafter context)
+    struct llama_dgather_inputs * dgather = nullptr;
 };
 
 // [GPU-RESIDENT-ROUND-2d] per decode: inverse temperature per draft block (1 = greedy) and Gumbel noise
 // [top_k, block_tokens, n_blocks] (0 = greedy); empty vectors mean greedy for every block
+// [GPU-RESIDENT-ROUND-2e] the target context's device layer-input tensors (one per DFlash target layer, in feature
+// order) and the target batch rows of the next encoder chunk
+struct llama_dgather_inputs {
+    std::vector<struct ggml_tensor *> feats;
+    std::vector<int32_t>              rows;
+};
+
 struct llama_dsel_inputs {
     std::vector<float> inv_temp;
     std::vector<float> noise;

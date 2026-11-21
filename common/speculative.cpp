@@ -1344,6 +1344,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1: the drafter selects the path on the device (Gumbel-max with
     // host Philox noise); the host reads compact [token | ids | probs] rows instead of the lattice
     bool dev_lattice = false;
+    bool dev_gather  = false; // [GPU-RESIDENT-ROUND-2e] LLAMA_DEVICE_DFLASH_GATHER=1 (needs the device feed)
+    bool dev_gather_init = false;
+    std::vector<ggml_tensor *> gather_feats;
+    std::vector<int32_t>       gather_rows;
     bool dev_feed    = false; // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1 (not for LiLiCorr / DSpark)
     std::vector<uint64_t> dsel_key;   // per seq, from the request seed
     std::vector<uint64_t> dsel_ctr;   // per seq, draft counter
@@ -1537,6 +1541,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 and LiLiCorr read their lattice from h_nextn and never consume raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
 
+        // [GPU-RESIDENT-ROUND-2e] device feature gather: the target's layer inputs stay on the device from the FIRST decode
+        // (prompt included) and the drafter encoder gathers them; needs the drafter's device feed (2c)
+        {
+            const char * e = getenv("LLAMA_DEVICE_DFLASH_GATHER");
+            bool ok = e != nullptr && strcmp(e, "1") == 0 && ctx_dft && llama_dflash_feed_enabled(ctx_dft) && !is_lilicorr && !is_dspark;
+            for (uint32_t k = 0; ok && k < target_layer_ids_n; ++k) {
+                ok = target_layer_ids[k] < n_layer_tgt; // the final hidden state (h_nextn) is not covered
+            }
+            if (ok && llama_set_layer_inp_device(ctx_tgt, true)) {
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    gather_feats.push_back(llama_get_layer_inp_device(ctx_tgt, (uint32_t) target_layer_ids[k]));
+                    ok = ok && gather_feats.back() != nullptr;
+                }
+                if (!ok) {
+                    llama_set_layer_inp_device(ctx_tgt, false);
+                    gather_feats.clear();
+                }
+                dev_gather = ok;
+            }
+        }
+
         // Generic DFlash uses a non-causal noise block; Laguna is trained causal.
         bool causal = false;
         {
@@ -1610,6 +1635,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // [GPU-RESIDENT-ROUND-2c] the drafter context decides (it owns the device feed)
         dev_feed = llama_dflash_feed_enabled(ctx_dft);
+
+        if (dev_gather) {
+            llama_synchronize(ctx_tgt); // the device copies run on the target context's stream
+        }
         GGML_ASSERT(!(dev_feed && (is_lilicorr || is_dspark)) && "LLAMA_DEVICE_DFLASH_FEED is DFlash / DFlash2 only");
 
         // [AK-DTREE-2] per-seq batch rows in order: in a single-tree-batch verify the accepted path's rows need not be
@@ -1634,6 +1663,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                if (dev_gather) {
+                    // [GPU-RESIDENT-ROUND-2e] the encoder gathers rows of the target's device layer inputs; features_buf is
+                    // only the (unread) embd payload the encode batch must carry. No sanitize of non-finite values here.
+                    const int32_t * dev_row = llama_get_layer_inp_device_rows(ctx_tgt);
+                    GGML_ASSERT(dev_row && "device layer-input row map missing");
+                    gather_rows.resize(n_chunk);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        gather_rows[i] = dev_row[rows[offset + i]];
+                    }
+                    llama_set_dflash_gather(ctx_dft, gather_feats.data(), (int32_t) gather_feats.size(), gather_rows.data(), n_chunk);
+                } else
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const int32_t target_layer_id = target_layer_ids[k];
                     const float * layer = target_layer_id == n_layer_tgt
@@ -1655,6 +1695,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // backend/model failure.
                 size_t n_bad = 0;
                 for (auto & value : features_buf) {
+                    if (dev_gather) {
+                        break;
+                    }
                     if (!std::isfinite(value)) {
                         value = value != value ? 0.0f : (value > 0.0f ? 65504.0f : -65504.0f);
                         ++n_bad;
