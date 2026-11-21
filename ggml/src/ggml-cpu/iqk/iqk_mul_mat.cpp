@@ -76,6 +76,36 @@ static inline bool iqk_dequant_enabled() {
     return f != 0;
 }
 
+
+// GGML_IQK_PREFETCH_NTA=<bytes> (CPU-NT-WEIGHT-STREAM, default 0 = off): before each 64-row weight tile is
+// multiplied, issue prefetchnta for the first <bytes> bytes of every row of the NEXT tile, so single-use weight
+// lines are brought in with the non-temporal hint (minimal L3 allocation) instead of displacing KV/state/activations.
+// Loads only: the kernels, their instruction sequence and every output value are unchanged.
+static inline int iqk_prefetch_nta_bytes() {
+    static int v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_IQK_PREFETCH_NTA");
+        int x = s ? atoi(s) : 0;
+        v = x > 0 ? x : 0;
+        if (v > 0) fprintf(stderr, "GGML_IQK_PREFETCH_NTA: %d bytes per row, next 64-row tile\n", v);
+    }
+    return v;
+}
+static inline void iqk_prefetch_nta_tile(const void * vx, size_t bx, int ix0, int nrc_x, int k_x_step) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const int dist = iqk_prefetch_nta_bytes();
+    if (!dist || ix0 >= nrc_x) return;
+    const int ix1 = std::min(nrc_x, ix0 + k_x_step);
+    const int nb = (int) std::min<size_t>((size_t) dist, bx);
+    for (int ix = ix0; ix < ix1; ++ix) {
+        const char * row = (const char *) vx + (size_t) ix * bx;
+        for (int off = 0; off < nb; off += 64) _mm_prefetch(row + off, _MM_HINT_NTA);
+    }
+#else
+    (void) vx; (void) bx; (void) ix0; (void) nrc_x; (void) k_x_step;
+#endif
+}
+
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
@@ -91,6 +121,7 @@ struct MulMat {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                iqk_prefetch_nta_tile(vx, bx, ix + k_x_step, nrc_x, k_x_step);
                 for (int iy = 0; iy < n_y; ++iy) {
                     funcs[0](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
                     this_info.cur_y += 1;
@@ -105,6 +136,7 @@ struct MulMat {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                iqk_prefetch_nta_tile(vx, bx, ix + k_x_step, nrc_x, k_x_step);
                 for (int iy = 0; iy < n_step; ++iy) {
                     func16(n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
                     this_info.cur_y += 16;
@@ -128,6 +160,7 @@ struct MulMat {
                     auto this_info = info;
                     this_info.s += ix;
                     int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                    iqk_prefetch_nta_tile(vx, bx, ix + k_x_step, nrc_x, k_x_step);
                     for (int iy = 0; iy < my1; ++iy) {
                         funcs[ny1-1](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
                         this_info.cur_y += ny1;
@@ -144,6 +177,7 @@ struct MulMat {
                     auto this_info = info;
                     this_info.s += ix;
                     int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                    iqk_prefetch_nta_tile(vx, bx, ix + k_x_step, nrc_x, k_x_step);
                     for (int iy = 0; iy < n_step; ++iy) {
                         funcs[ny-1](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
                         this_info.cur_y += ny;
@@ -154,7 +188,19 @@ struct MulMat {
         }
         n_left = nrc_y - info.cur_y;
         if (n_left > 0) {
-            funcs[n_left-1](n, vx, bx, info, nrc_x);
+            if (iqk_prefetch_nta_bytes() > 0) {
+                // knob on: same kernel per row, walked in 64-row tiles so the next tile can be NTA-prefetched
+                // (rows are independent, so per-row outputs equal the single call's)
+                for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                    auto this_info = info;
+                    this_info.s += ix;
+                    int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                    iqk_prefetch_nta_tile(vx, bx, ix + k_x_step, nrc_x, k_x_step);
+                    funcs[n_left-1](n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                }
+            } else {
+                funcs[n_left-1](n, vx, bx, info, nrc_x);
+            }
         }
     }
     inline static void gelu(int n, const float * src, float * dst);
@@ -212,6 +258,8 @@ struct MulMat {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                iqk_prefetch_nta_tile(vx_gate, bx, ix + k_x_step, nrc_x, k_x_step);
+                iqk_prefetch_nta_tile(vx_up, bx, ix + k_x_step, nrc_x, k_x_step);
                 for (int iy = 0; iy < n_y; ++iy) {
                     process(funcs[0], this_info, ix, this_nrc_x, 1);
                     this_info.cur_y += 1;
@@ -226,6 +274,8 @@ struct MulMat {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                iqk_prefetch_nta_tile(vx_gate, bx, ix + k_x_step, nrc_x, k_x_step);
+                iqk_prefetch_nta_tile(vx_up, bx, ix + k_x_step, nrc_x, k_x_step);
                 for (int iy = 0; iy < n_step; ++iy) {
                     process(func16, this_info, ix, this_nrc_x, 16);
                     this_info.cur_y += 16;
@@ -249,6 +299,8 @@ struct MulMat {
                     auto this_info = info;
                     this_info.s += ix;
                     int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                    iqk_prefetch_nta_tile(vx_gate, bx, ix + k_x_step, nrc_x, k_x_step);
+                    iqk_prefetch_nta_tile(vx_up, bx, ix + k_x_step, nrc_x, k_x_step);
                     for (int iy = 0; iy < my1; ++iy) {
                         process(funcs[ny1-1], this_info, ix, this_nrc_x, ny1);
                         this_info.cur_y += ny1;
@@ -265,6 +317,8 @@ struct MulMat {
                     auto this_info = info;
                     this_info.s += ix;
                     int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                    iqk_prefetch_nta_tile(vx_gate, bx, ix + k_x_step, nrc_x, k_x_step);
+                    iqk_prefetch_nta_tile(vx_up, bx, ix + k_x_step, nrc_x, k_x_step);
                     for (int iy = 0; iy < n_step; ++iy) {
                         process(funcs[ny-1], this_info, ix, this_nrc_x, ny);
                         this_info.cur_y += ny;
@@ -279,6 +333,8 @@ struct MulMat {
                 auto this_info = info;
                 this_info.s += ix;
                 int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                iqk_prefetch_nta_tile(vx_gate, bx, ix + k_x_step, nrc_x, k_x_step);
+                iqk_prefetch_nta_tile(vx_up, bx, ix + k_x_step, nrc_x, k_x_step);
                 process(funcs[n_left-1], this_info, ix, this_nrc_x, n_left);
             }
         }
