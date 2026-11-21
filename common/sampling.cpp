@@ -838,7 +838,12 @@ static llama_token device_argmax_pick(const common_params_sampling & p, llama_co
 llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
     static const bool dev_accept = [] {
         const char * e = getenv("LLAMA_DEVICE_ACCEPT");
-        return e != nullptr && e[0] == '1';
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) {
+            // build witness for the fix-1 eligibility rule (ban-only logit bias keeps the device row)
+            fprintf(stderr, "llama_device_accept: greedy sample eligible with ban-only logit bias (fix1)\n");
+        }
+        return on;
     }();
     if (dev_accept && gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr) {
         llama_synchronize(ctx);
