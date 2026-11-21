@@ -3,6 +3,7 @@
 #include "topk-moe.cuh"
 #include "topk-moe-asm-gfx90a.cuh"
 
+#include <climits>
 #include <cmath>
 #include <initializer_list>
 
@@ -177,17 +178,25 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     }
 
     ggml_cuda_pdl_lc();
+    // AK-ASM-H11-UNIQ: selection order is (value desc, expert index asc), the CPU argsort rule, and an expert is
+    // excluded by a per-thread taken bit, not by overwriting its value with -INFINITY. The old sentinel scheme let a
+    // round re-pick an already-selected expert when the remaining candidates compared equal to the sentinel, and wrote
+    // the mark through a dynamically indexed private array; both are gone. A thread with no untaken candidate offers
+    // (-INFINITY, INT_MAX), which loses every compare, so the k ids are distinct on every row (ties, -inf, NaN).
+    static_assert(experts_per_thread <= 32, "taken mask is 32 bits");
+    uint32_t taken = 0;
     for (int k = 0; k < n_expert_used; k++) {
-        float max_val    = wt[0];
-        int   max_expert = threadIdx.x;
+        float max_val    = -INFINITY;
+        int   max_expert = INT_MAX;
 
         if constexpr (has_bias) {
-            float max_val_s = selection_wt[0];
+            float max_val_s = -INFINITY;
 
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
+            for (int i = 0; i < experts_per_thread; i++) {
                 const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && !((taken >> i) & 1u) &&
+                    (max_expert == INT_MAX || selection_wt[i] > max_val_s)) {
                     max_val    = wt[i];
                     max_val_s  = selection_wt[i];
                     max_expert = expert;
@@ -205,15 +214,12 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                     max_expert = expert;
                 }
             }
-
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
         } else {
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
+            for (int i = 0; i < experts_per_thread; i++) {
                 const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && !((taken >> i) & 1u) &&
+                    (max_expert == INT_MAX || wt[i] > max_val)) {
                     max_val    = wt[i];
                     max_expert = expert;
                 }
@@ -228,10 +234,10 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                     max_expert = expert;
                 }
             }
+        }
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
+        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+            taken |= 1u << (max_expert / WARP_SIZE);
         }
 
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
