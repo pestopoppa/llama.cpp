@@ -1449,6 +1449,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // C17-FIX-LAZY: a deferred logits download must complete BEFORE this ubatch's graph is reset/rebuilt
+    // (graph_compute's flush runs after the rebuild, when the tensor may already belong to the new graph)
+    if (logits_lazy_t != nullptr) {
+        synchronize();
+        logits_lazy_flush();
+    }
     if (getenv("GGML_FUSED_DUMP_GLAYERS") != NULL && ubatch.token != nullptr && ubatch.n_tokens == 1) {
         fprintf(stderr, "process_ubatch: ubatch.token[0]=%d (0x%x) pos=%lld n_tokens=%lld\n",
                 ubatch.token[0], (unsigned) ubatch.token[0], (long long) ubatch.pos[0], (long long) ubatch.n_tokens);
@@ -2398,9 +2404,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            // AK-GAP-1-SAMPLE: single-ubatch decode with valid device argmax -> defer the download
+            // AK-GAP-1-SAMPLE: single-ubatch decode with valid device argmax -> defer the download.
+            // C17-FIX-LAZY: "all outputs in this ubatch" is NOT "single ubatch" (multi-seq split_equal / multi-slot
+            // server batches put every output in the first ubatch and run more ubatches after it, whose graph
+            // rebuild leaves logits_lazy_t pointing at a tensor that no longer has n_outputs rows -> OOB read).
+            // Lazy only when this ubatch is the whole batch, i.e. the LAST (and only) ubatch of the decode.
+            const bool last_ubatch = n_tokens_prev == 0 && (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all;
             const bool lazy = llama_device_accept_enabled() && argmax_valid && res->t_argmax != nullptr &&
-                              n_outputs_prev == 0 && n_outputs == n_outputs_all;
+                              n_outputs_prev == 0 && n_outputs == n_outputs_all && last_ubatch;
             if (lazy) {
                 logits_lazy_t       = t_logits;
                 logits_lazy_backend = backend_res;

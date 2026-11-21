@@ -183,6 +183,7 @@ llama_build(test-recurrent-rollback-guards.cpp get-model.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build(test-device-accept.cpp)
+llama_build(test-device-accept-multiseq.cpp)
 llama_build_and_test(test-mmap-evict.cpp LABEL "main")
 target_include_directories(test-mmap-evict PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
