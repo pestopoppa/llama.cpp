@@ -123,7 +123,13 @@ llama_context::llama_context(
         const char * env = getenv("LLAMA_RS_REPLAY");
         const bool supported = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT ||
                                model.arch == LLM_ARCH_QWEN4EXP; // [RS-REPLAY] fork: the KDA/Clover archs of the PR are not in this tree
-        cparams.rs_replay = env && atoi(env) != 0 && supported;
+        // [RS-REPLAY-AUTO] LLAMA_RS_REPLAY: unset/0 = off (snapshots); 1 = auto, on only when the context serves more than one
+        // sequence slot (n_seq_max > 1: RS-REPLAY-GATE-R4 measured ms/round 0.931 at np4 but 1.024 at np1); 2 = force on.
+        const int mode = env ? atoi(env) : 0;
+        cparams.rs_replay = supported && (mode >= 2 || (mode == 1 && cparams.n_seq_max > 1));
+        if (mode == 1 && supported && !cparams.rs_replay) {
+            LLAMA_LOG_INFO("%s: LLAMA_RS_REPLAY=1 (auto): n_seq_max = 1, using snapshots (LLAMA_RS_REPLAY=2 forces replay)\n", __func__);
+        }
         if (cparams.rs_replay && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.arch == LLM_ARCH_QWEN3NEXT) {
             // its conv channels split in two segments, which the channels-first replay conv history cannot keep
             LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY is not supported for qwen3next with SPLIT_MODE_TENSOR, using snapshots\n", __func__);
