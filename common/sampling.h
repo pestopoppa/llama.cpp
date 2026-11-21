@@ -132,6 +132,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 //
 // n_fast / n_fallback (optional) are incremented by the number of rows taken by the fast path and
 // by the chain respectively.
+// AK-GAP-1-SAMPLE: plain-decode sample for the target context. With LLAMA_DEVICE_ACCEPT=1 and a provably
+// greedy sampler (no grammar, reasoning budget, logit bias or n_probs) it returns the device argmax row
+// without touching logits; otherwise it is common_sampler_sample. Candidates are not populated on the
+// device path, so callers must not read them (n_probs == 0 guarantees the server does not).
+llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
+
 std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,

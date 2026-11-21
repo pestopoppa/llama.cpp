@@ -810,6 +810,27 @@ static bool greedy_fast_params_ok(const common_params_sampling & p) {
     return has_temp && has_top_k;
 }
 
+llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    static const bool dev_accept = [] {
+        const char * e = getenv("LLAMA_DEVICE_ACCEPT");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (dev_accept && gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr && gsmpl->params.logit_bias.empty() &&
+            greedy_fast_params_ok(gsmpl->params)) {
+        llama_synchronize(ctx);
+        if (llama_get_sampled_token_ith (ctx, idx) == LLAMA_TOKEN_NULL &&
+            llama_get_sampled_probs_ith (ctx, idx) == nullptr &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+            const auto tm = gsmpl->tm();
+            const llama_token dam = llama_get_argmax_ith(ctx, idx);
+            if (dam != LLAMA_TOKEN_NULL) {
+                return dam;
+            }
+        }
+    }
+    return common_sampler_sample(gsmpl, ctx, idx, false);
+}
+
 llama_token common_sampler_greedy_fast_select(const struct common_params_sampling & params, const float * logits, int32_t n_vocab) {
     if (logits == nullptr || n_vocab <= 0 || !greedy_fast_params_ok(params)) {
         return LLAMA_TOKEN_NULL;
