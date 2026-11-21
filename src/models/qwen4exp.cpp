@@ -2,6 +2,8 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp-svd.h"
+#include "llama-mtp-svd-ops.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -583,7 +585,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    // DRAFT-HEAD-SVD-CPU: LLAMA_MTP_DRAFT_HEAD_SVD=<factors> swaps the full draft head for a rank-r pre-score plus exact
+    // logits on the top-C rows (-inf elsewhere). Draft graph only; the trunk head (graph above) is untouched.
+    const llama_mtp_svd * svd = (head_s == nullptr && cur->ne[1] >= 1 && cur->ne[1] <= 4) ? llama_mtp_svd_get(head_w) : nullptr;
+    if (svd) {
+        cur = mtp_svd::build_head(ctx0, head_w, cur, svd->v, svd->a, svd->C);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
