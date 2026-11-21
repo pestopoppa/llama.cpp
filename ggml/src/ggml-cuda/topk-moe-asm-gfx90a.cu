@@ -171,7 +171,7 @@ uint64_t ggml_cuda_topk_moe_asm_gfx90a_n_calls() {
 // AK-ASM-H11-UNIQ-FIX: the asm picks by value equality with the row max (ff1 over v_cmp_eq), so a NaN row (all -inf
 // logits -> softmax NaN) matches no lane and every round falls through to the last index (ids 127,127,... / 255 x 8).
 // The code objects cannot take a compare fix, so this pass enforces the HIP kernel's contract on the asm output: k
-// distinct ids in [0, n_expert). A row that already satisfies it (every finite row) is copied unchanged; in a bad row
+// distinct ids in [0, n_expert) for more than one row. A row that already satisfies it (every finite row) is copied unchanged; in a bad row
 // the first occurrence of each valid id is kept and every duplicate / out-of-range slot takes the lowest unused index
 // in ascending order (the CPU argsort order for an all-tie row). One thread per row; it replaces the strided D2D copy
 // for more rows, so it adds no launch there.
@@ -299,8 +299,11 @@ bool ggml_cuda_topk_moe_asm_gfx90a_try(ggml_backend_cuda_context & ctx,
         (void) hipGetLastError();
         return false; // nothing written yet
     }
-    {
-        // unique-id pass (see topk_asm_unique_ids): scratch -> strided ids rows, or in place for one row
+    if (n_rows > 1) {
+        // unique-id pass (see topk_asm_unique_ids): scratch -> strided ids rows, in place of the strided D2D copy.
+        // One row (decode) is left to the asm alone: an extra launch there cost 3.3% A3B decode (row
+        // ak-h11-uniqfix-gpu-20261121-r3, ratio 0.967), and the only one-row failure is an all-NaN router row, which
+        // means the model state is already NaN. Kept as a documented gap; GGML_HIP_TOPK_ASM=0 closes it.
         const int threads = 64;
         topk_asm_unique_ids<<<(unsigned) ((n_rows + threads - 1) / threads), threads, 0, stream>>>(
             ids_out, k, (int32_t *) ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)), (int) n_rows, k, (int) n_expert);
