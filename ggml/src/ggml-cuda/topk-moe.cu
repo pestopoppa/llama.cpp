@@ -3,6 +3,7 @@
 #include "topk-moe.cuh"
 #include "topk-moe-asm-gfx90a.cuh"
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <initializer_list>
@@ -13,6 +14,7 @@ struct topk_moe_config {
     bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
+    bool sync_rows;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -99,8 +101,9 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                                                                   const float           clamp_val,
                                                                   const float           scale_val,
                                                                   const topk_moe_config config) {
-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= n_rows) {
+    const int  row    = blockIdx.x * blockDim.y + threadIdx.y;
+    const bool row_ok = row < n_rows;
+    if (!row_ok && !config.sync_rows) {
         return;
     }
 
@@ -122,7 +125,16 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 #pragma unroll
     for (int i = 0; i < n_experts; i += WARP_SIZE) {
         const int expert  = i + threadIdx.x;
-        wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+        wt[i / WARP_SIZE] = row_ok && (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+    }
+
+    // AK-GAP2-TOPK-MOE-MR: every row of the (single) block has been read before any row is written, so ids/weights
+    // may alias the logits buffer (the allocator reuses it for multi-row MTP/DFlash verify batches).
+    if (config.sync_rows) {
+        __syncthreads();
+        if (!row_ok) {
+            return;
+        }
     }
 
     if (!config.delayed_softmax) {
@@ -290,6 +302,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
     const int    rows_per_block = 4;
+    GGML_ASSERT(!config.sync_rows || n_rows <= rows_per_block);
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();
@@ -364,7 +377,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     // AK-ASM-H11: gfx90a AITER topksoftmax asm fast path (topk-moe-asm-gfx90a.cu). Returns false without enqueuing
     // anything for every case it does not cover; the existing kernel below then runs unchanged.
-    if (ggml_cuda_topk_moe_asm_gfx90a_try(ctx, logits, weights, ids, clamp, scale, bias, args)) {
+    if (!args.sync_rows && ggml_cuda_topk_moe_asm_gfx90a_try(ctx, logits, weights, ids, clamp, scale, bias, args)) {
         return;
     }
 
@@ -394,6 +407,13 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+    config.sync_rows         = args.sync_rows;
+    if (args.sync_rows) {
+        static std::atomic<int64_t> n_mr{0};
+        if (n_mr.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_topk_moe: GGML_HIP_TOPK_MOE_MULTIROW fused multi-row router ran (n_rows=%d)\n", n_rows);
+        }
+    }
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,

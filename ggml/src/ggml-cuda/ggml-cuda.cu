@@ -3561,6 +3561,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
+        // AK-GAP2-TOPK-MOE-MR (gap census 2: A3B-MTP verify batches of 2..4 rows never fused - the memory-range check
+        // only exempts 1 row - so softmax + k_argsort (3.5% of decode wall) + get_rows + norm ran unfused).
+        // GGML_HIP_TOPK_MOE_MULTIROW=1: for 2..4 rows run the fused kernel as ONE block with a read-before-write
+        // barrier (sync_rows), which makes output/logits aliasing safe, and skip the range check. Default off.
+        static const bool topk_moe_mr = [] {
+            const char * v = getenv("GGML_HIP_TOPK_MOE_MULTIROW");
+            return v != nullptr && atoi(v) != 0;
+        }();
+        const int64_t topk_moe_rows = ggml_nrows(cgraph->nodes[i]);
+        args.sync_rows = topk_moe_mr && topk_moe_rows >= 2 && topk_moe_rows <= 4;
         std::vector<ggml_op>    ops;
 
         if (can_fuse) {
@@ -3609,7 +3619,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        (args.sync_rows ||
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true))) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -3624,7 +3635,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        (args.sync_rows ||
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true))) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }

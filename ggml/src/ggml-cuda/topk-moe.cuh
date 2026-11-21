@@ -11,6 +11,7 @@ struct ggml_cuda_topk_moe_args {
     bool prob_bias{};
     bool norm{};
     bool scale{};
+    bool sync_rows{}; // AK-GAP2-TOPK-MOE-MR: one block, read-all-rows barrier before any write (outputs may alias logits)
 };
 
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,

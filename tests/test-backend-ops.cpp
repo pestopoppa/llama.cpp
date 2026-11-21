@@ -12643,6 +12643,13 @@ struct test_mul_mat_q8wv : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_Q8WV"; }
 };
+// AK-GAP2 (gap census 2) op labels, selected with -o so the A/B rows never change the standing corpora.
+// TOPK_MOE_MR: 2..4-row router batches (A3B-MTP verify), the GGML_HIP_TOPK_MOE_MULTIROW single-block fused path.
+struct test_topk_moe_mr : public test_topk_moe {
+    using test_topk_moe::test_topk_moe;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_MR"; }
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+};
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
@@ -14068,6 +14075,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));  // 27B ffn_down
         test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3000, n, 2112, {1, 1}, {1, 1}));   // nblk not page-aligned
     }
+    // AK-GAP2: gap census 2 levers (A/B by env knob; -o TOPK_MOE_MR / MUL_MAT_Q8WV / MUL_MAT_SHARED_Q81)
+    for (int64_t rows : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_topk_moe_mr({256, rows, 1, 1}, 8, true));                 // A3B router
+        test_cases.emplace_back(new test_topk_moe_mr({256, rows, 1, 1}, 8, false));
+        test_cases.emplace_back(new test_topk_moe_mr({128, rows, 1, 1}, 8, true, true));
+        test_cases.emplace_back(new test_topk_moe_mr({512, rows, 1, 1}, 10, true, false, GATING_FUNC_SIGMOID));
+        test_cases.emplace_back(new test_topk_moe_mr({32, rows, 1, 1}, 4, false, false, GATING_FUNC_SOFTMAX_WEIGHT));
+    }
     // AK-GAP-1-IDSORT: A3B-MTP drafter backend top_k(10) over n_vocab 248320 (GGML_HIP_TOPK_FAST multi-block path, k <= 16)
     for (int k : {1, 2, 10, 16}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
@@ -15032,6 +15047,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // AK-GAP2 op perf A/B (wv)
     test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 8, 17408, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_q8wv(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 8, 5120, {1, 1}, {1, 1}));
+    // AK-GAP2 op perf A/B (env knob on vs off): router 3 rows, 27B ffn_down M=8, shared-src1 trio n=3
+    test_cases.emplace_back(new test_topk_moe_mr({256, 3, 1, 1}, 8, true));
     // AK-GAP-1-IDSORT: A3B-MTP drafter top_k(10) over n_vocab; A/B GGML_HIP_TOPK_FAST=1 vs unset (radix select)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 10));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, 10));
