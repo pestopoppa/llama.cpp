@@ -15,8 +15,7 @@
 //     pool scratch [T, k] then one strided D2D copy into the argsort rows.
 //
 // Env:
-//   GGML_HIP_TOPK_ASM=1       enable the fast path (default OFF since AK-ASM-H11-UNIQ-FIX: the asm masks a picked
-//                             slot with 0.0 and emits duplicate ids on tie / zero-probability rows)
+//   GGML_HIP_TOPK_ASM=0       disable the fast path at run time (default: enabled when compiled in)
 //   GGML_HIP_TOPK_ASM_LOG=1   log every fast-path call (default: one line at first use, one per new reject reason)
 //
 // Graph capture: hipModuleLaunchKernel is captured and replayed correctly on ROCm 6.2 (AK-ASM-T0). Code objects are
@@ -89,7 +88,7 @@ bool topk_asm_env_flag(const char * name, bool def) {
 }
 
 bool topk_asm_enabled() {
-    static const bool v = topk_asm_env_flag("GGML_HIP_TOPK_ASM", false);
+    static const bool v = topk_asm_env_flag("GGML_HIP_TOPK_ASM", true);
     return v;
 }
 
