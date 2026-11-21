@@ -1823,7 +1823,8 @@ private:
         {
             const char * env = getenv("LLAMA_SNAPSLOT_CKPT");
             const bool want = env != nullptr && atoi(env) != 0;
-            bool spec_ok = !params_base.speculative.has_dft();
+            // a -md file is allowed only as an MTP sidecar head (every type MTP or none): its ctx is the same MTP context type
+            bool spec_ok = true;
             for (const auto t : params_base.speculative.types) {
                 spec_ok = spec_ok && (t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
             }
