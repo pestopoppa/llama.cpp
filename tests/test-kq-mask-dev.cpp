@@ -14,12 +14,14 @@
 
 #include "../src/llama-kq-mask-dev.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 static int g_fail = 0;
@@ -154,6 +156,8 @@ static void part1() {
 
 // ---------------------------------------------------------------- part 2
 
+static bool g_wrap = false; // KQMD_WRAP=1: small context, positions past the per-stream cells, prefix eviction
+
 static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) {
     // KQMD_KNOB selects the knob under test (default the device KQ mask; e.g. LLAMA_KV_RING for 2f phase 1)
     const char * kn = getenv("KQMD_KNOB") ? getenv("KQMD_KNOB") : "LLAMA_DEVICE_KQ_MASK";
@@ -162,10 +166,10 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
     } else {
         unsetenv(kn);
     }
-    const int n_seq = 4, n_draft = 7, n_rounds = 8;
+    const int n_seq = 4, n_draft = 7, n_rounds = g_wrap ? 90 : 8;
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx      = 2048;
+    cp.n_ctx      = g_wrap ? (getenv("KQMD_CTX") ? atoi(getenv("KQMD_CTX")) : 512) : 2048;   // wrap: few cells per stream
     cp.n_batch    = 512;
     cp.n_ubatch   = 512;
     cp.n_seq_max  = n_seq;
@@ -253,6 +257,9 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
             break;
         }
         grab(b.n_tokens);
+        if (g_wrap && r == n_rounds - 1) {
+            fprintf(stderr, "wrap: final positions %d %d %d %d (cells per stream = n_ctx / n_seq)\n", pos[0], pos[1], pos[2], pos[3]);
+        }
         for (int q = 0; q < n_seq; ++q) {
             // accept (r + q) % (n_draft + 1) draft tokens, roll back the rest when the memory allows it
             const int acc = (r + q) % (n_draft + 1);
@@ -260,8 +267,13 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
             if (llama_memory_seq_rm(mem, q, pos[q] + 1 + acc, -1)) {
                 keep = 1 + acc;
             }
-            last[q] = argmax(q*(n_draft + 1) + keep - 1);
+            // wrap mode feeds fixed tokens: an argmax feedback would let one near-tie flip diverge the whole trajectory
+            last[q] = g_wrap ? (llama_token) ((211 + 13*r + 7*q) % n_vocab) : argmax(q*(n_draft + 1) + keep - 1);
             pos[q] += keep;
+            if (g_wrap && pos[q] > 96) {
+                // evict the oldest tokens (keep the last 64 positions): frees ring cells so later positions wrap
+                llama_memory_seq_rm(mem, q, 0, pos[q] - 64);
+            }
         }
     }
     llama_batch_free(b);
@@ -278,6 +290,31 @@ static void part2(const char * path) {
         g_fail++;
         return;
     }
+    if (getenv("KQMD_XCMP")) {
+        // ground-truth check: unified first-fit (no ring) vs non-unified OFF / ON
+        const std::vector<float> ref = run_e2e(model, false, true);
+        const std::vector<float> off = run_e2e(model, false, false);
+        const std::vector<float> on  = run_e2e(model, true,  false);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        auto cmp = [&](const std::vector<float> & x, const char * name) -> std::pair<double, double> {
+            size_t rows = std::min(ref.size(), x.size()) / n_vocab, same = 0; double mr = 0;
+            for (size_t r = 0; r < rows; ++r) {
+                const float * a = ref.data() + r*n_vocab; const float * b = x.data() + r*n_vocab;
+                int ia = 0, ib = 0; float lo = a[0], hi = a[0]; double md = 0;
+                for (int v = 0; v < n_vocab; ++v) { if (a[v] > a[ia]) ia = v; if (b[v] > b[ib]) ib = v; lo = std::min(lo, a[v]); hi = std::max(hi, a[v]); md = std::max(md, (double) std::fabs(a[v]-b[v])); }
+                same += ia == ib; mr = std::max(mr, md / std::max(1e-6, (double) (hi - lo)));
+            }
+            printf("xcmp ref(unified) vs %s: argmax %zu / %zu, max rel diff %.2e\n", name, same, rows, mr);
+            return std::make_pair((double) same / std::max<size_t>(1, rows), mr);
+        };
+        const auto c_off = cmp(off, "non-unified OFF");
+        const auto c_on  = cmp(on, "non-unified ON");
+        // wrap gate: the ring layout must track the reference as well as the first-fit layout does
+        const bool ok = c_on.first >= c_off.first - 0.01 && c_on.second <= 1.10*c_off.second + 1e-3;
+        printf("xcmp gate (ON within OFF's distance to the unified reference): %s\n", ok ? "yes" : "NO");
+        g_fail += ok ? 0 : 1;
+        return;
+    }
     for (bool unified : { true, false }) {
         const std::vector<float> off = run_e2e(model, false, unified);
         const std::vector<float> on  = run_e2e(model, true,  unified);
@@ -285,8 +322,30 @@ static void part2(const char * path) {
             fprintf(stderr, "FAIL: knob never engaged (no ENABLED witness)\n");
             g_fail++;
         }
-        const bool ok = !off.empty() && off.size() == on.size() && memcmp(off.data(), on.data(), off.size()*sizeof(float)) == 0;
-        printf("part2 %s kv_unified=%d: %zu logits, ON == OFF bitwise: %s\n", path, (int) unified, off.size(), ok ? "yes" : "NO");
+        bool ok = !off.empty() && off.size() == on.size() && memcmp(off.data(), on.data(), off.size()*sizeof(float)) == 0;
+        if (g_wrap && !ok && !off.empty() && off.size() == on.size()) {
+            // after a wrap the ring may pick other cells than first-fit: same keys, other summation order. Judge by
+            // per-row argmax identity and max |diff| relative to the row's logit range.
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+            size_t rows = off.size() / n_vocab, same_argmax = 0;
+            double maxrel = 0;
+            for (size_t r = 0; r < rows; ++r) {
+                const float * a = off.data() + r*n_vocab; const float * b = on.data() + r*n_vocab;
+                int ia = 0, ib = 0; float lo = a[0], hi = a[0]; double md = 0;
+                for (int v = 0; v < n_vocab; ++v) {
+                    if (a[v] > a[ia]) ia = v;
+                    if (b[v] > b[ib]) ib = v;
+                    lo = std::min(lo, a[v]); hi = std::max(hi, a[v]);
+                    md = std::max(md, (double) std::fabs(a[v] - b[v]));
+                }
+                same_argmax += ia == ib;
+                maxrel = std::max(maxrel, md / std::max(1e-6, (double) (hi - lo)));
+            }
+            printf("part2-wrap %s kv_unified=%d: not bitwise; argmax identical %zu / %zu rows, max |diff| / row range %.2e\n",
+                   path, (int) unified, same_argmax, rows, maxrel);
+            ok = same_argmax == rows && maxrel < 1e-3;
+        }
+        printf("part2 %s kv_unified=%d%s: %zu logits, ON == OFF: %s\n", path, (int) unified, g_wrap ? " (wrap)" : "", off.size(), ok ? "yes" : "NO");
         g_fail += ok ? 0 : 1;
     }
     llama_model_free(model);
@@ -295,6 +354,7 @@ static void part2(const char * path) {
 int main() {
     ggml_backend_load_all();
     part1();
+    g_wrap = getenv("KQMD_WRAP") != nullptr;
     if (const char * m = getenv("KQMD_MODEL")) {
         llama_backend_init();
         llama_log_set(log_cb, nullptr);

@@ -1049,7 +1049,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     break;
                 }
                 const uint32_t c = (uint32_t) pos % size;
-                ok = cells.is_empty(c) && (!cont || i == 0 || c == res.idxs[s].back() + 1);
+                // usable like in the first-fit search: empty, or one sequence's token already outside its SWA window
+                bool usable = cells.is_empty(c);
+                if (!usable && cells.seq_count(c) == 1) {
+                    const llama_seq_id sc = cells.seq_get(c);
+                    usable = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(c), cells.seq_pos_max(sc) + 1);
+                }
+                ok = usable && (!cont || i == 0 || c == res.idxs[s].back() + 1);
                 res.idxs[s].push_back(c);
             }
             if (ok) {
