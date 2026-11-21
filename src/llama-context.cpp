@@ -539,6 +539,8 @@ llama_context::llama_context(
     }
 }
 
+static bool llama_device_accept_enabled(); // AK-GAP-1-SAMPLE, defined below
+
 llama_context::~llama_context() {
     if (llama_device_accept_enabled()) {
         fprintf(stderr, "llama_device_accept: lazy_skipped=%lld flushed=%lld\n",
