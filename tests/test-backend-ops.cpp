@@ -6315,9 +6315,11 @@ struct test_gdn_tree_cache : public test_case {
         const size_t row = ggml_row_size(GGML_TYPE_F32, D);
         ggml_tensor * dst = ggml_view_3d(ctx, cache, D, 1, n_tokens, cache->nb[1], (size_t) mem_size*row, (size_t) (mem_size - 1)*row);
         cpy = ggml_cpy(ctx, src, dst);
-        // one root that keeps both checked nodes alive, after the fused pair in graph order
+        // one root that keeps both checked nodes alive; the cpy branch is visited first so the cpy is the first
+        // non-view node after the gdn in graph order (the HIP fusion's match condition)
+        ggml_tensor * cpy_sum = ggml_sum(ctx, cpy);
         attn = ggml_scale(ctx, attn, 1.0f);
-        return ggml_add(ctx, ggml_sum(ctx, attn), ggml_sum(ctx, cpy));
+        return ggml_add(ctx, cpy_sum, ggml_sum(ctx, attn));
     }
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
