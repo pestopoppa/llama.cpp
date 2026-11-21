@@ -37,6 +37,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-mmap-evict.cpp
+            llama-mtp-svd.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
