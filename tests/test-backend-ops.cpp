@@ -14823,6 +14823,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 517, 2080, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 1023, 4128, {1, 1}, {1, 1}));
     }
+    // DTREE-A3B-MOE-ROOFLINE (opt-in, default corpus unchanged):
+    //   TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
+    // Qwen3.6-35B-A3B routed experts (256 experts, top-8, hidden 2048, expert ffn 512): ffn_gate_exps / ffn_up_exps
+    // (m=512, k=2048) and ffn_down_exps (m=2048, k=512), Q8_0, at 1..16 verify rows. Used to read achieved GB/s of the
+    // few-row expert GEMMs (the op's own byte count is all experts; the row scales it by the expected unique experts).
+    if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
