@@ -4416,8 +4416,10 @@ void llm_graph_context::build_pooling(
 // verification of a W-row draft tree reads W int32 ids instead of scanning W x n_vocab floats on the host.
 static bool llama_device_argmax_enabled() {
     static const bool v = [] {
+        // AK-GAP-1-SAMPLE: LLAMA_DEVICE_ACCEPT=1 (lazy logits download) needs the argmax rows, so it implies this
         const char * e = getenv("LLAMA_DEVICE_ARGMAX");
-        return e != nullptr && e[0] == '1';
+        const char * a = getenv("LLAMA_DEVICE_ACCEPT");
+        return (e != nullptr && e[0] == '1') || (a != nullptr && a[0] == '1');
     }();
     return v;
 }
