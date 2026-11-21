@@ -120,6 +120,11 @@ struct llama_memory_i {
         return false;
     }
 
+    // [KPF-64-SNAPSLOT-COPY] see llama_memory_seq_snap_begin / _end / llama_memory_set_state_write_pos_cap
+    virtual bool seq_snap_begin(llama_seq_id seq_id, uint32_t n_back) { (void) seq_id; (void) n_back; return false; }
+    virtual void seq_snap_end  (llama_seq_id seq_id) { (void) seq_id; }
+    virtual bool set_state_write_pos_cap(llama_pos cap) { (void) cap; return false; }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

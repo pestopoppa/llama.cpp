@@ -179,6 +179,7 @@ endif ()
 
 llama_build(test-multiseq-ubatch.cpp)
 llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build(test-snapslot-ckpt.cpp get-model.cpp) # KPF-64-SNAPSLOT-COPY
 llama_build(test-recurrent-rollback-guards.cpp get-model.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)

@@ -790,6 +790,27 @@ extern "C" {
             const int32_t * cols,
                    int32_t n_cols);
 
+    // [KPF-64-SNAPSLOT-COPY] expose the recurrent state n_back tokens before the end of seq_id, read from the
+    // per-token rollback snapshot slots of the last ubatch, so that a following PARTIAL_ONLY state write emits
+    // the state after (pos_max + 1 - n_back) tokens. Non-destructive: llama_memory_seq_snap_end() restores the
+    // live state. Refuses (returns false, no change) when the last ubatch of seq_id did not write slot n_back
+    // (fewer than n_back + 1 tokens of that seq in it), the cell is shared, a rollback is pending, or the
+    // memory has no rollback snapshots. Between begin and end, no decode may run.
+    LLAMA_API bool llama_memory_seq_snap_begin(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                   int32_t n_back);
+
+    LLAMA_API void llama_memory_seq_snap_end(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // [KPF-64-SNAPSLOT-COPY] attention KV caches only: the next state writes keep only cells with pos <= cap
+    // (cap < 0: all cells). Returns false (no change) when the memory does not support a cap.
+    LLAMA_API bool llama_memory_set_state_write_pos_cap(
+            llama_memory_t mem,
+                 llama_pos cap);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

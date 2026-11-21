@@ -505,6 +505,10 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // [KPF-64-SNAPSLOT-COPY] the n-4 prompt checkpoint is owed after the decode of the final prompt chunk:
+    // >= 0 holds the slot.prompt.n_tokens() the checkpoint must describe (N - 4); -1 = none owed
+    int64_t snap_ckpt_n_tokens = -1;
+
     // AK-DTREE-1 (--draft-tree-nodes, path-row tree verify after Infernix): alternative draft paths of this
     // round, each verified as its own target sequence spec_tree_seq0 + k in the same decode
     std::vector<llama_tokens> spec_tree_alts;
@@ -1382,6 +1386,15 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // [KPF-64-SNAPSLOT-COPY] LLAMA_SNAPSLOT_CKPT=1 (default off): take the n-4 prompt checkpoint from the GDN/conv
+    // rollback snapshot slot 4 of the final prompt ubatch instead of cutting the batch at n-4
+    bool snapslot_ckpt = false;
+    struct {
+        int64_t n_copied   = 0; // n-4 checkpoints taken from snapshot slot 4
+        int64_t n_refused  = 0; // owed but refused after the decode (guard failed) -> no n-4 checkpoint
+        int64_t n_cut_kept = 0; // final chunk too short for the copy -> classic n-4 cut kept
+    } snapslot_stats;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // INF-70 E2a
@@ -1801,6 +1814,27 @@ private:
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        // [KPF-64-SNAPSLOT-COPY] eligibility: recurrent rollback memory with >= 4 snapshot slots, no SWA, and a
+        // drafter whose checkpointed state can be taken after the final chunk: none, or MTP (its draft KV is a
+        // plain attention cache written with a pos cap of N-5, and it stashes no speculative state). Other
+        // drafters (EAGLE3/DFlash/DSpark boundary stash, draft model) keep the classic n-4 cut.
+        {
+            const char * env = getenv("LLAMA_SNAPSLOT_CKPT");
+            const bool want = env != nullptr && atoi(env) != 0;
+            bool spec_ok = !params_base.speculative.has_dft();
+            for (const auto t : params_base.speculative.types) {
+                spec_ok = spec_ok && (t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            }
+            spec_ok = spec_ok && (ctx_dft == nullptr || llama_memory_set_state_write_pos_cap(llama_get_memory(ctx_dft), -1));
+            snapslot_ckpt = want && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                            llama_n_rs_seq(ctx_tgt) >= 4 && n_swa == 0 && spec_ok && params_base.n_ctx_checkpoints > 0;
+            if (want) {
+                SRV_INF("KPF-64-SNAPSLOT-COPY: LLAMA_SNAPSLOT_CKPT=1 -> %s (seq_rm_type=%d n_rs_seq=%u n_swa=%d spec_ok=%d)\n",
+                        snapslot_ckpt ? "ENABLED (n-4 cut replaced by snapshot-slot copy)" : "REFUSED (classic n-4 cut)",
+                        (int) ctx_tgt_seq_rm_type, llama_n_rs_seq(ctx_tgt), n_swa, (int) spec_ok);
+            }
         }
 
         // GPU-ZOS-2: the gate reads this line (design section 8)
@@ -3375,6 +3409,49 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // [KPF-64-SNAPSLOT-COPY] the n-4 prompt checkpoint read from rollback snapshot slot 4 of the final prompt ubatch
+    // (called right after the decode of that ubatch, before any sampling decode). A refusal leaves no n-4
+    // checkpoint (the earlier ones stay valid); it never changes the live state.
+    void create_snapslot_checkpoint(server_slot & slot) {
+        const int64_t n_tokens_ck = slot.snap_ckpt_n_tokens;
+        slot.snap_ckpt_n_tokens = -1;
+
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        const auto pos_min = llama_memory_seq_pos_min(mem_tgt, slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(mem_tgt, slot.id);
+
+        // the memory must hold exactly the prompt (N tokens, positions 0..N-1 for a text prompt)
+        const bool shape_ok = pos_min >= 0 && n_tokens_ck + 4 == (int64_t) slot.prompt.n_tokens() && pos_max >= 4;
+        if (!shape_ok || !llama_memory_seq_snap_begin(mem_tgt, slot.id, 4)) {
+            snapslot_stats.n_refused++;
+            SLT_WRN(slot, "KPF-64-SNAPSLOT-COPY: refused (pos_min = %d, pos_max = %d, n_tokens = %d, want = %" PRId64 ") -> no n-4 checkpoint\n",
+                    pos_min, pos_max, slot.prompt.n_tokens(), n_tokens_ck);
+            return;
+        }
+        // the draft (MTP) KV is a plain attention cache: keep only what the cut path's checkpoint held (pos <= N-5)
+        llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+        if (mem_dft) {
+            llama_memory_set_state_write_pos_cap(mem_dft, pos_max - 4);
+        }
+        try {
+            // create_checkpoint() describes the state before the n_tokens_cur last tokens of slot.prompt
+            create_checkpoint(slot, 4, pos_min, pos_max - 4);
+        } catch (...) {
+            if (mem_dft) {
+                llama_memory_set_state_write_pos_cap(mem_dft, -1);
+            }
+            llama_memory_seq_snap_end(mem_tgt, slot.id);
+            throw;
+        }
+        if (mem_dft) {
+            llama_memory_set_state_write_pos_cap(mem_dft, -1);
+        }
+        llama_memory_seq_snap_end(mem_tgt, slot.id);
+        snapslot_stats.n_copied++;
+        SLT_INF(slot, "KPF-64-SNAPSLOT-COPY: n-4 checkpoint copied from snapshot slot 4 (n_tokens = %" PRId64 ", pos_max = %d; copied=%" PRId64 " refused=%" PRId64 " cut_kept=%" PRId64 ")\n",
+                n_tokens_ck, pos_max - 4, snapslot_stats.n_copied, snapslot_stats.n_refused, snapslot_stats.n_cut_kept);
     }
 
     // PFXC-A1: checkpoint the state at the end of a generation so the next request of a tool loop reuses the generated
@@ -5321,6 +5398,15 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                // [KPF-64-SNAPSLOT-COPY] no n-4 cut when the copy can take it: the final chunk then
+                                // holds >= 4 + 1 tokens of this slot (it would hold more than 4 anyway) -- a chunk
+                                // that would be shorter than K = n_rs_seq + 1 keeps the cut (snapshot slot 4 unwritten)
+                                if (offset == 4 && snapslot_ckpt) {
+                                    const int64_t n_final = slot.task->n_tokens() - (slot.prompt.n_tokens() - (int64_t) (batch.size() - n_tokens_prev));
+                                    if (n_final >= (int64_t) llama_n_rs_seq(ctx_tgt) + 1 && (int64_t) batch.size() + 4 <= (int64_t) n_prompt_limit) {
+                                        continue;
+                                    }
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -5376,6 +5462,16 @@ private:
                         slot.i_batch   = batch.size() - 1;
 
                         slot.init_sampler();
+
+                        // [KPF-64-SNAPSLOT-COPY] the n-4 cut was skipped: owe the n-4 checkpoint after this decode
+                        slot.snap_ckpt_n_tokens = -1;
+                        if (snapslot_ckpt && do_checkpoint && !has_mtmd) {
+                            if ((int64_t) n_tokens_cur >= (int64_t) llama_n_rs_seq(ctx_tgt) + 1) {
+                                slot.snap_ckpt_n_tokens = (int64_t) slot.prompt.n_tokens() - 4;
+                            } else {
+                                snapslot_stats.n_cut_kept++;
+                            }
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -5835,6 +5931,16 @@ private:
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
         }
+        }
+
+        // [KPF-64-SNAPSLOT-COPY] owed n-4 checkpoints, once the final prompt chunk of the slot is decoded (target
+        // and drafter). A slot whose final token is not in this view waits for its view.
+        if (snapslot_ckpt) {
+            for (auto & slot : slots) {
+                if (slot.snap_ckpt_n_tokens >= 0 && slot.i_batch >= off && slot.i_batch < off + batch_view.n_tokens) {
+                    create_snapslot_checkpoint(slot);
+                }
+            }
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

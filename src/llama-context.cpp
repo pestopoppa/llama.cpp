@@ -4808,6 +4808,26 @@ bool llama_memory_tree_accept(
     return mem->tree_accept(seq_id, cols, n_cols);
 }
 
+bool llama_memory_seq_snap_begin(llama_memory_t mem, llama_seq_id seq_id, int32_t n_back) {
+    if (!mem || n_back < 0) {
+        return false;
+    }
+    return mem->seq_snap_begin(seq_id, (uint32_t) n_back);
+}
+
+void llama_memory_seq_snap_end(llama_memory_t mem, llama_seq_id seq_id) {
+    if (mem) {
+        mem->seq_snap_end(seq_id);
+    }
+}
+
+bool llama_memory_set_state_write_pos_cap(llama_memory_t mem, llama_pos cap) {
+    if (!mem) {
+        return false;
+    }
+    return mem->set_state_write_pos_cap(cap);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

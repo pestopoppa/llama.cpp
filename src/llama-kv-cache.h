@@ -297,6 +297,7 @@ public:
 
     // [AK-DTREE-2] keep only the accepted root path of the last tree ubatch of seq_id
     bool tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) override;
+    bool set_state_write_pos_cap(llama_pos cap) override { if (other) { return false; } state_write_pos_cap = cap; return true; } // [KPF-64-SNAPSLOT-COPY]
 
     // Dual Chunk Attention: dst is F32 [n_kv, n_tps, n_stream, 3]; slice 0/1/2 is 1 where the
     // key cell lies in the query's chunk / the previous chunk / an earlier chunk, else 0

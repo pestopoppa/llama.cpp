@@ -145,7 +145,9 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
         cells[i].tail = -1;
         cells[i].rs_max = 0;
+        cells[i].snap_valid = 0;
     }
+    snap_active.clear();
 
     head = 0;
     used = 0;
@@ -452,6 +454,36 @@ bool llama_memory_recurrent::tree_accept(llama_seq_id seq_id, const int32_t * co
     return true;
 }
 
+bool llama_memory_recurrent::seq_snap_begin(llama_seq_id seq_id, uint32_t n_back) {
+    if (n_rs_seq == 0 || n_back == 0 || n_back > n_rs_seq || seq_id < 0 || (uint32_t) seq_id >= size ||
+        (uint32_t) seq_id >= n_seq_max || snap_active.count(seq_id)) {
+        return false;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    auto & cell = cells[tail_id];
+    if (cell.seq_id.size() != 1 || rs_idx[seq_id] != 0 || n_back > cell.snap_valid ||
+        cell.pos < (llama_pos) n_back || cell.src != tail_id) {
+        return false;
+    }
+    snap_active[seq_id] = { tail_id, cell.pos };
+    set_rs_idx(seq_id, n_back);
+    cell.pos -= (llama_pos) n_back;
+    return true;
+}
+
+void llama_memory_recurrent::seq_snap_end(llama_seq_id seq_id) {
+    auto it = snap_active.find(seq_id);
+    if (it == snap_active.end()) {
+        return;
+    }
+    cells[it->second.cell_id].pos = it->second.pos;
+    set_rs_idx(seq_id, 0);
+    snap_active.erase(it);
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
@@ -691,6 +723,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // below. Without this the bound stays with the row and describes some other sequence.
             dst_cell.rs_max = 0;
             src_cell.rs_max = 0;
+            dst_cell.snap_valid = 0;
+            src_cell.snap_valid = 0;
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -724,6 +758,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
         cell.pos = last_pos;
         cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
+        // tree ubatches write one slot per column, not the last min(n, K) states of one path
+        cell.snap_valid = ubatch.parent ? 0 : std::min<uint32_t>(n_seq_tokens, n_rs_seq + 1) - 1;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];

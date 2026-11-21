@@ -46,6 +46,8 @@ public:
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool tree_accept(llama_seq_id seq_id, const int32_t * cols, int32_t n_cols) override; // [AK-DTREE-2]
+    bool seq_snap_begin(llama_seq_id seq_id, uint32_t n_back) override; // [KPF-64-SNAPSLOT-COPY]
+    void seq_snap_end  (llama_seq_id seq_id)                  override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -83,6 +85,10 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [KPF-64-SNAPSLOT-COPY] live (pos, rs_idx) saved by seq_snap_begin, keyed by seq
+    struct snap_saved { int32_t cell_id; llama_pos pos; };
+    std::unordered_map<llama_seq_id, snap_saved> snap_active;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -99,6 +105,12 @@ public:
         // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
         // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
         uint32_t rs_max = 0;
+
+        // [KPF-64-SNAPSLOT-COPY] highest snapshot slot the last ubatch wrote: min(n_seq_tokens, n_rs_seq + 1) - 1.
+        // Unlike rs_max this is also valid for long ubatches (the op always writes the last min(n, K) states);
+        // it is a READ bound for checkpoints, not a rollback bound (a long ubatch's attention rows are not
+        // rolled back by it). Reset with rs_max.
+        uint32_t snap_valid = 0;
 
         std::set<llama_seq_id> seq_id;
 
