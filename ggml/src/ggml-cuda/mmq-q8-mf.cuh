@@ -4,6 +4,7 @@
 // V3 (DTREE-0-Q8MF-V3, 2 WGs/CU, 3 register stages): =3 (int8 16x16x16i8) or =4 (f16 16x16x16f16, in-register dequant);
 // V5 (DTREE-0-Q8MF-V5): =6, packed (GGML_HIP_Q8_MF_INPLACE) weights only, 4 WGs/CU half-tile units, atomic split-tile tail;
 // natural-layout weights run V3 MF=3. 2 register stages; GGML_HIP_Q8_MF_SLC=1 nontemporal loads.
+// V6 (DTREE-0-Q8MF-V6): =7, packed only, V5 + nontemporal default + fused tail quad, 3 register stages (P / P1 env).
 // default off -> wvsk / skinny / C6 route unchanged. Design note + roofline accounting: mmq-q8-mf.cu.
 #include "common.cuh"
 

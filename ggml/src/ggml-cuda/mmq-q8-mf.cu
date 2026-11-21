@@ -123,10 +123,10 @@ static const q8mf_cfg & q8mf_get_cfg() {
     static const q8mf_cfg cfg = [] {
         q8mf_cfg c;
         c.variant = q8mf_env_int("GGML_HIP_Q8_MF", 0);
-        if (c.variant < 1 || c.variant > 6) {
+        if (c.variant < 1 || c.variant > 7) {
             c.variant = 0;
         }
-        c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", 0) != 0 ? 1 : 0;
+        c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", c.variant == 7 ? 1 : 0) != 0 ? 1 : 0;   // V6: nontemporal default
         c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", c.variant == 5 ? 1 : 9));
         c.mmax    = std::min(Q8MF_MAXM, q8mf_env_int("GGML_HIP_Q8_MF_MAX", 16));
         c.wg      = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_WG", 0));
@@ -1049,7 +1049,7 @@ static int q8ip_mode() {
     static const int m = [] {
         const int v = q8mf_env_int("GGML_HIP_Q8_MF_INPLACE", 0);
         const int variant = q8mf_get_cfg().variant;
-        if (v <= 0 || (variant != 3 && variant != 4 && variant != 6)) {
+        if (v <= 0 || (variant != 3 && variant != 4 && variant != 6 && variant != 7)) {
             return 0;
         }
         GGML_LOG_INFO("ggml_cuda_q8ip: in-place Q8_0 stage-contiguous repack enabled (GGML_HIP_Q8_MF_INPLACE=%d, MF=%d)\n",
@@ -1503,6 +1503,236 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// DTREE-0-Q8MF-V6 (GGML_HIP_Q8_MF=7, packed layout only; unpacked weights run V3 MF=3). V5 (MF=6) with:
+//  * nontemporal (slc) weight loads by DEFAULT (V5 gate: slc beat temporal on 19/20 op cells); GGML_HIP_Q8_MF_SLC=0 -> temporal.
+//  * 16 instead of 20 VGPR per register stage: V5's third weight quad (chunks 512..543) and second activation quad (f32
+//    scales, chunks 256..287) were each live on 32 lanes only; V6 carries both in ONE quad on wave 0 (lanes 0..31 weights,
+//    32..63 scales, plain global loads, slc via __builtin_nontemporal_load), so P = 3 fits under the 128 cap (V5 P=3 spilled).
+//    (Holding activations one unit ahead instead was rejected offline: gfx9's single in-order vmcnt makes the wait for the
+//    activation of unit u+1 also drain the weight stages issued before it, collapsing the prefetch depth back to P-1.)
+//  * AGPRs do not help here: gfx90a VGPR+AGPR share one 512-entry file per SIMD, 4 waves/SIMD = 128 combined.
+//  * register depth P = 2|3|4 by GGML_HIP_Q8_MF_P (default 3) and a separate n=1 depth GGML_HIP_Q8_MF_P1 (default 3);
+//    WG count GGML_HIP_Q8_MF_WG (default 4 x #CU; LDS 15 KiB and 128 VGPR cap residency at 4 WG/CU, so 5 x #CU
+//    oversubscribes: the 5th WG per CU runs as a second wave of the persistent grid).
+// ---------------------------------------------------------------------------------------------------------------------
+#define Q8MF7_PMAX 3   // P=4 probed in the ISA table (spills), not instantiated
+static const char q8mf7_build_marker[] __attribute__((used)) =
+    "ggml-cuda: V6 nontemporal 3-stage fused-quad packed Q8_0 small-M kernel (GGML_HIP_Q8_MF=7)";
+
+template <int P, int AUX>
+static __global__ void __launch_bounds__(Q8MF_NT, 4)
+q8mf7_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
+              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    __shared__ __attribute__((aligned(16))) char lds[Q8MF6_HB + Q8MF_A1 + Q8MF6_RED];
+    const int tid  = threadIdx.x;
+    const int lane = tid & 63;
+    const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
+    const int g    = blockIdx.x;
+    const int u0   = (int) (((int64_t) g * U) / G);
+    const int u1   = (int) (((int64_t) (g + 1) * U) / G);
+
+    constexpr uint32_t OOB = 0x80000000u;
+    uint32_t ab[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int q = tid + i * Q8MF_NT;
+        const bool ok = q < 256 ? 2 * (q % 8) < M : (q < 288 && 4 * ((q - 256) % 4) < M);
+        ab[i] = ok ? (uint32_t) (q * 16) : OOB;
+    }
+    {   // V6: scale chunk 256 + (t - 32) rides lanes 32..63 of wave 0
+        const int q = 256 + tid - 32;
+        ab[1] = (tid >= 32 && tid < 64 && 4 * ((q - 256) % 4) < M) ? (uint32_t) (q * 16) : OOB;
+    }
+    const q8mf_v4i wrsrc = q8mf_make_rsrc(W, wbytes);
+    const q8mf_v4i arsrc = q8mf_make_rsrc(act, abytes);
+
+    // per register stage: w0, w1 (all threads: weight chunks t, t + 256), a0 (all threads: int8 activation chunk t) and ONE
+    // shared quad x: wave 0 lanes 0..31 the weight chunk 512 + t, lanes 32..63 the f32 scale chunk 256 + (t - 32); V5 spent
+    // two quads (w[2], a[1]) here, both live only on 32 lanes -> 16 instead of 20 VGPR per stage.
+    struct regs { q8mf_v4i w0, w1, a0, x; };
+    int ui = u0, iht = u0 / S, iks = u0 - (u0 / S) * S;
+    auto issue_next = [&](regs & R) {
+        const bool live = ui < u1;
+        const uint32_t sw = live ? ((uint32_t) ((iht >> 1) * S + iks) * Q8MF_WSTAGE + (uint32_t) (iht & 1) * Q8MF6_HB) : wbytes;
+        const uint32_t sa = live ? (uint32_t) (iks * Q8MF_A1) : abytes;
+        R.w0 = q8mf_buf_x4(wrsrc, (int) (sw + tid * 16), 0, AUX);
+        R.w1 = q8mf_buf_x4(wrsrc, (int) (sw + (tid + 256) * 16), 0, AUX);
+        R.a0 = q8mf_buf_x4(arsrc, (int) (sa + ab[0]), 0, 0);
+        if (w == 0) {   // wave-uniform
+            if (live && lane < 32) {
+                const q8mf_v4i * pw = (const q8mf_v4i *) (W + sw + (lane + 512) * 16);
+                R.x = AUX ? __builtin_nontemporal_load(pw) : *pw;
+            } else if (live && ab[1] != OOB) {
+                R.x = *(const q8mf_v4i *) (act + sa + ab[1]);
+            } else {
+                R.x = q8mf_v4i{0, 0, 0, 0};
+            }
+        }
+        ++ui;
+        if (++iks == S) {
+            iks = 0;
+            ++iht;
+        }
+    };
+    char * red   = lds + Q8MF6_HB + Q8MF_A1;
+    auto commit = [&](const regs & R) {
+        *(q8mf_v4i *) (lds + tid * 16)            = R.w0;
+        *(q8mf_v4i *) (lds + (tid + 256) * 16)    = R.w1;
+        *(q8mf_v4i *) (lds + Q8MF6_HB + tid * 16) = R.a0;
+        if (w == 0) {
+            *(q8mf_v4i *) (lane < 32 ? lds + (lane + 512) * 16 : lds + Q8MF6_HB + (lane + 224) * 16) = R.x;
+        }
+    };
+
+    const int rg = w & 1;
+    const int kh = w >> 1;
+    const int j  = lane & 15;
+    const int gq = lane >> 4;
+    const int c0 = 4 * gq;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto compute = [&]() {
+        const char * lw = lds + (16 * rg + j) * Q8MF_ROWB;
+        const char * la = lds + Q8MF6_HB;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+            const int i = 4 * kh + ii;
+            int w0, w1;
+            if (ii % 2 == 0) {
+                const int * p = (const int *) (lw + 34 * i + 8 * gq);
+                const int d0 = p[0], d1 = p[1], d2 = p[2];
+                w0 = (int) __builtin_amdgcn_alignbyte((uint32_t) d1, (uint32_t) d0, 2);
+                w1 = (int) __builtin_amdgcn_alignbyte((uint32_t) d2, (uint32_t) d1, 2);
+            } else {
+                const int * p = (const int *) (lw + 34 * i + 2 + 8 * gq);
+                w0 = p[0];
+                w1 = p[1];
+            }
+            const float  dw = __half2float(*(const __half *) (lw + 34 * i));
+            const int2   a  = *(const int2 *) (la + i * 512 + lane * 8);
+            const float4 da = *(const float4 *) (la + Q8MF_KS * 512 + i * 64 + gq * 16);
+            const q8mf_v4i z = {0, 0, 0, 0};
+            q8mf_v4i s = __builtin_amdgcn_mfma_i32_16x16x16i8(a.x, w0, z, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(a.y, w1, s, 0, 0, 0);
+            acc[0] += (float) s[0] * (dw * da.x);
+            acc[1] += (float) s[1] * (dw * da.y);
+            acc[2] += (float) s[2] * (dw * da.z);
+            acc[3] += (float) s[3] * (dw * da.w);
+        }
+    };
+
+    int cht = u0 / S, cks = u0 - (u0 / S) * S;
+    auto end_of_unit = [&](const int uc) {
+        if (cks == S - 1 || uc == u1 - 1) {
+            float * rf = (float *) red;
+            if (kh == 1) {
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    rf[(rg * 4 + r) * 64 + lane] = acc[r];
+                }
+            }
+            Q8MF_LDS_BARRIER();
+            if (kh == 0) {
+                const int  ts   = cht * S;
+                const bool full = ts >= u0 && ts + S <= u1;
+                const int  row  = (cht >> 1) * Q8MF_RT + (cht & 1) * 32 + 16 * rg + j;
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const float v = acc[r] + rf[(rg * 4 + r) * 64 + lane];
+                    if (c0 + r < M) {
+                        float * o = out + (int64_t) (c0 + r) * out_s1 + row;
+                        if (full) {
+                            *o = v;
+                        } else {
+                            unsafeAtomicAdd(o, v);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                acc[r] = 0.0f;
+            }
+        }
+        if (++cks == S) {
+            cks = 0;
+            ++cht;
+        }
+    };
+
+    regs R[P];
+#pragma unroll
+    for (int jj = 0; jj < P; ++jj) {
+        issue_next(R[jj]);
+        asm volatile("" ::: "memory");
+    }
+    int u = u0;
+    do {
+#pragma unroll
+        for (int jj = 0; jj < P; ++jj) {
+            commit(R[jj]);
+            issue_next(R[jj]);
+            Q8MF_LDS_BARRIER();
+            if (u + jj < u1) {
+                compute();
+                end_of_unit(u + jj);
+            }
+            Q8MF_LDS_BARRIER();
+        }
+        u += P;
+    } while (u < u1);
+#else
+    GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S); GGML_UNUSED(U);
+    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
+static void ggml_cuda_mul_mat_q8_mf7(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const q8mf_cfg & cfg = q8mf_get_cfg();
+    static const int pn = std::max(2, std::min(Q8MF7_PMAX, q8mf_env_int("GGML_HIP_Q8_MF_P", 3)));
+    static const int p1 = std::max(2, std::min(Q8MF7_PMAX, q8mf_env_int("GGML_HIP_Q8_MF_P1", 3)));
+    const int M = (int) src1->ne[1];
+    const int p = M == 1 ? p1 : pn;
+    {
+        static std::atomic<int64_t> n_calls{0};
+        if (n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V6 nontemporal fused-quad packed path ran (call 1, GGML_HIP_Q8_MF=7, P=%d, P1=%d, "
+                "slc=%d, wg=%d, %s)\n", pn, p1, cfg.slc, cfg.wg, q8mf7_build_marker);
+        }
+    }
+    cudaStream_t stream = ctx.stream();
+    const int     N      = (int) src0->ne[1];
+    const int     nblk   = (int) (src0->ne[0] / 32);
+    const int64_t s1     = src1->nb[1] / sizeof(float);
+    const int64_t dst_s1 = dst->nb[1]  / sizeof(float);
+    const int     S      = nblk / Q8MF_KS;
+    const int     U      = (N / Q8MF_RT) * 2 * S;
+    const int     ncu    = ggml_cuda_info().devices[ctx.device].nsm;
+    GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
+    const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    const size_t abytes = (size_t) S * Q8MF_A1;
+    ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
+    float * d = (float *) dst->data;
+    {
+        const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
+        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+    }
+    const char *   W      = (const char *) src0->data;
+    const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
+#define Q8MF7_L(PP, AA) q8mf7_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+#define Q8MF7_LP(AA) do { if (p == 2) { Q8MF7_L(2, AA); } else { Q8MF7_L(3, AA); } } while (0)
+    if (cfg.slc) {
+        Q8MF7_LP(2);
+    } else {
+        Q8MF7_LP(0);
+    }
+#undef Q8MF7_LP
+#undef Q8MF7_L
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg0 = q8mf_get_cfg();
     if (cfg0.variant == 6 && ggml_cuda_q8ip_is_packed(src0)) {
@@ -1510,7 +1740,11 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return;
     }
     q8mf_cfg cfg = cfg0;
-    if (cfg.variant == 6) {   // V5 reads only the packed layout; natural-layout weights run V3 (MF=3)
+    if (cfg0.variant == 7 && ggml_cuda_q8ip_is_packed(src0)) {
+        ggml_cuda_mul_mat_q8_mf7(ctx, src0, src1, dst);
+        return;
+    }
+    if (cfg.variant == 6 || cfg.variant == 7) {   // V5/V6 read only the packed layout; natural-layout weights run V3 (MF=3)
         cfg.variant = 3;
     }
     if (cfg.variant == 5) {
