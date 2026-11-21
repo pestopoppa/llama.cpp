@@ -19,6 +19,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-degen.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -679,6 +680,7 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     int32_t n_spec_exact_extra = 0;  // INF-70 E2a: extra target tokens decoded by LLAMA_SPEC_EXACT drop/redecode
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
+    common_spec_degen degen;         // AK-H-MTP-DEGEN-1 (default off: LLAMA_SPEC_DEGEN_SUSPEND)
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -712,6 +714,7 @@ struct server_slot {
         n_draft_verif_steps = 0;
         n_spec_exact_extra = 0;
         n_accepted_per_pos.clear();
+        degen.reset();
         n_tree_rounds    = 0;
         n_tree_alt_wins  = 0;
         n_tree_alt_extra = 0;
@@ -831,6 +834,9 @@ struct server_slot {
         // The request may reduce the launch-time speculative budget, including
         // setting it to zero to disable speculation for this request.
         n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+
+        // AK-H-MTP-DEGEN-1: suspended / probing slots draft less (0 = target-only); no-op unless the knob is set
+        n_draft_max = std::min(n_draft_max, degen.cap(task->params.speculative.draft.n_max));
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
@@ -4646,6 +4652,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
+                slot.degen.advance(slot.n_decoded);
                 const int n_draft_max = slot.get_n_draft_max();
 
                 if (n_draft_max > 0) {
@@ -6447,6 +6454,18 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+
+            // AK-H-MTP-DEGEN-1: rolling acceptance guard (no-op unless LLAMA_SPEC_DEGEN_SUSPEND=1)
+            {
+                const int32_t tr = slot.degen.on_round((int32_t) n_draft, (int32_t) ids.size() - 1,
+                                                       slot.task ? slot.task->params.speculative.draft.n_max : (int32_t) n_draft);
+                if (tr > 0) {
+                    SLT_INF(slot, "spec degen guard: SUSPEND drafting (acceptance < %.2f over >= %d tokens), probe every %d tokens\n",
+                            slot.degen.c.thresh, slot.degen.c.tokens, slot.degen.c.probe);
+                } else if (tr < 0) {
+                    SLT_INF(slot, "spec degen guard: RESUME drafting (recovered), suspends so far %d\n", slot.degen.n_suspends);
+                }
+            }
 
             // AK-DTREE-1 auto: time of the whole round (draft + verify + accept) and the tokens it emitted
             if (slot.spec_tree_arm >= 0) {
