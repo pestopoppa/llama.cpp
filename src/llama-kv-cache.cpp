@@ -249,6 +249,17 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        if (const auto * lsa_map = llama_lsa_cpu::get_map()) {
+            if (n_stream == 1 && has_k &&
+                    llama_lsa_cpu::layer_supported(*lsa_map, (int) il, (int) hparams.n_head(il), (int) hparams.n_head_kv(il), (int) hparams.n_embd_head_k(il))) {
+                auto st = std::make_unique<llama_lsa_cpu::layer_state>();
+                st->init(*lsa_map, (int) il, kv_size);
+                st->ik = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, llama_lsa_cpu::index_dim, kv_size);
+                ggml_format_name(st->ik, "cache_%slsa_ik_l%d", name_tag, il);
+                lsa_states[(int32_t) il] = std::move(st);
+            }
+        }
     }
 
     if (reuse) {
@@ -294,6 +305,21 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    for (auto it = lsa_states.begin(); it != lsa_states.end(); ) {
+        auto & st = *it->second;
+        if (hparams.no_alloc || !st.ik->buffer || !ggml_backend_buffer_is_host(st.ik->buffer)) {
+            LLAMA_LOG_WARN("%s: LSA-CPU: layer %d index-key cache is not host memory: LSA off for this layer\n", __func__, it->first);
+            it = lsa_states.erase(it);
+            continue;
+        }
+        st.cells = &v_cells[0];
+        ++it;
+    }
+    if (!lsa_states.empty()) {
+        LLAMA_LOG_INFO("%s: LSA-CPU: index-key cache on %d layers (%.2f MiB)\n", __func__, (int) lsa_states.size(),
+                lsa_states.size()*(double) kv_size*llama_lsa_cpu::index_dim*2/1024.0/1024.0);
     }
 
     {
@@ -372,6 +398,10 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+    }
+
+    for (auto & [_, st] : lsa_states) {
+        st->invalidate_all();
     }
 
     if (data) {
@@ -3193,6 +3223,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
+    // restored K rows carry no index keys: force-keep every cell until it is rewritten
+    for (auto & [_, st] : lsa_states) {
+        st->invalidate_all();
+    }
+
     uint32_t v_trans;
     uint32_t n_layer;
 
@@ -3461,6 +3496,18 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+llama_lsa_cpu::layer_state * llama_kv_cache::get_lsa(int32_t il) const {
+    if (lsa_states.empty()) {
+        return nullptr;
+    }
+    auto it = lsa_states.find(il);
+    return it == lsa_states.end() ? nullptr : it->second.get();
+}
+
+llama_lsa_cpu::layer_state * llama_kv_cache_context::get_lsa(int32_t il) const {
+    return kv->get_lsa(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

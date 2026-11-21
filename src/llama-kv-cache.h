@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-lsa-cpu.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -134,6 +135,9 @@ public:
     bool get_can_shift() const override;
 
     void clear(bool data) override;
+
+    // LSA-CPU-SPARSE state of model layer il, nullptr when not active
+    llama_lsa_cpu::layer_state * get_lsa(int32_t il) const;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -387,6 +391,9 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // LSA-CPU-SPARSE: per global layer index-key cache state (empty unless LLAMA_LSA_CPU=1 + map)
+    std::map<int32_t, std::unique_ptr<llama_lsa_cpu::layer_state>> lsa_states;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -472,6 +479,8 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    llama_lsa_cpu::layer_state * get_lsa(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

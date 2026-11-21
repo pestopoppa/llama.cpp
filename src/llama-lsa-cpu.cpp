@@ -1,6 +1,11 @@
 #include "llama-lsa-cpu.h"
 
 #include "llama-impl.h"
+#include "llama-kv-cells.h"
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -216,6 +221,100 @@ bool load_lsamap(const std::string & path, lsamap & out, std::string & err) {
 
     out = std::move(m);
     return true;
+}
+
+bool layer_supported(const lsamap & m, int il, int n_head, int n_head_kv, int head_dim) {
+    return m.layers.count(il) && m.q_heads == n_head && m.kv_heads == n_head_kv && m.head_dim == head_dim;
+}
+
+void layer_state::init(const lsamap & m, int il_, uint32_t kv_size) {
+    il       = il_;
+    q_heads  = m.q_heads;
+    kv_heads = m.kv_heads;
+    head_dim = m.head_dim;
+    rope_dim = m.rope_dim;
+    const auto & lp = m.layers.at(il_);
+    wq = lp.first.data();
+    wk = lp.second.data();
+    ik_pos.assign(kv_size, -1);
+    score.assign(kv_size, 0.0f);
+}
+
+void layer_state::invalidate_all() {
+    std::fill(ik_pos.begin(), ik_pos.end(), -1);
+}
+
+int32_t layer_state::cell_pos(int64_t cell) const {
+    if (!cells) {
+        return (int32_t) cell;
+    }
+    return cells->is_empty((uint32_t) cell) ? -1 : (int32_t) cells->pos_get((uint32_t) cell);
+}
+
+// ---------------------------------------------------------------------------------------------
+// kernels
+
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (uint16_t) ((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+}
+
+// out[64] = l2norm(W^T x), W row-major [rows][64]
+void project(const float * w, int rows, const float * x, float * out) {
+    for (int o = 0; o < index_dim; ++o) {
+        out[o] = 0.0f;
+    }
+    for (int r = 0; r < rows; ++r) {
+        const float xr = x[r];
+        const float * wr = w + (size_t) r*index_dim;
+        for (int o = 0; o < index_dim; ++o) {
+            out[o] += xr*wr[o];
+        }
+    }
+    float n = 0.0f;
+    for (int o = 0; o < index_dim; ++o) {
+        n += out[o]*out[o];
+    }
+    n = 1.0f/std::max(std::sqrt(n), 1e-30f);
+    for (int o = 0; o < index_dim; ++o) {
+        out[o] *= n;
+    }
+}
+
+static void ik_write_op(ggml_tensor * dst, const ggml_tensor * idxs, const ggml_tensor * k, int ith, int nth, void * ud) {
+    layer_state & st = *(layer_state *) ud;
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && idxs->type == GGML_TYPE_I64);
+    GGML_ASSERT(k->ne[0] == st.head_dim && k->ne[1] == st.kv_heads);
+    const int64_t n_tokens = k->ne[2];
+    GGML_ASSERT(idxs->ne[0] == n_tokens && ggml_is_contiguous(idxs));
+    const int W = st.head_dim - st.rope_dim, rows = st.kv_heads*W;
+    std::vector<float> x(rows);
+    float out[index_dim];
+    uint16_t * ik = (uint16_t *) st.ik->data;
+    const int64_t * cell = (const int64_t *) idxs->data;
+    for (int64_t t = ith; t < n_tokens; t += nth) {
+        for (int g = 0; g < st.kv_heads; ++g) {
+            const char * kr = (const char *) k->data + t*k->nb[2] + g*k->nb[1];
+            for (int d = 0; d < W; ++d) {
+                x[g*W + d] = *(const float *) (kr + (size_t) (st.rope_dim + d)*k->nb[0]);
+            }
+        }
+        project(st.wk, rows, x.data(), out);
+        const int64_t c = cell[t];
+        GGML_ASSERT(c >= 0 && c < (int64_t) st.ik_pos.size());
+        uint16_t * row = ik + c*index_dim;
+        for (int o = 0; o < index_dim; ++o) {
+            row[o] = f32_to_bf16(out[o]);
+        }
+        st.ik_pos[c] = st.cell_pos(c);
+        ((int64_t *) dst->data)[t] = c;
+    }
+}
+
+ggml_tensor * build_ik_write(ggml_context * ctx, layer_state * st, ggml_tensor * k_cur, ggml_tensor * k_idxs) {
+    GGML_ASSERT(st && st->ik);
+    return ggml_map_custom2(ctx, k_idxs, k_cur, ik_write_op, GGML_N_TASKS_MAX, st);
 }
 
 const lsamap * get_map() {

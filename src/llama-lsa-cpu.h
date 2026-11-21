@@ -26,8 +26,11 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
+
+class llama_kv_cells;
 
 namespace llama_lsa_cpu {
 
@@ -71,5 +74,44 @@ bool load_lsamap(const std::string & path, lsamap & out, std::string & err);
 
 // the process-wide map when enabled and loaded, else nullptr (logged once)
 const lsamap * get_map();
+
+// out[64] = l2norm(W^T x), W row-major [rows][64]
+void project(const float * w, int rows, const float * x, float * out);
+
+// true when `il` has a map and the layer geometry matches it
+bool layer_supported(const lsamap & m, int il, int n_head, int n_head_kv, int head_dim);
+
+// Per (KV cache, global layer) persistent state. Owned by llama_kv_cache; single stream only.
+struct layer_state {
+    int il = -1;
+    int q_heads = 0, kv_heads = 0, head_dim = 0, rope_dim = 0;
+    const float * wq = nullptr; // [rows][64]
+    const float * wk = nullptr; // [rows][64]
+
+    ggml_tensor * ik = nullptr; // BF16 [64, kv_size], host buffer; row = KV cell
+
+    // cell positions are read at compute time (cells are applied before the graph runs);
+    // nullptr -> pos = cell index (tests)
+    const llama_kv_cells * cells = nullptr;
+
+    // position the index key of a cell was written for; -1 = invalid. A cell whose position differs
+    // (seq_rm + reuse, K-shift, state restore) is never scored: it is force-kept (dense-safe).
+    std::vector<int32_t> ik_pos;
+
+    // decode scratch [kv_size]
+    std::vector<float> score;
+
+    // last decode selection statistics (diagnostic)
+    int64_t last_eligible = 0, last_kept = 0;
+
+    void init(const lsamap & m, int il, uint32_t kv_size);
+    void invalidate_all();
+    int32_t cell_pos(int64_t cell) const;
+};
+
+// Index-key write, run at K-store time for every ubatch:
+//   k_cur  F32 [head_dim, n_head_kv, n_tokens], k_idxs I64 [n_tokens] (cells, as for cpy_k)
+// returns an I64 copy of k_idxs that orders the write before any consumer.
+ggml_tensor * build_ik_write(ggml_context * ctx, layer_state * st, ggml_tensor * k_cur, ggml_tensor * k_idxs);
 
 } // namespace llama_lsa_cpu

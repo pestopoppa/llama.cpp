@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-lsa-cpu.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -3351,6 +3352,13 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    const auto * mctx_cur = inp->mctx;
+
+    // LSA-CPU-SPARSE: logical (pre-rotation) Q/K feed the index; the map is RoPE-free
+    llama_lsa_cpu::layer_state * lsa = mctx_cur->get_lsa(il);
+    ggml_tensor * lsa_q = q_cur;
+    ggml_tensor * lsa_k = k_cur;
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -3367,7 +3375,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * lsa_written = nullptr;
 
     // store to KV cache
     {
@@ -3376,9 +3384,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+        if (lsa && lsa_k->type == GGML_TYPE_F32) {
+            lsa_written = llama_lsa_cpu::build_ik_write(ctx0, lsa, lsa_k, k_idxs);
+            ggml_build_forward_expand(gf, lsa_written);
+        }
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    GGML_UNUSED(lsa_q);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
