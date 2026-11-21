@@ -14976,6 +14976,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
+    // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
+    // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
+    if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
