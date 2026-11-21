@@ -15472,6 +15472,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // [RS-REPLAY] np4 verify at the 27B dims (16 qk heads x3), n_max 7 (8 rows) and n_max 15 (16 rows):
+    // snapshot op (K = rows) vs replay op (keep, n_pend = rows, n_rep random <= n_pend)
+    for (int64_t rows : { 8, 16 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, rows, 4, 3, false, false, rows));
+        test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, rows, 4, 3, false, rows, true));
+    }
     // [C8-6-GDN-CHUNKED] production geometry perf: 27B (16 qk heads x3 = 48 v-heads) and A3B (x2 = 32), d=128
     for (int vr : { 3, 2 }) {
         for (int64_t nt : { 1, 9, 36, 512, 2048, 8192 }) {
