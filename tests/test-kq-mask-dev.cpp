@@ -183,6 +183,7 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
     llama_batch b = llama_batch_init(512, 0, 1);
     std::vector<int> pos(n_seq, 0);
     std::vector<llama_token> last(n_seq);
+    std::vector<int> outs;
 
     // prompts of different lengths
     b.n_tokens = 0;
@@ -195,8 +196,17 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
             b.n_seq_id[i] = 1;
             b.seq_id[i][0] = q;
             b.logits[i] = k == len - 1;
+            if (k == len - 1) {
+                outs.push_back(i);
+            }
         }
     }
+    auto grab_idx = [&](const std::vector<int> & idx) {
+        for (int k : idx) {
+            const float * l = llama_get_logits_ith(ctx, k);
+            all.insert(all.end(), l, l + n_vocab);
+        }
+    };
     auto grab = [&](int n_out) {
         for (int k = 0; k < n_out; ++k) {
             const float * l = llama_get_logits_ith(ctx, k);
@@ -217,9 +227,9 @@ static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) 
         fprintf(stderr, "FAIL: prompt decode\n");
         g_fail++;
     }
-    grab(n_seq);
+    grab_idx(outs);
     for (int q = 0; q < n_seq; ++q) {
-        last[q] = argmax(q);
+        last[q] = argmax(outs[q]);
     }
 
     for (int r = 0; r < n_rounds; ++r) {
