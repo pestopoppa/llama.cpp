@@ -23,6 +23,7 @@ void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, boo
 void ggml_cuda_q8ip_forget_range(const void * base, size_t size);
 bool ggml_cuda_q8ip_get(const ggml_tensor * t, void * data, size_t offset, size_t size);
 bool ggml_cuda_q8ip_mmq_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
+bool ggml_cuda_q8ip_blas_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 bool ggml_cuda_q8ip_mf_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_q8ip_substitute(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_q8ip_subst & s);
 void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s);
