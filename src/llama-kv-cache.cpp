@@ -2049,7 +2049,9 @@ void llama_kv_cache::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * u
 
 bool llama_kv_cache::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {
     // the device mask reproduces only the causal, non-ALiBi, non-SWA, 1-D, non-tree host mask
-    return causal_attn && !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE && !ubatch.is_pos_2d() && !ubatch.parent;
+    // M-RoPE (n_pos >= 3) is allowed: its extra host rule only drops a cell with p0 == p1 whose 2-D ext is greater than the
+    // token's, which set_input_kq_mask_dev detects exactly (never the case for text-only decode) and reports
+    return causal_attn && !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE && !ubatch.parent;
 }
 
 void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
@@ -2087,6 +2089,42 @@ void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * cse
         float * row = cp + (int64_t) seq_id*n_kv;
         for (int64_t j = 0; j < n_kv; ++j) {
             row[j] = (cells.is_empty(j) || !cells.seq_has(j, seq_id)) ? LLAMA_KQ_MASK_DEV_FAR : (float) cells.pos_get(j);
+        }
+
+        if (ubatch->is_pos_2d()) {
+            // exact check of the host M-RoPE rule: token k of this seq drops cell j iff p0 == p1 and ext(j) > (p1_x, p1_y).
+            // Only cells inside the seq's ubatch position range can tie: collect them in the O(n_kv) pass, then compare.
+            llama_pos pmin = INT32_MAX, pmax = INT32_MIN;
+            for (uint32_t k = i; k < n_tokens; ++k) {
+                if (ubatch->seq_id[k][0] == seq_id) {
+                    pmin = std::min(pmin, ubatch->pos[k]);
+                    pmax = std::max(pmax, ubatch->pos[k]);
+                }
+            }
+            std::vector<int64_t> cand;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (row[j] >= (float) pmin && row[j] <= (float) pmax) {
+                    cand.push_back(j);
+                }
+            }
+            for (uint32_t k = i; k < n_tokens && !cand.empty(); ++k) {
+                if (ubatch->seq_id[k][0] != seq_id) {
+                    continue;
+                }
+                const llama_pos p1   = ubatch->pos[k];
+                const llama_pos p1_x = ubatch->pos[k + n_tokens*2];
+                const llama_pos p1_y = ubatch->pos[k + n_tokens];
+                for (int64_t j : cand) {
+                    if (cells.pos_get(j) == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                        static int n_warn = 0;
+                        if (n_warn++ < 4) {
+                            LLAMA_LOG_ERROR("%s: LLAMA_DEVICE_KQ_MASK MISMATCH: 2-D ext rule drops cell %lld for seq %d pos %d; "
+                                    "the device mask keeps it (do not use the knob with multimodal input)\n",
+                                    __func__, (long long) j, seq_id, p1);
+                        }
+                    }
+                }
+            }
         }
     }
 }
