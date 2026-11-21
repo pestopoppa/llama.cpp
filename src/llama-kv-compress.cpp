@@ -393,6 +393,74 @@ int llama_kv_compress_evict(
     llama_memory_t mem = llama_get_memory(ctx);
     const int n_kv = (int)scores.size();
 
+    // EA-POOL-SCREEN: post-process the scores (default off). Group modes evict whole groups, lowest score first.
+    std::vector<int> group_of;   // group id per position (empty = per-token threshold path)
+    int n_groups = 0;
+    {
+        const int s0 = params.n_sink;
+        if (params.pool_kernel > 1) {
+            std::vector<float> pooled(scores);
+            const int half = params.pool_kernel / 2;
+            for (int p = s0; p < n_kv; p++) {
+                float m = scores[p];
+                for (int q = std::max(s0, p - half); q <= std::min(n_kv - 1, p + half); q++) m = std::max(m, scores[q]);
+                pooled[p] = m;
+            }
+            scores.swap(pooled);
+        }
+        if (params.chunk_size > 0 || params.rand_mode == 2) {
+            const int g = params.chunk_size > 0 ? params.chunk_size : std::max(1, params.rand_span);
+            group_of.assign(n_kv, -1);
+            n_groups = 0;
+            for (int p = s0; p < n_kv; p += g) {
+                for (int q = p; q < std::min(n_kv, p + g); q++) group_of[q] = n_groups;
+                n_groups++;
+            }
+            std::vector<float> gscore(n_groups, 0.0f);
+            std::vector<int>   gcount(n_groups, 0);
+            for (int p = s0; p < n_kv; p++) { gscore[group_of[p]] += scores[p]; gcount[group_of[p]]++; }
+            for (int i = 0; i < n_groups; i++) gscore[i] /= (float) std::max(1, gcount[i]);
+            if (params.rand_mode == 2) {
+                uint64_t st = params.rand_seed;
+                for (int i = 0; i < n_groups; i++) {
+                    st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+                    gscore[i] = (float) ((st >> 40) & 0xFFFFFF) / 16777216.0f;
+                }
+            }
+            for (int p = s0; p < n_kv; p++) scores[p] = gscore[group_of[p]];
+        } else if (params.rand_mode == 1) {
+            uint64_t st = params.rand_seed;
+            for (int p = s0; p < n_kv; p++) {
+                st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+                scores[p] = (float) ((st >> 40) & 0xFFFFFF) / 16777216.0f;
+            }
+        }
+    }
+    if (n_groups > 0) {
+        // whole-group eviction: lowest group score first until the per-token target is met; protected tail/sink untouched
+        const int n_protect_end_g = std::max(params.n_sink, n_kv - std::max(0, params.n_recent));
+        if (n_protect_end_g <= params.n_sink) return 0;
+        const int target = (int) ((n_protect_end_g - params.n_sink) * params.compression_ratio);
+        if (target <= 0) return 0;
+        std::vector<int> order(n_groups);
+        std::iota(order.begin(), order.end(), 0);
+        std::vector<float> gs(n_groups, 0.0f);
+        for (int p = params.n_sink; p < n_kv; p++) gs[group_of[p]] = scores[p];
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return gs[a] < gs[b]; });
+        std::vector<bool> g_evict(n_groups, false);
+        std::vector<int> g_cnt(n_groups, 0);
+        for (int p = params.n_sink; p < n_protect_end_g; p++) g_cnt[group_of[p]]++;
+        int got = 0;
+        for (int gi : order) { if (got >= target) break; if (g_cnt[gi] == 0) continue; g_evict[gi] = true; got += g_cnt[gi]; }
+        int ev = 0, rs = -1;
+        for (int p = params.n_sink; p <= n_protect_end_g; p++) {
+            const bool e = (p < n_protect_end_g) && g_evict[group_of[p]];
+            if (e && rs < 0) rs = p;
+            else if (!e && rs >= 0) { llama_memory_seq_rm(mem, seq_id, rs, p); ev += p - rs; rs = -1; }
+        }
+        return ev;
+    }
+
     // Find eviction threshold
     const int n_protect_end = std::max(params.n_sink, n_kv - std::max(0, params.n_recent)); // [n_protect_end, n_kv) is protected
     if (n_protect_end <= params.n_sink) return 0;

@@ -206,6 +206,12 @@ struct server_task {
         float beta             = 0.1f;  // constant beta set on every kept cell (needs LLAMA_KV_AM_BETA=1 to act)
         int   keep_last        = 15;    // trailing positions always kept
         bool  keep_last_set    = false; // EA only: protect the trailing keep_last positions when the request names it
+        // EA-POOL-SCREEN (EA only, default off)
+        int      pool_kernel = 1;
+        int      chunk_size  = 0;
+        int      rand_mode   = 0;       // 0 off, 1 token, 2 span
+        int      rand_span   = 64;
+        uint64_t rand_seed   = 20261121;
     };
     slot_action slot_action;
 

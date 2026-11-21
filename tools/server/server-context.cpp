@@ -7445,6 +7445,11 @@ static llama_kv_compress_params make_server_expected_attention_params(const serv
     ea_params.use_covariance    = task.slot_action.use_covariance;
     ea_params.layer_weights     = task.slot_action.layer_weights;
     ea_params.n_recent          = task.slot_action.keep_last_set ? task.slot_action.keep_last : 0;
+    ea_params.pool_kernel       = task.slot_action.pool_kernel;
+    ea_params.chunk_size        = task.slot_action.chunk_size;
+    ea_params.rand_mode         = task.slot_action.rand_mode;
+    ea_params.rand_span         = task.slot_action.rand_span;
+    ea_params.rand_seed         = task.slot_action.rand_seed;
 
     // Server slot prompt/checkpoint state tracks logical positions independently.
     // Keep Expected Attention in gapped-eviction mode until the server can compact
@@ -7487,6 +7492,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const 
     task.slot_action.beta      = body.is_object() && body.contains("beta")      ? body["beta"].get<float>()    : 0.1f;
     task.slot_action.keep_last = body.is_object() && body.contains("keep_last") ? body["keep_last"].get<int>() : 15;
     task.slot_action.keep_last_set = body.is_object() && body.contains("keep_last");
+    // EA-POOL-SCREEN knobs (EA selector only): "pool_kernel", "chunk_size", "random" ("token"|"span"), "rand_span", "rand_seed"
+    if (body.is_object()) {
+        if (body.contains("pool_kernel")) task.slot_action.pool_kernel = std::max(1, body["pool_kernel"].get<int>());
+        if (body.contains("chunk_size"))  task.slot_action.chunk_size  = std::max(0, body["chunk_size"].get<int>());
+        if (body.contains("rand_span"))   task.slot_action.rand_span   = std::max(1, body["rand_span"].get<int>());
+        if (body.contains("rand_seed"))   task.slot_action.rand_seed   = body["rand_seed"].get<uint64_t>();
+        if (body.contains("random") && body["random"].is_string()) {
+            const std::string r = body["random"].get<std::string>();
+            task.slot_action.rand_mode = r == "token" ? 1 : r == "span" ? 2 : 0;
+        }
+    }
 
     // Layer-adaptive weights for autopilot tuning. Pass "layer_weights": [..] to emphasize
     // specific attention layers. If omitted, uniform weighting across all attention layers.

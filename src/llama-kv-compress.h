@@ -21,6 +21,13 @@ struct llama_kv_compress_params {
                                       // positions" check (seen with a 5x ratio on a 3K prompt).
     bool  use_covariance    = true;   // include covariance term (more accurate, slower)
 
+    // EA-POOL-SCREEN (host-side score post-processing before the eviction threshold; all default off):
+    int      pool_kernel = 1;         // >1: max-pool the EA scores over a centred sequence window of this many positions
+    int      chunk_size  = 0;         // >0: ChunkEA, score = mean EA score of fixed chunks (from n_sink), evict whole chunks
+    int      rand_mode   = 0;         // 1: random per-token scores, 2: random per-span scores (control arms; ignores EA scores)
+    int      rand_span   = 64;        // span length for rand_mode 2
+    uint64_t rand_seed   = 20261121;  // fixed seed for the random controls
+
     // If true, shift remaining positions to close gaps after eviction via seq_add.
     // WARNING: Only use when the caller manages token positions directly (e.g., test
     // binaries). Do NOT use from llama-server — the server's prompt cache tracks
