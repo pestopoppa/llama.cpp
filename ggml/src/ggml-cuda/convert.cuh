@@ -69,4 +69,5 @@ template<typename dst_t, typename src_t>
 bool ggml_cuda_h20_enabled();
 bool ggml_cuda_h20_reuse_enabled();
 // contiguous f32/q8_0 -> f16; returns false (nothing launched) when not applicable
+void ggml_cuda_h20_convert_q8_0_packed_f16(const void * x, half * y, int64_t k, int64_t nblk, cudaStream_t stream);
 bool ggml_cuda_h20_convert_f16(ggml_type type, const void * x, half * y, int64_t k, cudaStream_t stream);

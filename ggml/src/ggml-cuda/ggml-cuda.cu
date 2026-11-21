@@ -1546,6 +1546,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if (ggml_is_contiguously_allocated(src0)) {
             bool h20_done = false;
             if constexpr (compute_type == GGML_TYPE_F16) {
+                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
+                    ggml_cuda_h20_convert_q8_0_packed_f16(src0->data, (half *) src0_alloc.get(), ggml_nelements(src0), ne00 / QK8_0, main_stream);
+                    h20_done = true;
+                } else
                 h20_done = ggml_cuda_h20_convert_f16(src0->type, src0->data, (half *) src0_alloc.get(), ggml_nelements(src0), main_stream);
             }
             if (!h20_done) {
@@ -2061,6 +2065,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_mmq_handles(src0, src1, dst, cc)) {
         ggml_cuda_log_mul_mat_route("MMQ_Q8_INPLACE", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_blas_handles(src0, src1, dst, cc)) {   // packed -> f16 convert + cuBLAS
+        ggml_cuda_log_mul_mat_route("CUBLAS_Q8_INPLACE", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
         return;
     }
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {

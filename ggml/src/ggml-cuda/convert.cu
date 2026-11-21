@@ -990,6 +990,40 @@ static __global__ void h20_q8_0_to_f16_vec(const void * __restrict__ vx, half * 
     *((uint4 *) (y + i)) = *((const uint4 *) h);
 }
 
+// DTREE-0-Q8MF-PACKED-CONSUMERS: same, reading an in-place packed Q8_0 weight ([tile][k-stage][64 rows][8 blocks]) and
+// writing the natural f16 layout (prefill cuBLAS path: one pass instead of natural copy + convert)
+static __global__ void h20_q8_0_packed_to_f16_vec(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, const int nblk) {
+    const int64_t t  = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t i  = 8*t;
+    if (i >= k) {
+        return;
+    }
+    const int64_t n   = t/4;
+    const int64_t row = n / nblk;
+    const int     b   = (int) (n - row*nblk);
+    const block_q8_0 * xb = ((const block_q8_0 *) vx) + ((row & ~63ll)*nblk + (b >> 3)*512 + (row & 63)*8 + (b & 7));
+    const int sub = t % 4;
+    const half d = xb->d;
+    const uint16_t * q16 = (const uint16_t *) (xb->qs + 8*sub);
+    half2 h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint16_t v = q16[j];
+        h[j] = __hmul2(make_half2((int8_t) (v & 0xFF), (int8_t) (v >> 8)), __half2half2(d));
+    }
+    *((uint4 *) (y + i)) = *((const uint4 *) h);
+}
+
+void ggml_cuda_h20_convert_q8_0_packed_f16(const void * x, half * y, int64_t k, int64_t nblk, cudaStream_t stream) {
+    GGML_ASSERT(k % QK8_0 == 0 && (uintptr_t) y % 16 == 0 && nblk % 8 == 0);
+    const int64_t nthr = k/8;
+    h20_q8_0_packed_to_f16_vec<<<(nthr + 255)/256, 256, 0, stream>>>(x, y, k, (int) nblk);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("ggml_cuda_q8ip: packed-layout q8_0->f16 prefill convert ran\n");
+    }
+}
+
 bool ggml_cuda_h20_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_HIP_H20");
