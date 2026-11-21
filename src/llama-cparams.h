@@ -77,6 +77,10 @@ struct llama_cparams {
 
     // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1 inputs of the device DFlash2 lattice selection (owned by the context)
     struct llama_dsel_inputs * dsel = nullptr;
+
+    // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1: persistent device tensor [n_embd, n_ubatch] the DFlash encoder
+    // writes and the KV-injection decode reads, so the fused target features never round-trip through the host
+    struct ggml_tensor * dflash_feed = nullptr;
 };
 
 // [GPU-RESIDENT-ROUND-2d] per decode: inverse temperature per draft block (1 = greedy) and Gumbel noise

@@ -1344,6 +1344,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1: the drafter selects the path on the device (Gumbel-max with
     // host Philox noise); the host reads compact [token | ids | probs] rows instead of the lattice
     bool dev_lattice = false;
+    bool dev_feed    = false; // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1 (not for LiLiCorr / DSpark)
     std::vector<uint64_t> dsel_key;   // per seq, from the request seed
     std::vector<uint64_t> dsel_ctr;   // per seq, draft counter
     std::vector<float>    dsel_inv_temp;
@@ -1607,6 +1608,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // [GPU-RESIDENT-ROUND-2c] the drafter context decides (it owns the device feed)
+        dev_feed = llama_dflash_feed_enabled(ctx_dft);
+        GGML_ASSERT(!(dev_feed && (is_lilicorr || is_dspark)) && "LLAMA_DEVICE_DFLASH_FEED is DFlash / DFlash2 only");
+
         // [AK-DTREE-2] per-seq batch rows in order: in a single-tree-batch verify the accepted path's rows need not be
         // contiguous (shared main prefix, then a side branch further down the batch); everything below indexes rows[]
         std::vector<std::vector<int32_t>> seq_rows(n_seq);
@@ -1693,6 +1698,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
+                }
+
+                // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1: the features stay on the device; the injection
+                // decode reads them there, so there is no encoder sync / D2H here and no H2D of the inject rows
+                if (dev_feed) {
+                    batch_inject.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        batch_inject.pos[i]       = batch_in.pos[rows[offset + i]];
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    llama_synchronize(ctx_dft);
+                    continue;
                 }
 
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);

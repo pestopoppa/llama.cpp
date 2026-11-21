@@ -431,6 +431,35 @@ llama_context::llama_context(
             }
         }
 
+        // [GPU-RESIDENT-ROUND-2c] persistent device buffer for the DFlash encoder -> KV-injection feed
+        {
+            const char * e = getenv("LLAMA_DEVICE_DFLASH_FEED");
+            if (e && strcmp(e, "1") == 0 && model.arch == LLM_ARCH_DFLASH && model.fc != nullptr &&
+                model.hparams.dsv4_hc_mult == 0 && model.hparams.lilicorr_candidate_topk == 0 && model.dspark_conf_proj == nullptr) {
+                ggml_backend_t be = nullptr;
+                for (auto & b : backends) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+                    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        be = b.get();
+                        break;
+                    }
+                }
+                if (!be) {
+                    be = backend_cpu;
+                }
+                ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                dflash_feed_ctx.reset(ggml_init(ip));
+                ggml_tensor * t = ggml_new_tensor_2d(dflash_feed_ctx.get(), GGML_TYPE_F32, model.hparams.n_embd, cparams.n_ubatch);
+                ggml_set_name(t, "dflash_feed");
+                dflash_feed_buf.reset(ggml_backend_alloc_ctx_tensors(dflash_feed_ctx.get(), be));
+                if (dflash_feed_buf) {
+                    cparams.dflash_feed = t;
+                    fprintf(stderr, "llama_context: LLAMA_DEVICE_DFLASH_FEED: device DFlash feed ENABLED ([%lld, %u] on %s)\n",
+                            (long long) model.hparams.n_embd, cparams.n_ubatch, ggml_backend_name(be));
+                }
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -4532,6 +4561,10 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_dflash_feed_enabled(const llama_context * ctx) {
+    return ctx->dflash_feed_enabled();
 }
 
 void llama_set_dflash_select(llama_context * ctx, const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {

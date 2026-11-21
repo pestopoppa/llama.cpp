@@ -17,6 +17,18 @@ static bool llama_dflash_device_lattice_enabled() {
     return e != nullptr && strcmp(e, "1") == 0;
 }
 
+// [GPU-RESIDENT-ROUND-2c] marker input for a KV-injection graph that reads the device feed: nothing to upload; reusable
+// for the same token count
+class llm_graph_input_dflash_feed : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_dflash_feed(int64_t n) : n_tokens(n) {}
+    void set_input(const llama_ubatch * ubatch) override { GGML_UNUSED(ubatch); }
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.ubatch.embd && !params.ubatch.token && (int64_t) params.ubatch.n_tokens == n_tokens;
+    }
+    int64_t n_tokens;
+};
+
 class llm_graph_input_dsel : public llm_graph_input_i {
 public:
     llm_graph_input_dsel(const llama_dsel_inputs * src, int64_t top_k, int64_t block) : src(src), top_k(top_k), block(block) {}
@@ -712,6 +724,13 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
     cb(cur, "enc_norm_out", -1);
 
+    // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1: keep the fused features on the device for the KV injection
+    if (cparams.dflash_feed && n_tokens <= cparams.dflash_feed->ne[1] && cur->ne[0] == cparams.dflash_feed->ne[0]) {
+        ggml_tensor * dst = ggml_view_2d(ctx0, cparams.dflash_feed, cur->ne[0], n_tokens, cparams.dflash_feed->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, dst));
+        return; // no host output: nothing reads it
+    }
+
     ggml_set_output(cur);
     res->t_h_nextn = cur;
 
@@ -1069,15 +1088,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection (embd-only batch; a token+embd batch is a draft block with state rows)
     if (ubatch.embd && !ubatch.token) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        ggml_tensor * inp_g = nullptr;
+        if (cparams.dflash_feed && n_tokens <= cparams.dflash_feed->ne[1] && n_embd == cparams.dflash_feed->ne[0]) {
+            // [GPU-RESIDENT-ROUND-2c] the encoder left the fused features on the device; the batch embd rows are ignored
+            inp_g = ggml_view_2d(ctx0, cparams.dflash_feed, n_embd, n_tokens, cparams.dflash_feed->nb[1], 0);
+            res->add_input(std::make_unique<llm_graph_input_dflash_feed>(n_tokens));
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
 
-        ggml_tensor * inp_g = inp->embd;
+            inp_g = inp->embd;
+            res->add_input(std::move(inp));
+        }
         cb(inp_g, "inp_g_embeddings", -1);
-
-        res->add_input(std::move(inp));
 
         const auto & model_df = static_cast<const llama_model_dflash &>(model);
 

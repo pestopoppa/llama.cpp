@@ -328,7 +328,12 @@ private:
 
     // [GPU-RESIDENT-ROUND-2d] inputs of the device DFlash2 lattice selection (cparams.dsel points here)
     llama_dsel_inputs dsel_inputs;
+
+    // [GPU-RESIDENT-ROUND-2c] owner of cparams.dflash_feed
+    ggml_context_ptr          dflash_feed_ctx;
+    ggml_backend_buffer_ptr   dflash_feed_buf;
 public:
+    bool dflash_feed_enabled() const { return cparams.dflash_feed != nullptr; }
     void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
         dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
         dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));

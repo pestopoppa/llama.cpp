@@ -181,6 +181,11 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Selection is Gumbel-max: argmax(scores * inv_temp + noise), exact softmax(scores / T) sampling;
 // inv_temp = 1 and noise = 0 give the greedy path. Set before llama_decode; inv_temp has one value per
 // draft block in ubatch order, noise top_k * block_tokens values per block (row 0 of each block ignored).
+// [GPU-RESIDENT-ROUND-2c] true when this (DFlash drafter) context keeps the encoder output on the device for the
+// KV injection (LLAMA_DEVICE_DFLASH_FEED=1): llama_encode then exports no h_nextn and an embd-only decode ignores
+// the batch embd rows
+LLAMA_API bool llama_dflash_feed_enabled(const struct llama_context * ctx);
+
 LLAMA_API void llama_set_dflash_select(struct llama_context * ctx, const float * inv_temp, int32_t n_blocks,
                                        const float * noise, int32_t n_noise);
 
