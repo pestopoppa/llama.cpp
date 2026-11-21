@@ -1176,6 +1176,9 @@ extern "C" {
     // DTREE-A: argmax of output row i computed on the device (env LLAMA_DEVICE_ARGMAX=1; first maximum on ties).
     // LLAMA_TOKEN_NULL when it was not computed for the last decode.
     LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
+    // AK-GAP-1-STOCH-ACCEPT: device top-K candidates of output row i (env GGML_HIP_DEVICE_ACCEPT_STOCH=K). Returns K and
+    // points *ids / *vals at K token ids and their raw logits (unordered), or 0 when the row has none.
+    LLAMA_API int32_t llama_get_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids, const float ** vals);
 
     // AK-GAP-1-SAMPLE: LLAMA_DEVICE_ACCEPT=1 witness counters (deferred logits downloads skipped / later flushed by a reader)
     LLAMA_API void llama_device_accept_stats(const struct llama_context * ctx, int64_t * lazy_skipped, int64_t * flushed);

@@ -14034,6 +14034,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 1, 1, 1}, k));
     }
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 17)); // just above KMAX: radix fallback
+    // AK-GAP-1-STOCH-ACCEPT (GGML_HIP_DEVICE_ACCEPT_STOCH=K): top_k(K) over n_vocab for every verify row, then the per-row candidate logits
+    // gathered by get_rows on the [1, n_vocab, rows] view of the logits (ne0 = 1, batched over rows: be1 = rows)
+    for (int k : {20, 32}) {
+        for (int rows : {1, 8, 32}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, rows, 1, 1}, k));
+            test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 248320, k, rows, 1, false));
+        }
+    }
     // AK-ASM-H12: QSA-shaped wide top-k (radix select on HIP) and the fused QSA sparse attention composition
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 4, 1, 1}, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 2, 1, 2}, 2051));
