@@ -116,6 +116,21 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    // [EXPERIMENTAL] deferred commit for delta-net: keep one state and the inputs of the last ubatch
+    // LLAMA_RS_REPLAY=1: the gdn op replays the kept pending tokens before the new ones
+    cparams.rs_replay = false;
+    if (cparams.n_rs_seq > 0) {
+        const char * env = getenv("LLAMA_RS_REPLAY");
+        const bool supported = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT ||
+                               model.arch == LLM_ARCH_QWEN4EXP; // [RS-REPLAY] fork: the KDA/Clover archs of the PR are not in this tree
+        cparams.rs_replay = env && atoi(env) != 0 && supported;
+        if (cparams.rs_replay && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.arch == LLM_ARCH_QWEN3NEXT) {
+            // its conv channels split in two segments, which the channels-first replay conv history cannot keep
+            LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY is not supported for qwen3next with SPLIT_MODE_TENSOR, using snapshots\n", __func__);
+            cparams.rs_replay = false;
+        }
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -354,6 +369,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: rs_replay     = %s\n",   __func__, cparams.rs_replay ? "true" : "false");
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
@@ -1487,7 +1503,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // EXL3 weights need the matrix executor's aux sources; the fused path calls vec_dot directly
     // it also needs a previous graph with a logits row to write into, which a
     // zero-output ubatch does not leave behind; that case takes the graph path
-    if (llama_fused_decode_env_enabled() && model.supports_fused_decode() && model.exl3_aux.empty() &&
+    if (llama_fused_decode_env_enabled() && !cparams.rs_replay /* [RS-REPLAY] fused decode bypasses the replay graph */ && model.supports_fused_decode() && model.exl3_aux.empty() &&
             gtype == LLM_GRAPH_TYPE_DEFAULT && !cparams.embeddings_nextn &&
             ubatch.n_tokens == 1 && ubatch.n_seqs == 1 && ubatch.token != nullptr &&
             llama_fused_decode_prev_logits_ok(res->get_logits(), model.vocab.n_tokens())) {
