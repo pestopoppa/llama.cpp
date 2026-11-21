@@ -2557,6 +2557,20 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent);
 
+    // [DTREE-ROUND-OVERHEAD-2] fused tree SSM_CONV: the window taps are gathered by parent index straight from
+    // the conv history cs [d_conv-1, d_inner, n_s] and the token inputs x [d_inner, n_t, n_s] (no concat, no
+    // transposes), and the conv state after each column c is scattered into state_dst [(d_conv-1)*d_inner, n_t,
+    // n_s] at column n_t-1-c (the rollback slot order of the tree ubatch; nb1 = slot stride, nb2 = seq stride,
+    // layout [d_conv-1, d_inner] per state). Output [d_inner, n_t, n_s], bit-identical to ggml_ssm_conv_tree.
+    // state_dst is written as a side effect (like a ggml_cpy destination).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cs,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * parent,
+            struct ggml_tensor  * state_dst);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

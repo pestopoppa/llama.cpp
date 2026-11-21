@@ -466,6 +466,27 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    // [DTREE-ROUND-OVERHEAD-2] tree ubatch, fused: ssm_conv_tree_fused gathers the taps by parent index straight
+    // from conv_states and qkv_mixed and scatters the W rollback conv states itself (replaces concat(transpose),
+    // cont(transpose), get_rows, cont(permute) and the strided cpy). LLAMA_DTREE_CONV_FUSED=0 restores the
+    // unfused graph.
+    static const bool tree_conv_fused = [] {
+        const char * e = getenv("LLAMA_DTREE_CONV_FUSED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (ubatch.parent && tree_conv_fused && conv_kernel_size >= 3 && conv_kernel_size <= 5 &&
+            conv_states_all->type == GGML_TYPE_F32 && conv_states->type == GGML_TYPE_F32) {
+        const int64_t W = ubatch.n_seq_tokens;
+        GGML_ASSERT(W <= (int64_t) cparams.n_rs_seq + 1 && "tree batch wider than the recurrent rollback slots");
+        const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+        const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
+        tree_conv_cs = conv_states;
+        tree_conv_x  = qkv_mixed;
+        tree_conv_sd = ggml_view_3d(ctx0, conv_states_all, row_count, W, n_seqs,
+                (size_t) mem_size * row_size, conv_states_all->nb[1], (size_t) kv_head * row_size);
+        return qkv_mixed;
+    }
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -547,6 +568,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 }
 
 ggml_tensor * llm_build_delta_net_base::build_ssm_conv(ggml_tensor * conv_input, ggml_tensor * conv_kernel) {
+    if (ubatch.parent && tree_conv_x != nullptr && conv_input == tree_conv_x) {
+        ggml_tensor * out = ggml_ssm_conv_tree_fused(ctx0, tree_conv_cs, tree_conv_x, conv_kernel,
+                build_inp_tree(conv_kernel->ne[0])->parent, tree_conv_sd);
+        tree_conv_cs = tree_conv_x = tree_conv_sd = nullptr;
+        return out;
+    }
     if (ubatch.parent) {
         return ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, build_inp_tree(conv_kernel->ne[0])->parent);
     }

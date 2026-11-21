@@ -11008,6 +11008,72 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // [DTREE-ROUND-OVERHEAD-2] fused tree layout: src0 = conv history [nc-1, nr, n_s], src3 = x [nr, n_t, n_s],
+    // src4 = conv-state scatter destination [(nc-1)*nr, n_t, n_s] (column n_t-1-c = state after column c)
+    if (ggml_get_op_params_i32(dst, 0) == 1) {
+        const ggml_tensor * par_t = dst->src[2];
+        const ggml_tensor * xs    = dst->src[3];
+        const ggml_tensor * sd    = dst->src[4];
+        const int nc  = src1->ne[0];
+        const int nk  = nc - 1;
+        const int nr  = src1->ne[1];
+        const int n_t = dst->ne[1];
+        const int n_s = dst->ne[2];
+        GGML_ASSERT(nc <= 16);
+        const int dr  = (nr + nth - 1)/nth;
+        const int ir0 = dr*ith;
+        const int ir1 = MIN(ir0 + dr, nr);
+        const int ir  = ir1 - ir0;
+        if (ir <= 0) {
+            return;
+        }
+        // tap source of window position pos: pos < nk -> history column pos, else token pos - nk
+        std::vector<float> hist((size_t) nk * ir);
+        std::vector<float> win((size_t) nc * ir);
+        int widx[16];
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            const int32_t * par = (const int32_t *) ((const char *) par_t->data + i3*par_t->nb[1]);
+            const float * h = (const float *) ((const char *) src0->data + i3*src0->nb[2]);
+            // read the history before any state write (the scatter may alias it)
+            for (int i1 = 0; i1 < ir; ++i1) {
+                for (int j = 0; j < nk; ++j) {
+                    hist[j + i1*nk] = h[j + (ir0 + i1)*nk];
+                }
+            }
+            const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1]));
+            for (int i2 = 0; i2 < n_t; ++i2) {
+                int pos = i2 + nk;
+                widx[nc - 1] = pos;
+                for (int w = nc - 2; w >= 0; --w) {
+                    if (pos >= nk) {
+                        const int p = par[pos - nk];
+                        GGML_ASSERT(p < pos - nk);
+                        pos = p >= 0 ? p + nk : nk - 1;
+                    } else {
+                        pos = pos - 1;
+                    }
+                    widx[w] = pos;
+                }
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        const int q = widx[i0];
+                        win[i0 + i1*nc] = q < nk ? hist[q + i1*nk]
+                            : *(const float *) ((const char *) xs->data + (ir0 + i1)*sizeof(float) + (q - nk)*xs->nb[1] + i3*xs->nb[2]);
+                    }
+                }
+                float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2]));
+                ggml_ssm_conv_rows_f32(win.data(), nc, c, nc, x, ir);
+                float * st = (float *) ((char *) sd->data + (size_t) (n_t - 1 - i2)*sd->nb[1] + i3*sd->nb[2]);
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    for (int j = 0; j < nk; ++j) {
+                        st[j + (ir0 + i1)*nk] = win[1 + j + i1*nc];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     const int nc  = src1->ne[0]; // d_conv
     const int ncs = src0->ne[0]; // d_conv - 1 + n_t
     const int nr  = src0->ne[1]; // d_inner
