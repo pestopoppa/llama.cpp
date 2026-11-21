@@ -206,7 +206,22 @@ static __device__ __forceinline__ void gv_compute_chunk(
 }
 #endif
 
-template <bool KV_Q8, bool PIPE, bool LATE = false>
+// KPF-41 FAROWS-INPLACE: with ROWS the kernel reads the K/V rows of slice `seq` in place from the unified KV cache through
+// the per-slice row list (rows_s = rows + seq*rows_s1, entry i = KV cell of gathered row i; < 0 = padding, read as cell 0
+// and hidden by the gathered -inf mask column, exactly like the zero row of the gather path). Without ROWS it is the
+// identity, so the non-ROWS instantiations compile to the unchanged code.
+template <bool ROWS>
+static __device__ __forceinline__ int64_t gv_kv_row(const int32_t * __restrict__ rows_s, const int i) {
+    if constexpr (ROWS) {
+        const int32_t r = rows_s[i];
+        return (int64_t) (r < 0 ? 0 : r);
+    } else {
+        GGML_UNUSED(rows_s);
+        return (int64_t) i;
+    }
+}
+
+template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false>
 static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
@@ -215,7 +230,8 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
-        const int64_t nb31, const int64_t nb33, const int ne33) {
+        const int64_t nb31, const int64_t nb33, const int ne33,
+        const int32_t * __restrict__ rows = nullptr, const int64_t rows_s1 = 0) {
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
     extern __shared__ char gv_smem[];
     _Float16 * sK   = (_Float16 *) gv_smem;
@@ -246,6 +262,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
 
     const char * Kb = K + seq * nb13 + hkv * nb12;
     const char * Vb = V + seq * nb23 + hkv * nb22;
+    const int32_t * rows_s = ROWS ? rows + (int64_t) seq * rows_s1 : nullptr; // ROWS: host passes nb13 = nb23 = 0
     const char * Mb = mask + (seq % ne33) * nb33 + (int64_t) q0 * nb31;
 
     // Q fragments of this wave's tile (A operand), f32 -> f16
@@ -358,8 +375,8 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             if constexpr (KV_Q8) {
                 if (tid < GV_KC * (GV_D / QK8_0)) {
                     const int b = tid / GV_KC, key = tid % GV_KC;
-                    const uint16_t * pk = (const uint16_t *) (Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0));
-                    const uint16_t * pv = (const uint16_t *) (Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0));
+                    const uint16_t * pk = (const uint16_t *) (Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0));
+                    const uint16_t * pv = (const uint16_t *) (Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0));
                     if constexpr (LATE) {
                         const gv_q8_raw * qk = (const gv_q8_raw *) pk;
                         const gv_q8_raw * qv = (const gv_q8_raw *) pv;
@@ -384,8 +401,8 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                     const int i = tid + s * nthreads;
                     if (i < GV_KC * (GV_D / 8)) {
                         const int cc = i / GV_KC, key = i % GV_KC;
-                        const uint4 tk = *(const uint4 *) (Kb + (int64_t) (kbase + key) * nb11 + cc * 16);
-                        const uint4 tv = *(const uint4 *) (Vb + (int64_t) (kbase + key) * nb21 + cc * 16);
+                        const uint4 tk = *(const uint4 *) (Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + cc * 16);
+                        const uint4 tv = *(const uint4 *) (Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + cc * 16);
                         fk[4 * s + 0] = tk.x; fk[4 * s + 1] = tk.y; fk[4 * s + 2] = tk.z; fk[4 * s + 3] = tk.w;
                         fv[4 * s + 0] = tv.x; fv[4 * s + 1] = tv.y; fv[4 * s + 2] = tv.z; fv[4 * s + 3] = tv.w;
                     }
@@ -503,7 +520,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                 const int b   = i / GV_KC;
                 const int key = i % GV_KC;
                 {
-                    const char * blk = Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0);
+                    const char * blk = Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0);
                     const float d = __half2float(*(const half *) blk);
                     const uint16_t * qs = (const uint16_t *) (blk + sizeof(half));
 #pragma unroll
@@ -519,7 +536,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                     }
                 }
                 {
-                    const char * blk = Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0);
+                    const char * blk = Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0);
                     const float d = __half2float(*(const half *) blk);
                     const uint16_t * qs = (const uint16_t *) (blk + sizeof(half));
 #pragma unroll
@@ -534,9 +551,9 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             for (int i = tid; i < GV_KC * (GV_D / 8); i += nthreads) {
                 const int cc  = i / GV_KC;
                 const int key = i % GV_KC;
-                const uint4 kv = *(const uint4 *) (Kb + (int64_t) (kbase + key) * nb11 + cc * 16);
+                const uint4 kv = *(const uint4 *) (Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + cc * 16);
                 *(uint4 *) (sK + key * GV_KSTR + cc * 8) = kv;
-                const uint4 vv = *(const uint4 *) (Vb + (int64_t) (kbase + key) * nb21 + cc * 16);
+                const uint4 vv = *(const uint4 *) (Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + cc * 16);
                 const _Float16 * vh = (const _Float16 *) &vv;
 #pragma unroll
                 for (int t = 0; t < 8; ++t) {
@@ -571,7 +588,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q_tot, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-        nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33);
+        nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33, rows, rows_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 }
@@ -725,7 +742,7 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
 #endif // defined(GGML_USE_HIP)
 }
 
-void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int32_t * rows, const int64_t rows_s1) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -775,41 +792,33 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
     const bool late = pipe && q8 && gv_prefetch_late();
+    // ROWS (KPF-41 in-place): K/V are the unified cache itself, one slice per ne[3] -> no per-slice K/V offset
+    const int64_t nb13 = rows ? 0 : K->nb[3];
+    const int64_t nb23 = rows ? 0 : V->nb[3];
+#define GV_LAUNCH(Q8, PIPE_, LATE_, ROWS_) \
+    gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_><<<grid, block, smem, stream>>>( \
+        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
+        Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
+        Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], nb13, V->nb[1], V->nb[2], nb23, \
+        mask->nb[1], mask->nb[3], ne33, rows, rows_s1)
+#define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)
     if (late) {
-        gv_fattn_kernel<true, true, true><<<grid, block, smem, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+        GV_LAUNCH_R(true, true, true);
     } else if (pipe) {
         if (q8) {
-            gv_fattn_kernel<true, true><<<grid, block, smem, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            GV_LAUNCH_R(true, true, false);
         } else {
-            gv_fattn_kernel<false, true><<<grid, block, smem, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            GV_LAUNCH_R(false, true, false);
         }
     } else {
         if (q8) {
-            gv_fattn_kernel<true, false><<<grid, block, smem, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            GV_LAUNCH_R(true, false, false);
         } else {
-            gv_fattn_kernel<false, false><<<grid, block, smem, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-            mask->nb[1], mask->nb[3], ne33);
+            GV_LAUNCH_R(false, false, false);
         }
     }
+#undef GV_LAUNCH_R
+#undef GV_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 
     gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
@@ -829,6 +838,10 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
     if (pipe && n_pipe_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: pipelined K/V load variant ran (call 1)\n");
     }
+    static int n_rows_calls = 0;
+    if (rows && n_rows_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_ROWS_INPLACE in-place row-list K/V read ran (call 1)\n");
+    }
     static int n_late_calls = 0;
     if (late && n_late_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_GV_PREFETCH_LATE prefetch-overlap path ran (call 1)\n");
@@ -837,4 +850,16 @@ void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * d
         GGML_LOG_WARN("%s: %s n_q=%d gqa=%d n_head_kv=%d n_kv=%d n_seq=%d type=%s splits=%d waves=%d smem=%zu pipe=%d\n",
             __func__, dst->name, n_q, gqa, n_head_kv, n_kv, n_seq, ggml_type_name(K->type), n_splits, nwaves, smem, (int) pipe);
     }
+}
+
+void ggml_cuda_fattn_gqa_verify(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    gv_run(ctx, dst, nullptr, 0);
+}
+
+// KPF-41 FAROWS-INPLACE: dst is the gathered [D, n_rows, H_kv, n_slices] view of the UP-FAROWS-HIP plan, except that
+// src[1]/src[2] point at the unified K/V cache itself (ne[1] = n_rows, nb[1]/nb[2] of the cache) and `rows` is the
+// device row list [n_rows, n_slices] (row stride rows_s1). The caller gathers only the mask.
+void ggml_cuda_fattn_gqa_verify_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int32_t * rows, const int64_t rows_s1) {
+    GGML_ASSERT(rows != nullptr);
+    gv_run(ctx, dst, rows, rows_s1);
 }

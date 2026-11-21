@@ -1012,7 +1012,7 @@ static bool ggml_cuda_fattn_rows_trace_enabled() {
 static void ggml_cuda_fattn_rows_trace(const ggml_tensor * dst, const char * path, const char * why, int kernel) {
     // separate budgets for gathered and dense calls, so that one kind cannot hide the other
     static std::atomic<int> n_trace[2] = {{0}, {0}};
-    const bool gathered = strcmp(path, "gather") == 0;
+    const bool gathered = strcmp(path, "gather") == 0 || strcmp(path, "inplace") == 0;
     if (!ggml_cuda_fattn_rows_trace_enabled() || n_trace[gathered ? 1 : 0].fetch_add(1) >= FA_ROWS_TRACE_MAX) {
         return;
     }
@@ -1121,6 +1121,31 @@ static best_fattn_kernel ggml_cuda_fattn_rows_kernel(const int device, const ggm
         return BEST_FATTN_KERNEL_MMA_F16;
     }
     return BEST_FATTN_KERNEL_NONE;
+}
+
+// KPF-41 FAROWS-INPLACE knob (default OFF): see ggml_cuda_fattn_rows_gather_run.
+static bool ggml_cuda_fattn_rows_inplace_enabled() {
+    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_INPLACE");
+    return v;
+}
+
+static thread_local bool ggml_cuda_fattn_rows_inplace_suppressed = false; // INPLACE_VERIFY reference arm
+
+static bool ggml_cuda_fattn_rows_inplace_applies(const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_rows_inplace_enabled() || ggml_cuda_fattn_rows_inplace_suppressed || kernel != BEST_FATTN_KERNEL_GQA_VERIFY || ggml_cuda_fattn_rows_canary()) {
+        return false;
+    }
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    if (K->type == GGML_TYPE_F16) {
+        return K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && V->nb[2] % 16 == 0 &&
+            (uintptr_t) K->data % 16 == 0 && (uintptr_t) V->data % 16 == 0;
+    }
+    return K->nb[1] % 2 == 0 && V->nb[1] % 2 == 0 && K->nb[2] % 2 == 0 && V->nb[2] % 2 == 0 &&
+        (uintptr_t) K->data % 2 == 0 && (uintptr_t) V->data % 2 == 0;
 }
 
 struct ggml_cuda_fattn_rows_plan {
@@ -1443,13 +1468,67 @@ static bool ggml_cuda_fattn_rows_verify_run(ggml_backend_cuda_context & ctx, ggm
     return true;
 }
 
+// KPF-41 FAROWS-INPLACE: GGML_CUDA_FA_ROWS_INPLACE_VERIFY=N (with GGML_CUDA_FA_ROWS_INPLACE=1) runs, for the first N
+// row-list calls outside graph capture, the GATHER path (reference) and then the in-place path, and prints the number of
+// bitwise-different output floats and max |diff| (FA_ROWS_INPLACE_VERIFY ... BITWISE_IDENTICAL | DIFF). The in-place
+// result is the one left in dst. Run with GGML_CUDA_DISABLE_GRAPHS=1.
+static bool ggml_cuda_fattn_rows_inplace_verify_take() {
+    static const int budget = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_INPLACE_VERIFY");
+        return env ? atoi(env) : 0;
+    }();
+    static std::atomic<int> n_done{0};
+    return budget > 0 && ggml_cuda_fattn_rows_inplace_enabled() && n_done.fetch_add(1) < budget;
+}
+
+static bool ggml_cuda_fattn_rows_inplace_verify_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+    if (cs != cudaStreamCaptureStatusNone || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return ggml_cuda_fattn_rows_gather_run(ctx, dst);
+    }
+    const int64_t n = ggml_nelements(dst);
+    std::vector<float> ref(n);
+    std::vector<float> got(n);
+    ggml_cuda_fattn_rows_inplace_suppressed = true;
+    const bool ran_ref = ggml_cuda_fattn_rows_gather_run(ctx, dst);
+    ggml_cuda_fattn_rows_inplace_suppressed = false;
+    if (!ran_ref) {
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(ref.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
+        return true;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(got.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int64_t n_diff = 0;
+    double max_d = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+            n_diff++;
+            const double d = std::fabs((double) ref[i] - (double) got[i]);
+            max_d = std::max(max_d, std::isfinite(d) ? d : INFINITY);
+        }
+    }
+    fprintf(stderr, "FA_ROWS_INPLACE_VERIFY fattn: node=%s Q=[%lld,%lld,%lld] K=[%lld,%lld] %s/%s n=%lld n_bitwise_diff=%lld max_abs_diff=%g %s\n",
+        dst->name, (long long) dst->src[0]->ne[0], (long long) dst->src[0]->ne[1], (long long) dst->src[0]->ne[2],
+        (long long) dst->src[1]->ne[1], (long long) dst->src[1]->ne[2], ggml_type_name(dst->src[1]->type),
+        ggml_type_name(dst->src[2]->type), (long long) n, (long long) n_diff, max_d, n_diff == 0 ? "BITWISE_IDENTICAL" : "DIFF");
+    fflush(stderr);
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     // UP-FAROWS-HIP: per-sequence K/V row gather (GGML_CUDA_FA_ROWS_GATHER=1 and a row-list key only).
     if (ggml_flash_attn_ext_get_rows_key(dst, nullptr, nullptr) != 0) {
         const char * why = ggml_cuda_fattn_rows_gather_why_not(dst);
         if (why == nullptr) {
-            if (ggml_cuda_fattn_rows_verify_take() ? ggml_cuda_fattn_rows_verify_run(ctx, dst) : ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
+            if (ggml_cuda_fattn_rows_inplace_verify_take() ? ggml_cuda_fattn_rows_inplace_verify_run(ctx, dst) :
+                    ggml_cuda_fattn_rows_verify_take() ? ggml_cuda_fattn_rows_verify_run(ctx, dst) : ggml_cuda_fattn_rows_gather_run(ctx, dst)) {
                 return;
             }
         } else {
@@ -1536,6 +1615,43 @@ static bool ggml_cuda_fattn_rows_gather_run(ggml_backend_cuda_context & ctx, ggm
     ggml_cuda_fattn_rows_trace(dst, "gather", stub_why /* first choice was a stub -> promoted */, (int) kernel);
 
     char * base = (char *) dst->data;
+
+    // KPF-41 FAROWS-INPLACE (GGML_CUDA_FA_ROWS_INPLACE=1, default off): the GQA-verify kernel reads the listed K/V rows in
+    // place from the unified cache through the row list instead of from a gathered copy; only the (small) mask is still
+    // gathered. Dispatch gate: same kernel as the gathered call would run (GQA_VERIFY), K type == V type (the #32520
+    // review found mixed K/V pairs regress without this check; GQA-verify itself rejects them, so this is belt and braces),
+    // and the cache strides satisfy the kernel's alignment contract. Anything else keeps the gather.
+    if (ggml_cuda_fattn_rows_inplace_applies(kernel, dst)) {
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        ggml_tensor Ki = p.K;
+        ggml_tensor Vi = p.V;
+        Ki.data = K->data; Ki.nb[1] = K->nb[1]; Ki.nb[2] = K->nb[2]; Ki.nb[3] = 0;
+        Vi.data = V->data; Vi.nb[1] = V->nb[1]; Vi.nb[2] = V->nb[2]; Vi.nb[3] = 0;
+        p.dst.src[1] = &Ki;
+        p.dst.src[2] = &Vi;
+        p.mask.data  = base + p.off_mask;
+        const ggml_tensor * mask = dst->src[3];
+        const int64_t rows_s1 = p.K.ne[1];
+        cudaStream_t stream = ctx.stream();
+        const int R = (int) p.mask.ne[0];
+        const int T = (int) p.mask.ne[1];
+        const int S = (int) p.mask.ne[3];
+        const dim3 grid((unsigned) ((R + 255)/256), (unsigned) T, (unsigned) S);
+        ggml_cuda_fattn_rows_gather_mask<<<grid, dim3(256, 1, 1), 0, stream>>>(
+            (const half *) mask->data, (half *) p.mask.data, rows_d, R, T, rows_s1, mask->nb[1] / sizeof(half));
+        CUDA_CHECK(cudaGetLastError());
+        static bool logged_inplace = false;
+        if (!logged_inplace) {
+            logged_inplace = true;
+            GGML_LOG_WARN("%s: GGML_CUDA_FA_ROWS_INPLACE engaged: n_kv=%lld -> n_rows=%lld x n_slices=%lld, in-place K/V read (no K/V gather)\n",
+                __func__, (long long) K->ne[1], (long long) p.K.ne[1], (long long) p.K.ne[3]);
+        }
+        ggml_cuda_fattn_rows_trace(dst, "inplace", nullptr, (int) kernel);
+        ggml_cuda_fattn_gqa_verify_rows(ctx, &p.dst, rows_d, rows_s1);
+        return true;
+    }
+
     p.K.data    = base + p.off_K;
     p.V.data    = base + p.off_V;
     p.mask.data = base + p.off_mask;
