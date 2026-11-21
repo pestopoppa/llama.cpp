@@ -5409,7 +5409,14 @@ private:
     // GPU-ZOS-2 C2a: engaged per slot for greedy requests that read no probabilities; the common function
     // checks the rest of the chain (grammar, reasoning budget, penalties, ...) and falls back row by row.
     bool zos2_greedy_fast_engaged(const server_slot & slot) const {
-        return zos2.greedy_fast && slot.task->params.sampling.temp <= 0.0f && slot.task->params.sampling.n_probs == 0;
+        // AK-GAP-1-SAMPLE: LLAMA_DEVICE_ACCEPT=1 also engages the greedy-fast verify, whose rows read the device
+        // argmax (one int32 per row) so the chain accept never downloads the verify logits
+        static const bool dev_accept = [] {
+            const char * e = getenv("LLAMA_DEVICE_ACCEPT");
+            return e != nullptr && e[0] == '1';
+        }();
+        return (zos2.greedy_fast || dev_accept) && slot.task->params.sampling.temp <= 0.0f &&
+               slot.task->params.sampling.n_probs == 0;
     }
 
     // GPU-ZOS-2 C3: verification sampling of one slot for phase 1 of an overlapped step. n_probs == 0 is part of
