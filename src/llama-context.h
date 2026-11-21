@@ -360,6 +360,17 @@ private:
     std::vector<int32_t> argmax_out;
     bool                 argmax_valid = false;
 
+    // AK-GAP-1-SAMPLE (LLAMA_DEVICE_ACCEPT=1): when a single-ubatch decode produced device argmax rows, the
+    // n_outputs x n_vocab logits download is deferred until something reads the logits. A greedy accept that
+    // only reads argmax ids never pays it. Discarded at the next decode, flushed before any other compute.
+    ggml_tensor *  logits_lazy_t       = nullptr;
+    ggml_backend_t logits_lazy_backend = nullptr;
+    int64_t        logits_lazy_n       = 0;
+    int64_t        n_logits_lazy_skip  = 0;
+    int64_t        n_logits_lazy_flush = 0;
+
+    void logits_lazy_flush();
+
     struct swap_info {
         uint32_t i0;
         uint32_t i1;

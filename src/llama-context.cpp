@@ -540,6 +540,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (llama_device_accept_enabled()) {
+        fprintf(stderr, "llama_device_accept: lazy_skipped=%lld flushed=%lld\n",
+                (long long) n_logits_lazy_skip, (long long) n_logits_lazy_flush);
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -898,8 +902,38 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+// AK-GAP-1-SAMPLE: default-off knob, read once
+static bool llama_device_accept_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_DEVICE_ACCEPT");
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) {
+            fprintf(stderr, "llama_device_accept: ENABLED (LLAMA_DEVICE_ACCEPT=1, lazy logits download behind device argmax)\n");
+        }
+        return on;
+    }();
+    return v;
+}
+
+void llama_context::logits_lazy_flush() {
+    if (logits_lazy_t == nullptr) {
+        return;
+    }
+    ggml_tensor *  t = logits_lazy_t;
+    ggml_backend_t b = logits_lazy_backend;
+    const int64_t  n = logits_lazy_n;
+    logits_lazy_t = nullptr;
+    logits_lazy_backend = nullptr;
+    logits_lazy_n = 0;
+    GGML_ASSERT(logits.data != nullptr);
+    ggml_backend_tensor_get_async(b, t, logits.data, 0, n*model.vocab.n_tokens()*sizeof(float));
+    ggml_backend_synchronize(b);
+    n_logits_lazy_flush++;
+}
+
 float * llama_context::get_logits() {
     output_reorder();
+    logits_lazy_flush();
 
     return logits.data;
 }
@@ -935,6 +969,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
+    logits_lazy_flush();
 
     try {
         if (logits.data == nullptr) {
@@ -2257,6 +2292,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    // this decode rewrites every output row: the previous decode's deferred logits are dead
+    logits_lazy_t = nullptr;
+    logits_lazy_backend = nullptr;
+    logits_lazy_n = 0;
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -2356,7 +2396,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            if (n_outputs) {
+            // AK-GAP-1-SAMPLE: single-ubatch decode with valid device argmax -> defer the download
+            const bool lazy = llama_device_accept_enabled() && argmax_valid && res->t_argmax != nullptr &&
+                              n_outputs_prev == 0 && n_outputs == n_outputs_all;
+            if (lazy) {
+                logits_lazy_t       = t_logits;
+                logits_lazy_backend = backend_res;
+                logits_lazy_n       = n_outputs;
+                n_logits_lazy_skip++;
+            } else if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
@@ -2527,6 +2575,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+    if (logits_lazy_t != nullptr) {
+        synchronize();
+        logits_lazy_flush();
+    }
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2717,6 +2769,10 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    if (logits_lazy_t != nullptr && !output_swaps.empty()) {
+        synchronize();
+        logits_lazy_flush();
+    }
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
@@ -2908,6 +2964,10 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    if (logits_lazy_t != nullptr) {
+        synchronize();
+        logits_lazy_flush();
+    }
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
