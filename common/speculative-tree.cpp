@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <queue>
 
 namespace {
 
@@ -102,6 +105,146 @@ std::vector<std::vector<int32_t>> common_dtree_build_paths(
     }
 
     return paths;
+}
+
+namespace {
+
+struct greedy_node {
+    double               v;     // cumulative probability
+    std::vector<int32_t> path;  // candidate-index path from the anchor
+};
+
+// max-heap order: higher v first, ties to the lexicographically smaller path (tree_sim.py heapq on (-v, path))
+struct greedy_worse {
+    bool operator()(const greedy_node & a, const greedy_node & b) const {
+        if (a.v != b.v) {
+            return a.v < b.v;
+        }
+        return b.path < a.path;
+    }
+};
+
+// softmax exactly as tree_sim.py: exp(x - max) in double, Neumaier-compensated sum (CPython >= 3.12 sum() of floats),
+// then divide. Bit-exact agreement keeps near-tie expansion order identical to the simulator.
+void softmax_d(const float * s, int32_t K, std::vector<double> & out) {
+    out.resize(K);
+    double mx = (double) s[0];
+    for (int32_t k = 1; k < K; ++k) {
+        mx = std::max(mx, (double) s[k]);
+    }
+    double sum = 0.0;
+    double c   = 0.0;
+    for (int32_t k = 0; k < K; ++k) {
+        out[k] = std::exp((double) s[k] - mx);
+        const double x = out[k];
+        const double t = sum + x;
+        c += std::fabs(sum) >= std::fabs(x) ? (sum - t) + x : (x - t) + sum;
+        sum = t;
+    }
+    if (c != 0.0 && std::isfinite(c)) {
+        sum += c;
+    }
+    for (int32_t k = 0; k < K; ++k) {
+        out[k] = out[k] / sum;
+    }
+}
+
+} // namespace
+
+std::vector<std::vector<int32_t>> common_dtree_build_greedy(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, int32_t n_nodes, bool branch_follows_main) {
+    std::vector<std::vector<int32_t>> paths;
+    if (D <= 0 || K <= 0 || n_nodes < 2) {
+        return paths;
+    }
+
+    std::priority_queue<greedy_node, std::vector<greedy_node>, greedy_worse> heap;
+    std::vector<double> pr;
+
+    auto on_chain = [](const std::vector<int32_t> & p) {
+        return std::all_of(p.begin(), p.end(), [](int32_t k) { return k == 0; });
+    };
+    // greedy chain index at each depth (argmax, lowest index on ties == std::max_element)
+    std::vector<int32_t> chain;
+    {
+        int32_t pred = 0;
+        for (int32_t j = 0; j < D; ++j) {
+            const float * s = scores(j, pred);
+            pred = (int32_t) std::distance(s, std::max_element(s, s + K));
+            chain.push_back(pred);
+        }
+    }
+    auto is_chain_prefix = [&](const std::vector<int32_t> & p) {
+        return std::equal(p.begin(), p.end(), chain.begin());
+    };
+
+    auto push_children = [&](const std::vector<int32_t> & path, double v) {
+        const int32_t j = (int32_t) path.size();
+        if (j >= D) {
+            return;
+        }
+        if (branch_follows_main && !on_chain(path)) {
+            const float * s = scores(j, 0);
+            softmax_d(s, K, pr);
+            greedy_node n { v * pr[0], path };
+            n.path.push_back(0);
+            heap.push(std::move(n));
+            return;
+        }
+        const float * s = scores(j, path.empty() ? 0 : path.back());
+        softmax_d(s, K, pr);
+        for (int32_t k = 0; k < K; ++k) {
+            greedy_node n { v * pr[k], path };
+            n.path.push_back(k);
+            heap.push(std::move(n));
+        }
+    };
+
+    std::vector<std::vector<int32_t>> tree; // insertion order
+    push_children({}, 1.0);
+    while ((int32_t) tree.size() < n_nodes - 1 && !heap.empty()) {
+        greedy_node n = heap.top();
+        heap.pop();
+        tree.push_back(n.path);
+        push_children(n.path, n.v);
+    }
+
+    // leaves: nodes that are no other node's parent
+    std::vector<bool> leaf(tree.size(), true);
+    for (const auto & p : tree) {
+        if (p.size() < 2) {
+            continue;
+        }
+        const std::vector<int32_t> par(p.begin(), p.end() - 1);
+        for (size_t i = 0; i < tree.size(); ++i) {
+            if (tree[i] == par) {
+                leaf[i] = false;
+                break;
+            }
+        }
+    }
+    // path 0: the deepest greedy-chain node in the tree
+    std::vector<int32_t> main;
+    for (const auto & p : tree) {
+        if (is_chain_prefix(p) && p.size() > main.size()) {
+            main = p;
+        }
+    }
+    paths.push_back(main);
+    for (size_t i = 0; i < tree.size(); ++i) {
+        if (leaf[i] && !is_chain_prefix(tree[i])) {
+            paths.push_back(tree[i]);
+        }
+    }
+    return paths;
+}
+
+int32_t common_dtree_policy() {
+    static const int32_t policy = [] {
+        const char * e = std::getenv("LLAMA_DTREE_POLICY");
+        return e != nullptr && std::strcmp(e, "greedy") == 0 ? 1 : 0;
+    }();
+    return policy;
 }
 
 int32_t common_dtree_n_columns(const std::vector<std::vector<int32_t>> & paths) {

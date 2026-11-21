@@ -184,7 +184,9 @@ void llm_graph_input_tree::set_input(const llama_ubatch * ubatch) {
         for (int64_t s = 0; s < n_s; ++s) {
             for (int64_t c = 0; c < n_st; ++c) {
                 int32_t pos = (int32_t) (c + nc - 1);
-                int32_t * out = ci.data() + (s*n_st + c)*(nc - 1);
+                // [DTREE-ROUND-OVERHEAD] stored in rollback-slot order (slot n_st-1-c = state after column c), so the
+                // graph scatters all W conv states with one strided cpy instead of W per-column copies
+                int32_t * out = ci.data() + (s*n_st + (n_st - 1 - c))*(nc - 1);
                 out[nc - 2] = pos;
                 for (int64_t w = nc - 3; w >= 0; --w) {
                     if (pos >= nc - 1) {

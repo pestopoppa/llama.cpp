@@ -6275,6 +6275,63 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// [DTREE-ROUND-OVERHEAD] tree walk + the snapshot scatter into a rollback-slot cache, as emitted by
+// llm_build_delta_net_base::build_recurrent_attn for a tree ubatch (gdn tail view -> strided cache view cpy).
+// The HIP backend fuses the pair (the kernel writes the slots, the cpy is skipped); verifies the attention
+// output AND every cache slot against the unfused CPU graph.
+struct test_gdn_tree_cache : public test_case {
+    const int64_t head_count, head_size, n_tokens, mem_size;
+    const int tree_kind;
+    ggml_tensor * attn = nullptr;
+    ggml_tensor * cpy  = nullptr;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GDN_TREE_CACHE"; }
+    std::string vars() override { return VARS_TO_STR5(head_count, head_size, n_tokens, mem_size, tree_kind); }
+    test_gdn_tree_cache(int64_t head_count = 4, int64_t head_size = 128, int64_t n_tokens = 16, int64_t mem_size = 1, int tree_kind = 1)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens), mem_size(mem_size), tree_kind(tree_kind) {}
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn, cpy }; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size, H = head_count, D = S*S*H;
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, 1);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, 1);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, 1);
+        ggml_tensor * st   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, 1);
+        ggml_tensor * par  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tokens, 1);
+        ggml_set_name(par, "parent");
+        // cache: mem_size cells x (n_tokens + 1) rollback groups; this seq lives in cell mem_size - 1
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size*(n_tokens + 1));
+        ggml_set_name(cache, "cache");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        beta = ggml_sigmoid(ctx, beta);
+        g = ggml_neg(ctx, ggml_softplus(ctx, g));
+        ggml_tensor * out = ggml_gated_delta_net_tree(ctx, q, k, v, g, beta, st, par);
+        attn = ggml_view_4d(ctx, out, S, H, n_tokens, 1, ggml_row_size(out->type, S), ggml_row_size(out->type, S*H),
+                            ggml_row_size(out->type, S*H*n_tokens), 0);
+        ggml_tensor * src = ggml_view_3d(ctx, out, D, 1, n_tokens, ggml_row_size(out->type, D), ggml_row_size(out->type, D),
+                                         ggml_row_size(out->type, S*H*n_tokens));
+        const size_t row = ggml_row_size(GGML_TYPE_F32, D);
+        ggml_tensor * dst = ggml_view_3d(ctx, cache, D, 1, n_tokens, cache->nb[1], (size_t) mem_size*row, (size_t) (mem_size - 1)*row);
+        cpy = ggml_cpy(ctx, src, dst);
+        // one root that keeps both checked nodes alive; the cpy branch is visited first so the cpy is the first
+        // non-view node after the gdn in graph order (the HIP fusion's match condition)
+        ggml_tensor * cpy_sum = ggml_sum(ctx, cpy);
+        attn = ggml_scale(ctx, attn, 1.0f);
+        return ggml_add(ctx, cpy_sum, ggml_sum(ctx, attn));
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                dtree_set_parents(t, tree_kind);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -14545,6 +14602,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, kk));
             }
         }
+    }
+    // [DTREE-ROUND-OVERHEAD] fused tree snapshot scatter (27B dims: 128-wide heads; W 8/12/16; 1 and 3 cache cells)
+    for (int kind = 0; kind < 3; ++kind) {
+        for (int64_t W : { 8, 12, 16 }) {
+            test_cases.emplace_back(new test_gdn_tree_cache(4, 128, W, 1, kind));
+        }
+        test_cases.emplace_back(new test_gdn_tree_cache(4, 128, 16, 3, kind));
     }
     // [AK-DTREE-2] tree-verification ops at 27B (16 k-heads x3 -> 48 v-heads) and A3B (16 x2 -> 32) GDN
     // dims and conv widths (27B 10240, A3B 8192 channels), W in {8, 12, 16}, chain/layout/bushy trees.

@@ -2974,9 +2974,17 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
-    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output.
+    // [DTREE-ROUND-OVERHEAD] tree walks (src[6] = parent) fuse too: the tree kernel's parent-snapshot reloads read
+    // slot (n_tokens-1-p) through the same state pointer + slot stride it wrote with, so pointing it at the cache
+    // keeps the reload exact and drops the W x D snapshot cpy (48 x 48 MiB D2D blits per 27B T16 round).
+    // GGML_HIP_GDN_TREE_FUSE=0 restores the unfused tree path.
+    static const bool tree_fuse = [] {
+        const char * e = getenv("GGML_HIP_GDN_TREE_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
-        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || gdn->src[6] != nullptr) {
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || (gdn->src[6] != nullptr && !tree_fuse)) {
         return 0;
     }
 
