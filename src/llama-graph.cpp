@@ -856,6 +856,10 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
 }
 
 void llm_graph_input_attn_kv::set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    if (dctl_wb) {
+        kv->ctl_sync(*ubatch);
+        return;
+    }
     if (dkv_p0) {
         if (dkv_p0->buffer) {
             std::vector<float> p0, base;
@@ -874,7 +878,10 @@ bool llm_graph_input_attn_kv::can_reuse_kv_idx_dev(const llama_kv_cache_context 
     std::vector<float> p0, base;
     int64_t size = 0;
     const bool want = llama_kv_idx_dev_enabled() && kv->kv_idx_dev_info(ubatch, p0, base, size);
-    return want == (dkv_p0 != nullptr) && (!want || dkv_p0->ne[1] == (int64_t) p0.size());
+    int64_t s0 = -1, n = 0;
+    const bool want_ctl = want && kv->ctl_range(ubatch, s0, n) != nullptr;
+    return want == (dkv_p0 != nullptr) && (!want || dkv_p0->ne[1] == (int64_t) p0.size()) &&
+           want_ctl == (dctl_wb != nullptr) && (!want_ctl || s0 == dctl_s0);
 }
 
 void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
@@ -3529,16 +3536,40 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         if (llama_kv_idx_dev_enabled() && mctx_cur->kv_idx_dev_info(ubatch, p0, base, size)) {
             const int64_t n_str = (int64_t) p0.size();
             const int64_t n_tps = ubatch.n_tokens / n_str;
-            inp->dkv_p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
-            ggml_set_input(inp->dkv_p0);
-            ggml_set_name(inp->dkv_p0, "attn_inp_kv_idx_p0");
-            inp->dkv_base = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
-            ggml_set_input(inp->dkv_base);
-            ggml_set_name(inp->dkv_base, "attn_inp_kv_idx_base");
-            ggml_tensor * q   = llama_build_pos_dev(ctx0, inp->dkv_p0, n_tps, n_str);                 // [n_tps, n_str]
+            int64_t ctl_s0 = -1, ctl_n = 0;
+            ggml_tensor * ctl = mctx_cur->ctl_range(ubatch, ctl_s0, ctl_n);
+            ggml_tensor * p0_src = nullptr;
+            ggml_tensor * base_src = nullptr;
+            ggml_tensor * p0_view = nullptr;
+            if (ctl) {
+                // [GPU-RESIDENT-ROUND-2f phase 2.2] read p0/base from the device control block (no host input)
+                GGML_ASSERT(ctl_n == n_str);
+                inp->dkv_p0   = ggml_view_2d(ctx0, ctl, 1, n_str, ctl->nb[1], ctl_s0*ctl->nb[1]);
+                inp->dkv_base = ggml_view_2d(ctx0, ctl, 1, n_str, ctl->nb[1], ctl_s0*ctl->nb[1] + ggml_element_size(ctl));
+                p0_view  = inp->dkv_p0;
+                p0_src   = ggml_cont(ctx0, inp->dkv_p0);
+                base_src = ggml_cont(ctx0, inp->dkv_base);
+                inp->dctl_s0 = ctl_s0;
+            } else {
+                inp->dkv_p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
+                ggml_set_input(inp->dkv_p0);
+                ggml_set_name(inp->dkv_p0, "attn_inp_kv_idx_p0");
+                inp->dkv_base = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
+                ggml_set_input(inp->dkv_base);
+                ggml_set_name(inp->dkv_base, "attn_inp_kv_idx_base");
+                p0_src   = inp->dkv_p0;
+                base_src = inp->dkv_base;
+            }
+            ggml_tensor * q   = llama_build_pos_dev(ctx0, p0_src, n_tps, n_str);                       // [n_tps, n_str]
+            if (ctl) {
+                // write-back p0 + n_tps, derived from q so it is ordered after the read of the control block
+                ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
+                inp->dctl_wb = ggml_cpy(ctx0, ggml_scale_bias(ctx0, last, 1.0f, 1.0f), p0_view);
+                ggml_set_name(inp->dctl_wb, "attn_kv_ctl_wb");
+            }
             // floor((q + 0.5)/size): robust to the rounding of the reciprocal for any size
             ggml_tensor * wrp = ggml_scale(ctx0, ggml_floor(ctx0, ggml_scale_bias(ctx0, q, 1.0f/(float) size, 0.5f/(float) size)), (float) size);
-            ggml_tensor * idx = ggml_add(ctx0, ggml_sub(ctx0, q, wrp), inp->dkv_base);
+            ggml_tensor * idx = ggml_add(ctx0, ggml_sub(ctx0, q, wrp), base_src);
             idx = ggml_cast(ctx0, ggml_reshape_1d(ctx0, idx, ubatch.n_tokens), GGML_TYPE_I32);
             ggml_set_name(idx, "attn_kv_idx_dev");
             inp->self_k_idxs = idx;
@@ -3635,6 +3666,9 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
+    if (inp->dctl_wb) {
+        ggml_build_forward_expand(gf, inp->dctl_wb);
+    }
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -4502,6 +4536,9 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, hparams, cparams, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
+    if (inp_attn->dctl_wb) {
+        ggml_build_forward_expand(gf, inp_attn->dctl_wb);
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

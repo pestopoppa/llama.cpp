@@ -430,6 +430,10 @@ public:
     // first position and stream base (ring layout: cell = base + (p0 + i) % size); nullptr = host-written indices
     ggml_tensor * dkv_p0   = nullptr; // F32 [1, n_stream]
     ggml_tensor * dkv_base = nullptr; // F32 [1, n_stream]
+    // [GPU-RESIDENT-ROUND-2f phase 2.2] LLAMA_DEVICE_CTL=1: p0/base are views of the KV cache's device control block;
+    // dctl_wb writes p0 + n_tps back (the caller expands it); dctl_s0 = first stream of the view (-1 = unused)
+    ggml_tensor * dctl_wb = nullptr;
+    int64_t       dctl_s0 = -1;
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 

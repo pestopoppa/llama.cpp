@@ -303,6 +303,28 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // [GPU-RESIDENT-ROUND-2f phase 2.2] device control block, on the buffer type of the first KV layer
+    if (const char * e = getenv("LLAMA_DEVICE_CTL"); e && strcmp(e, "1") == 0 && !hparams.no_alloc && !layers.empty() && !v_trans) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers[0].k->buffer);
+        ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+        ggml_context * cctx = ggml_init(params);
+        ctl = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, 2, n_stream);
+        ggml_format_name(ctl, "cache_%sctl", name_tag);
+        ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors_from_buft(cctx, buft);
+        if (!cbuf) {
+            throw std::runtime_error("failed to allocate kv control block");
+        }
+        std::vector<float> init(2*n_stream);
+        ctl_host.assign(n_stream, -1.0f);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            init[2*s + 0] = -1.0f;
+            init[2*s + 1] = (float) ((int64_t) s*kv_size);
+        }
+        ggml_backend_tensor_set(ctl, init.data(), 0, ggml_nbytes(ctl));
+        ctxs_bufs.emplace_back(ggml_context_ptr(cctx), cbuf);
+        LLAMA_LOG_INFO("%s: LLAMA_DEVICE_CTL: device control block ENABLED (%u streams, %s)\n", __func__, n_stream, ggml_backend_buft_name(buft));
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
@@ -375,6 +397,13 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    if (ctl) {
+        fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CTL: device_hits=%lld host_writes=%lld\n",
+                (long long) ctl_device_hits, (long long) ctl_host_writes);
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -384,6 +413,16 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        if (ctl) {
+            // [GPU-RESIDENT-ROUND-2f phase 2.2] restore the stream bases; p0 mirror = 0 (cleared)
+            std::vector<float> init(2*n_stream);
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                init[2*s + 0] = 0.0f;
+                init[2*s + 1] = (float) ((int64_t) s*get_size());
+                ctl_host[s] = 0.0f;
+            }
+            ggml_backend_tensor_set(ctl, init.data(), 0, ggml_nbytes(ctl));
         }
         if (observer) {
             observer->on_invalidate_all();
@@ -3752,6 +3791,39 @@ bool llama_kv_cache_context::kv_idx_dev_info(const llama_ubatch & ubatch, std::v
         base[s] = (float) ((int64_t) si.strm[s]*size);
     }
     return true;
+}
+
+ggml_tensor * llama_kv_cache_context::ctl_range(const llama_ubatch & ubatch, int64_t & s0, int64_t & n) const {
+    if (!kv->ctl || sinfos.empty() || i_cur >= sinfos.size()) {
+        return nullptr;
+    }
+    const auto & si = sinfos[i_cur];
+    n  = si.n_stream();
+    s0 = si.strm[0];
+    for (int64_t s = 1; s < n; ++s) {
+        if ((int64_t) si.strm[s] != s0 + s) {
+            return nullptr;
+        }
+    }
+    GGML_UNUSED(ubatch);
+    return kv->ctl;
+}
+
+void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch) const {
+    std::vector<float> p0, base;
+    int64_t size = 0, s0 = 0, n = 0;
+    GGML_ASSERT(ctl_range(ubatch, s0, n) && kv_idx_dev_info(ubatch, p0, base, size));
+    const float n_tps = (float) (ubatch.n_tokens / n);
+    for (int64_t s = 0; s < n; ++s) {
+        float & m = kv->ctl_host[s0 + s];
+        if (m != p0[s]) {
+            ggml_backend_tensor_set(kv->ctl, &p0[s], (s0 + s)*kv->ctl->nb[1], sizeof(float));
+            kv->ctl_host_writes++;
+        } else {
+            kv->ctl_device_hits++;
+        }
+        m = p0[s] + n_tps; // the graph writes this back
+    }
 }
 
 bool llama_kv_cache_context::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {

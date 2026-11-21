@@ -116,7 +116,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -395,6 +395,17 @@ private:
     // HSF-5.P: null unless a host KV mirror is enabled
     write_observer * observer = nullptr;
 
+public:
+    // [GPU-RESIDENT-ROUND-2f phase 2.2] LLAMA_DEVICE_CTL=1: per-stream device control block F32 [2, n_stream]
+    // (row 0 = next first position n_past the device expects, row 1 = stream base cell). The graph reads its K/V
+    // write indices from it and writes back p0 + n_tokens; the host mirror tracks the device value and the host
+    // writes an element only when the ubatch disagrees with it (rollback / new sequence). nullptr = disabled
+    ggml_tensor * ctl = nullptr;
+    mutable std::vector<float> ctl_host;
+    mutable int64_t ctl_host_writes = 0;
+    mutable int64_t ctl_device_hits = 0;
+private:
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -513,6 +524,11 @@ public:
     // [GPU-RESIDENT-ROUND-2f phase 2] K/V write indices derivable on the device: per-sequence streams whose slots follow
     // the ring (cell = pos % size) for position-contiguous tokens; fills per stream the first position and stream base
     bool kv_idx_dev_info(const llama_ubatch & ubatch, std::vector<float> & p0, std::vector<float> & base, int64_t & size) const;
+    // [GPU-RESIDENT-ROUND-2f phase 2.2] the ubatch's streams as a contiguous ascending range [s0, s0+n) of the
+    // device control block (nullptr when disabled or not contiguous)
+    ggml_tensor * ctl_range(const llama_ubatch & ubatch, int64_t & s0, int64_t & n) const;
+    // writes the control-block elements whose mirror disagrees with the ubatch, then advances the mirror by n_tps
+    void ctl_sync(const llama_ubatch & ubatch) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows
