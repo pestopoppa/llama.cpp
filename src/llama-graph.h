@@ -178,7 +178,8 @@ public:
 
 // [AK-DTREE-2] tree-verification inputs for recurrent layers (tree ubatch only):
 //   parent   I32 [n_seq_tokens, n_seqs]          parent column within the seq set (-1 = root)
-//   conv_idx I32 [(d_conv-1)*n_seq_tokens, n_seqs] conv_input column of each tap of the conv state after column c
+//   conv_idx I32 [(d_conv-1)*n_seq_tokens, n_seqs] conv_input column of each tap of the conv state of rollback
+//            slot j (= the state after column n_seq_tokens-1-j)
 class llm_graph_input_tree : public llm_graph_input_i {
 public:
     llm_graph_input_tree(int64_t d_conv) : d_conv(d_conv) {}
