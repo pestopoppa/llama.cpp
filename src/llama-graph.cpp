@@ -4419,7 +4419,7 @@ static bool llama_device_argmax_enabled() {
         // AK-GAP-1-SAMPLE: LLAMA_DEVICE_ACCEPT=1 (lazy logits download) needs the argmax rows, so it implies this
         const char * e = getenv("LLAMA_DEVICE_ARGMAX");
         const char * a = getenv("LLAMA_DEVICE_ACCEPT");
-        return (e != nullptr && e[0] == '1') || (a != nullptr && a[0] == '1');
+        return (e != nullptr && e[0] == '1') || (a == nullptr || a[0] != '0');   // C17: LLAMA_DEVICE_ACCEPT default ON (=0 disables)
     }();
     return v;
 }

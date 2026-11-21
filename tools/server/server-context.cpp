@@ -5443,7 +5443,7 @@ private:
         // argmax (one int32 per row) so the chain accept never downloads the verify logits
         static const bool dev_accept = [] {
             const char * e = getenv("LLAMA_DEVICE_ACCEPT");
-            return e != nullptr && e[0] == '1';
+            return e == nullptr || e[0] != '0';   // C17: default ON (=0 disables)
         }();
         return (zos2.greedy_fast || dev_accept) && slot.task->params.sampling.temp <= 0.0f &&
                slot.task->params.sampling.n_probs == 0;

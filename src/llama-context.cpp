@@ -904,13 +904,13 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
-// AK-GAP-1-SAMPLE: default-off knob, read once
+// AK-GAP-1-SAMPLE: default ON since C17 (LLAMA_DEVICE_ACCEPT=0 disables), read once
 static bool llama_device_accept_enabled() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_DEVICE_ACCEPT");
-        const bool on = e != nullptr && e[0] == '1';
+        const bool on = e == nullptr || e[0] != '0';
         if (on) {
-            fprintf(stderr, "llama_device_accept: ENABLED (LLAMA_DEVICE_ACCEPT=1, lazy logits download behind device argmax)\n");
+            fprintf(stderr, "llama_device_accept: ENABLED (LLAMA_DEVICE_ACCEPT default on, =0 disables; lazy logits download behind device argmax)\n");
         }
         return on;
     }();
