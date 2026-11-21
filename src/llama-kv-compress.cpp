@@ -387,7 +387,15 @@ int llama_kv_compress_evict(
         llama_seq_id    seq_id,
         const llama_kv_compress_params & params) {
 
-    auto scores = llama_kv_compress_score(ctx, seq_id, params);
+    // EA-POOL-SCREEN: the random controls ignore the EA scores, so skip the (slow, host-side) scoring pass for them
+    std::vector<float> scores;
+    if (params.rand_mode != 0) {
+        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
+        if (pmax < 0) return -1;
+        scores.assign((size_t) pmax + 1, 0.0f);
+    } else {
+        scores = llama_kv_compress_score(ctx, seq_id, params);
+    }
     if (scores.empty()) return -1;
 
     llama_memory_t mem = llama_get_memory(ctx);
