@@ -2559,6 +2559,9 @@ struct test_case {
     // comparison, witness_check() right after it; a non-empty reason fails the case. Default: none.
     virtual void witness_begin(ggml_backend_t backend) { GGML_UNUSED(backend); }
     virtual std::string witness_check(ggml_backend_t backend) { GGML_UNUSED(backend); return ""; }
+    // true: the witness is the whole verdict, the per-node NaN/inf/err value checks are skipped (degenerate inputs whose
+    // reference itself is NaN). Default: false.
+    virtual bool witness_only_values() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -2910,6 +2913,10 @@ struct test_case {
                         return true;
                     }
                 }
+            }
+
+            if (ud->tc->witness_only_values()) {
+                return true;
             }
 
             for (size_t i = 0; i < f1.size(); i++) {
@@ -8469,6 +8476,7 @@ struct test_topk_moe_degen : public test_topk_moe {
     }
 
     double err(const float * a, const float * b, size_t n) override { GGML_UNUSED(a); GGML_UNUSED(b); GGML_UNUSED(n); return 0.0; }
+    bool witness_only_values() override { return true; }
 
     std::string witness_check(ggml_backend_t backend) override {
         GGML_UNUSED(backend);
@@ -8486,7 +8494,8 @@ struct test_topk_moe_degen : public test_topk_moe {
             if (!uniq || !range_ok) {
                 if (bad++ == 0) {
                     reason = std::string("TOPK_UNIQ_WITNESS: ") + (uniq ? "out-of-range" : "duplicate") + " id on row " +
-                             std::to_string(r) + " (" + pattern_name(r) + ")";
+                             std::to_string(r) + " (" + pattern_name(r) + ") ids=";
+                    for (int64_t j = 0; j < k; ++j) { reason += (j ? "," : "") + std::to_string(ids[r * k + j]); }
                 }
             }
         }
