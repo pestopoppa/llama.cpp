@@ -8447,8 +8447,8 @@ struct test_topk_moe_degen : public test_topk_moe {
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "TOPK_MOE_DEGEN"; }
 
     static const char * pattern_name(int64_t r) {
-        static const char * names[] = { "all_tie", "tie_levels", "half_neginf", "all_neginf", "one_nan", "all_nan", "tie_top_k" };
-        return names[r % 7];
+        static const char * names[] = { "all_tie", "tie_levels", "half_neginf", "all_neginf", "one_nan", "all_nan", "tie_top_k", "few_finite" };
+        return names[r % 8];
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -8460,7 +8460,7 @@ struct test_topk_moe_degen : public test_topk_moe {
             for (int64_t r = 0; r < n_rows; ++r) {
                 float * row = data.data() + r * n_expert;
                 for (int64_t e = 0; e < n_expert; ++e) {
-                    switch (r % 7) {
+                    switch (r % 8) {
                         case 0: row[e] = 0.5f; break;                                        // every logit equal
                         case 1: row[e] = (float) (e % 3); break;                             // 3 tie levels
                         case 2: row[e] = (e % 2) ? -INFINITY : (float) (e % 5); break;      // half -inf, ties among rest
@@ -8468,6 +8468,7 @@ struct test_topk_moe_degen : public test_topk_moe {
                         case 4: row[e] = (e == n_expert / 2) ? NAN : 0.25f * (float) (e % 4); break;
                         case 5: row[e] = NAN; break;
                         case 6: row[e] = (e < 2 * n_expert_used) ? 3.0f : -1.0f; break;     // tie across the k boundary
+                        case 7: row[e] = (e % 4 == 0 && e < 2 * (n_expert_used / 2)) ? 1.0f : -INFINITY; break; // < k nonzero probs
                     }
                 }
             }
@@ -8482,7 +8483,12 @@ struct test_topk_moe_degen : public test_topk_moe {
         GGML_UNUSED(backend);
         const int64_t k = selected_experts->ne[0], n_rows = selected_experts->ne[1], n_expert = ne[0];
         std::vector<int32_t> ids(k * n_rows);
-        ggml_backend_tensor_get(selected_experts, ids.data(), 0, ids.size() * sizeof(int32_t));
+        // selected_experts is a k-column VIEW of the [n_expert, n_rows] argsort result (row stride nb[1] = n_expert * 4):
+        // read it row by row. A flat read of k * n_rows ints walks into the unwritten tail of row 0 (the fused router
+        // writes only k ids per row), which is what produced the FAIL(dup_ids) of ak-asm-h11-uniq-gpu-20261120.
+        for (int64_t r = 0; r < n_rows; ++r) {
+            ggml_backend_tensor_get(selected_experts, ids.data() + r * k, r * selected_experts->nb[1], k * sizeof(int32_t));
+        }
         std::string reason;
         int64_t bad = 0;
         for (int64_t r = 0; r < n_rows; ++r) {
