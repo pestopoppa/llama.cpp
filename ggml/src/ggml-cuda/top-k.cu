@@ -148,6 +148,141 @@ static void top_k_radix_cuda(const float * src, int * dst, const int ncols, cons
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// AK-GAP-1-IDSORT: multi-block small-k top-k (GGML_HIP_TOPK_FAST=1, default off). The radix select above
+// runs ONE workgroup per row, so a single vocab-wide row (A3B-MTP drafter backend top_k(10) over n_vocab)
+// occupies one CU for 5 full passes (~1.3 ms on MI210). Here each element is packed into a 64-bit key
+// (order-preserving float key << 32 | ~index): a strict total order in which ties go to the LOWEST index.
+// Pass 1: many blocks per row, each thread keeps a sorted register list of its K best, then k rounds of a
+// block-wide max emit the block's k best. Pass 2: one block per row merges the partial lists the same way.
+// Output: the k indices sorted by value descending, ties by ascending index (deterministic).
+
+bool ggml_cuda_top_k_fast_enabled() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_HIP_TOPK_FAST");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return v;
+}
+
+static constexpr int TOPK_FAST_KMAX = 16;
+static constexpr int TOPK_FAST_NT   = 256;
+static constexpr int TOPK_FAST_EPT  = 8; // elements per thread per pass-1 block
+
+static __device__ __forceinline__ uint64_t top_k_fast_pack(const float f, const int i) {
+    return ((uint64_t) top_k_radix_key(f) << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) i);
+}
+
+template <int K>
+static __device__ __forceinline__ void top_k_fast_insert(uint64_t (&l)[K], uint64_t v) {
+    if (v <= l[K - 1]) {
+        return;
+    }
+    l[K - 1] = v;
+#pragma unroll
+    for (int j = K - 1; j > 0; --j) {
+        if (l[j] > l[j - 1]) {
+            const uint64_t tmp = l[j]; l[j] = l[j - 1]; l[j - 1] = tmp;
+        }
+    }
+}
+
+static __device__ __forceinline__ uint64_t top_k_fast_warp_max(uint64_t v) {
+    constexpr int ws = ggml_cuda_get_physical_warp_size();
+#pragma unroll
+    for (int off = ws/2; off > 0; off >>= 1) {
+        const uint32_t lo = __shfl_xor((uint32_t) (v & 0xFFFFFFFFu), off, ws);
+        const uint32_t hi = __shfl_xor((uint32_t) (v >> 32), off, ws);
+        const uint64_t o  = ((uint64_t) hi << 32) | lo;
+        v = o > v ? o : v;
+    }
+    return v;
+}
+
+// k rounds of block max over each thread's list head; out(r, value) is called by thread 0
+template <int NT, int K, typename F>
+static __device__ __forceinline__ void top_k_fast_emit(uint64_t (&l)[K], const int k, F out) {
+    constexpr int ws = ggml_cuda_get_physical_warp_size();
+    constexpr int nw = NT / ws;
+    __shared__ uint64_t s_w[nw];
+    const int t = threadIdx.x;
+    for (int r = 0; r < k; ++r) {
+        uint64_t m = top_k_fast_warp_max(l[0]);
+        if (t % ws == 0) {
+            s_w[t / ws] = m;
+        }
+        __syncthreads();
+        m = s_w[0];
+#pragma unroll
+        for (int w = 1; w < nw; ++w) {
+            m = s_w[w] > m ? s_w[w] : m;
+        }
+        if (t == 0) {
+            out(r, m);
+        }
+        if (l[0] == m) { // unique for real elements (distinct indices); 0 sentinels pop harmlessly
+#pragma unroll
+            for (int j = 0; j < K - 1; ++j) {
+                l[j] = l[j + 1];
+            }
+            l[K - 1] = 0;
+        }
+        __syncthreads();
+    }
+}
+
+template <int NT, int K>
+static __global__ void __launch_bounds__(NT) k_top_k_fast_p1(const float * src, uint64_t * part, const int ncols, const int k, const int chunk) {
+    const int64_t row = blockIdx.y;
+    const int     b   = blockIdx.x;
+    const float * x   = src + row*ncols;
+    uint64_t    * p   = part + (row*gridDim.x + b)*k;
+    const int start = b*chunk;
+    const int end   = min(ncols, start + chunk);
+
+    uint64_t l[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+        l[j] = 0;
+    }
+    for (int i = start + threadIdx.x; i < end; i += NT) {
+        top_k_fast_insert<K>(l, top_k_fast_pack(x[i], i));
+    }
+    top_k_fast_emit<NT, K>(l, k, [&](int r, uint64_t m) { p[r] = m; });
+}
+
+template <int NT, int K>
+static __global__ void __launch_bounds__(NT) k_top_k_fast_p2(const uint64_t * part, int * dst, const int nparts, const int k) {
+    const int64_t row = blockIdx.x;
+    const uint64_t * p = part + row*nparts;
+    int            * y = dst + row*k;
+
+    uint64_t l[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+        l[j] = 0;
+    }
+    for (int i = threadIdx.x; i < nparts; i += NT) {
+        top_k_fast_insert<K>(l, p[i]);
+    }
+    top_k_fast_emit<NT, K>(l, k, [&](int r, uint64_t m) { y[r] = (int) (0xFFFFFFFFu - (uint32_t) (m & 0xFFFFFFFFu)); });
+}
+
+static void top_k_fast_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int64_t nrows, const int k, cudaStream_t stream) {
+    constexpr int NT = TOPK_FAST_NT;
+    constexpr int K  = TOPK_FAST_KMAX;
+    const int chunk = NT*TOPK_FAST_EPT;
+    const int nb    = (ncols + chunk - 1) / chunk;
+    ggml_cuda_pool_alloc<uint64_t> part(pool, (size_t) nrows*nb*k);
+    k_top_k_fast_p1<NT, K><<<dim3(nb, nrows, 1), NT, 0, stream>>>(src, part.get(), ncols, k, chunk);
+    k_top_k_fast_p2<NT, K><<<nrows, NT, 0, stream>>>(part.get(), dst, nb*k, k);
+    static int n_calls = 0;
+    if (n_calls++ == 0) {
+        GGML_LOG_INFO("ggml_cuda_top_k_fast: GGML_HIP_TOPK_FAST multi-block top-k ran (call 1, ncols=%d k=%d nrows=%lld nb=%d)\n",
+                      ncols, k, (long long) nrows, nb);
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -196,6 +331,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+    if (ncols > 1024 && k <= TOPK_FAST_KMAX && nrows <= 65535 && ggml_cuda_top_k_fast_enabled()) {
+        top_k_fast_cuda(pool, src0_d, dst_d, (int) ncols, nrows, (int) k, stream);
+        return;
+    }
     if (ncols > 1024 && ggml_cuda_top_k_radix_enabled()) {
         top_k_radix_cuda(src0_d, dst_d, (int) ncols, nrows, (int) k, stream);
         return;
