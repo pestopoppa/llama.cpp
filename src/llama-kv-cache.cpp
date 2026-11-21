@@ -1,6 +1,12 @@
 #include "llama-kv-cache.h"
 #include "llama-kq-mask-dev.h"
 
+// [GPU-RESIDENT-ROUND-2f] LLAMA_KV_RING=1 (default off), read per call so tests can flip it in-process
+static bool llama_kv_ring_enabled() {
+    const char * e = getenv("LLAMA_KV_RING");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1028,6 +1034,37 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         if (n_tokens > cells.size()) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
             return { };
+        }
+
+        // [GPU-RESIDENT-ROUND-2f phase 1] LLAMA_KV_RING=1: per-sequence streams place token i at cell pos % size (a ring),
+        // so a token's cell is a pure function of its position and the device can derive K/V indices from the position
+        // alone (phase 2). Falls back to the first-fit search when a target cell is taken (context shift, seq_cp, ...).
+        if (n_stream > 1 && llama_kv_ring_enabled()) {
+            const uint32_t size = cells.size();
+            bool ok = true;
+            for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+                const llama_pos pos = ubatch.pos[s*n_tokens + i];
+                if (pos < 0) {
+                    ok = false;
+                    break;
+                }
+                const uint32_t c = (uint32_t) pos % size;
+                ok = cells.is_empty(c) && (!cont || i == 0 || c == res.idxs[s].back() + 1);
+                res.idxs[s].push_back(c);
+            }
+            if (ok) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    fprintf(stderr, "llama_kv_cache: LLAMA_KV_RING: ring KV placement ENABLED (cell = pos %% %u)\n", size);
+                }
+                continue;
+            }
+            res.idxs[s].clear();
+            static int n_fallback = 0;
+            if (n_fallback++ < 4) {
+                fprintf(stderr, "llama_kv_cache: LLAMA_KV_RING: fallback to first-fit (stream %u, %u tokens)\n", seq_to_stream[seq_id], n_tokens);
+            }
         }
 
         uint32_t n_tested = 0;

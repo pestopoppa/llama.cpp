@@ -155,10 +155,12 @@ static void part1() {
 // ---------------------------------------------------------------- part 2
 
 static std::vector<float> run_e2e(llama_model * model, bool knob, bool unified) {
+    // KQMD_KNOB selects the knob under test (default the device KQ mask; e.g. LLAMA_KV_RING for 2f phase 1)
+    const char * kn = getenv("KQMD_KNOB") ? getenv("KQMD_KNOB") : "LLAMA_DEVICE_KQ_MASK";
     if (knob) {
-        setenv("LLAMA_DEVICE_KQ_MASK", "1", 1);
+        setenv(kn, "1", 1);
     } else {
-        unsetenv("LLAMA_DEVICE_KQ_MASK");
+        unsetenv(kn);
     }
     const int n_seq = 4, n_draft = 7, n_rounds = 8;
 
@@ -279,7 +281,7 @@ static void part2(const char * path) {
     for (bool unified : { true, false }) {
         const std::vector<float> off = run_e2e(model, false, unified);
         const std::vector<float> on  = run_e2e(model, true,  unified);
-        if (g_witness == 0) {
+        if (g_witness == 0 && !getenv("KQMD_KNOB")) { // other knobs witness on stderr (checked by the caller)
             fprintf(stderr, "FAIL: knob never engaged (no ENABLED witness)\n");
             g_fail++;
         }
