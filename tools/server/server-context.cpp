@@ -1826,8 +1826,13 @@ private:
             // a -md file is allowed only as an MTP sidecar head (every type MTP or none): its ctx is the same MTP context type
             bool spec_ok = true;
             for (const auto t : params_base.speculative.types) {
-                spec_ok = spec_ok && (t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+                // DFlash/DFlash2: the drafter keeps no speculative stash (no get_state); its draft context is a plain
+                // attention KV of injected target features, so the N-5 pos cap reproduces the cut path's draft blob
+                spec_ok = spec_ok && (t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                                      t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
             }
+            // GPU-ZOS-2 overlap-process writes ctx_dft on a worker after the decode: the copy cannot read it there
+            spec_ok = spec_ok && !zos2.overlap_process;
             spec_ok = spec_ok && (ctx_dft == nullptr || llama_memory_set_state_write_pos_cap(llama_get_memory(ctx_dft), -1));
             snapslot_ckpt = want && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
                             llama_n_rs_seq(ctx_tgt) >= 4 && n_swa == 0 && spec_ok && params_base.n_ctx_checkpoints > 0;
