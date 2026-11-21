@@ -1,12 +1,55 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "../llama-dflash-dsel.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#include <cstring>
+
+// [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1 (default off)
+static bool llama_dflash_device_lattice_enabled() {
+    const char * e = getenv("LLAMA_DEVICE_LATTICE");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
+class llm_graph_input_dsel : public llm_graph_input_i {
+public:
+    llm_graph_input_dsel(const llama_dsel_inputs * src, int64_t top_k, int64_t block) : src(src), top_k(top_k), block(block) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        if (!inv_temp->buffer) {
+            return;
+        }
+        const int64_t nb = inv_temp->ne[1];
+        std::vector<float> it(nb, 1.0f);
+        std::vector<float> nz(ggml_nelements(noise), 0.0f);
+        if (src && (int64_t) src->inv_temp.size() == nb) {
+            it = src->inv_temp;
+        }
+        if (src && src->noise.size() == nz.size()) {
+            nz = src->noise;
+        }
+        ggml_backend_tensor_set(inv_temp, it.data(), 0, ggml_nbytes(inv_temp));
+        ggml_backend_tensor_set(noise,    nz.data(), 0, ggml_nbytes(noise));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const int64_t nb = params.ubatch.n_seqs_unq;
+        return inv_temp->ne[1] == nb && noise->ne[2] == nb && (int64_t) params.ubatch.n_tokens == nb*block;
+    }
+
+    ggml_tensor * inv_temp = nullptr; // F32 [1, n_blocks]
+    ggml_tensor * noise    = nullptr; // F32 [top_k, block, n_blocks]
+    const llama_dsel_inputs * src;
+    int64_t top_k;
+    int64_t block;
+};
 
 // INF-77 DS41-B13. DeepSeek-V4.1-Flash DSpark ships as its own architecture
 // ("deepseek41-dspark", /mnt/raid0/llm/models/deepseek-ai/DeepSeek-V4.1-Flash-DSpark.gguf):
@@ -1375,6 +1418,33 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
 
     packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
     cb(packed, "dflash2_lattice", -1);
+
+    // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1: select the draft path on the device (Gumbel-max) and emit
+    // compact rows [token | ids (top_k) | probs (top_k)] instead of the n_embd-wide lattice (see llama-ext.h)
+    if (llama_dflash_device_lattice_enabled() && block_size == tokens_per_block && cparams.dsel) {
+        auto inp = std::make_unique<llm_graph_input_dsel>(cparams.dsel, top_k, tokens_per_block);
+        inp->inv_temp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks);
+        ggml_set_input(inp->inv_temp);
+        ggml_set_name(inp->inv_temp, "dflash2_dsel_inv_temp");
+        inp->noise = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, top_k, tokens_per_block, n_blocks);
+        ggml_set_input(inp->noise);
+        ggml_set_name(inp->noise, "dflash2_dsel_noise");
+
+        ggml_tensor * out = llama_build_dflash_dsel(ctx0, packed, inp->inv_temp, inp->noise, top_k, block_size, n_blocks);
+        cb(out, "dflash2_dsel", -1);
+        res->add_input(std::move(inp));
+        res->t_h_nextn = out;
+        ggml_build_forward_expand(gf, out);
+
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_LATTICE: device DFlash2 lattice selection ENABLED (top_k=%lld, block=%lld, n_blocks=%lld)\n",
+                    __func__, (long long) top_k, (long long) block_size, (long long) n_blocks);
+        }
+        return;
+    }
+
     res->t_h_nextn = packed;
     ggml_build_forward_expand(gf, packed);
 }

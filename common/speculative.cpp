@@ -10,6 +10,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "philox.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1339,6 +1340,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_dspark41    = false;
     int32_t selector_top_k = 0;
     std::vector<std::mt19937> selector_rng;
+
+    // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1: the drafter selects the path on the device (Gumbel-max with
+    // host Philox noise); the host reads compact [token | ids | probs] rows instead of the lattice
+    bool dev_lattice = false;
+    std::vector<uint64_t> dsel_key;   // per seq, from the request seed
+    std::vector<uint64_t> dsel_ctr;   // per seq, draft counter
+    std::vector<float>    dsel_inv_temp;
+    std::vector<float>    dsel_noise;
     std::vector<bool> selector_reset;
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
@@ -1500,6 +1509,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         selector_rng.resize(n_seq);
+        dsel_key.assign(n_seq, 0);
+        dsel_ctr.assign(n_seq, 0);
+        {
+            const char * e = getenv("LLAMA_DEVICE_LATTICE");
+            dev_lattice = e != nullptr && strcmp(e, "1") == 0;
+        }
         selector_reset.assign(n_seq, true);
 
         // GGUF stores HF hidden-state indices: an index below n_layer is the
@@ -1726,6 +1741,51 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    // [GPU-RESIDENT-ROUND-2d] per-block inverse temperature and Philox Gumbel noise for the device selection
+    void dsel_set_inputs(common_speculative_draft_params_vec & dparams, const std::vector<int32_t> & i_block_beg,
+                         const std::vector<int32_t> & n_block) {
+        int32_t block = 0;
+        int32_t n_blocks = 0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (i_block_beg[s] >= 0) {
+                block = n_block[s];
+                n_blocks = std::max(n_blocks, i_block_beg[s] / n_block[s] + 1);
+            }
+        }
+        dsel_inv_temp.assign(n_blocks, 1.0f);
+        dsel_noise.assign((size_t) n_blocks * block * selector_top_k, 0.0f);
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (i_block_beg[s] < 0) {
+                continue;
+            }
+            auto & dp = dparams[s];
+            const int32_t b = i_block_beg[s] / block;
+            if (selector_reset[s]) {
+                uint32_t seed = dp.seed;
+                if (seed == LLAMA_DEFAULT_SEED) {
+                    seed = (uint32_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                }
+                dsel_key[s] = ((uint64_t) (seed ^ 0x85ebca6bU) << 32) | (uint32_t) s;
+                dsel_ctr[s] = 0;
+                selector_reset[s] = false;
+            }
+            if (dp.temperature <= 0.0f) {
+                continue;
+            }
+            dsel_inv_temp[b] = 1.0f / dp.temperature;
+            const uint64_t ctr = dsel_ctr[s]++;
+            float * nz = dsel_noise.data() + (size_t) b * block * selector_top_k;
+            for (int32_t j = selector_top_k; j < block * selector_top_k; j += 4) {
+                uint32_t r[4];
+                common_philox4x32::gen(dsel_key[s], ctr, (uint64_t) j, r);
+                for (int32_t q = 0; q < 4 && j + q < block * selector_top_k; ++q) {
+                    nz[j + q] = common_philox4x32::gumbel(r[q]);
+                }
+            }
+        }
+        llama_set_dflash_select(params.ctx_dft, dsel_inv_temp.data(), n_blocks, dsel_noise.data(), (int32_t) dsel_noise.size());
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         if (is_lilicorr) {
             draft_lilicorr(dparams);
@@ -1765,6 +1825,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (is_dflash2 && dev_lattice) {
+            dsel_set_inputs(dparams, i_block_beg, n_block);
+        }
+
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
@@ -1787,6 +1851,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (dp.dists) {
                 dp.dists->clear();
+            }
+
+            if (is_dflash2 && dev_lattice) {
+                GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
+                const float * sel = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(sel && "DFlash2 device selection produced no rows");
+                const int32_t W = 1 + 2*selector_top_k;
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    const float * row = sel + (size_t) (beg + i) * W;
+                    result.push_back((llama_token) row[0]);
+                    if (dp.temperature > 0.0f) {
+                        common_speculative_token_dist dist;
+                        dist.ids.resize(selector_top_k);
+                        dist.probs.assign(row + 1 + selector_top_k, row + 1 + 2*selector_top_k);
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            dist.ids[k] = (llama_token) row[1 + k];
+                        }
+                        dp.dists->push_back(std::move(dist));
+                    }
+                }
+                if (dp.tree_alts) {
+                    dp.tree_alts->clear(); // tree paths need the full lattice: not available with LLAMA_DEVICE_LATTICE=1
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                    if (dp.dists) {
+                        dp.dists->clear();
+                    }
+                }
+                continue;
             }
 
             if (is_dflash2) {

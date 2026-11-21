@@ -192,6 +192,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.dsel      = &dsel_inputs;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2044,7 +2045,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_out();
+        // a compact h_nextn (device DFlash2 lattice selection) is narrower than n_embd: copy what it holds
+        const uint32_t n_embd = t_h_nextn->ne[0] < (int64_t) hparams.n_embd_out() ? (uint32_t) t_h_nextn->ne[0] : hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -2560,7 +2562,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
+                const uint32_t n_embd  = t_h_nextn->ne[0] < (int64_t) hparams.n_embd_out() ? (uint32_t) t_h_nextn->ne[0] : hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -4530,6 +4532,10 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+void llama_set_dflash_select(llama_context * ctx, const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
+    ctx->set_dflash_select(inv_temp, n_blocks, noise, n_noise);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

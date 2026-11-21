@@ -174,6 +174,16 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// [GPU-RESIDENT-ROUND-2d] device DFlash2 lattice selection (LLAMA_DEVICE_LATTICE=1, default off).
+// When enabled the DFlash2 drafter emits, instead of the [ids | scores] lattice, one compact row of
+// 1 + 2*top_k floats per draft token: [selected token, candidate ids (top_k), selection probs (top_k)],
+// rows at stride 1 + 2*top_k in llama_get_embeddings_nextn() (row 0 of each block is zero).
+// Selection is Gumbel-max: argmax(scores * inv_temp + noise), exact softmax(scores / T) sampling;
+// inv_temp = 1 and noise = 0 give the greedy path. Set before llama_decode; inv_temp has one value per
+// draft block in ubatch order, noise top_k * block_tokens values per block (row 0 of each block ignored).
+LLAMA_API void llama_set_dflash_select(struct llama_context * ctx, const float * inv_temp, int32_t n_blocks,
+                                       const float * noise, int32_t n_noise);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

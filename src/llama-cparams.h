@@ -74,4 +74,14 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1 inputs of the device DFlash2 lattice selection (owned by the context)
+    struct llama_dsel_inputs * dsel = nullptr;
+};
+
+// [GPU-RESIDENT-ROUND-2d] per decode: inverse temperature per draft block (1 = greedy) and Gumbel noise
+// [top_k, block_tokens, n_blocks] (0 = greedy); empty vectors mean greedy for every block
+struct llama_dsel_inputs {
+    std::vector<float> inv_temp;
+    std::vector<float> noise;
 };

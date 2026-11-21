@@ -326,6 +326,15 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    // [GPU-RESIDENT-ROUND-2d] inputs of the device DFlash2 lattice selection (cparams.dsel points here)
+    llama_dsel_inputs dsel_inputs;
+public:
+    void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
+        dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
+        dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));
+    }
+private:
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
