@@ -50,11 +50,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "usage: %s model.gguf [threads] [ngl] [draws]\n", argv[0]);
         return 2;
     }
-    setenv("GGML_HIP_DEVICE_ACCEPT_STOCH", "32", 1);
+    setenv("GGML_HIP_DEVICE_ACCEPT_STOCH", getenv("STOCH_TEST_K") ? getenv("STOCH_TEST_K") : "32", 1);
     const int nth   = argc > 2 ? atoi(argv[2]) : 4;
     const int ngl   = argc > 3 ? atoi(argv[3]) : 0;
     const int draws = argc > 4 ? atoi(argv[4]) : 20000;
-    const int K     = 32;
+    const int K     = atoi(getenv("GGML_HIP_DEVICE_ACCEPT_STOCH")) == 1 ? 20 : atoi(getenv("GGML_HIP_DEVICE_ACCEPT_STOCH"));
     const int NOUT  = 8;
 
     llama_backend_init();

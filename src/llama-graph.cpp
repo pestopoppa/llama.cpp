@@ -4485,14 +4485,14 @@ static bool llama_device_argmax_enabled() {
     return v;
 }
 
-// AK-GAP-1-STOCH-ACCEPT: GGML_HIP_DEVICE_ACCEPT_STOCH=K (K in [2, 64]; =1 -> 32) adds top-K candidate outputs;
+// AK-GAP-1-STOCH-ACCEPT: GGML_HIP_DEVICE_ACCEPT_STOCH=K (K in [2, 64]; =1 -> 20, the served top_k) adds top-K candidate outputs;
 // unset / 0 = off (default). Read once.
 int llama_device_accept_stoch_k() {
     static const int k = [] {
         const char * e = getenv("GGML_HIP_DEVICE_ACCEPT_STOCH");
         int v = (e != nullptr && *e) ? atoi(e) : 0;
         if (v == 1) {
-            v = 32;
+            v = 20;
         }
         if (v < 2) {
             return 0;
