@@ -13614,6 +13614,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
     }
+    // AK-GAP-1-IDSORT: A3B-MTP drafter backend top_k(10) over n_vocab 248320 (GGML_HIP_TOPK_FAST multi-block path, k <= 16)
+    for (int k : {1, 2, 10, 16}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151943, 2, 1, 2}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1025, 5, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 1, 1, 1}, k));
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 17)); // just above KMAX: radix fallback
     // AK-ASM-H12: QSA-shaped wide top-k (radix select on HIP) and the fused QSA sparse attention composition
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 4, 1, 1}, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 2, 1, 2}, 2051));
@@ -14472,6 +14482,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, kv, 36, 4, kv/4, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4));
     }
 
+    // AK-GAP-1-IDSORT: A3B-MTP drafter top_k(10) over n_vocab; A/B GGML_HIP_TOPK_FAST=1 vs unset (radix select)
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 10));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, 10));
     // AK-ASM-H12: Q38FN QSA layer attention at ctx 8k/32k (heads 24/2, hd256, width = top_k 2048 + ratio 4 - 1).
     // A/B: GGML_CUDA_QSA_SPARSE=1 (fused sparse) vs =0 (dense masked FA); both arms include the top-k + mask chain.
     for (int64_t kv : {8192, 32768}) {
