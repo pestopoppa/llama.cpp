@@ -101,6 +101,9 @@ struct layer_state {
     // decode scratch [kv_size]
     std::vector<float> score;
 
+    // budgets (from config at init; tests may override)
+    int top_k = 4096, window = 512, sink = 4;
+
     // last decode selection statistics (diagnostic)
     int64_t last_eligible = 0, last_kept = 0;
 

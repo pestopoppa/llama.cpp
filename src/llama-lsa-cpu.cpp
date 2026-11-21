@@ -237,6 +237,10 @@ void layer_state::init(const lsamap & m, int il_, uint32_t kv_size) {
     const auto & lp = m.layers.at(il_);
     wq = lp.first.data();
     wk = lp.second.data();
+    const config & c = get_config();
+    top_k  = c.top_k;
+    window = c.window;
+    sink   = c.sink;
     ik_pos.assign(kv_size, -1);
     score.assign(kv_size, 0.0f);
 }
@@ -427,7 +431,6 @@ static void decode_score_op(ggml_tensor * dst, const ggml_tensor * mask, const g
                             int ith, int nth, void * ud) {
     GGML_UNUSED(dst);
     layer_state & st = *(layer_state *) ud;
-    const config & cfg = get_config();
     const int64_t n_kv = mask->ne[0];
     GGML_ASSERT(n_kv <= (int64_t) st.score.size());
     GGML_ASSERT(written->type == GGML_TYPE_I64 && written->ne[0] >= 1);
@@ -446,7 +449,7 @@ static void decode_score_op(ggml_tensor * dst, const ggml_tensor * mask, const g
             continue;
         }
         const int32_t pos = st.cell_pos(j);
-        if (pos < 0 || st.ik_pos[j] != pos || pos < cfg.sink || pos > qpos - cfg.window) {
+        if (pos < 0 || st.ik_pos[j] != pos || pos < st.sink || pos > qpos - st.window) {
             score[j] = INFINITY;
         }
     }
@@ -469,7 +472,7 @@ static void decode_select_op(ggml_tensor * dst, const ggml_tensor * mask, const 
         n_elig += st.score[j] != -INFINITY;
     }
     st.last_eligible = n_elig;
-    st.last_kept     = select_topk(st.score.data(), n_kv, get_config().top_k, keep.data());
+    st.last_kept     = select_topk(st.score.data(), n_kv, st.top_k, keep.data());
     for (int64_t j = 0; j < n_kv; ++j) {
         if (!keep[j]) {
             char * p = (char *) dst->data + j*dst->nb[0];
