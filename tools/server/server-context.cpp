@@ -3438,7 +3438,10 @@ private:
         }
         try {
             // create_checkpoint() describes the state before the n_tokens_cur last tokens of slot.prompt
-            create_checkpoint(slot, 4, pos_min, pos_max - 4);
+            // the cut path reads the memory before the last 4 tokens are decoded: pos_min = pos_max = N-5 for the recurrent
+            // cell. The live pos_min after the decode is N-1 and would make the restore search (pos_min < pos_min_thold)
+            // reject this checkpoint forever.
+            create_checkpoint(slot, 4, std::min(pos_min, pos_max - 4), pos_max - 4);
         } catch (...) {
             if (mem_dft) {
                 llama_memory_set_state_write_pos_cap(mem_dft, -1);
