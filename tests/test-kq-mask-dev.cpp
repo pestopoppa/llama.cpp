@@ -26,8 +26,9 @@ static int g_fail = 0;
 static int g_witness = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void *) {
-    if (strstr(text, "LLAMA_DEVICE_KQ_MASK: device-built KQ mask ENABLED")) {
-        g_witness++;
+    if (strstr(text, "LLAMA_DEVICE_KQ_MASK")) {
+        if (strstr(text, "ENABLED"))
+            g_witness++;
         fputs(text, stderr);
     }
     (void) level;

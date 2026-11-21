@@ -2118,7 +2118,7 @@ void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * cse
                     if (cells.pos_get(j) == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
                         static int n_warn = 0;
                         if (n_warn++ < 4) {
-                            LLAMA_LOG_ERROR("%s: LLAMA_DEVICE_KQ_MASK MISMATCH: 2-D ext rule drops cell %lld for seq %d pos %d; "
+                            fprintf(stderr, "%s: LLAMA_DEVICE_KQ_MASK MISMATCH: 2-D ext rule drops cell %lld for seq %d pos %d; "
                                     "the device mask keeps it (do not use the knob with multimodal input)\n",
                                     __func__, (long long) j, seq_id, p1);
                         }

@@ -3452,8 +3452,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         static bool logged = false;
         if (!logged) {
             logged = true;
-            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_KQ_MASK: device-built KQ mask ENABLED (n_kv=%lld n_seq_rows=%lld n_tokens=%u, backend %s)\n",
+            // stderr like the other fork witnesses (llama_device_accept): the server log drops INFO lines from graph builds
+            fprintf(stderr, "%s: LLAMA_DEVICE_KQ_MASK: device-built KQ mask ENABLED (n_kv=%lld n_seq_rows=%lld n_tokens=%u, backend %s)\n",
                     __func__, (long long) m->ne[0], (long long) n_seq_rows, ubatch.n_tokens, be ? ggml_backend_name(be) : "CPU");
+            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_KQ_MASK: device-built KQ mask ENABLED (backend %s)\n", __func__, be ? ggml_backend_name(be) : "CPU");
         }
     }
 

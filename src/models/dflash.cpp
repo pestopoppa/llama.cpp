@@ -1439,7 +1439,7 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_LATTICE: device DFlash2 lattice selection ENABLED (top_k=%lld, block=%lld, n_blocks=%lld)\n",
+            fprintf(stderr, "%s: LLAMA_DEVICE_LATTICE: device DFlash2 lattice selection ENABLED (top_k=%lld, block=%lld, n_blocks=%lld)\n",
                     __func__, (long long) top_k, (long long) block_size, (long long) n_blocks);
         }
         return;
