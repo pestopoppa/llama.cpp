@@ -168,6 +168,55 @@ uint64_t ggml_cuda_topk_moe_asm_gfx90a_n_calls() {
     return g_topk_asm_n_calls.load(std::memory_order_relaxed);
 }
 
+// AK-ASM-H11-UNIQ-FIX: the asm picks by value equality with the row max (ff1 over v_cmp_eq), so a NaN row (all -inf
+// logits -> softmax NaN) matches no lane and every round falls through to the last index (ids 127,127,... / 255 x 8).
+// The code objects cannot take a compare fix, so this pass enforces the HIP kernel's contract on the asm output: k
+// distinct ids in [0, n_expert). A row that already satisfies it (every finite row) is copied unchanged; in a bad row
+// the first occurrence of each valid id is kept and every duplicate / out-of-range slot takes the lowest unused index
+// in ascending order (the CPU argsort order for an all-tie row). One thread per row; it replaces the strided D2D copy
+// for more rows, so it adds no launch there.
+static __global__ void topk_asm_unique_ids(const int32_t * src, const int64_t src_stride, int32_t * dst,
+                                           const int64_t dst_stride, const int n_rows, const int k, const int n_expert) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    int32_t v[16];
+    bool    bad = false;
+    for (int j = 0; j < k; ++j) {
+        v[j] = src[row * src_stride + j];
+        bool keep = v[j] >= 0 && v[j] < n_expert;
+        for (int i = 0; keep && i < j; ++i) {
+            keep = v[i] != v[j];
+        }
+        if (!keep) {
+            v[j] = -1;
+            bad  = true;
+        }
+    }
+    if (bad) {
+        int next = 0;
+        for (int j = 0; j < k; ++j) {
+            if (v[j] >= 0) {
+                continue;
+            }
+            for (;; ++next) {
+                bool used = false;
+                for (int i = 0; i < k; ++i) {
+                    used |= v[i] == next;
+                }
+                if (!used) {
+                    break;
+                }
+            }
+            v[j] = next++;
+        }
+    }
+    for (int j = 0; j < k; ++j) {
+        dst[row * dst_stride + j] = v[j];
+    }
+}
+
 bool ggml_cuda_topk_moe_asm_gfx90a_try(ggml_backend_cuda_context & ctx,
                                        const ggml_tensor *         logits,
                                        ggml_tensor *               weights,
@@ -250,9 +299,12 @@ bool ggml_cuda_topk_moe_asm_gfx90a_try(ggml_backend_cuda_context & ctx,
         (void) hipGetLastError();
         return false; // nothing written yet
     }
-    if (n_rows > 1) {
-        CUDA_CHECK(cudaMemcpy2DAsync(ids->data, ids->nb[1], ids_out, k * sizeof(int32_t), k * sizeof(int32_t),
-                                     (size_t) n_rows, cudaMemcpyDeviceToDevice, stream));
+    {
+        // unique-id pass (see topk_asm_unique_ids): scratch -> strided ids rows, or in place for one row
+        const int threads = 64;
+        topk_asm_unique_ids<<<(unsigned) ((n_rows + threads - 1) / threads), threads, 0, stream>>>(
+            ids_out, k, (int32_t *) ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)), (int) n_rows, k, (int) n_expert);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     const uint64_t n = g_topk_asm_n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
