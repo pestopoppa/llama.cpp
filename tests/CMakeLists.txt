@@ -428,6 +428,7 @@ llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
 llama_build_and_test(test-gdn-replay-identity.cpp)
+llama_build(test-rs-replay-model.cpp) # needs a model path: test-rs-replay-model <gguf> [n_rs_seq]
 # [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
 llama_build(test-akx-numerics.cpp)
 
