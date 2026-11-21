@@ -6317,6 +6317,8 @@ struct test_gdn_tree_cache : public test_case {
         cpy = ggml_cpy(ctx, src, dst);
         // one root that keeps both checked nodes alive; the cpy branch is visited first so the cpy is the first
         // non-view node after the gdn in graph order (the HIP fusion's match condition)
+        // the cache view is strided for mem_size > 1: compare (and reduce) a contiguous read-back of it
+        cpy = ggml_cont(ctx, cpy);
         ggml_tensor * cpy_sum = ggml_sum(ctx, cpy);
         attn = ggml_scale(ctx, attn, 1.0f);
         return ggml_add(ctx, cpy_sum, ggml_sum(ctx, attn));
