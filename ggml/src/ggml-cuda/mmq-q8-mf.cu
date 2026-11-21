@@ -1646,7 +1646,7 @@ static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __rest
 }
 
 static int q8ip_mmvq_max() {
-    static const int v = std::max(0, std::min(1, q8mf_env_int("GGML_HIP_Q8IP_MMVQ_MAX", 1)));   // n1 only
+    static const int v = std::max(0, std::min(1, q8mf_env_int("GGML_HIP_Q8IP_MMVQ_MAX", 0)));   // n1 only; default 0 (C17: packed n1 MMVQ loses on M=1)
     return v;
 }
 
