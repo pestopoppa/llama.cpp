@@ -428,6 +428,7 @@ llama_build_and_test(test-moe-fused-upgate.cpp) # CH-19 Q8_0 opt-in; external ga
 llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
+llama_build_and_test(test-gdn-replay-identity.cpp)
 # [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
 llama_build(test-akx-numerics.cpp)
 
