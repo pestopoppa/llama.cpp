@@ -92,6 +92,8 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
     llama_token get_argmax_ith(int32_t i);
+    int64_t n_lazy_skipped() const { return n_logits_lazy_skip; }
+    int64_t n_lazy_flushed() const { return n_logits_lazy_flush; }
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);

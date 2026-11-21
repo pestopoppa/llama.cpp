@@ -8,12 +8,16 @@
 //   plain decode : common_sampler_sample_device_greedy  vs  first-max argmax over llama_get_logits_ith
 //   chain verify : common_sampler_sample_and_accept_n_greedy_fast  vs  the host accept loop over the same rows
 // Drafts are the host-greedy continuation with one token corrupted at a step-dependent position, so the
-// accepted count covers 0..n_draft. Exit 0 iff every step matches and the deferred path actually engaged.
+// accepted count covers 0..n_draft.
+//   server-style : the gate request (temp 0, top_k 1, ignore_eos EOG bans) on the device path alone must not
+//                  flush the deferred logits (except on a banned device pick) and must match the host scan.
+// Exit 0 iff every step matches and the deferred path actually engaged.
 
 #include "common.h"
 #include "llama.h"
 #include "sampling.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -176,6 +180,108 @@ int main(int argc, char ** argv) {
         printf(" %d:%d", k, hist[k]);
     }
     printf("\n");
+
+
+    // phase 3: server-style plain decode (AK-GAP-1-SAMPLE fix 1). The server's /completion request of the gate
+    // (temperature 0, top_k 1, default chain incl. penalty_last_n 64, ignore_eos -> -inf bias on every EOG token)
+    // must take the device row WITHOUT reading the logits: 3a decodes with the device path only and asserts zero
+    // deferred-download flushes, 3b replays the same steps on the host (first max over non-banned tokens) and
+    // must give the same tokens. One extra banned token (the 6th phase-1 token) forces the banned-pick fallback.
+    common_params_sampling sps;
+    sps.temp  = 0.0f;
+    sps.top_k = 1;
+    for (int t = 0; t < n_vocab; ++t) {
+        if (llama_vocab_is_eog(vocab, t)) {
+            sps.logit_bias.push_back({t, -INFINITY});
+        }
+    }
+    const llama_token extra_ban = gen.size() > 5 ? gen[5] : gen.back();
+    sps.logit_bias.push_back({extra_ban, -INFINITY});
+    auto banned = [&](llama_token t) {
+        for (const auto & lb : sps.logit_bias) {
+            if (lb.token == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto run_prompt = [&]() {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        common_batch_clear(batch);
+        for (int i = 0; i < n_p; ++i) {
+            common_batch_add(batch, toks[i], i, {0}, i == n_p - 1);
+        }
+        return llama_decode(ctx, batch) == 0;
+    };
+    std::vector<llama_token> dev_seq, host_seq;
+    int64_t sk0 = 0, fl0 = 0, sk1 = 0, fl1 = 0;
+    int n_banned_hits = 0;
+    {
+        common_sampler * s3 = common_sampler_init(model, sps);
+        if (!run_prompt()) {
+            fprintf(stderr, "FAIL: prompt decode (3a)\n");
+            return 1;
+        }
+        llama_device_accept_stats(ctx, &sk0, &fl0);
+        int ix = n_p - 1;
+        for (int s = 0; s < n_gen; ++s) {
+            if (banned(llama_get_argmax_ith(ctx, ix))) {
+                n_banned_hits++; // this step legitimately falls back to the host scan (one flush)
+            }
+            const llama_token d = common_sampler_sample_device_greedy(s3, ctx, ix);
+            common_sampler_accept(s3, d, true);
+            dev_seq.push_back(d);
+            common_batch_clear(batch);
+            common_batch_add(batch, d, n_p + s, {0}, true);
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "FAIL: decode (3a)\n");
+                return 1;
+            }
+            ix = 0;
+        }
+        llama_device_accept_stats(ctx, &sk1, &fl1);
+        common_sampler_free(s3);
+    }
+    {
+        if (!run_prompt()) {
+            fprintf(stderr, "FAIL: prompt decode (3b)\n");
+            return 1;
+        }
+        int ix = n_p - 1;
+        for (int s = 0; s < n_gen; ++s) {
+            const float * l = llama_get_logits_ith(ctx, ix);
+            int best = -1;
+            for (int t = 0; t < n_vocab; ++t) {
+                if (!banned(t) && (best < 0 || l[t] > l[best])) {
+                    best = t;
+                }
+            }
+            host_seq.push_back(best);
+            common_batch_clear(batch);
+            common_batch_add(batch, dev_seq[s], n_p + s, {0}, true); // teacher-forced on the device tokens
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "FAIL: decode (3b)\n");
+                return 1;
+            }
+            ix = 0;
+        }
+    }
+    int sfails = 0;
+    for (int s = 0; s < n_gen; ++s) {
+        if (dev_seq[s] != host_seq[s]) {
+            fprintf(stderr, "server-style step %d: device %d != host %d\n", s, dev_seq[s], host_seq[s]);
+            sfails++;
+        }
+    }
+    const int64_t flushed_3a = fl1 - fl0;
+    const int64_t skipped_3a = sk1 - sk0;
+    printf("server-style decode: %d steps, %d mismatches, lazy_skipped=%lld flushed=%lld (banned-pick fallbacks %d)\n",
+           n_gen, sfails, (long long) skipped_3a, (long long) flushed_3a, n_banned_hits);
+    if (skipped_3a < n_gen || flushed_3a != n_banned_hits) {
+        fprintf(stderr, "server-style decode: deferred download not honoured (expected flushed == %d)\n", n_banned_hits);
+        sfails++;
+    }
+    fails += sfails;
 
     common_sampler_free(smpl);
     llama_batch_free(batch);
