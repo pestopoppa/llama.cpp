@@ -620,7 +620,7 @@ static int device_accept_stoch_k_env() {
         const char * e = getenv("GGML_HIP_DEVICE_ACCEPT_STOCH");
         int v = (e != nullptr && *e) ? atoi(e) : 0;
         if (v == 1) {
-            v = 32;
+            v = 20;   // =1 -> K=20 (served top_k 20; top_k <= K is all the candidate path needs)
         }
         return v < 2 ? 0 : std::min(v, 64);
     }();
