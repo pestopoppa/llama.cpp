@@ -176,6 +176,18 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// [GPU-RESIDENT-ROUND-2f phase 2] LLAMA_DEVICE_KV_IDX=1: token positions computed on the device as p0[g] + i for
+// n_g position-contiguous groups of n_tps tokens; the host uploads only p0 (one float per group)
+class llm_graph_input_pos_dev : public llm_graph_input_i {
+public:
+    llm_graph_input_pos_dev(uint32_t n_pos_per_embd, int64_t n_g, int64_t n_tps) : n_pos_per_embd(n_pos_per_embd), n_g(n_g), n_tps(n_tps) {}
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    ggml_tensor * p0 = nullptr; // F32 [1, n_g]
+    const uint32_t n_pos_per_embd;
+    const int64_t  n_g, n_tps;
+};
+
 // [AK-DTREE-2] tree-verification inputs for recurrent layers (tree ubatch only):
 //   parent   I32 [n_seq_tokens, n_seqs]          parent column within the seq set (-1 = root)
 //   conv_idx I32 [(d_conv-1)*n_seq_tokens, n_seqs] conv_input column of each tap of the conv state of rollback
@@ -413,6 +425,13 @@ public:
     ggml_tensor * dmask_cpos = nullptr; // F32 [n_kv, n_seq_max]
     ggml_tensor * dmask_csel = nullptr; // I32 [n_batch]
     ggml_tensor * dmask_tpos = nullptr; // F32 [1, n_batch/n_stream, 1, n_stream]
+
+    // [GPU-RESIDENT-ROUND-2f phase 2] LLAMA_DEVICE_KV_IDX=1: K/V write indices computed on the device from per-stream
+    // first position and stream base (ring layout: cell = base + (p0 + i) % size); nullptr = host-written indices
+    ggml_tensor * dkv_p0   = nullptr; // F32 [1, n_stream]
+    ggml_tensor * dkv_base = nullptr; // F32 [1, n_stream]
+    void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
+    bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 
     // fills the host-built mask or the device-mask inputs; also called by the hybrid memory inputs
     void set_input_kq_mask_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);

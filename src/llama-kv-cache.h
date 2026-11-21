@@ -510,6 +510,9 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     bool kq_mask_dev_eligible (const llama_ubatch & ubatch, bool causal_attn) const;
     void set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const;
+    // [GPU-RESIDENT-ROUND-2f phase 2] K/V write indices derivable on the device: per-sequence streams whose slots follow
+    // the ring (cell = pos % size) for position-contiguous tokens; fills per stream the first position and stream base
+    bool kv_idx_dev_info(const llama_ubatch & ubatch, std::vector<float> & p0, std::vector<float> & base, int64_t & size) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows

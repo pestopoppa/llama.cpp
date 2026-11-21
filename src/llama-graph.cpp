@@ -154,8 +154,66 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 2]
+static bool llama_kv_idx_dev_enabled() {
+    const char * e = getenv("LLAMA_DEVICE_KV_IDX");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
+// n_g groups of equal size, each position-contiguous; fills the first position of each group
+static bool llama_pos_runs(const llama_ubatch & ub, int64_t n_g, std::vector<float> * p0) {
+    if (n_g <= 0 || ub.n_tokens % n_g != 0 || !ub.pos || ub.parent) {
+        return false;
+    }
+    const int64_t n_tps = ub.n_tokens / n_g;
+    if (p0) {
+        p0->assign(n_g, 0.0f);
+    }
+    for (int64_t g = 0; g < n_g; ++g) {
+        const llama_pos first = ub.pos[g*n_tps];
+        for (int64_t i = 0; i < n_tps; ++i) {
+            if (ub.pos[g*n_tps + i] != first + (llama_pos) i) {
+                return false;
+            }
+        }
+        if (p0) {
+            (*p0)[g] = (float) first;
+        }
+    }
+    return true;
+}
+
+static bool llama_pos_dev_eligible(const llama_ubatch & ub, uint32_t n_pos_per_embd) {
+    return llama_kv_idx_dev_enabled() && (n_pos_per_embd == 1 || (n_pos_per_embd == 4 && ub.token)) &&
+           llama_pos_runs(ub, std::max<int64_t>(1, ub.n_seqs_unq), nullptr);
+}
+
+void llm_graph_input_pos_dev::set_input(const llama_ubatch * ubatch) {
+    if (!p0->buffer) {
+        return;
+    }
+    std::vector<float> v;
+    GGML_ASSERT(llama_pos_runs(*ubatch, n_g, &v));
+    ggml_backend_tensor_set(p0, v.data(), 0, ggml_nbytes(p0));
+}
+
+bool llm_graph_input_pos_dev::can_reuse(const llm_graph_params & params) {
+    const auto & ub = params.ubatch;
+    return llama_pos_dev_eligible(ub, n_pos_per_embd) && std::max<int64_t>(1, ub.n_seqs_unq) == n_g &&
+           (int64_t) ub.n_tokens == n_g*n_tps;
+}
+
+// positions p0[g] + i as I32 [n_g*n_tps]
+static ggml_tensor * llama_build_pos_dev(ggml_context * ctx0, ggml_tensor * p0, int64_t n_tps, int64_t n_g) {
+    ggml_tensor * ar = ggml_arange(ctx0, 0.0f, (float) n_tps, 1.0f);                       // [n_tps]
+    ar = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, ar, n_tps, 1), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tps, n_g));
+    return ggml_add(ctx0, ar, p0);                                                          // F32 [n_tps, n_g]
+}
+
 bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     bool res = true;
+
+    res &= !llama_pos_dev_eligible(params.ubatch, n_pos_per_embd); // a device-position graph would be built now
 
     res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
 
@@ -797,6 +855,28 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
     return kv_rows_key == kv->get_fa_rows_key() && kv_rows_n_rows == n_rows && kv_rows_n_slices == n_slices;
 }
 
+void llm_graph_input_attn_kv::set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    if (dkv_p0) {
+        if (dkv_p0->buffer) {
+            std::vector<float> p0, base;
+            int64_t size = 0;
+            GGML_ASSERT(kv->kv_idx_dev_info(*ubatch, p0, base, size) && "device K/V index layout changed after graph build");
+            ggml_backend_tensor_set(dkv_p0,   p0.data(),   0, ggml_nbytes(dkv_p0));
+            ggml_backend_tensor_set(dkv_base, base.data(), 0, ggml_nbytes(dkv_base));
+        }
+        return;
+    }
+    kv->set_input_k_idxs(self_k_idxs, ubatch);
+    kv->set_input_v_idxs(self_v_idxs, ubatch);
+}
+
+bool llm_graph_input_attn_kv::can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const {
+    std::vector<float> p0, base;
+    int64_t size = 0;
+    const bool want = llama_kv_idx_dev_enabled() && kv->kv_idx_dev_info(ubatch, p0, base, size);
+    return want == (dkv_p0 != nullptr) && (!want || dkv_p0->ne[1] == (int64_t) p0.size());
+}
+
 void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (dmask_cpos) {
         // device-built mask: only its inputs live on the host (unallocated when the graph does not attend)
@@ -819,8 +899,7 @@ bool llm_graph_input_attn_kv::can_reuse_kq_mask_dev(const llama_kv_cache_context
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    set_input_kv_idx_any(mctx, ubatch);
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -907,6 +986,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
     res &= can_reuse_kq_mask_dev(mctx, params.ubatch);
+
+    res &= can_reuse_kv_idx_dev(mctx, params.ubatch);
 
     res &= can_reuse_kv_rows(mctx, params.ubatch);
 
@@ -1469,8 +1550,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    inp_attn->set_input_kv_idx_any(mctx->get_attn(), ubatch);
 
     inp_attn->set_input_kq_mask_any(mctx->get_attn(), ubatch);
 
@@ -1515,6 +1595,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_attn->can_reuse_kq_mask_dev(mctx->get_attn(), params.ubatch);
+
+    res &= inp_attn->can_reuse_kv_idx_dev(mctx->get_attn(), params.ubatch);
 
     res &= inp_attn->can_reuse_kv_rows(mctx->get_attn(), params.ubatch);
 
@@ -3021,6 +3103,30 @@ llm_graph_input_tree * llm_graph_context::build_inp_tree(int64_t d_conv) const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
+    // [GPU-RESIDENT-ROUND-2f phase 2] device positions
+    if (llama_pos_dev_eligible(ubatch, hparams.n_pos_per_embd())) {
+        const int64_t n_g   = std::max<int64_t>(1, ubatch.n_seqs_unq);
+        const int64_t n_tps = n_tokens / n_g;
+        auto inp = std::make_unique<llm_graph_input_pos_dev>(hparams.n_pos_per_embd(), n_g, n_tps);
+        inp->p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_g);
+        ggml_set_input(inp->p0);
+        ggml_set_name(inp->p0, "inp_pos_dev_p0");
+        ggml_tensor * p = ggml_reshape_1d(ctx0, llama_build_pos_dev(ctx0, inp->p0, n_tps, n_g), n_tokens);
+        if (hparams.n_pos_per_embd() == 4) {
+            // M-RoPE text tokens: [p, p, p, 0]
+            p = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, p, p, 0), p, 0), ggml_scale(ctx0, p, 0.0f), 0);
+        }
+        ggml_tensor * cur = ggml_cast(ctx0, p, GGML_TYPE_I32);
+        ggml_set_name(cur, "inp_pos_dev");
+        res->add_input(std::move(inp));
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "llm_graph: LLAMA_DEVICE_KV_IDX: device positions ENABLED (n_pos_per_embd=%u)\n", hparams.n_pos_per_embd());
+        }
+        return cur;
+    }
+
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
     auto & cur = inp->pos;
@@ -3414,6 +3520,35 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+    }
+
+    // [GPU-RESIDENT-ROUND-2f phase 2] device K/V write indices (ring layout): idx = base + q - size*floor(q/size), q = p0 + i
+    {
+        std::vector<float> p0, base;
+        int64_t size = 0;
+        if (llama_kv_idx_dev_enabled() && mctx_cur->kv_idx_dev_info(ubatch, p0, base, size)) {
+            const int64_t n_str = (int64_t) p0.size();
+            const int64_t n_tps = ubatch.n_tokens / n_str;
+            inp->dkv_p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
+            ggml_set_input(inp->dkv_p0);
+            ggml_set_name(inp->dkv_p0, "attn_inp_kv_idx_p0");
+            inp->dkv_base = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_str);
+            ggml_set_input(inp->dkv_base);
+            ggml_set_name(inp->dkv_base, "attn_inp_kv_idx_base");
+            ggml_tensor * q   = llama_build_pos_dev(ctx0, inp->dkv_p0, n_tps, n_str);                 // [n_tps, n_str]
+            // floor((q + 0.5)/size): robust to the rounding of the reciprocal for any size
+            ggml_tensor * wrp = ggml_scale(ctx0, ggml_floor(ctx0, ggml_scale_bias(ctx0, q, 1.0f/(float) size, 0.5f/(float) size)), (float) size);
+            ggml_tensor * idx = ggml_add(ctx0, ggml_sub(ctx0, q, wrp), inp->dkv_base);
+            idx = ggml_cast(ctx0, ggml_reshape_1d(ctx0, idx, ubatch.n_tokens), GGML_TYPE_I32);
+            ggml_set_name(idx, "attn_kv_idx_dev");
+            inp->self_k_idxs = idx;
+            inp->self_v_idxs = idx;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_KV_IDX: device K/V indices ENABLED (ring, size %lld)\n", (long long) size);
+            }
+        }
     }
 
     // [GPU-RESIDENT-ROUND-2a] LLAMA_DEVICE_KQ_MASK=1: build the mask on the device from per-cell / per-token positions

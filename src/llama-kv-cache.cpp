@@ -3724,6 +3724,36 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     }
 }
 
+bool llama_kv_cache_context::kv_idx_dev_info(const llama_ubatch & ubatch, std::vector<float> & p0, std::vector<float> & base, int64_t & size) const {
+    if (kv->get_v_trans() || sinfos.empty() || i_cur >= sinfos.size()) {
+        return false;
+    }
+    const auto & si = sinfos[i_cur];
+    const uint32_t n_str = si.n_stream();
+    if (n_str < 2 && ubatch.n_seqs_unq > 1) {
+        return false; // unified cache: no per-stream ring
+    }
+    size = kv->get_size();
+    const uint32_t n_tps = si.size();
+    if ((int64_t) n_tps * n_str != (int64_t) ubatch.n_tokens) {
+        return false;
+    }
+    p0.assign(n_str, 0.0f);
+    base.assign(n_str, 0.0f);
+    for (uint32_t s = 0; s < n_str; ++s) {
+        const llama_pos first = ubatch.pos[s*n_tps];
+        for (uint32_t i = 0; i < n_tps; ++i) {
+            const llama_pos p = ubatch.pos[s*n_tps + i];
+            if (p != first + (llama_pos) i || p < 0 || (int64_t) si.idxs[s][i] != (int64_t) (p % size)) {
+                return false;
+            }
+        }
+        p0[s]   = (float) first;
+        base[s] = (float) ((int64_t) si.strm[s]*size);
+    }
+    return true;
+}
+
 bool llama_kv_cache_context::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {
     return kv->kq_mask_dev_eligible(ubatch, causal_attn);
 }
