@@ -491,14 +491,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         win = ggml_cont(ctx0, ggml_permute(ctx0, win, 1, 0, 2, 3));                 // [nk, ch, W, n_seqs]
         cb(win, "conv_state_tree", il);
 
-        for (int64_t c = 0; c < W; ++c) {
-            const int64_t s_slot = W - 1 - c;
-            ggml_tensor * src = ggml_view_3d(ctx0, win, nk, conv_channels, n_seqs,
-                    win->nb[1], win->nb[3], c*win->nb[2]);
-            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1],
-                    (s_slot * mem_size + kv_head) * row_size);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
-        }
+        // [DTREE-ROUND-OVERHEAD] conv_idx lists the windows in slot order (win column j = rollback slot j), so one
+        // strided cpy scatters all W states: [row_count, W, n_seqs] -> slot stride mem_size rows, seq stride 1 row
+        // (was W per-column copies: 768 D2D blits per 27B T16 round, 3.3 ms)
+        ggml_tensor * src = ggml_reshape_3d(ctx0, win, row_count, W, n_seqs);
+        ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all, row_count, W, n_seqs,
+                (size_t) mem_size * row_size, conv_states_all->nb[1], (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
     } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
