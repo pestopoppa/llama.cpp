@@ -857,7 +857,7 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
 
 void llm_graph_input_attn_kv::set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (dctl_wb) {
-        kv->ctl_sync(*ubatch);
+        kv->ctl_sync(*ubatch, dctl_wb->op != GGML_OP_CPY ? 0 : dctl_accept ? 2 : 1);
         return;
     }
     if (dkv_p0) {
@@ -1806,6 +1806,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
+    ctl_inps.clear();
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -3562,10 +3563,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             }
             ggml_tensor * q   = llama_build_pos_dev(ctx0, p0_src, n_tps, n_str);                       // [n_tps, n_str]
             if (ctl) {
-                // write-back p0 + n_tps, derived from q so it is ordered after the read of the control block
-                ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
-                inp->dctl_wb = ggml_cpy(ctx0, ggml_scale_bias(ctx0, last, 1.0f, 1.0f), p0_view);
-                ggml_set_name(inp->dctl_wb, "attn_kv_ctl_wb");
+                // the write-back is built in build_sampling, from q so it is ordered after the read of the control block
+                inp->dctl_wb    = p0_view; // destination; replaced by the cpy node at finalize
+                inp->dctl_p0src = p0_src;
+                inp->dctl_q     = q;
             }
             // floor((q + 0.5)/size): robust to the rounding of the reciprocal for any size
             ggml_tensor * wrp = ggml_scale(ctx0, ggml_floor(ctx0, ggml_scale_bias(ctx0, q, 1.0f/(float) size, 0.5f/(float) size)), (float) size);
@@ -3667,7 +3668,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
     if (inp->dctl_wb) {
-        ggml_build_forward_expand(gf, inp->dctl_wb);
+        res->ctl_inps.push_back(inp.get());
     }
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
@@ -4537,7 +4538,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, hparams, cparams, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
     if (inp_attn->dctl_wb) {
-        ggml_build_forward_expand(gf, inp_attn->dctl_wb);
+        res->ctl_inps.push_back(inp_attn.get());
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -4744,6 +4745,39 @@ int llama_device_accept_stoch_k() {
     return k;
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 2.2b] device control block write-back. When every token of the ubatch is an output
+// row with a device argmax (a speculative verify batch [last, d1..dk] per stream), the device advances n_past by
+// n_accepted + 1, n_accepted = leading count of argmax[i] == token[i+1]; otherwise by n_tps.
+static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_result * res, int64_t n_tokens, int64_t n_outputs) {
+    for (auto * inp : res->ctl_inps) {
+        ggml_tensor * dst  = inp->dctl_wb;
+        ggml_tensor * q    = inp->dctl_q;
+        const int64_t n_tps = q->ne[0], n_str = q->ne[1];
+        ggml_tensor * nv = nullptr;
+        if (res->t_argmax && res->t_inp_tokens && n_outputs == n_tokens && n_tps > 1 && n_tps*n_str == n_tokens) {
+            ggml_tensor * am  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, res->t_argmax,     n_tps, n_str), GGML_TYPE_F32);
+            ggml_tensor * tk  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, res->t_inp_tokens, n_tps, n_str), GGML_TYPE_F32);
+            ggml_tensor * amv = ggml_view_2d(ctx0, am, n_tps - 1, n_str, am->nb[1], 0);
+            ggml_tensor * tkv = ggml_view_2d(ctx0, tk, n_tps - 1, n_str, tk->nb[1], tk->nb[0]);
+            ggml_tensor * mis = ggml_step(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, ggml_cont(ctx0, amv), ggml_cont(ctx0, tkv)))); // 1 = mismatch
+            ggml_tensor * cs  = ggml_cumsum(ctx0, mis);
+            ggml_tensor * acc = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, cs, -1.0f, 0.5f)));          // [1, n_str]
+            // + 0*q[0]: orders the write after the read of the control block through q
+            ggml_tensor * q0  = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], 0));
+            nv = ggml_add(ctx0, ggml_scale_bias(ctx0, acc, 1.0f, 1.0f), q0);                                       // p0 + n_acc + 1
+            inp->dctl_accept = true;
+        } else {
+            ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
+            nv = ggml_scale_bias(ctx0, last, 1.0f, 1.0f);                                                          // p0 + n_tps
+            inp->dctl_accept = false;
+        }
+        inp->dctl_wb = ggml_cpy(ctx0, nv, dst);
+        ggml_set_name(inp->dctl_wb, "attn_kv_ctl_wb");
+        ggml_build_forward_expand(gf, inp->dctl_wb);
+    }
+    res->ctl_inps.clear();
+}
+
 void llm_graph_context::build_sampling() const {
     if (res->t_logits && llama_device_argmax_enabled() && res->t_logits->type == GGML_TYPE_F32 &&
             ggml_n_dims(res->t_logits) <= 2) {
@@ -4771,6 +4805,7 @@ void llm_graph_context::build_sampling() const {
         res->t_topk_ids  = ids;
         res->t_topk_vals = val;
     }
+    llama_build_ctl_wb(ctx0, gf, res, n_tokens, n_outputs); // after t_argmax exists; no-op when already built
     if (samplers.empty() || !res->t_logits) {
         return;
     }
@@ -4856,6 +4891,7 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

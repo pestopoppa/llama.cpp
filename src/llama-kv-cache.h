@@ -404,6 +404,7 @@ public:
     mutable std::vector<float> ctl_host;
     mutable int64_t ctl_host_writes = 0;
     mutable int64_t ctl_device_hits = 0;
+    mutable int64_t ctl_reads = 0;
 private:
 
     // model layer id -> KV cache layer id
@@ -528,7 +529,9 @@ public:
     // device control block (nullptr when disabled or not contiguous)
     ggml_tensor * ctl_range(const llama_ubatch & ubatch, int64_t & s0, int64_t & n) const;
     // writes the control-block elements whose mirror disagrees with the ubatch, then advances the mirror by n_tps
-    void ctl_sync(const llama_ubatch & ubatch) const;
+    // accept = the graph advances by the device accept count: the mirror becomes pending (resolved by a 4-byte read)
+    // mode: 0 = graph has no write-back (build_sampling not run), 1 = advances by n_tps, 2 = by the device accept count
+    void ctl_sync(const llama_ubatch & ubatch, int mode) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows

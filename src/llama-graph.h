@@ -434,6 +434,10 @@ public:
     // dctl_wb writes p0 + n_tps back (the caller expands it); dctl_s0 = first stream of the view (-1 = unused)
     ggml_tensor * dctl_wb = nullptr;
     int64_t       dctl_s0 = -1;
+    // phase 2.2b: write-back pieces, finalized in build_sampling (accept advance when every token is a verify row)
+    ggml_tensor * dctl_p0src = nullptr; // contiguous copy of the p0 view [1, n_str]
+    ggml_tensor * dctl_q     = nullptr; // positions [n_tps, n_str]
+    bool          dctl_accept = false;  // the write-back is p0 + n_accepted + 1 (device leading-match count)
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 
@@ -1010,6 +1014,8 @@ public:
     ggml_tensor * t_logits      = nullptr;
     // DTREE-A: per-output-row argmax of t_logits computed on the device (LLAMA_DEVICE_ARGMAX=1), I32 [n_outputs]
     ggml_tensor * t_argmax      = nullptr;
+    // [GPU-RESIDENT-ROUND-2f phase 2.2] attention inputs whose device control block write-back is still to be built
+    std::vector<llm_graph_input_attn_kv *> ctl_inps;
     // AK-GAP-1-STOCH-ACCEPT: per-output-row top-K candidates of t_logits (GGML_HIP_DEVICE_ACCEPT_STOCH=K), ids I32 [K, n_outputs], logits F32 [1, K, n_outputs]
     ggml_tensor * t_topk_ids    = nullptr;
     ggml_tensor * t_topk_vals   = nullptr;

@@ -399,8 +399,8 @@ llama_kv_cache::llama_kv_cache(
 
 llama_kv_cache::~llama_kv_cache() {
     if (ctl) {
-        fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CTL: device_hits=%lld host_writes=%lld\n",
-                (long long) ctl_device_hits, (long long) ctl_host_writes);
+        fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CTL: device_hits=%lld host_writes=%lld reads=%lld\n",
+                (long long) ctl_device_hits, (long long) ctl_host_writes, (long long) ctl_reads);
     }
 }
 
@@ -3809,20 +3809,25 @@ ggml_tensor * llama_kv_cache_context::ctl_range(const llama_ubatch & ubatch, int
     return kv->ctl;
 }
 
-void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch) const {
+void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode) const {
     std::vector<float> p0, base;
     int64_t size = 0, s0 = 0, n = 0;
     GGML_ASSERT(ctl_range(ubatch, s0, n) && kv_idx_dev_info(ubatch, p0, base, size));
     const float n_tps = (float) (ubatch.n_tokens / n);
     for (int64_t s = 0; s < n; ++s) {
         float & m = kv->ctl_host[s0 + s];
+        if (std::isnan(m)) {
+            // pending after a device accept advance: read what the device computed
+            ggml_backend_tensor_get(kv->ctl, &m, (s0 + s)*kv->ctl->nb[1], sizeof(float));
+            kv->ctl_reads++;
+        }
         if (m != p0[s]) {
             ggml_backend_tensor_set(kv->ctl, &p0[s], (s0 + s)*kv->ctl->nb[1], sizeof(float));
             kv->ctl_host_writes++;
         } else {
             kv->ctl_device_hits++;
         }
-        m = p0[s] + n_tps; // the graph writes this back
+        m = mode == 2 ? NAN : mode == 1 ? p0[s] + n_tps : p0[s]; // the graph writes this back
     }
 }
 
