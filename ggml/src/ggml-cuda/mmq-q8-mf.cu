@@ -1515,10 +1515,10 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
 
 // ---------------------------------------------------------------------------------------------------------------------
 // DTREE-0-Q8MF-PACKED-CONSUMERS: consumers that read the in-place packed layout directly (no natural copy).
-// (a) q8ip_mmvq: n 1..GGML_HIP_Q8IP_MMVQ_MAX (default 1, max 4) Q8_0 x q8_1 matvec. A WG (256 threads) owns Q8IPV_R = 8
+// (a) q8ip_mmvq: n1 (GGML_HIP_Q8IP_MMVQ_MAX=0 -> V3) Q8_0 x q8_1 matvec. A WG (256 threads) owns Q8IPV_R = 8
 //     consecutive rows of one 64-row tile; in the packed layout those rows' segment of a k-stage is ONE contiguous,
 //     16 B aligned 8 x 272 = 2176 B run (136 dwordx4), so each iteration streams Q8IPV_U = 8 stages = 8 contiguous runs
-//     with fully used dwordx4 loads (next group prefetched into VGPRs while the current one is consumed) into LDS, then 2 threads per Q8_0 block (16 quants each, 4 dp4a per column) consume
+//     with fully used dwordx4 loads (next group prefetched into VGPRs while the current one is consumed) into LDS together with the group's 2304 B of q8_1 activations (no per-block global y loads), then 2 threads per Q8_0 block (16 quants each, 4 dp4a per column) consume
 //     them. 17 KB LDS, N/8 WGs (17408 rows -> 2176 WGs) -> high occupancy, no stream-K / atomics.
 // (b) MMQ prefill (n > 16): ggml_cuda_mul_mat_q is called with a NEGATIVE row stride (-K/32) for a packed weight; the
 //     Q8_0 tile loader decodes (row, block) from the natural index and reads the packed address (in-stage blocks stay
@@ -1533,6 +1533,7 @@ static const char q8ipc_build_marker[] __attribute__((used)) =
 #define Q8IPV_NT 256
 #define Q8IPV_CH (Q8IPV_R * Q8MF_ROWB / 16)   // 136 dwordx4 per (stage, 8-row group)
 #define Q8IPV_NL ((Q8IPV_U * Q8IPV_CH + Q8IPV_NT - 1) / Q8IPV_NT)   // 5 dwordx4 per thread per iteration
+#define Q8IPV_YC (Q8IPV_U * Q8MF_KS * 36 / 16)                       // 144 dwordx4 of q8_1 activations per iteration
 
 // aligned dword read of a 2-byte aligned LDS int pair (Q8_0 qs): two ds_read_b32 + v_alignbyte
 static __device__ __forceinline__ int q8ipv_ld(const char * p) {
@@ -1544,7 +1545,10 @@ static __device__ __forceinline__ int q8ipv_ld(const char * p) {
 template <int NC>
 static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __restrict__ W, const block_q8_1 * __restrict__ y,
         const int S, const int sy, float * __restrict__ dst, const int dst_s1) {
+    static_assert(NC == 1, "activations staged in LDS for one column");
     __shared__ int4  lds[Q8IPV_U * Q8IPV_CH + 1];   // +1: the alignbyte read of the last block may touch 4 B past it
+    __shared__ int4  ldy[Q8IPV_YC];                  // the group's 64 q8_1 activation blocks (2304 B, contiguous)
+    const int ybytes = sy * (int) sizeof(block_q8_1);
     __shared__ float red[NC][Q8IPV_R];
     const int tid  = threadIdx.x;
     const int row0 = blockIdx.x * Q8IPV_R;
@@ -1569,8 +1573,12 @@ static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __rest
         const char * src_ = base + (int64_t) (ks0_) * Q8MF_WSTAGE;                         \
         Q8IPV_LD1(0, src_, nu_); Q8IPV_LD1(1, src_, nu_); Q8IPV_LD1(2, src_, nu_);         \
         Q8IPV_LD1(3, src_, nu_); Q8IPV_LD1(4, src_, nu_);                                  \
+        const int yo_ = (ks0_) * Q8MF_KS * (int) sizeof(block_q8_1) + tid * 16;            \
+        if (tid < Q8IPV_YC && yo_ + 16 <= ybytes) {                                        \
+            py = *(const int4 *) ((const char *) y + yo_);                                 \
+        }                                                                                  \
     } while (0)
-    int4 p0, p1, p2, p3, p4;
+    int4 p0, p1, p2, p3, p4, py = make_int4(0, 0, 0, 0);
     Q8IPV_ISSUE(0);
     for (int ks0 = 0; ks0 < S; ks0 += Q8IPV_U) {
         const int nu = min(Q8IPV_U, S - ks0);
@@ -1581,6 +1589,9 @@ static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __rest
         lds[tid + 3 * Q8IPV_NT] = p3;
         if (tid + 4 * Q8IPV_NT < Q8IPV_U * Q8IPV_CH) {
             lds[tid + 4 * Q8IPV_NT] = p4;
+        }
+        if (tid < Q8IPV_YC) {
+            ldy[tid] = py;
         }
         __syncthreads();
         if (ks0 + Q8IPV_U < S) {
@@ -1598,10 +1609,9 @@ static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __rest
                 for (int k = 0; k < 4; ++k) {
                     xi[k] = q8ipv_ld(qx + 4*k);
                 }
-                const int kb = (ks0 + u) * Q8MF_KS + b;
 #pragma unroll
                 for (int j = 0; j < NC; ++j) {
-                    const block_q8_1 * yb = y + j * sy + kb;
+                    const block_q8_1 * yb = (const block_q8_1 *) ldy + u * Q8MF_KS + b;
                     const int * yq = (const int *) yb->qs + h * 4;   // 36 B blocks: dword aligned only
                     int s = 0;
 #pragma unroll
@@ -1636,7 +1646,7 @@ static __global__ void __launch_bounds__(Q8IPV_NT) q8ip_mmvq(const char * __rest
 }
 
 static int q8ip_mmvq_max() {
-    static const int v = std::max(0, std::min(4, q8mf_env_int("GGML_HIP_Q8IP_MMVQ_MAX", 1)));
+    static const int v = std::max(0, std::min(1, q8mf_env_int("GGML_HIP_Q8IP_MMVQ_MAX", 1)));   // n1 only
     return v;
 }
 
@@ -1663,9 +1673,6 @@ static void q8ip_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int grid = N / Q8IPV_R;
     switch (M) {
         case 1: q8ip_mmvq<1><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
-        case 2: q8ip_mmvq<2><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
-        case 3: q8ip_mmvq<3><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
-        case 4: q8ip_mmvq<4><<<grid, Q8IPV_NT, 0, stream>>>(W, y, S, sy, d, dst_s1); break;
         default: GGML_ABORT("q8ip_mmvq: bad n %d", M);
     }
     CUDA_CHECK(cudaGetLastError());
