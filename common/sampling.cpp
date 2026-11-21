@@ -11,6 +11,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -573,6 +574,111 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// AK-GAP-1-STOCH-ACCEPT: true when the chain common_sampler_init builds from these params, run on the full row,
+// selects with the same law (and, for one RNG state, the same token) as the same chain run on the row's top-K
+// candidates: every stage before top_k is a no-op for these values, top_k is in [1, K] so its output lies inside
+// the K candidates, and every later stage (typ_p, top_p, min_p, xtc, temperature, dist) reads only the array top_k
+// left. Logit bias is allowed only as -inf bans (checked per row against the candidates by the caller).
+static bool stoch_topk_params_ok(const common_params_sampling & p, int K) {
+    if (K <= 0 || p.mirostat != 0 || p.n_probs != 0 || !(p.temp > 0.0f) || p.top_k <= 0 || p.top_k > K) {
+        return false;
+    }
+    for (const auto & lb : p.logit_bias) {
+        if (!(std::isinf(lb.bias) && lb.bias < 0.0f)) {
+            return false;
+        }
+    }
+    for (const auto type : p.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return true;   // stages from here on act on the top_k array only
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(p.penalty_last_n == 0 ||
+                      (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (p.dry_multiplier != 0.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (!(p.top_n_sigma <= 0.0f)) {
+                    return false;
+                }
+                break;
+            default:
+                // anything else ahead of top_k reads (or rescales) the full row
+                return false;
+        }
+    }
+    return false;   // no top_k stage
+}
+
+static int device_accept_stoch_k_env() {
+    static const int k = [] {
+        const char * e = getenv("GGML_HIP_DEVICE_ACCEPT_STOCH");
+        int v = (e != nullptr && *e) ? atoi(e) : 0;
+        if (v == 1) {
+            v = 32;
+        }
+        return v < 2 ? 0 : std::min(v, 64);
+    }();
+    return k;
+}
+
+static std::atomic<int64_t> g_stoch_topk_rows{0};   // AK-GAP-1-STOCH-ACCEPT witness (rows served from the device candidates)
+
+// fills gsmpl->cur with the row's device top-K candidates sorted by logit (descending, id ascending on ties) and
+// returns true, or returns false (caller takes the full-row path) when the row is not eligible
+static bool stoch_topk_set_candidates(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    const int K = device_accept_stoch_k_env();
+    if (K == 0 || gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr || !stoch_topk_params_ok(gsmpl->params, K)) {
+        return false;
+    }
+    if (llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
+        llama_get_sampled_probs_ith (ctx, idx) != nullptr ||
+        llama_get_sampled_logits_ith(ctx, idx) != nullptr) {
+        return false;
+    }
+    const int32_t * ids  = nullptr;
+    const float *   vals = nullptr;
+    const int32_t   n    = llama_get_topk_ith(ctx, idx, &ids, &vals);
+    if (n <= 0 || n < gsmpl->params.top_k) {
+        return false;
+    }
+    int n_banned = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || !std::isfinite(vals[i])) {
+            return false;   // NaN / inf rows and missing ids go to the full-row path
+        }
+        for (const auto & lb : gsmpl->params.logit_bias) {
+            if (lb.token == ids[i]) {
+                n_banned++;
+                break;
+            }
+        }
+    }
+    // after the bans the full row's top_k must still lie inside the unbanned candidates
+    if (n - n_banned < gsmpl->params.top_k) {
+        return false;
+    }
+    auto & cur = gsmpl->cur;
+    cur.resize(n);
+    for (int32_t i = 0; i < n; ++i) {
+        cur[i] = llama_token_data{ ids[i], vals[i], 0.0f };
+    }
+    std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    });
+    gsmpl->cur_p = { cur.data(), cur.size(), -1, false };
+    if (g_stoch_topk_rows.fetch_add(1) == 0) {
+        fprintf(stderr, "llama_device_accept_stoch: first row sampled from device top-%d candidates (GGML_HIP_DEVICE_ACCEPT_STOCH)\n", n);
+    }
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -585,6 +691,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // AK-GAP-1-STOCH-ACCEPT (GGML_HIP_DEVICE_ACCEPT_STOCH=K, default off): exact chain on the device top-K candidates
+    if (stoch_topk_set_candidates(gsmpl, ctx, idx)) {
+        llama_sampler_apply(chain, &cur_p);
+        return cur_p.data[cur_p.selected].id;
+    }
 
     gsmpl->set_logits(ctx, idx);
 

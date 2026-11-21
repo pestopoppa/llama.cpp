@@ -1697,6 +1697,8 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_argmax      = nullptr;
+    t_topk_ids    = nullptr;
+    t_topk_vals   = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -4483,6 +4485,25 @@ static bool llama_device_argmax_enabled() {
     return v;
 }
 
+// AK-GAP-1-STOCH-ACCEPT: GGML_HIP_DEVICE_ACCEPT_STOCH=K (K in [2, 64]; =1 -> 32) adds top-K candidate outputs;
+// unset / 0 = off (default). Read once.
+int llama_device_accept_stoch_k() {
+    static const int k = [] {
+        const char * e = getenv("GGML_HIP_DEVICE_ACCEPT_STOCH");
+        int v = (e != nullptr && *e) ? atoi(e) : 0;
+        if (v == 1) {
+            v = 32;
+        }
+        if (v < 2) {
+            return 0;
+        }
+        v = std::min(v, 64);
+        fprintf(stderr, "llama_device_accept_stoch: ENABLED (GGML_HIP_DEVICE_ACCEPT_STOCH, K=%d top-K candidate rows)\n", v);
+        return v;
+    }();
+    return k;
+}
+
 void llm_graph_context::build_sampling() const {
     if (res->t_logits && llama_device_argmax_enabled() && res->t_logits->type == GGML_TYPE_F32 &&
             ggml_n_dims(res->t_logits) <= 2) {
@@ -4491,6 +4512,24 @@ void llm_graph_context::build_sampling() const {
         ggml_set_output(am);
         ggml_build_forward_expand(gf, am);
         res->t_argmax = am;
+    }
+    // AK-GAP-1-STOCH-ACCEPT: top-K candidate ids + logits per row so a temp > 0 sampler whose chain starts with
+    // top_k <= K can run exactly on K candidates (common_sampler_sample_device_topk) without the n_vocab download.
+    const int stoch_k = llama_device_accept_stoch_k();
+    if (stoch_k > 0 && res->t_logits && res->t_logits->type == GGML_TYPE_F32 && ggml_n_dims(res->t_logits) <= 2 &&
+            res->t_logits->ne[0] > stoch_k) {
+        ggml_tensor * lg  = res->t_logits;
+        ggml_tensor * ids = ggml_top_k(ctx0, lg, stoch_k);                                   // I32 [K, rows]
+        ggml_tensor * v3  = ggml_reshape_3d(ctx0, lg, 1, lg->ne[0], lg->ne[1]);              // [1, V, rows]
+        ggml_tensor * val = ggml_get_rows(ctx0, v3, ids);                                    // [1, K, rows]
+        ggml_set_name(ids, "result_topk_ids");
+        ggml_set_name(val, "result_topk_vals");
+        ggml_set_output(ids);
+        ggml_set_output(val);
+        ggml_build_forward_expand(gf, ids);
+        ggml_build_forward_expand(gf, val);
+        res->t_topk_ids  = ids;
+        res->t_topk_vals = val;
     }
     if (samplers.empty() || !res->t_logits) {
         return;

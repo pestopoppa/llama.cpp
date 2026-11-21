@@ -1032,6 +1032,25 @@ llama_token llama_context::get_argmax_ith(int32_t i) {
     }
 }
 
+int32_t llama_context::get_topk_ith(int32_t i, const int32_t ** ids, const float ** vals) {
+    output_reorder();
+
+    if (!topk_valid || topk_k <= 0 || topk_ids_out.empty()) {
+        return 0;
+    }
+    try {
+        const int64_t j = output_resolve_row(i);
+        if (j < 0 || (j + 1) * topk_k > (int64_t) topk_ids_out.size()) {
+            return 0;
+        }
+        *ids  = topk_ids_out.data()  + j * topk_k;
+        *vals = topk_vals_out.data() + j * topk_k;
+        return topk_k;
+    } catch (const std::exception &) {
+        return 0;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2342,6 +2361,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     argmax_out.assign(n_outputs_all, -1);
     argmax_valid = true;
 
+    topk_k     = llama_device_accept_stoch_k();
+    topk_valid = topk_k > 0;
+    if (topk_valid) {
+        topk_ids_out.assign((size_t) n_outputs_all * topk_k, -1);
+        topk_vals_out.assign((size_t) n_outputs_all * topk_k, 0.0f);
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2418,6 +2444,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_tensor_get_async(backend_am, t_am, argmax_out.data() + n_outputs_prev, 0, n_outputs*sizeof(int32_t));
             } else {
                 argmax_valid = false;
+            }
+        }
+
+        // AK-GAP-1-STOCH-ACCEPT: device top-K candidate rows (K ids + K logits per output), same row offsets as argmax
+        if (topk_valid && n_outputs > 0) {
+            ggml_tensor * t_ti = res->t_topk_ids;
+            ggml_tensor * t_tv = res->t_topk_vals;
+            if (t_ti != nullptr && t_tv != nullptr && t_ti->ne[0] == topk_k && t_ti->ne[1] == n_outputs) {
+                GGML_ASSERT((n_outputs_prev + n_outputs) * topk_k <= (int64_t) topk_ids_out.size());
+                ggml_backend_t b_ti = ggml_backend_sched_get_tensor_backend(sched.get(), t_ti);
+                ggml_backend_t b_tv = ggml_backend_sched_get_tensor_backend(sched.get(), t_tv);
+                ggml_backend_tensor_get_async(b_ti, t_ti, topk_ids_out.data()  + n_outputs_prev*topk_k, 0, n_outputs*topk_k*sizeof(int32_t));
+                ggml_backend_tensor_get_async(b_tv, t_tv, topk_vals_out.data() + n_outputs_prev*topk_k, 0, n_outputs*topk_k*sizeof(float));
+            } else {
+                topk_valid = false;
             }
         }
 
@@ -2827,6 +2868,13 @@ void llama_context::output_reorder() {
 
         if (i0 < argmax_out.size() && i1 < argmax_out.size()) {
             std::swap(argmax_out[i0], argmax_out[i1]);
+        }
+
+        if (topk_k > 0 && (i1 + 1) * topk_k <= topk_ids_out.size() && (i0 + 1) * topk_k <= topk_ids_out.size()) {
+            for (int32_t k = 0; k < topk_k; k++) {
+                std::swap(topk_ids_out [i0*topk_k + k], topk_ids_out [i1*topk_k + k]);
+                std::swap(topk_vals_out[i0*topk_k + k], topk_vals_out[i1*topk_k + k]);
+            }
         }
 
         if (embd.size > 0) {
@@ -4516,6 +4564,12 @@ void llama_device_accept_stats(const llama_context * ctx, int64_t * lazy_skipped
     if (flushed) {
         *flushed = ctx->n_lazy_flushed();
     }
+}
+
+int32_t llama_get_topk_ith(llama_context * ctx, int32_t i, const int32_t ** ids, const float ** vals) {
+    ctx->synchronize();
+
+    return ctx->get_topk_ith(i, ids, vals);
 }
 
 llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {

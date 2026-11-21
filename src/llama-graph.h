@@ -976,6 +976,9 @@ public:
     ggml_tensor * t_logits      = nullptr;
     // DTREE-A: per-output-row argmax of t_logits computed on the device (LLAMA_DEVICE_ARGMAX=1), I32 [n_outputs]
     ggml_tensor * t_argmax      = nullptr;
+    // AK-GAP-1-STOCH-ACCEPT: per-output-row top-K candidates of t_logits (GGML_HIP_DEVICE_ACCEPT_STOCH=K), ids I32 [K, n_outputs], logits F32 [1, K, n_outputs]
+    ggml_tensor * t_topk_ids    = nullptr;
+    ggml_tensor * t_topk_vals   = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     // [n_embd, n_outputs] architecture-defined hidden state used to seed NextN/MTP decoders.
@@ -1024,6 +1027,9 @@ struct llm_graph_qkv {
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
+
+// AK-GAP-1-STOCH-ACCEPT: top-K candidate count from GGML_HIP_DEVICE_ACCEPT_STOCH (0 = off)
+int llama_device_accept_stoch_k();
 
 struct llm_graph_context {
     const llm_arch arch;

@@ -92,6 +92,7 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
     llama_token get_argmax_ith(int32_t i);
+    int32_t     get_topk_ith(int32_t i, const int32_t ** ids, const float ** vals);
     int64_t n_lazy_skipped() const { return n_logits_lazy_skip; }
     int64_t n_lazy_flushed() const { return n_logits_lazy_flush; }
 
@@ -361,6 +362,11 @@ private:
     // DTREE-A: device argmax per output row (LLAMA_DEVICE_ARGMAX=1); empty / -1 when not computed
     std::vector<int32_t> argmax_out;
     bool                 argmax_valid = false;
+    // AK-GAP-1-STOCH-ACCEPT: device top-K candidates per output row (GGML_HIP_DEVICE_ACCEPT_STOCH=K); K == 0 when absent
+    std::vector<int32_t> topk_ids_out;
+    std::vector<float>   topk_vals_out;
+    int32_t              topk_k     = 0;
+    bool                 topk_valid = false;
 
     // AK-GAP-1-SAMPLE (LLAMA_DEVICE_ACCEPT=1): when a single-ubatch decode produced device argmax rows, the
     // n_outputs x n_vocab logits download is deferred until something reads the logits. A greedy accept that
