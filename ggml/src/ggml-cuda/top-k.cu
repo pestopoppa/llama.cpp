@@ -165,7 +165,22 @@ bool ggml_cuda_top_k_fast_enabled() {
     return v;
 }
 
+// AK-GAP-1-STOCH-ACCEPT: GGML_HIP_TOPK_FAST=32 widens the fast path to 16 < k <= 32 (K=32 register lists; the default
+// k <= 16 instantiation is unchanged). Unset / 1 keeps k <= 16, so k 17..32 still take the radix select by default.
+static int ggml_cuda_top_k_fast_kmax() {
+    static const int v = [] {
+        const char * s = getenv("GGML_HIP_TOPK_FAST");
+        const int kmax = (s != nullptr && atoi(s) >= 32) ? 32 : 16;
+        if (kmax == 32) {
+            GGML_LOG_INFO("ggml_cuda_top_k_fast: GGML_HIP_TOPK_FAST=32 wide fast path enabled (k <= 32)\n");
+        }
+        return kmax;
+    }();
+    return v;
+}
+
 static constexpr int TOPK_FAST_KMAX = 16;
+static constexpr int TOPK_FAST_KMAX_WIDE = 32;
 static constexpr int TOPK_FAST_NT   = 256;
 static constexpr int TOPK_FAST_EPT  = 8; // elements per thread per pass-1 block
 
@@ -268,9 +283,9 @@ static __global__ void __launch_bounds__(NT) k_top_k_fast_p2(const uint64_t * pa
     top_k_fast_emit<NT, K>(l, k, [&](int r, uint64_t m) { y[r] = (int) (0xFFFFFFFFu - (uint32_t) (m & 0xFFFFFFFFu)); });
 }
 
-static void top_k_fast_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int64_t nrows, const int k, cudaStream_t stream) {
+template <int K>
+static void top_k_fast_cuda_k(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int64_t nrows, const int k, cudaStream_t stream) {
     constexpr int NT = TOPK_FAST_NT;
-    constexpr int K  = TOPK_FAST_KMAX;
     const int chunk = NT*TOPK_FAST_EPT;
     const int nb    = (ncols + chunk - 1) / chunk;
     ggml_cuda_pool_alloc<uint64_t> part(pool, (size_t) nrows*nb*k);
@@ -278,8 +293,16 @@ static void top_k_fast_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
     k_top_k_fast_p2<NT, K><<<nrows, NT, 0, stream>>>(part.get(), dst, nb*k, k);
     static int n_calls = 0;
     if (n_calls++ == 0) {
-        GGML_LOG_INFO("ggml_cuda_top_k_fast: GGML_HIP_TOPK_FAST multi-block top-k ran (call 1, ncols=%d k=%d nrows=%lld nb=%d)\n",
-                      ncols, k, (long long) nrows, nb);
+        GGML_LOG_INFO("ggml_cuda_top_k_fast: GGML_HIP_TOPK_FAST multi-block top-k ran (call 1, ncols=%d k=%d nrows=%lld nb=%d, K=%d)\n",
+                      ncols, k, (long long) nrows, nb, K);
+    }
+}
+
+static void top_k_fast_cuda(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int64_t nrows, const int k, cudaStream_t stream) {
+    if (k <= TOPK_FAST_KMAX) {
+        top_k_fast_cuda_k<TOPK_FAST_KMAX>(pool, src, dst, ncols, nrows, k, stream);
+    } else {
+        top_k_fast_cuda_k<TOPK_FAST_KMAX_WIDE>(pool, src, dst, ncols, nrows, k, stream);
     }
 }
 
@@ -331,7 +354,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
-    if (ncols > 1024 && k <= TOPK_FAST_KMAX && nrows <= 65535 && ggml_cuda_top_k_fast_enabled()) {
+    if (ncols > 1024 && k <= ggml_cuda_top_k_fast_kmax() && nrows <= 65535 && ggml_cuda_top_k_fast_enabled()) {
         top_k_fast_cuda(pool, src0_d, dst_d, (int) ncols, nrows, (int) k, stream);
         return;
     }
