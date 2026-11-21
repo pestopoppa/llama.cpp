@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 #include <cinttypes>
 #include <cstdlib>
@@ -2402,6 +2403,18 @@ void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx) {
     }
 }
 
+// AK-GAP2-Q81-REUSE (gap census 2, A3B-MTP quantize_q8_1 9.1% of decode wall): the capture-scoped q8_1 src1 cache
+// above only served ne11 == 1. MTP/DFlash verify batches (ne11 2..8) re-quantized the same src1 for every sibling
+// MUL_MAT (q/k/v, gate/up when not gate-fused, ...). GGML_HIP_Q8_1_REUSE_BATCH=1 extends it to ne11 <= MMVQ_MAX_BATCH_SIZE.
+// Default off. Same quantized bytes are reused, so the knob is bitwise output-neutral.
+static bool mmvq_q8_1_reuse_batch_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_HIP_Q8_1_REUSE_BATCH");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 static bool mmvq_q8_1_graph_cache_matches(
         const mmvq_q8_1_graph_cache_entry & entry, const ggml_tensor * src1,
         const int64_t ne10_padded, const size_t q8_1_size, const bool q4k_isum) {
@@ -2504,7 +2517,7 @@ void ggml_cuda_mul_mat_vec_q(
 #if defined(GGML_USE_HIP) && defined(GGML_HIP_GRAPHS)
     const bool cache_eligible = ctx.curr_stream_no == 0 && ids == nullptr &&
         (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0) &&
-        ne11 == 1 && ne12 == 1 && ne13 == 1;
+        (ne11 == 1 || (mmvq_q8_1_reuse_batch_enabled() && ne11 <= MMVQ_MAX_BATCH_SIZE)) && ne12 == 1 && ne13 == 1;
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     unsigned long long capture_id = 0;
     if (cache_eligible) {
@@ -2530,6 +2543,13 @@ void ggml_cuda_mul_mat_vec_q(
             if (mmvq_q8_1_graph_cache_matches(entry, src1, ne10_padded, src1_q8_1_size, src0->type == GGML_TYPE_Q4_K)) {
                 src1_q8_1 = entry.q8_1;
                 reuse_src1_q8_1 = true;
+                if (ne11 > 1) {
+                    // AK-GAP2-Q81-REUSE witness (gate packets grep it; also the build's strings content marker)
+                    static std::atomic<int64_t> n_batch_hits{0};
+                    if (n_batch_hits.fetch_add(1) == 0) {
+                        GGML_LOG_INFO("mmvq_q8_1_reuse_batch: GGML_HIP_Q8_1_REUSE_BATCH reused a batched q8_1 src1 (ne11=%d)\n", (int) ne11);
+                    }
+                }
                 break;
             }
         }

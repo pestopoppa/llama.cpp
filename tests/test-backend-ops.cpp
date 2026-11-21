@@ -12611,6 +12611,32 @@ static void add_near_f16_max_mul_mat_cases(std::vector<std::unique_ptr<test_case
     }
 }
 
+// AK-GAP2 op label (gap census 2), selected with -o.
+// MUL_MAT_SHARED_Q81: two quantized MUL_MATs reading the same f32 src1 batch (ne11 2..8), the GGML_HIP_Q8_1_REUSE_BATCH
+// capture-scoped q8_1 reuse (only active under HIP graph capture; the case pins the output either way).
+struct test_mul_mat_shared_q81 : public test_case {
+    const ggml_type type_a; const int64_t m; const int64_t n; const int64_t k;
+    std::string vars() override { return VARS_TO_STR4(type_a, m, n, k); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_SHARED_Q81"; }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    test_mul_mat_shared_q81(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 2048, int64_t n = 3, int64_t k = 2048)
+        : type_a(type_a), m(m), n(n), k(k) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type_a, k, m / 2);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * y0 = ggml_mul_mat(ctx, a0, b);
+        ggml_tensor * y1 = ggml_mul_mat(ctx, a1, b);
+        ggml_tensor * y2 = ggml_mul_mat(ctx, a2, b);
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, y0, y1), ggml_concat(ctx, y2, y2, 0));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
@@ -14024,6 +14050,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
     }
+    // AK-GAP2 (gap census 2, sh)
+    for (int64_t n : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q4_K, 1024, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q6_K, 1024, n, 512));
+    }
     // AK-GAP-1-IDSORT: A3B-MTP drafter backend top_k(10) over n_vocab 248320 (GGML_HIP_TOPK_FAST multi-block path, k <= 16)
     for (int k : {1, 2, 10, 16}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, k));
@@ -15022,6 +15054,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, kv, 36, 4, kv/4, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4));
     }
 
+    // AK-GAP2 op perf A/B (sh)
+    test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, 3, 2048));
     // AK-GAP-1-IDSORT: A3B-MTP drafter top_k(10) over n_vocab; A/B GGML_HIP_TOPK_FAST=1 vs unset (radix select)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 10));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 3, 1, 1}, 10));
