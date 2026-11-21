@@ -408,6 +408,17 @@ public:
     std::vector<int32_t> kv_rows_data;
     bool kv_rows_valid = false;
 
+    // [GPU-RESIDENT-ROUND-2a] LLAMA_DEVICE_KQ_MASK=1: self_kq_mask is then a device-computed tensor built from these
+    // small host inputs (llama-kq-mask-dev.h); nullptr = host-built mask (default)
+    ggml_tensor * dmask_cpos = nullptr; // F32 [n_kv, n_seq_max]
+    ggml_tensor * dmask_csel = nullptr; // I32 [n_batch]
+    ggml_tensor * dmask_tpos = nullptr; // F32 [1, n_batch/n_stream, 1, n_stream]
+
+    // fills the host-built mask or the device-mask inputs; also called by the hybrid memory inputs
+    void set_input_kq_mask_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
+    // the graph's mask mode must match what a fresh build would choose for this ubatch
+    bool can_reuse_kq_mask_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
+
     // also called by the hybrid memory inputs
     void set_input_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_rows(const llama_kv_cache_context * kv, const llama_ubatch & ubatch);

@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kq-mask-dev.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -2046,6 +2047,50 @@ void llama_kv_cache::set_input_dca_sel(ggml_tensor * dst, const llama_ubatch * u
     }
 }
 
+bool llama_kv_cache::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {
+    // the device mask reproduces only the causal, non-ALiBi, non-SWA, 1-D, non-tree host mask
+    return causal_attn && !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE && !ubatch.is_pos_2d() && !ubatch.parent;
+}
+
+void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(cpos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(csel->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(tpos->buffer));
+
+    const uint32_t n_tokens   = ubatch->n_tokens;
+    const int64_t  n_kv       = cpos->ne[0];
+    const int64_t  n_seq_rows = cpos->ne[1];
+
+    GGML_ASSERT(csel->ne[0] == (int64_t) n_tokens);
+    GGML_ASSERT(ggml_nelements(tpos) == (int64_t) n_tokens);
+
+    float   * cp = (float   *) cpos->data;
+    int32_t * cs = (int32_t *) csel->data;
+    float   * tp = (float   *) tpos->data;
+
+    bool done[LLAMA_MAX_SEQ] = {};
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        GGML_ASSERT(seq_id >= 0 && seq_id < n_seq_rows && seq_id < LLAMA_MAX_SEQ);
+
+        cs[i] = seq_id;
+        tp[i] = (float) ubatch->pos[i];
+
+        if (done[seq_id]) {
+            continue;
+        }
+        done[seq_id] = true;
+
+        // one row per sequence of the ubatch: rows of absent sequences are never selected
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        float * row = cp + (int64_t) seq_id*n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            row[j] = (cells.is_empty(j) || !cells.seq_has(j, seq_id)) ? LLAMA_KQ_MASK_DEV_FAR : (float) cells.pos_get(j);
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3596,6 +3641,14 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     if (ubatch->parent) {
         kv->set_input_kq_mask_tree(dst, ubatch, sinfos[i_cur]);
     }
+}
+
+bool llama_kv_cache_context::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {
+    return kv->kq_mask_dev_eligible(ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_mask_dev(cpos, csel, tpos, ubatch);
 }
 
 int32_t llama_kv_cache_context::get_fa_rows_key() const {

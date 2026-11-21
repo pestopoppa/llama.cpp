@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-kq-mask-dev.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -758,7 +759,7 @@ void llm_graph_input_attn_kv::set_input_kv_rows(const llama_kv_cache_context * k
             }
             used += " s" + std::to_string(s) + "=" + std::to_string(n) + "[" + std::to_string(lo) + ".." + std::to_string(hi) + "]";
         }
-        const int64_t bad = llama_fa_rows_check_superset(self_kq_mask, kv_rows_data, R, S);
+        const int64_t bad = dmask_cpos ? -1 : llama_fa_rows_check_superset(self_kq_mask, kv_rows_data, R, S);
         fprintf(stderr, "FA_ROWS_TRACE llama: row list uploaded=%d key=%d n_rows=%lld n_slices=%lld n_kv=%u n_tokens=%u n_seqs_unq=%u "
                 "mask=[%lld,%lld,%lld,%lld] superset_violations=%lld (-1 = not checked) used:%s\n",
                 (int) uploaded, (int) kv_rows_key, (long long) R, (long long) S, kv->get_n_kv(), ubatch->n_tokens, ubatch->n_seqs_unq,
@@ -796,15 +797,34 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
     return kv_rows_key == kv->get_fa_rows_key() && kv_rows_n_rows == n_rows && kv_rows_n_slices == n_slices;
 }
 
+void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
+    if (dmask_cpos) {
+        // device-built mask: only its inputs live on the host (unallocated when the graph does not attend)
+        if (dmask_cpos->buffer) {
+            kv->set_input_kq_mask_dev(dmask_cpos, dmask_csel, dmask_tpos, ubatch);
+        }
+        return;
+    }
+    if (self_kq_mask && self_kq_mask->buffer) {
+        kv->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+}
+
+bool llm_graph_input_attn_kv::can_reuse_kq_mask_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const {
+    const bool want = llama_kq_mask_dev_enabled() && cparams.dca_chunk_size == 0 && kv->kq_mask_dev_eligible(ubatch, cparams.causal_attn);
+    if (want != (dmask_cpos != nullptr)) {
+        return false;
+    }
+    return !want || (dmask_csel->ne[0] == (int64_t) ubatch.n_tokens && dmask_cpos->ne[0] == (int64_t) kv->get_n_kv());
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
-    if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
-    }
+    set_input_kq_mask_any(mctx, ubatch);
 
     set_input_kv_rows(mctx, ubatch);
 
@@ -885,6 +905,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= can_reuse_kq_mask_dev(mctx, params.ubatch);
 
     res &= can_reuse_kv_rows(mctx, params.ubatch);
 
@@ -1450,7 +1472,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    inp_attn->set_input_kq_mask_any(mctx->get_attn(), ubatch);
 
     inp_attn->set_input_kv_rows(mctx->get_attn(), ubatch);
 
@@ -1491,6 +1513,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->can_reuse_kq_mask_dev(mctx->get_attn(), params.ubatch);
 
     res &= inp_attn->can_reuse_kv_rows(mctx->get_attn(), params.ubatch);
 
@@ -3377,7 +3401,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    ggml_backend_sched_t sched) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3389,6 +3414,47 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+    }
+
+    // [GPU-RESIDENT-ROUND-2a] LLAMA_DEVICE_KQ_MASK=1: build the mask on the device from per-cell / per-token positions
+    if (llama_kq_mask_dev_enabled() && cparams.dca_chunk_size == 0 && mctx_cur->kq_mask_dev_eligible(ubatch, cparams.causal_attn)) {
+        const ggml_tensor * m = inp->self_kq_mask; // shape and type template; left out of the graph (never allocated)
+
+        const int64_t n_seq_rows = std::max<int64_t>(1, cparams.n_seq_max);
+
+        inp->dmask_cpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, m->ne[0], n_seq_rows);
+        ggml_set_input(inp->dmask_cpos);
+        ggml_set_name(inp->dmask_cpos, "attn_inp_kq_mask_dev_cpos");
+
+        inp->dmask_csel = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(inp->dmask_csel);
+        ggml_set_name(inp->dmask_csel, "attn_inp_kq_mask_dev_csel");
+
+        inp->dmask_tpos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, m->ne[1], 1, m->ne[3]);
+        ggml_set_input(inp->dmask_tpos);
+        ggml_set_name(inp->dmask_tpos, "attn_inp_kq_mask_dev_tpos");
+
+        ggml_tensor * dm = llama_build_kq_mask_dev(ctx0, inp->dmask_cpos, inp->dmask_csel, inp->dmask_tpos, m->type);
+        ggml_set_name(dm, "attn_kq_mask_dev");
+
+        // pin the mask chain to the first (highest-priority) backend when it is a device: left alone, the scheduler
+        // may keep these input-only nodes on the CPU, which would only move the host work around
+        ggml_backend_t be = sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
+        if (be && ggml_backend_dev_type(ggml_backend_get_device(be)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            for (ggml_tensor * t = dm; t && t != inp->dmask_cpos && t != inp->dmask_tpos; t = t->src[0]) {
+                ggml_backend_sched_set_tensor_backend(sched, t, be);
+            }
+        }
+
+        inp->self_kq_mask     = dm;
+        inp->self_kq_mask_cnv = dm;
+
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_KQ_MASK: device-built KQ mask ENABLED (n_kv=%lld n_seq_rows=%lld n_tokens=%u, backend %s)\n",
+                    __func__, (long long) m->ne[0], (long long) n_seq_rows, ubatch.n_tokens, be ? ggml_backend_name(be) : "CPU");
+        }
     }
 
     // UP-FAROWS-HIP: per-sequence K/V row lists (unified KV + flash attention, GGML_CUDA_FA_ROWS_GATHER=1)
@@ -3431,7 +3497,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -4298,7 +4364,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, hparams, cparams, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

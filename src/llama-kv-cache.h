@@ -283,6 +283,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // [GPU-RESIDENT-ROUND-2a] device-built KQ mask inputs (see llama-kq-mask-dev.h)
+    bool kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const;
+    void set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const;
+
     // UP-FAROWS-HIP: per-sequence K/V row lists for FLASH_ATTN_EXT (ggml_flash_attn_ext_set_rows_key) over the first
     // n_kv cells of a unified cache. The ubatch is split into n_slices equal runs of single-sequence tokens when it is
     // made of such runs (np slots, draft verify), else one slice over the union of the cells of its sequences. Each
@@ -504,6 +508,8 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    bool kq_mask_dev_eligible (const llama_ubatch & ubatch, bool causal_attn) const;
+    void set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows
