@@ -3392,7 +3392,12 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
-    GGML_UNUSED(lsa_q);
+
+    if (lsa_written && lsa_q->type == GGML_TYPE_F32 && lsa_q->ne[2] == 1 &&
+            kq_mask->ne[0] >= llama_lsa_cpu::get_config().min_kv) {
+        kq_mask = llama_lsa_cpu::build_decode_mask(ctx0, lsa, kq_mask, lsa_q, lsa_written);
+        cb(kq_mask, "lsa_cpu_mask", il);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

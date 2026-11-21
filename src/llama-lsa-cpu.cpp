@@ -417,6 +417,81 @@ ggml_tensor * build_ik_write(ggml_context * ctx, layer_state * st, ggml_tensor *
     return ggml_map_custom2(ctx, k_idxs, k_cur, ik_write_op, GGML_N_TASKS_MAX, st);
 }
 
+static inline float mask_at(const ggml_tensor * m, int64_t j) {
+    const char * p = (const char *) m->data + j*m->nb[0];
+    return m->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(*(const ggml_fp16_t *) p) : *(const float *) p;
+}
+
+// parallel: scores of row 0 into st.score (+inf forced, -inf excluded)
+static void decode_score_op(ggml_tensor * dst, const ggml_tensor * mask, const ggml_tensor * q, const ggml_tensor * written,
+                            int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    layer_state & st = *(layer_state *) ud;
+    const config & cfg = get_config();
+    const int64_t n_kv = mask->ne[0];
+    GGML_ASSERT(n_kv <= (int64_t) st.score.size());
+    GGML_ASSERT(written->type == GGML_TYPE_I64 && written->ne[0] >= 1);
+    const int32_t qpos = st.cell_pos(((const int64_t *) written->data)[0]);
+
+    float qhat[index_dim];
+    project_query(st, (const char *) q->data, q->nb[0], q->nb[1], qhat);
+
+    const int64_t per = (n_kv + nth - 1)/nth;
+    const int64_t lo = std::min<int64_t>(n_kv, per*ith), hi = std::min<int64_t>(n_kv, lo + per);
+    float * score = st.score.data();
+    score_bf16((const uint16_t *) st.ik->data, lo, hi, qhat, score);
+    for (int64_t j = lo; j < hi; ++j) {
+        if (mask_at(mask, j) == -INFINITY) {
+            score[j] = -INFINITY;
+            continue;
+        }
+        const int32_t pos = st.cell_pos(j);
+        if (pos < 0 || st.ik_pos[j] != pos || pos < cfg.sink || pos > qpos - cfg.window) {
+            score[j] = INFINITY;
+        }
+    }
+}
+
+// single thread: exact top-k, write the masked copy
+static void decode_select_op(ggml_tensor * dst, const ggml_tensor * mask, const ggml_tensor * scored, int ith, int nth, void * ud) {
+    GGML_UNUSED(scored);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    layer_state & st = *(layer_state *) ud;
+    const int64_t n_kv = mask->ne[0];
+    GGML_ASSERT(ggml_is_contiguous(mask) && ggml_are_same_shape(mask, dst) && mask->type == dst->type);
+    memcpy(dst->data, mask->data, ggml_nbytes(mask));
+    std::vector<uint8_t> keep(n_kv);
+    int64_t n_elig = 0;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        n_elig += st.score[j] != -INFINITY;
+    }
+    st.last_eligible = n_elig;
+    st.last_kept     = select_topk(st.score.data(), n_kv, get_config().top_k, keep.data());
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (!keep[j]) {
+            char * p = (char *) dst->data + j*dst->nb[0];
+            if (dst->type == GGML_TYPE_F16) {
+                *(ggml_fp16_t *) p = ggml_fp32_to_fp16(-INFINITY);
+            } else {
+                *(float *) p = -INFINITY;
+            }
+        }
+    }
+}
+
+ggml_tensor * build_decode_mask(ggml_context * ctx, layer_state * st, ggml_tensor * kq_mask,
+                                ggml_tensor * q_cur, ggml_tensor * ik_written) {
+    GGML_ASSERT(st && st->ik && ik_written);
+    GGML_ASSERT(kq_mask->type == GGML_TYPE_F16 || kq_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_cur->type == GGML_TYPE_F32 && q_cur->ne[0] == st->head_dim && q_cur->ne[1] == st->q_heads && q_cur->ne[2] == 1);
+    GGML_ASSERT(kq_mask->ne[3] == 1);
+    ggml_tensor * scored = ggml_map_custom3(ctx, kq_mask, q_cur, ik_written, decode_score_op, GGML_N_TASKS_MAX, st);
+    return ggml_map_custom2(ctx, kq_mask, scored, decode_select_op, 1, st);
+}
+
 const lsamap * get_map() {
     static std::once_flag once;
     static lsamap map;

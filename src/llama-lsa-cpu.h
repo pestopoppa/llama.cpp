@@ -127,4 +127,10 @@ int64_t select_topk(const float * score, int64_t n, int top_k, uint8_t * keep);
 // returns an I64 copy of k_idxs that orders the write before any consumer.
 ggml_tensor * build_ik_write(ggml_context * ctx, layer_state * st, ggml_tensor * k_cur, ggml_tensor * k_idxs);
 
+// Decode (one query token) index mask: returns kq_mask with -inf for every cell outside
+// top_k + window + sink. q_cur F32 [head_dim, q_heads, 1] (logical, pre-rotation);
+// ik_written = build_ik_write() result of the same graph (orders the score after the write).
+ggml_tensor * build_decode_mask(ggml_context * ctx, layer_state * st, ggml_tensor * kq_mask,
+                                ggml_tensor * q_cur, ggml_tensor * ik_written);
+
 } // namespace llama_lsa_cpu
