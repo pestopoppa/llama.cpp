@@ -56,7 +56,7 @@ def arm(tag, knobs):
         out['dead'] = subprocess.run(['/usr/bin/ps', '-p', str(p.pid)], capture_output=True).returncode != 0
         out['pid'] = p.pid
     txt = open(log, errors='replace').read()
-    out['witness'] = [l[-160:] for l in txt.splitlines() if 'ENABLED' in l and ('DEVICE_CTL' in l or 'KV_IDX' in l or 'KV_RING' in l or 'DEVICE_CPOS' in l or 'SCOPY' in l or 'DFEED' in l)]
+    out['witness'] = [l[-160:] for l in txt.splitlines() if ('kround' in l) or 'ENABLED' in l and ('DEVICE_CTL' in l or 'KV_IDX' in l or 'KV_RING' in l or 'DEVICE_CPOS' in l or 'SCOPY' in l or 'DFEED' in l)]
     out['mismatch'] = 'MISMATCH' in txt; out['ctl'] = [l for l in txt.splitlines() if 'device_hits' in l or 'token_hits' in l or 'llama_kv_cache: LLAMA_DEVICE_' in l or 'LLAMA_DEVICE_SCOPY' in l or 'LLAMA_DEVICE_DFEED' in l or 'DSEL_RNG' in l or 'FIXED_T' in l or 'DFT_KV' in l]
     out['rs'] = sorted(set(l[-120:] for l in txt.splitlines() if 'rs_replay ' in l or 'RS_REP' in l))
     return out
