@@ -52,6 +52,16 @@ static inline bool llama_cpos_dev_enabled() {
     return e != nullptr && std::strcmp(e, "1") == 0 && llama_ctl_pos_enabled();
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.10] LLAMA_DEVICE_SWA_CPOS=1 (default off; needs LLAMA_DEVICE_CPOS, LLAMA_DEVICE_SWA_MASK and
+// LLAMA_DEVICE_DFT_KV): the iSWA SWA sub-cache's device-mask cell positions from the ring formula + its high-water row
+static inline bool llama_swa_cpos_dev_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_DEVICE_SWA_CPOS");
+        return e && e[0] == '1' && llama_cpos_dev_enabled();
+    }();
+    return on;
+}
+
 // cpos [n_kv, n_seq_rows] F32, csel [n_tokens] I32, tpos [1, n_tps, 1, n_stream] F32 -> mask [n_kv, n_tps, 1, n_stream]
 static inline ggml_tensor * llama_build_kq_mask_dev(
         ggml_context * ctx,

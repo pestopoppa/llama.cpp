@@ -1369,6 +1369,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (swa_mdev) {
+        if (swa_mdev->dcpos_dev) {
+            swa_mdev->dcpos_hw_on = swa_dev && swa_dev->dcpos_hw_on; // [phase 3.10] the hw write-back lives on swa_dev
+        }
         swa_mdev->set_input_kq_mask_any(mctx->get_swa(), ubatch); // [phase 3.9] device-mask inputs only
     } else if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
@@ -1426,6 +1429,9 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         res &= want == (swa_mdev != nullptr);
         if (res && swa_mdev) {
             const bool tctl = swa_dev && swa_dev->dctl_q && llama_tpos_ctl_ok(mctx->get_swa(), params.ubatch, params.cparams);
+            const bool sc = llama_swa_cpos_dev_enabled() && swa_dev && swa_dev->dctl_q && swa_dev->dctl_p0src && swa_dev->dctl_s0 >= 0 &&
+                            tctl && mctx->get_swa()->cpos_dev_check(params.ubatch);
+            res &= sc == swa_mdev->dcpos_dev;
             res &= tctl == swa_mdev->dmask_tpos_ctl &&
                    swa_mdev->dmask_csel->ne[0] == (int64_t) params.ubatch.n_tokens &&
                    swa_mdev->dmask_cpos->ne[0] == (int64_t) mctx->get_swa()->get_n_kv();
@@ -3964,6 +3970,43 @@ static void llama_build_kv_idx_dev(ggml_context * ctx0, const llama_ubatch & uba
 
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.4a] ring-formula cell positions over a cache's control block (shared by the base
+// cache and, phase 3.10, the iSWA SWA sub-cache): E1 = p0 + n_tps - 1, H = max(hw, E1) (written back via
+// inp->dcpos_hw_wb), cpos_j = E1 - ((E1 - j) mod size), valid iff cpos_j > max(H - size, -1); invalid -> FAR.
+static void llama_build_cpos_ring(ggml_context * ctx0, const llama_ubatch & ubatch, const llama_kv_cache_context * mctx_cur,
+        llm_graph_input_attn_kv * inp, int64_t n_kv, ggml_tensor ** out_cpos, ggml_tensor ** out_csel) {
+    std::vector<float> p0v, basev;
+    int64_t size = 0;
+    GGML_ASSERT(mctx_cur->kv_idx_dev_info(ubatch, p0v, basev, size));
+    const int64_t n_tps = inp->dctl_q->ne[0], n_str = inp->dctl_q->ne[1];
+    int64_t cs0 = -1, cn = 0;
+    ggml_tensor * ctl = mctx_cur->ctl_range(ubatch, cs0, cn);
+    GGML_ASSERT(ctl && cs0 == inp->dctl_s0 && cn == n_str);
+    const int32_t row = mctx_cur->ctl_hw_row();
+    ggml_tensor * hwv = ggml_view_2d(ctx0, ctl, 1, n_str, ctl->nb[1], cs0*ctl->nb[1] + row*ggml_element_size(ctl));
+    ggml_tensor * hwp = ggml_cont(ctx0, hwv);                  // read
+    ggml_tensor * e1  = ggml_scale_bias(ctx0, inp->dctl_p0src, 1.0f, (float) (n_tps - 1));     // [1, n_str]
+    ggml_tensor * H   = ggml_add(ctx0, hwp, ggml_relu(ctx0, ggml_sub(ctx0, e1, hwp)));       // max(hw, E1)
+    ggml_tensor * hwb = ggml_cpy(ctx0, H, hwv);                // write-back
+    ggml_set_name(hwb, "attn_kv_ctl_hw_wb");
+    inp->dcpos_hw_wb = hwb; // expanded with the other control-block write-backs in build_sampling
+    ggml_tensor * thr = ggml_scale_bias(ctx0, ggml_relu(ctx0, ggml_scale_bias(ctx0, H, 1.0f, (float) (1 - size))), 1.0f, -1.0f);
+    ggml_tensor * jv  = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), n_kv, 1);
+    ggml_tensor * e1r = ggml_repeat_4d(ctx0, e1, n_kv, n_str, 1, 1);
+    ggml_tensor * d   = ggml_sub(ctx0, e1r, jv);                       // E1 - j
+    ggml_tensor * fl  = ggml_floor(ctx0, ggml_scale_bias(ctx0, d, 1.0f/(float) size, 0.5f/(float) size));
+    ggml_tensor * fm  = ggml_sub(ctx0, d, ggml_scale(ctx0, fl, (float) size));        // (E1 - j) mod size
+    ggml_tensor * cp  = ggml_sub(ctx0, e1r, fm);
+    ggml_tensor * vl  = ggml_step(ctx0, ggml_sub(ctx0, cp, thr));             // 1 valid, 0 not
+    ggml_tensor * cpd = ggml_add(ctx0, ggml_mul(ctx0, vl, cp), ggml_scale_bias(ctx0, vl, -LLAMA_KQ_MASK_DEV_FAR, LLAMA_KQ_MASK_DEV_FAR));
+    ggml_set_name(cpd, "attn_kq_mask_dev_cpos_ring");
+    ggml_tensor * ci  = ggml_arange(ctx0, 0.0f, (float) ubatch.n_tokens, 1.0f);
+    ci = ggml_cast(ctx0, ggml_floor(ctx0, ggml_scale_bias(ctx0, ci, 1.0f/(float) n_tps, 0.5f/(float) n_tps)), GGML_TYPE_I32);
+    ggml_set_name(ci, "attn_kq_mask_dev_csel_dev");
+    *out_cpos = cpd;
+    *out_csel = ci;
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -3997,42 +4040,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             // [GPU-RESIDENT-ROUND-2f phase 3.4a] cell positions from the ring formula over the control block:
             //   E1 = p0 + n_tps - 1, H = max(hw, E1) (written back), cpos_j = E1 - ((E1 - j) mod size),
             //   valid iff cpos_j > max(H - size, -1); invalid -> FAR. csel = i / n_tps (streams are seq ids s0..)
-            std::vector<float> p0v, basev;
-            int64_t size = 0;
-            GGML_ASSERT(mctx_cur->kv_idx_dev_info(ubatch, p0v, basev, size));
-            const int64_t n_kv  = m->ne[0];
-            const int64_t n_tps = inp->dctl_q->ne[0], n_str = inp->dctl_q->ne[1];
-            int64_t cs0 = -1, cn = 0;
-            ggml_tensor * ctl = mctx_cur->ctl_range(ubatch, cs0, cn);
-            GGML_ASSERT(ctl && cs0 == inp->dctl_s0 && cn == n_str);
-            const int32_t row = mctx_cur->ctl_hw_row();
-            ggml_tensor * hwv = ggml_view_2d(ctx0, ctl, 1, n_str, ctl->nb[1], cs0*ctl->nb[1] + row*ggml_element_size(ctl));
-            ggml_tensor * hwp = ggml_cont(ctx0, hwv);                                                  // read
-            ggml_tensor * e1  = ggml_scale_bias(ctx0, inp->dctl_p0src, 1.0f, (float) (n_tps - 1));     // [1, n_str]
-            ggml_tensor * H   = ggml_add(ctx0, hwp, ggml_relu(ctx0, ggml_sub(ctx0, e1, hwp)));       // max(hw, E1)
-            ggml_tensor * hwb = ggml_cpy(ctx0, H, hwv);                                                // write-back
-            ggml_set_name(hwb, "attn_kv_ctl_hw_wb");
-            inp->dcpos_hw_wb = hwb; // expanded with the other control-block write-backs in build_sampling
-            ggml_tensor * thr = ggml_scale_bias(ctx0, ggml_relu(ctx0, ggml_scale_bias(ctx0, H, 1.0f, (float) (1 - size))), 1.0f, -1.0f);
-            ggml_tensor * jv  = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), n_kv, 1);
-            ggml_tensor * e1r = ggml_repeat_4d(ctx0, e1, n_kv, n_str, 1, 1);
-            ggml_tensor * d   = ggml_sub(ctx0, e1r, jv);                                               // E1 - j
-            ggml_tensor * fl  = ggml_floor(ctx0, ggml_scale_bias(ctx0, d, 1.0f/(float) size, 0.5f/(float) size));
-            ggml_tensor * fm  = ggml_sub(ctx0, d, ggml_scale(ctx0, fl, (float) size));                // (E1 - j) mod size
-            ggml_tensor * cp  = ggml_sub(ctx0, e1r, fm);
-            ggml_tensor * vl  = ggml_step(ctx0, ggml_sub(ctx0, cp, thr));                             // 1 valid, 0 not
-            ggml_tensor * cpd = ggml_add(ctx0, ggml_mul(ctx0, vl, cp), ggml_scale_bias(ctx0, vl, -LLAMA_KQ_MASK_DEV_FAR, LLAMA_KQ_MASK_DEV_FAR));
-            ggml_set_name(cpd, "attn_kq_mask_dev_cpos_ring");
-            ggml_tensor * ci  = ggml_arange(ctx0, 0.0f, (float) ubatch.n_tokens, 1.0f);
-            ci = ggml_cast(ctx0, ggml_floor(ctx0, ggml_scale_bias(ctx0, ci, 1.0f/(float) n_tps, 0.5f/(float) n_tps)), GGML_TYPE_I32);
-            ggml_set_name(ci, "attn_kq_mask_dev_csel_dev");
-            inp->dmask_cpos = cpd;
-            inp->dmask_csel = ci;
+            llama_build_cpos_ring(ctx0, ubatch, mctx_cur, inp.get(), m->ne[0], &inp->dmask_cpos, &inp->dmask_csel);
             inp->dcpos_dev  = true;
             static bool logged_cpos = false;
             if (!logged_cpos) {
                 logged_cpos = true;
-                fprintf(stderr, "llm_graph: LLAMA_DEVICE_CPOS: device-mask cell positions from the ring formula ENABLED (size %lld)\n", (long long) size);
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_CPOS: device-mask cell positions from the ring formula ENABLED (n_kv %lld)\n", (long long) inp->self_kq_mask->ne[0]);
             }
         } else {
             inp->dmask_cpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, m->ne[0], n_seq_rows);
@@ -4803,13 +4816,27 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
             mctx_cur->get_swa()->kq_mask_dev_eligible_swa(ubatch, cparams.causal_attn, swa_n)) {
         const ggml_tensor * m = inp->self_kq_mask_swa;
         auto md = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur->get_swa());
-        md->dmask_cpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, m->ne[0], std::max<int64_t>(1, cparams.n_seq_max));
-        ggml_set_input(md->dmask_cpos);
-        ggml_set_name(md->dmask_cpos, "attn_inp_kq_mask_swa_dev_cpos");
-        md->dmask_csel = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-        ggml_set_input(md->dmask_csel);
-        ggml_set_name(md->dmask_csel, "attn_inp_kq_mask_swa_dev_csel");
-        const auto * sd = inp->swa_dev.get();
+        auto * sd = inp->swa_dev.get();
+        if (llama_swa_cpos_dev_enabled() && sd && sd->dctl_q && sd->dctl_p0src && sd->dctl_s0 >= 0 &&
+                llama_tpos_ctl_ok(mctx_cur->get_swa(), ubatch, cparams) && mctx_cur->get_swa()->cpos_dev_check(ubatch)) {
+            // [GPU-RESIDENT-ROUND-2f phase 3.10] LLAMA_DEVICE_SWA_CPOS=1: the SWA sub-cache's cell positions from the
+            // ring formula over its own control block + high-water row; the write-back rides with the SWA ctl write-back
+            llama_build_cpos_ring(ctx0, ubatch, mctx_cur->get_swa(), sd, m->ne[0], &md->dmask_cpos, &md->dmask_csel);
+            md->dcpos_dev = true;
+            static bool logged_sc = false;
+            if (!logged_sc) {
+                logged_sc = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_SWA_CPOS: iSWA SWA-mask cell positions from the ring formula ENABLED (n_kv %lld)\n",
+                        (long long) m->ne[0]);
+            }
+        } else {
+            md->dmask_cpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, m->ne[0], std::max<int64_t>(1, cparams.n_seq_max));
+            ggml_set_input(md->dmask_cpos);
+            ggml_set_name(md->dmask_cpos, "attn_inp_kq_mask_swa_dev_cpos");
+            md->dmask_csel = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(md->dmask_csel);
+            ggml_set_name(md->dmask_csel, "attn_inp_kq_mask_swa_dev_csel");
+        }
         if (sd && sd->dctl_q && llama_tpos_ctl_ok(mctx_cur->get_swa(), ubatch, cparams) &&
                 sd->dctl_q->ne[0] == m->ne[1] && sd->dctl_q->ne[1] == m->ne[3]) {
             md->dmask_tpos = ggml_reshape_4d(ctx0, sd->dctl_q, 1, m->ne[1], 1, m->ne[3]);
