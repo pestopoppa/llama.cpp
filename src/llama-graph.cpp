@@ -1368,7 +1368,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
+    if (swa_mdev) {
+        swa_mdev->set_input_kq_mask_any(mctx->get_swa(), ubatch); // [phase 3.9] device-mask inputs only
+    } else if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
@@ -1414,6 +1416,20 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    // [phase 3.9] the SWA device-mask decision must match too
+    {
+        uint32_t swa_n = 0;
+        const bool want = llama_swa_mask_dev_enabled() && params.cparams.dca_chunk_size == 0 &&
+                          mctx->get_swa()->kq_mask_dev_eligible_swa(params.ubatch, params.cparams.causal_attn, swa_n);
+        res &= want == (swa_mdev != nullptr);
+        if (res && swa_mdev) {
+            const bool tctl = swa_dev && swa_dev->dctl_q && llama_tpos_ctl_ok(mctx->get_swa(), params.ubatch, params.cparams);
+            res &= tctl == swa_mdev->dmask_tpos_ctl &&
+                   swa_mdev->dmask_csel->ne[0] == (int64_t) params.ubatch.n_tokens &&
+                   swa_mdev->dmask_cpos->ne[0] == (int64_t) mctx->get_swa()->get_n_kv();
+        }
     }
 
     // [phase 3.6] the device-index decision must match the one this graph was built with
@@ -4777,6 +4793,43 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
                 logged = true;
                 fprintf(stderr, "llm_graph: LLAMA_DEVICE_DFT_KV: iSWA SWA-cache K/V indices from the device control block ENABLED\n");
             }
+        }
+    }
+
+    // [GPU-RESIDENT-ROUND-2f phase 3.9] LLAMA_DEVICE_SWA_MASK=1: the SWA sub-cache's mask on the device (window and
+    // non-causal rule in-graph); token positions from its control block when the SWA K/V indices read it
+    uint32_t swa_n = 0;
+    if (llama_swa_mask_dev_enabled() && cparams.dca_chunk_size == 0 && inp->self_kq_mask_swa &&
+            mctx_cur->get_swa()->kq_mask_dev_eligible_swa(ubatch, cparams.causal_attn, swa_n)) {
+        const ggml_tensor * m = inp->self_kq_mask_swa;
+        auto md = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur->get_swa());
+        md->dmask_cpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, m->ne[0], std::max<int64_t>(1, cparams.n_seq_max));
+        ggml_set_input(md->dmask_cpos);
+        ggml_set_name(md->dmask_cpos, "attn_inp_kq_mask_swa_dev_cpos");
+        md->dmask_csel = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(md->dmask_csel);
+        ggml_set_name(md->dmask_csel, "attn_inp_kq_mask_swa_dev_csel");
+        const auto * sd = inp->swa_dev.get();
+        if (sd && sd->dctl_q && llama_tpos_ctl_ok(mctx_cur->get_swa(), ubatch, cparams) &&
+                sd->dctl_q->ne[0] == m->ne[1] && sd->dctl_q->ne[1] == m->ne[3]) {
+            md->dmask_tpos = ggml_reshape_4d(ctx0, sd->dctl_q, 1, m->ne[1], 1, m->ne[3]);
+            md->dmask_tpos_ctl = true;
+        } else {
+            md->dmask_tpos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, m->ne[1], 1, m->ne[3]);
+            ggml_set_input(md->dmask_tpos);
+            ggml_set_name(md->dmask_tpos, "attn_inp_kq_mask_swa_dev_tpos");
+        }
+        ggml_tensor * dm = llama_build_kq_mask_dev_swa(ctx0, md->dmask_cpos, md->dmask_csel, md->dmask_tpos, m->type,
+                                                       cparams.causal_attn, swa_n);
+        ggml_set_name(dm, "attn_kq_mask_swa_dev");
+        inp->self_kq_mask_swa     = dm;
+        inp->self_kq_mask_swa_cnv = dm;
+        inp->swa_mdev = std::move(md);
+        static bool logged_swa = false;
+        if (!logged_swa) {
+            logged_swa = true;
+            fprintf(stderr, "llm_graph: LLAMA_DEVICE_SWA_MASK: device-built iSWA SWA mask ENABLED (n_swa=%u causal=%d)\n",
+                    swa_n, (int) cparams.causal_attn);
         }
     }
 

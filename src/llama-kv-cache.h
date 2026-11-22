@@ -286,6 +286,9 @@ public:
 
     // [GPU-RESIDENT-ROUND-2a] device-built KQ mask inputs (see llama-kq-mask-dev.h)
     bool kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const;
+    // [GPU-RESIDENT-ROUND-2f phase 3.9] the device mask with a standard SWA window and/or non-causal attention (iSWA
+    // sub-caches, e.g. the DFlash2 drafter); n_swa = the cache's window (0 = none)
+    bool kq_mask_dev_eligible_swa(const llama_ubatch & ubatch, bool causal_attn, uint32_t & n_swa) const;
     void set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const;
 
     // UP-FAROWS-HIP: per-sequence K/V row lists for FLASH_ATTN_EXT (ggml_flash_attn_ext_set_rows_key) over the first
@@ -564,6 +567,7 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     bool kq_mask_dev_eligible (const llama_ubatch & ubatch, bool causal_attn) const;
+    bool kq_mask_dev_eligible_swa(const llama_ubatch & ubatch, bool causal_attn, uint32_t & n_swa) const;
     void set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const;
     // [GPU-RESIDENT-ROUND-2f phase 2] K/V write indices derivable on the device: per-sequence streams whose slots follow
     // the ring (cell = pos % size) for position-contiguous tokens; fills per stream the first position and stream base

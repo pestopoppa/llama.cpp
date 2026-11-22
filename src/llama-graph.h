@@ -616,6 +616,9 @@ public:
     // [GPU-RESIDENT-ROUND-2f phase 3.6] LLAMA_DEVICE_DFT_KV=1: the SWA sub-cache's K/V write indices from its device
     // control block (self_k_idxs_swa / self_v_idxs_swa are then device-computed; nullptr = host-written)
     std::unique_ptr<llm_graph_input_attn_kv> swa_dev;
+    // [GPU-RESIDENT-ROUND-2f phase 3.9] LLAMA_DEVICE_SWA_MASK=1: holder of the SWA sub-cache's device-mask inputs
+    // (self_kq_mask_swa is then device-computed; nullptr = host-built)
+    std::unique_ptr<llm_graph_input_attn_kv> swa_mdev;
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {

@@ -74,3 +74,39 @@ static inline ggml_tensor * llama_build_kq_mask_dev(
     }
     return cur;
 }
+
+// [GPU-RESIDENT-ROUND-2f phase 3.9] LLAMA_DEVICE_SWA_MASK=1 (default off; needs LLAMA_DEVICE_KQ_MASK=1): the device mask
+// for the SWA sub-cache of an iSWA cache (standard window n_swa) and for non-causal attention (the DFlash2 drafter):
+//   keep = step(p1 - p0 + 0.5 [+ 2^22 when non-causal]) * step(p0 - p1 + n_swa - 0.5) [n_swa > 0]
+// The 2^22 offset keeps every in-seq cell (|p1 - p0| < 2^22) and still drops FAR (empty / other-seq) cells; only the
+// sign of each step argument matters, so F32 rounding at these magnitudes cannot flip it. log(1) = 0, log(0) = -inf.
+static inline bool llama_swa_mask_dev_enabled() {
+    const char * e = std::getenv("LLAMA_DEVICE_SWA_MASK");
+    return e != nullptr && std::strcmp(e, "1") == 0 && llama_kq_mask_dev_enabled();
+}
+
+static inline ggml_tensor * llama_build_kq_mask_dev_swa(
+        ggml_context * ctx,
+        ggml_tensor  * cpos,
+        ggml_tensor  * csel,
+        ggml_tensor  * tpos,
+        ggml_type      type,
+        bool           causal,
+        uint32_t       n_swa) {
+    const int64_t n_kv     = cpos->ne[0];
+    const int64_t n_tps    = tpos->ne[1];
+    const int64_t n_stream = tpos->ne[3];
+
+    ggml_tensor * d = ggml_get_rows(ctx, cpos, csel);
+    d = ggml_reshape_4d(ctx, d, n_kv, n_tps, 1, n_stream);
+    d = ggml_sub(ctx, d, tpos);                                                         // p0 - p1
+    ggml_tensor * cur = ggml_step(ctx, ggml_scale_bias(ctx, d, -1.0f, causal ? 0.5f : 4194304.5f));
+    if (n_swa > 0) {
+        cur = ggml_mul(ctx, cur, ggml_step(ctx, ggml_scale_bias(ctx, d, 1.0f, (float) n_swa - 0.5f)));
+    }
+    cur = ggml_log(ctx, cur);
+    if (type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx, cur, type);
+    }
+    return cur;
+}

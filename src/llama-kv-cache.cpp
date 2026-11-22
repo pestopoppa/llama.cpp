@@ -2200,6 +2200,14 @@ bool llama_kv_cache::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool caus
     return causal_attn && !hparams.use_alibi && swa_type == LLAMA_SWA_TYPE_NONE && !ubatch.parent;
 }
 
+bool llama_kv_cache::kq_mask_dev_eligible_swa(const llama_ubatch & ubatch, bool causal_attn, uint32_t & n_swa_out) const {
+    // host rule: drop if the cell is empty / not in the seq, (causal) p0 > p1, (standard SWA) p1 - p0 >= n_swa.
+    // 2-D positions are left out (their extra causal rule is not reproduced for the non-causal formula)
+    n_swa_out = swa_type == LLAMA_SWA_TYPE_STANDARD ? n_swa : 0;
+    return !hparams.use_alibi && !ubatch.parent && !ubatch.is_pos_2d() &&
+           (swa_type == LLAMA_SWA_TYPE_NONE || (swa_type == LLAMA_SWA_TYPE_STANDARD && n_swa > 0));
+}
+
 void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(cpos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(csel->buffer));
@@ -4135,6 +4143,10 @@ void llama_kv_cache::ctl_resolve(const std::function<int32_t(int64_t)> & am) con
 
 bool llama_kv_cache_context::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool causal_attn) const {
     return kv->kq_mask_dev_eligible(ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_dev_eligible_swa(const llama_ubatch & ubatch, bool causal_attn, uint32_t & n_swa) const {
+    return kv->kq_mask_dev_eligible_swa(ubatch, causal_attn, n_swa);
 }
 
 void llama_kv_cache_context::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
