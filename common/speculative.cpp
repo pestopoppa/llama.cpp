@@ -1842,11 +1842,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const common_dtree_scores_fn scores = [&](int32_t j, int32_t pred) {
                         return lattice + (size_t) (beg + j + 1) * n_embd_dec + selector_top_k + (size_t) pred * selector_top_k;
                     };
-                    const auto paths = common_dtree_build_paths(D, selector_top_k, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                    // DTREE-TREE-QUALITY: LLAMA_DTREE_POLICY=greedy grows a best-first tree; the main draft is then the
+                    // greedy chain's prefix inside the tree (it may be shorter than D) and alternatives vary in length
+                    const bool greedy = common_dtree_policy() == 1;
+                    const auto paths = greedy
+                            ? common_dtree_build_greedy(D, selector_top_k, scores, dp.tree_nodes, false)
+                            : common_dtree_build_paths(D, selector_top_k, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                    if (greedy && !paths.empty() && paths[0].size() < result.size()) {
+                        result.resize(paths[0].size());
+                    }
                     for (size_t p = 1; p < paths.size(); ++p) {
                         llama_tokens alt;
-                        alt.reserve(D);
-                        for (int32_t j = 0; j < D; ++j) {
+                        alt.reserve(paths[p].size());
+                        for (size_t j = 0; j < paths[p].size(); ++j) {
                             alt.push_back((llama_token) lattice[(size_t) (beg + j + 1) * n_embd_dec + paths[p][j]]);
                         }
                         dp.tree_alts->push_back(std::move(alt));
@@ -2491,10 +2499,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
                 const common_dtree_scores_fn scores = [&](int32_t j, int32_t) { return sc.data() + (size_t) j * K; };
-                const auto paths = common_dtree_build_paths(D, K, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                const bool greedy = common_dtree_policy() == 1; // DTREE-TREE-QUALITY, see the DFlash2 reader
+                const auto paths = greedy ? common_dtree_build_greedy(D, K, scores, dp.tree_nodes, true)
+                                          : common_dtree_build_paths(D, K, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                if (greedy && !paths.empty() && paths[0].size() < dp.result->size()) {
+                    dp.result->resize(paths[0].size());
+                }
                 for (size_t p = 1; p < paths.size(); ++p) {
                     llama_tokens alt;
-                    for (int32_t j = 0; j < D; ++j) {
+                    for (size_t j = 0; j < paths[p].size(); ++j) {
                         alt.push_back(tc[j][paths[p][j]].first);
                     }
                     dp.tree_alts->push_back(std::move(alt));

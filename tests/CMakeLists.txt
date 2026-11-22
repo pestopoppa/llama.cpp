@@ -194,6 +194,7 @@ llama_build(bench-grammar-sampler.cpp)
 llama_build(test-spec-dtree-verify.cpp)
 # [AK-DTREE-2] single tree batch verify (llama_batch.parent + llama_memory_tree_accept) on a hybrid model; needs a model arg
 llama_build(test-dtree-batch.cpp)
+llama_build_and_test(test-dtree-greedy.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/dtree-greedy-rounds.txt)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

@@ -883,32 +883,47 @@ struct server_slot {
                 // parents; a shared prefix with the main draft reuses the main rows
                 spec_tree_i_batch.resize(spec_tree_alts.size());
                 const llama_pos pa = prompt.tokens.pos_next(); // anchor position
+                // DTREE-TREE-QUALITY greedy tree: an alternative also shares its longest prefix with any EARLIER
+                // alternative (a best-first tree branches off branches), and never exceeds the round's column budget
+                const bool greedy = common_dtree_policy() == 1;
+                int32_t n_cols = (int32_t) (spec_draft.size() + 1);
+                std::vector<llama_tokens>         alts_kept;
+                std::vector<std::vector<int32_t>> rows_kept;
                 for (size_t a = 0; a < spec_tree_alts.size(); ++a) {
                     const auto & alt = spec_tree_alts[a];
                     size_t l = 0;
                     while (l < alt.size() && l < spec_draft.size() && alt[l] == spec_draft[l]) {
                         ++l;
                     }
-                    auto & rows = spec_tree_i_batch[a];
-                    rows.assign(spec_i_batch.begin(), spec_i_batch.begin() + l + 1);
+                    const std::vector<int32_t> * src = &spec_i_batch;
+                    for (size_t b = 0; greedy && b < alts_kept.size(); ++b) {
+                        size_t m = 0;
+                        while (m < alt.size() && m < alts_kept[b].size() && alt[m] == alts_kept[b][m]) {
+                            ++m;
+                        }
+                        if (m > l) {
+                            l   = m;
+                            src = &rows_kept[b];
+                        }
+                    }
+                    if (greedy && n_cols + (int32_t) (alt.size() - l) > spec_tree_cols) {
+                        continue;
+                    }
+                    std::vector<int32_t> rows(src->begin(), src->begin() + l + 1);
                     for (size_t j = l; j < alt.size(); ++j) {
                         const int32_t par = rows.back();
                         rows.push_back(batch.size());
                         add_ok &= batch.add(id, alt[j], pa + 1 + (llama_pos) j, true, par);
+                        ++n_cols;
                     }
+                    alts_kept.push_back(alt);
+                    rows_kept.push_back(std::move(rows));
                 }
+                spec_tree_alts    = std::move(alts_kept);
+                spec_tree_i_batch = std::move(rows_kept);
                 // a constant verify width keeps the target graph (and its HIP graph) reusable across rounds whose
                 // alternatives differ in number or length: pad to the round's column budget with dummy children of the
                 // anchor (Infernix: "columns past the live count repeat the anchor"); they belong to no path
-                const int32_t n_cols = (int32_t) (spec_draft.size() + 1) + [&] {
-                    int32_t n = 0;
-                    for (size_t a = 0; a < spec_tree_i_batch.size(); ++a) {
-                        for (const int32_t r : spec_tree_i_batch[a]) {
-                            n += std::find(spec_i_batch.begin(), spec_i_batch.end(), r) == spec_i_batch.end() ? 1 : 0;
-                        }
-                    }
-                    return n;
-                }();
                 for (int32_t c = n_cols; c < spec_tree_cols; ++c) {
                     add_ok &= batch.add(id, sampled, pa + 1, true, spec_i_batch[0]);
                 }
@@ -1539,6 +1554,7 @@ private:
                     params_base.speculative.draft_tree_mode == COMMON_DTREE_MODE_BATCH ? "batch" : "paths",
                     params_base.speculative.tree_seqs_per_slot(),
                     params_base.n_parallel * params_base.speculative.tree_seqs_per_slot());
+            SRV_INF("draft tree policy: %s (LLAMA_DTREE_POLICY)\n", common_dtree_policy() == 1 ? "greedy" : "static");
         }
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -4717,7 +4733,22 @@ private:
             {
                 common_speculative_get_draft_params(spec.get(), slot.id).tree_alts = nullptr;
                 std::vector<llama_tokens> keep;
-                if (!draft.empty() && !use_serial_speculative_verify(slot)) {
+                if (!draft.empty() && !use_serial_speculative_verify(slot) && common_dtree_policy() == 1) {
+                    // DTREE-TREE-QUALITY greedy tree: alternatives keep their own length (a leaf may be deeper or
+                    // shallower than the main chain); drop empties, prefixes of the main draft and duplicates.
+                    // The paths mode verifies one sequence per path, so it keeps only as many as it has sequences.
+                    const size_t cap = slot.spec_tree_batch ? slot.spec_tree_alts.size()
+                                                            : (size_t) std::max(0, params_base.speculative.tree_seqs_per_slot() - 1);
+                    for (auto & a : slot.spec_tree_alts) {
+                        if (keep.size() >= cap) {
+                            break;
+                        }
+                        const bool prefix = a.size() <= draft.size() && std::equal(a.begin(), a.end(), draft.begin());
+                        if (!a.empty() && !prefix && std::find(keep.begin(), keep.end(), a) == keep.end()) {
+                            keep.push_back(std::move(a));
+                        }
+                    }
+                } else if (!draft.empty() && !use_serial_speculative_verify(slot)) {
                     for (auto & a : slot.spec_tree_alts) {
                         if (a.size() < draft.size()) {
                             continue;
@@ -5545,6 +5576,10 @@ private:
         }
         const int32_t D = params_base.speculative.draft.n_max;
         if (cfg > 0) {
+            // a greedy tree budgets its own depth (the main chain may be shorter than D), so any width >= 2 works
+            if (common_dtree_policy() == 1) {
+                return cfg >= 2 ? cfg : 0;
+            }
             return cfg >= D + 2 ? cfg : 0;
         }
         slot.spec_tree_arm = slot.spec_tree_auto.choose();
@@ -5666,6 +5701,8 @@ private:
                     tree_seq_store[i - off] = slot.id;
                 }
 
+                // the prompt holds anchor + MAIN draft; the accept path rolls back by the winner's length
+                common_dtree_swap_winner_draft(slot.prompt.tokens, slot.spec_draft.size(), slot.spec_tree_alts[best]);
                 slot.spec_draft   = slot.spec_tree_alts[best];
                 slot.spec_i_batch = slot.spec_tree_i_batch[best];
                 slot.n_tree_alt_wins++;
