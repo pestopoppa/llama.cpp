@@ -435,6 +435,16 @@ public:
     mutable int64_t rsrep_hits = 0, rsrep_writes = 0, rsrep_predicts = 0;
     // rep[s] = replay count of stream s0 + s for this ubatch
     void rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const;
+    // [GPU-RESIDENT-ROUND-2f phase 3.4a] LLAMA_DEVICE_CPOS=1: control-block row ctl_hw_row = high-water position of
+    // the stream as the device last advanced it; the device-mask cell positions follow the ring formula
+    // cpos_j = (E-1) - ((E-1-j) mod size), valid iff cpos_j > max(hw, E-1) - size and >= 0. hw_host mirrors the device
+    // row, hw_true is the host's max position written since the stream was last emptied
+    int32_t ctl_hw_row = -1;
+    mutable std::vector<float>     hw_host;
+    std::vector<llama_pos>         hw_true;
+    mutable int64_t cpos_dev_hits = 0, cpos_hw_writes = 0, cpos_host_rounds = 0;
+    bool cpos_check_streams(const llama_ubatch & ubatch, int64_t s0, int64_t n, int64_t n_tps, int64_t n_kv, int64_t size,
+            const std::vector<float> & p0, std::vector<float> * hw_c) const;
     bool ctl_any_pending() const;
     // am(row) = device argmax of a pre-reorder output row of the previous decode (< 0 = unavailable)
     void ctl_resolve(const std::function<int32_t(int64_t)> & am) const;
@@ -572,6 +582,13 @@ public:
     void ctl_sync(const llama_ubatch & ubatch, int mode) const;
     // [phase 3.3] writes control-block row 2 (recurrent replay count) of the streams whose mirror disagrees
     void rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const;
+    // [phase 3.4a] true when the device ring formula reproduces the host cell positions of every stream of this
+    // ubatch exactly (seq id == stream, ring layout); *hw_c = per-stream high-water the device must hold (mirror or
+    // the host's true value). cpos_sync writes the elements whose mirror differs and advances the mirror
+    bool cpos_dev_check(const llama_ubatch & ubatch, std::vector<float> * hw_c = nullptr) const;
+    void cpos_sync(const llama_ubatch & ubatch, bool advance) const;
+    int32_t ctl_hw_row() const;
+    void cpos_host_round() const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows

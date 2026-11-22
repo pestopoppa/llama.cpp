@@ -310,6 +310,12 @@ llama_kv_cache::llama_kv_cache(
         ggml_context * cctx = ggml_init(params);
         // [phase 3.3] LLAMA_DEVICE_RS_REP=1: row 2 = recurrent replay count
         ctl_rows = llama_rs_rep_dev_enabled() ? 3 : 2;
+        // [phase 3.4a] LLAMA_DEVICE_CPOS=1: one more row, the high-water position (init -1 = empty)
+        // (always row 3: row 2 stays the replay-count row, written by the accept advance even when unused)
+        if (llama_cpos_dev_enabled()) {
+            ctl_rows   = 4;
+            ctl_hw_row = 3;
+        }
         ctl = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, ctl_rows, n_stream);
         ggml_format_name(ctl, "cache_%sctl", name_tag);
         // [GPU-RESIDENT-ROUND-2f phase 3.2] LLAMA_DEVICE_VTOK=<T>: persistent verify-token buffer F32 [T + 1, n_stream]
@@ -328,12 +334,19 @@ llama_kv_cache::llama_kv_cache(
         ctl_host.assign(n_stream, -1.0f);
         ctl_pend.assign(n_stream, ctl_pend_t{});
         rsrep_host.assign(n_stream, 0.0f);
+        hw_host.assign(n_stream, -1.0f);
+        if (ctl_hw_row >= 0) {
+            hw_true.assign(n_stream, -1);
+        }
         if (vtok) {
             vtok_host.assign((size_t) (vtok_T + 1)*n_stream, NAN); // unknown: the first verify batch writes it
         }
         for (uint32_t s = 0; s < n_stream; ++s) {
             init[ctl_rows*s + 0] = -1.0f;
             init[ctl_rows*s + 1] = (float) ((int64_t) s*kv_size);
+            if (ctl_hw_row >= 0) {
+                init[ctl_rows*s + ctl_hw_row] = -1.0f;
+            }
         }
         ggml_backend_tensor_set(ctl, init.data(), 0, ggml_nbytes(ctl));
         ctxs_bufs.emplace_back(ggml_context_ptr(cctx), cbuf);
@@ -420,7 +433,11 @@ llama_kv_cache::~llama_kv_cache() {
             fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_VTOK: token_hits=%lld token_writes=%lld bonus_predicts=%lld drafter_rows=%lld\n",
                     (long long) vtok_hits, (long long) vtok_writes, (long long) vtok_bonus_predicts, (long long) vtok_mirror_sets);
         }
-        if (ctl_rows > 2) {
+        if (ctl_hw_row >= 0) {
+            fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CPOS: cpos_device_rounds=%lld hw_host_writes=%lld cpos_host_rounds=%lld\n",
+                    (long long) cpos_dev_hits, (long long) cpos_hw_writes, (long long) cpos_host_rounds);
+        }
+        if (ctl_rows > 2 && llama_rs_rep_dev_enabled()) {
             fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_RS_REP: rs_device_hits=%lld rs_host_writes=%lld rs_predicts=%lld\n",
                     (long long) rsrep_hits, (long long) rsrep_writes, (long long) rsrep_predicts);
         }
@@ -431,6 +448,9 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+    }
+    for (auto & h : hw_true) {
+        h = -1;
     }
 
     if (data) {
@@ -443,6 +463,10 @@ void llama_kv_cache::clear(bool data) {
             for (uint32_t s = 0; s < n_stream; ++s) {
                 init[ctl_rows*s + 0] = 0.0f;
                 init[ctl_rows*s + 1] = (float) ((int64_t) s*get_size());
+                if (ctl_hw_row >= 0) {
+                    init[ctl_rows*s + ctl_hw_row] = -1.0f;
+                    hw_host[s] = -1.0f;
+                }
                 ctl_host[s] = 0.0f;
                 ctl_pend[s].on = false;
                 rsrep_host[s] = 0.0f;
@@ -478,6 +502,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // [phase 3.4a] the stream's sequence is removed whole: its high-water restarts
+        if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max() && !hw_true.empty()) {
+            hw_true[seq_to_stream[seq_id]] = -1;
+        }
+
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -501,6 +530,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
+
+            if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max() && !hw_true.empty()) {
+                hw_true[s] = -1; // [phase 3.4a]
+            }
 
             uint32_t new_head = cells.size();
 
@@ -1258,6 +1291,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+            if (!hw_true.empty()) {
+                hw_true[sinfo.strm[s]] = std::max(hw_true[sinfo.strm[s]], ubatch.pos[i]); // [phase 3.4a]
+            }
 
             if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
@@ -3947,6 +3983,97 @@ void llama_kv_cache::rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) co
             rsrep_writes++;
         }
     }
+}
+
+bool llama_kv_cache::cpos_check_streams(const llama_ubatch & ubatch, int64_t s0, int64_t n, int64_t n_tps, int64_t n_kv, int64_t size,
+        const std::vector<float> & p0, std::vector<float> * hw_c) const {
+    if (hw_c) {
+        hw_c->assign(n, 0.0f);
+    }
+    for (int64_t s = 0; s < n; ++s) {
+        const llama_seq_id sid = (llama_seq_id) (s0 + s);
+        for (int64_t i = 0; i < n_tps; ++i) {
+            if (ubatch.n_seq_id[s*n_tps + i] != 1 || ubatch.seq_id[s*n_tps + i][0] != sid) {
+                return false; // the cpos row is indexed by stream, the host's by seq id
+            }
+        }
+        if ((int64_t) seq_to_stream[sid] != s0 + s) {
+            return false;
+        }
+        const auto & cells = v_cells[s0 + s];
+        const double e1 = (double) p0[s] + (double) (n_tps - 1);
+        // candidates for the device high-water: its mirror (no write), then the host's true value (one write)
+        const double cand[2] = { (double) hw_host[s0 + s], (double) hw_true[s0 + s] };
+        bool ok = false;
+        for (int c = 0; c < 2 && !ok; ++c) {
+            if (c == 1 && cand[1] == cand[0]) {
+                break;
+            }
+            const double H   = std::max(cand[c], e1);
+            const double thr = std::max(H - (double) size, -1.0);
+            ok = true;
+            for (int64_t j = 0; j < n_kv && ok; ++j) {
+                double cp = e1 - std::fmod(e1 - (double) j, (double) size);
+                if (cp > e1) {
+                    cp -= (double) size; // fmod of a negative argument
+                }
+                const float dev  = cp > thr ? (float) cp : LLAMA_KQ_MASK_DEV_FAR;
+                const float host = (cells.is_empty(j) || !cells.seq_has(j, sid)) ? LLAMA_KQ_MASK_DEV_FAR : (float) cells.pos_get(j);
+                ok = dev == host;
+            }
+            if (ok && hw_c) {
+                (*hw_c)[s] = (float) cand[c];
+            }
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int32_t llama_kv_cache_context::ctl_hw_row() const {
+    return kv->ctl ? kv->ctl_hw_row : -1;
+}
+
+void llama_kv_cache_context::cpos_host_round() const {
+    if (kv->ctl_hw_row >= 0) {
+        kv->cpos_host_rounds++;
+    }
+}
+
+bool llama_kv_cache_context::cpos_dev_check(const llama_ubatch & ubatch, std::vector<float> * hw_c) const {
+    // M-RoPE (is_pos_2d) is fine: once the cells match the ring formula every cell holds a distinct position, so the
+    // only cell with p0 == p1 is the token's own (same ext), and the host 2-D ext rule never drops a cell
+    if (kv->ctl_hw_row < 0) {
+        return false;
+    }
+    std::vector<float> p0, base;
+    int64_t size = 0, s0 = -1, n = 0;
+    if (!ctl_range(ubatch, s0, n) || !kv_idx_dev_info(ubatch, p0, base, size) || n < 1) {
+        return false;
+    }
+    const int64_t n_tps = ubatch.n_tokens / n;
+    const int64_t n_kv  = get_n_kv();
+    return kv->cpos_check_streams(ubatch, s0, n, n_tps, n_kv, size, p0, hw_c);
+}
+
+void llama_kv_cache_context::cpos_sync(const llama_ubatch & ubatch, bool advance) const {
+    std::vector<float> hw_c, p0, base;
+    int64_t size = 0, s0 = -1, n = 0;
+    GGML_ASSERT(cpos_dev_check(ubatch, &hw_c) && ctl_range(ubatch, s0, n) && kv_idx_dev_info(ubatch, p0, base, size) &&
+                "device cpos layout changed after graph build");
+    const int64_t n_tps = ubatch.n_tokens / n;
+    ggml_tensor * ctl = kv->ctl;
+    for (int64_t s = 0; s < n; ++s) {
+        float & m = kv->hw_host[s0 + s];
+        if (m != hw_c[s]) {
+            ggml_backend_tensor_set(ctl, &hw_c[s], (s0 + s)*ctl->nb[1] + kv->ctl_hw_row*ggml_element_size(ctl), sizeof(float));
+            kv->cpos_hw_writes++;
+        }
+        m = advance ? std::max(hw_c[s], p0[s] + (float) (n_tps - 1)) : hw_c[s]; // what the graph writes back
+    }
+    kv->cpos_dev_hits++;
 }
 
 bool llama_kv_cache::ctl_any_pending() const {

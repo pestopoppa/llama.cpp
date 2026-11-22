@@ -452,6 +452,9 @@ public:
     ggml_tensor * dctl_q     = nullptr; // positions [n_tps, n_str]
     bool          dctl_accept = false;  // the write-back is p0 + n_accepted + 1 (device leading-match count)
     bool          dmask_tpos_ctl = false; // phase 3.1: dmask_tpos is the control-block positions (no host input)
+    bool          dcpos_dev = false;      // phase 3.4a: dmask_cpos / dmask_csel are device-computed (ring formula)
+    ggml_tensor * dcpos_hw_wb = nullptr;  // phase 3.4a: high-water write-back node (expanded in build_sampling)
+    bool          dcpos_hw_on = false;    // the write-back is in the graph
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 

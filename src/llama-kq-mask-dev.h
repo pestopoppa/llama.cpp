@@ -44,6 +44,14 @@ static inline bool llama_rs_rep_dev_enabled() {
     return e != nullptr && std::strcmp(e, "1") == 0 && llama_ctl_pos_enabled();
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.4a] LLAMA_DEVICE_CPOS=1 (default off; needs LLAMA_DEVICE_CTL_POS=1 and
+// LLAMA_DEVICE_KQ_MASK=1): the device mask's cell positions come from the ring formula over the control block
+// (p0 row + a high-water row) and csel = i / n_tps, so neither is a host input when the host check passes
+static inline bool llama_cpos_dev_enabled() {
+    const char * e = std::getenv("LLAMA_DEVICE_CPOS");
+    return e != nullptr && std::strcmp(e, "1") == 0 && llama_ctl_pos_enabled();
+}
+
 // cpos [n_kv, n_seq_rows] F32, csel [n_tokens] I32, tpos [1, n_tps, 1, n_stream] F32 -> mask [n_kv, n_tps, 1, n_stream]
 static inline ggml_tensor * llama_build_kq_mask_dev(
         ggml_context * ctx,
