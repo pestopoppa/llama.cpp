@@ -3875,7 +3875,7 @@ ggml_tensor * llama_kv_cache_context::ctl_range(const llama_ubatch & ubatch, int
     return kv->ctl;
 }
 
-void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode) const {
+void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode, const llama_kv_cache * tgt) const {
     std::vector<float> p0, base;
     int64_t size = 0, s0 = 0, n = 0;
     GGML_ASSERT(ctl_range(ubatch, s0, n) && kv_idx_dev_info(ubatch, p0, base, size));
@@ -3893,7 +3893,13 @@ void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode) con
         } else {
             kv->ctl_device_hits++;
         }
-        m = mode == 2 ? NAN : mode == 1 ? p0[s] + n_tps : p0[s]; // the graph writes this back
+        if (mode == 3) {
+            // [phase 3.7] p0 + the target's n_acc + 1 (row 2 of its control block); unknown mirror -> pending (read)
+            const float a1 = tgt && (size_t) (s0 + s) < tgt->rsrep_host.size() ? tgt->rsrep_host[s0 + s] : NAN;
+            m = std::isnan(a1) ? NAN : p0[s] + a1;
+        } else {
+            m = mode == 2 ? NAN : mode == 1 ? p0[s] + n_tps : p0[s]; // the graph writes this back (mode 4: hold p0)
+        }
         // [phase 3.1] remember the verify tokens: the next decode predicts the accept count from the argmax rows
         auto & pd = kv->ctl_pend[s0 + s];
         pd.on = mode == 2 && llama_ctl_pos_enabled() && ubatch.token != nullptr;

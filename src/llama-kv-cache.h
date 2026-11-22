@@ -579,7 +579,7 @@ public:
     // writes the control-block elements whose mirror disagrees with the ubatch, then advances the mirror by n_tps
     // accept = the graph advances by the device accept count: the mirror becomes pending (resolved by a 4-byte read)
     // mode: 0 = graph has no write-back (build_sampling not run), 1 = advances by n_tps, 2 = by the device accept count
-    void ctl_sync(const llama_ubatch & ubatch, int mode) const;
+    void ctl_sync(const llama_ubatch & ubatch, int mode, const llama_kv_cache * tgt = nullptr) const;
     // [phase 3.3] writes control-block row 2 (recurrent replay count) of the streams whose mirror disagrees
     void rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const;
     // [phase 3.4a] true when the device ring formula reproduces the host cell positions of every stream of this

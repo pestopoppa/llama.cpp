@@ -469,6 +469,12 @@ public:
     ggml_tensor * dcpos_hw_wb = nullptr;  // phase 3.4a: high-water write-back node (expanded in build_sampling)
     bool          dcpos_hw_on = false;    // the write-back is in the graph
     bool          dctl_no_accept = false; // phase 3.6: always advance by n_tps (drafter caches: never an accept count)
+    // phase 3.7 LLAMA_DEVICE_DFT_P0=1 (drafter SWA cache): 3 = injection, write back p0 + n_acc + 1 read from the TARGET
+    // control block row 2 (= the target's new n_past = next draft p0); 4 = draft block, write back p0 (the block is
+    // always rolled back to n_past = the next injection's verify p0); 0 = p0 + n_tps
+    int           dctl_dft_mode = 0;
+    ggml_tensor * dctl_tgt_r2   = nullptr;              // [1, n_str] target ctl row 2 (mode 3)
+    const class llama_kv_cache * dctl_tgt_kv = nullptr; // its host mirror predicts the write-back (mode 3)
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 

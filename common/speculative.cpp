@@ -1350,6 +1350,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool dev_gather_init = false;
     // [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1 counters
     int64_t n_fixed_t = 0, n_fixed_t_masked = 0, n_fixed_t_fallback = 0;
+    static bool dft_p0_knob() {
+        static const bool on = [] {
+            for (const char * k : { "LLAMA_DEVICE_DFT_P0", "LLAMA_DEVICE_DFT_INJ_POS" }) {
+                const char * e = getenv(k);
+                if (e && strcmp(e, "1") == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+        return on;
+    }
     static bool fixed_t_knob() {
         static const bool on = [] { const char * e = getenv("LLAMA_DEVICE_DFLASH_FIXED_T"); return e && strcmp(e, "1") == 0; }();
         return on;
@@ -1718,6 +1730,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 llama_set_dflash_gather(ctx_dft, gather_feats.data(), (int32_t) gather_feats.size(), gather_rows.data(), N);
                 llama_set_dflash_inject(ctx_dft, ctx_tgt, verify && R > 1, s0, R, n_act, iota);
+                if (dft_p0_knob() && verify && R > 1) {
+                    // [GPU-RESIDENT-ROUND-2f phase 3.7] predict the target's accept advance now: its row-2 / n_past
+                    // mirrors vouch for the drafter's device write-back and injection positions
+                    llama_ctl_resolve(ctx_tgt);
+                }
                 features_buf.resize((size_t) N * n_embd_enc);
                 llama_batch enc_batch = { N, nullptr, features_buf.data(), nullptr, nullptr, nullptr, nullptr };
                 int32_t rc = llama_encode(ctx_dft, enc_batch);

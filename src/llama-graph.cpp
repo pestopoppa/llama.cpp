@@ -209,6 +209,34 @@ static bool llama_dft_kv_dev_enabled() {
     return e != nullptr && strcmp(e, "1") == 0 && llama_kv_idx_dev_enabled();
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.7] LLAMA_DEVICE_DFT_P0=1 (default off; with LLAMA_DEVICE_DFT_KV): the drafter's SWA
+// control block lands on the target's n_past without host writes: an injection (fixed-T, masked) writes back
+// p0 + n_acc + 1 from the target control block row 2; a draft block (always rolled back) writes back p0
+static bool llama_dft_p0_enabled() {
+    const char * e = getenv("LLAMA_DEVICE_DFT_P0");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
+static int llama_dft_p0_mode(const llama_cparams & cparams, const llama_ubatch & ub, int64_t s0, int64_t n_tps, int64_t n_str) {
+    if (!llama_dft_p0_enabled() || s0 < 0) {
+        return 0;
+    }
+    if (ub.token && !ub.embd) {
+        return 4;
+    }
+    const auto * d = cparams.dinj;
+    if (!ub.embd || !d || !d->mask || !d->tgt_kv || !d->tgt_kv->ctl || d->tgt_kv->ctl->ne[0] < 3 ||
+            d->s0 != s0 || d->n_str != n_str || d->R != n_tps || n_tps*n_str != (int64_t) ub.n_tokens) {
+        return 0;
+    }
+    for (int64_t s = 0; s < n_str; ++s) {
+        if (ub.n_seq_id[s*n_tps] != 1 || ub.seq_id[s*n_tps][0] != (llama_seq_id) (s0 + s)) {
+            return 0;
+        }
+    }
+    return 3;
+}
+
 // n_g groups of equal size, each position-contiguous; fills the first position of each group
 static bool llama_pos_runs(const llama_ubatch & ub, int64_t n_g, std::vector<float> * p0) {
     if (n_g <= 0 || ub.n_tokens % n_g != 0 || !ub.pos || ub.parent) {
@@ -1071,7 +1099,7 @@ bool llm_graph_input_attn_kv::can_reuse_kv_rows(const llama_kv_cache_context * k
 
 void llm_graph_input_attn_kv::set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (dctl_wb) {
-        kv->ctl_sync(*ubatch, dctl_wb->op != GGML_OP_CPY ? 0 : dctl_accept ? 2 : 1);
+        kv->ctl_sync(*ubatch, dctl_wb->op != GGML_OP_CPY ? 0 : dctl_accept ? 2 : dctl_dft_mode ? dctl_dft_mode : 1, dctl_tgt_kv);
         return;
     }
     if (dkv_p0) {
@@ -1352,6 +1380,10 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (llama_dft_kv_dev_enabled()) {
         if (swa_dev) {
             res &= swa_dev->can_reuse_kv_idx_dev(mctx->get_swa(), params.ubatch);
+            if (res && swa_dev->dctl_wb) {
+                res &= llama_dft_p0_mode(params.cparams, params.ubatch, swa_dev->dctl_s0, swa_dev->dctl_q->ne[0], swa_dev->dctl_q->ne[1]) ==
+                       swa_dev->dctl_dft_mode;
+            }
         } else {
             std::vector<float> p0, base;
             int64_t size = 0, s0 = -1, n = 0;
@@ -4667,6 +4699,20 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         llama_build_kv_idx_dev(ctx0, ubatch, mctx_cur->get_swa(), sd.get());
         if (sd->dctl_wb) {
             sd->dctl_no_accept = true;
+            sd->dctl_dft_mode  = llama_dft_p0_mode(cparams, ubatch, sd->dctl_s0, sd->dctl_q->ne[0], sd->dctl_q->ne[1]);
+            if (sd->dctl_dft_mode == 3) {
+                ggml_tensor * tc = cparams.dinj->tgt_kv->ctl;
+                sd->dctl_tgt_kv = cparams.dinj->tgt_kv;
+                sd->dctl_tgt_r2 = ggml_cont(ctx0, ggml_view_2d(ctx0, tc, 1, sd->dctl_q->ne[1], tc->nb[1],
+                        sd->dctl_s0*tc->nb[1] + 2*ggml_element_size(tc)));
+            }
+            if (sd->dctl_dft_mode) {
+                static bool logged_p0 = false;
+                if (!logged_p0) {
+                    logged_p0 = true;
+                    fprintf(stderr, "llm_graph: LLAMA_DEVICE_DFT_P0: drafter SWA control block write-back from the target n_past ENABLED\n");
+                }
+            }
             inp->self_k_idxs_swa = sd->self_k_idxs;
             inp->self_v_idxs_swa = sd->self_v_idxs;
             res->ctl_inps.push_back(sd.get());
@@ -5222,6 +5268,11 @@ static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_
                 ggml_build_forward_expand(gf, wb);
                 vi->vtok_bonus = true;
             }
+        } else if (inp->dctl_dft_mode == 3 || inp->dctl_dft_mode == 4) {
+            // [phase 3.7] drafter: land on the target's n_past (3: p0 + n_acc + 1 from the target ctl row 2; 4: hold p0)
+            ggml_tensor * q0 = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], 0));
+            nv = inp->dctl_dft_mode == 3 ? ggml_add(ctx0, q0, inp->dctl_tgt_r2) : ggml_scale_bias(ctx0, q0, 1.0f, 0.0f);
+            inp->dctl_accept = false;
         } else {
             ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
             nv = ggml_scale_bias(ctx0, last, 1.0f, 1.0f);                                                          // p0 + n_tps
