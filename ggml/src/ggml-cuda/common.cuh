@@ -1420,6 +1420,16 @@ struct ggml_cuda_fattn_asm_mask_cache {
     int64_t      len    = 0;        // effective KV length L (the -INF tail beyond it is KV padding)
 };
 
+// GGML_DETERMINISTIC=1 (default off): run-to-run bit-reproducible GPU matmuls (fixed-order Q8_MF V5 split reduction,
+// rocBLAS atomics disabled). Read once.
+static inline bool ggml_cuda_deterministic() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_DETERMINISTIC");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1528,6 +1538,13 @@ struct ggml_backend_cuda_context {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+#if defined(GGML_USE_HIP)
+            if (ggml_cuda_deterministic()) {
+                // GGML_DETERMINISTIC: forbid rocBLAS/Tensile atomic (global-split-U) kernels -> rocblas_atomics_not_allowed
+                CUBLAS_CHECK(hipblasSetAtomicsMode(cublas_handles[device], HIPBLAS_ATOMICS_NOT_ALLOWED));
+                GGML_LOG_INFO("ggml_cuda: GGML_DETERMINISTIC rocblas_atomics_not_allowed set on device %d handle\n", device);
+            }
+#endif
         }
         return cublas_handles[device];
     }
