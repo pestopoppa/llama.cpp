@@ -159,6 +159,31 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // [GPU-RESIDENT-ROUND-2f phase 3.4b] LLAMA_DEVICE_SCOPY=1: persistent device copy indices, on the buffer type of
+    // the first state layer
+    if (const char * e = getenv("LLAMA_DEVICE_SCOPY"); e && strcmp(e, "1") == 0) {
+        ggml_tensor * r0 = nullptr;
+        for (auto * t : r_l) {
+            if (t && t->buffer) {
+                r0 = t;
+                break;
+            }
+        }
+        if (r0) {
+            ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+            scopy_ctx.reset(ggml_init(params));
+            scopy_t = ggml_new_tensor_1d(scopy_ctx.get(), GGML_TYPE_I32, mem_size);
+            ggml_set_name(scopy_t, "cache_rs_scopy");
+            scopy_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(scopy_ctx.get(), ggml_backend_buffer_get_type(r0->buffer)));
+            if (!scopy_buf) {
+                throw std::runtime_error("failed to allocate rs copy-index buffer");
+            }
+            scopy_host.assign(mem_size, std::numeric_limits<int32_t>::min());
+            LLAMA_LOG_INFO("%s: LLAMA_DEVICE_SCOPY: device copy indices ENABLED (%u cells, %s)\n", __func__, mem_size,
+                    ggml_backend_buffer_name(scopy_buf.get()));
+        }
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -169,6 +194,45 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+    }
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    if (scopy_t) {
+        fprintf(stderr, "llama_memory_recurrent: LLAMA_DEVICE_SCOPY: scopy_hits=%lld scopy_writes=%lld scopy_elems_written=%lld\n",
+                (long long) scopy_hits, (long long) scopy_writes, (long long) scopy_elems);
+    }
+}
+
+ggml_tensor * llama_memory_recurrent_context::scopy_dev() const {
+    return mem ? mem->scopy_t : nullptr;
+}
+
+void llama_memory_recurrent_context::scopy_sync(const std::vector<int32_t> & v) const {
+    ggml_tensor * t = mem->scopy_t;
+    GGML_ASSERT(t && v.size() <= mem->scopy_host.size());
+    auto & m = mem->scopy_host;
+    bool any = false;
+    // write each run of differing elements (in steady state the copy is the identity: no write)
+    for (size_t i = 0; i < v.size();) {
+        if (m[i] == v[i]) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < v.size() && m[j] != v[j]) {
+            m[j] = v[j];
+            ++j;
+        }
+        ggml_backend_tensor_set(t, v.data() + i, i*sizeof(int32_t), (j - i)*sizeof(int32_t));
+        mem->scopy_elems += (int64_t) (j - i);
+        any = true;
+        i = j;
+    }
+    if (any) {
+        mem->scopy_writes++;
+    } else {
+        mem->scopy_hits++;
     }
 }
 

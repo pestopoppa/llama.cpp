@@ -513,18 +513,38 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.4b] LLAMA_DEVICE_SCOPY=1 (default off): s_copy is a view of a persistent device I32
+// tensor of the recurrent memory with a host mirror; the host writes only the elements that differ (none in steady
+// state, where the copy is the identity). s_copy(i) is still called for every i: it also resets the rollback index
+static bool llama_scopy_dev_want(const llama_memory_recurrent_context * m) {
+    const char * e = std::getenv("LLAMA_DEVICE_SCOPY");
+    return e != nullptr && std::strcmp(e, "1") == 0 && m->scopy_dev() != nullptr;
+}
+
+static void llama_rs_set_s_copy(llm_graph_input_rs * inp, const llama_memory_recurrent_context * m, int64_t n_rs) {
+    if (!inp->s_copy) {
+        return;
+    }
+    if (inp->s_copy_dev) {
+        std::vector<int32_t> v(n_rs);
+        for (int64_t i = 0; i < n_rs; ++i) {
+            v[i] = m->s_copy(i);
+        }
+        m->scopy_sync(v);
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy->buffer));
+    int32_t * data = (int32_t *) inp->s_copy->data;
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (int64_t i = 0; i < n_rs; ++i) {
+        data[i] = m->s_copy(i);
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
-    }
+    llama_rs_set_s_copy(this, mctx, n_rs); // [phase 3.4b] device mirror when LLAMA_DEVICE_SCOPY=1
 
     set_input_rep(mctx, ubatch);
 }
@@ -574,6 +594,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
+    res &= s_copy_dev == llama_scopy_dev_want(mctx);
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
@@ -1683,15 +1704,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llama_rs_set_s_copy(inp_rs.get(), mctx->get_recr(), n_rs); // [phase 3.4b] device mirror when LLAMA_DEVICE_SCOPY=1
 
     inp_rs->set_input_rep(mctx->get_recr(), ubatch);
 }
@@ -1715,6 +1728,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->can_reuse_kv_rows(mctx->get_attn(), params.ubatch);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy_dev == llama_scopy_dev_want(mctx->get_recr());
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1741,15 +1755,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llama_rs_set_s_copy(inp_rs.get(), mctx->get_recr(), n_rs); // [phase 3.4b] device mirror when LLAMA_DEVICE_SCOPY=1
 
     inp_rs->set_input_rep(mctx->get_recr(), ubatch);
 }
@@ -1766,6 +1772,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy_dev == llama_scopy_dev_want(mctx->get_recr());
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -1817,15 +1824,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llama_rs_set_s_copy(inp_rs.get(), mctx->get_recr(), n_rs); // [phase 3.4b] device mirror when LLAMA_DEVICE_SCOPY=1
 
     inp_rs->set_input_rep(mctx->get_recr(), ubatch);
 }
@@ -1856,6 +1855,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= inp_rs->s_copy_dev == llama_scopy_dev_want(mctx->get_recr());
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
@@ -4668,8 +4668,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
-    inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
-    ggml_set_input(inp->s_copy);
+    if (llama_scopy_dev_want(mctx_cur)) {
+        // [phase 3.4b] persistent device copy indices (host mirror, written on disagreement only)
+        inp->s_copy = ggml_view_1d(ctx0, mctx_cur->scopy_dev(), n_rs, 0);
+        inp->s_copy_dev = true;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "llm_graph: LLAMA_DEVICE_SCOPY: device-resident s_copy ENABLED\n");
+        }
+    } else {
+        inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy);
+    }
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);

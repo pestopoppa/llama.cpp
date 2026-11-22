@@ -321,6 +321,7 @@ public:
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
     // rs_replay: the ubatch first replays the kept pending tokens of the last ubatch (none is a no-op)
+    bool          s_copy_dev = false; // [phase 3.4b] s_copy is a view of the memory's device copy-index tensor
     bool          has_rep  = false;
     int64_t       n_conv   = 0;       // conv window columns, the widest conv of the model
     int64_t       n_pend   = 0;       // pending slots per seq

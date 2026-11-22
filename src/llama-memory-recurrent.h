@@ -4,6 +4,8 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include "ggml-cpp.h"
+
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -28,7 +30,7 @@ public:
                          bool   rs_replay,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -85,6 +87,14 @@ public:
     bool rs_replay = false;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // [GPU-RESIDENT-ROUND-2f phase 3.4b] LLAMA_DEVICE_SCOPY=1: device I32 [size] copy indices the graph's s_copy views,
+    // scopy_host mirrors it (INT32_MIN = unknown); the host writes only the elements that differ
+    ggml_tensor * scopy_t = nullptr;
+    mutable std::vector<int32_t> scopy_host;
+    mutable int64_t scopy_hits = 0, scopy_writes = 0, scopy_elems = 0;
+    ggml_context_ptr       scopy_ctx;
+    ggml_backend_buffer_ptr scopy_buf;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -202,6 +212,10 @@ public:
     ggml_tensor * get_spgb_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // [GPU-RESIDENT-ROUND-2f phase 3.4b] LLAMA_DEVICE_SCOPY=1: persistent device I32 copy indices + host mirror
+    ggml_tensor * scopy_dev() const;
+    void          scopy_sync(const std::vector<int32_t> & v) const;
 
     bool     get_rs_replay() const;
     uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
