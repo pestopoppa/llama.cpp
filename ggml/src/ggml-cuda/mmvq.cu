@@ -2410,7 +2410,7 @@ void ggml_cuda_mmvq_q8_1_graph_cache_clear(ggml_backend_cuda_context * ctx) {
 static bool mmvq_q8_1_reuse_batch_enabled() {
     static const bool on = [] {
         const char * v = getenv("GGML_HIP_Q8_1_REUSE_BATCH");
-        return v != nullptr && atoi(v) != 0;
+        return v == nullptr || atoi(v) != 0; // C18: default ON (=0 disables)
     }();
     return on;
 }
