@@ -34,7 +34,7 @@ GGML_PHILOX_HD void ggml_philox4x32_10(uint32_t key_lo, uint32_t key_hi, uint64_
 // common_philox4x32::gumbel: -log(-log(u)), u = ((bits >> 8) + 0.5) / 2^24
 GGML_PHILOX_HD float ggml_philox_gumbel_bits(uint32_t bits) {
     const float u = ((float) (bits >> 8) + 0.5f) * (1.0f / 16777216.0f);
-    return -logf(-logf(u));
+    return (float) -log(-log((double) u)); // double on every backend: float rounding of the double result matches across libms
 }
 
 // value of flat element j of a block with key (lo, hi) and counter ctr (ctr < 0 -> 0)

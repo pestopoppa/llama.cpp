@@ -41,6 +41,6 @@ struct common_philox4x32 {
 
     // standard Gumbel noise: argmax(x_k + g_k) samples softmax(x) exactly
     static float gumbel(uint32_t bits) {
-        return -std::log(-std::log(u01(bits)));
+        return (float) -std::log(-std::log((double) u01(bits))); // same double formulation as ggml-philox.h (GPU bit-identity)
     }
 };
