@@ -338,6 +338,13 @@ struct llama_hparams {
 
     // Step35: optional per-layer clamps for (Swi)GLU
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
+
+    // SITU activation (kimi-k3, inkling2): beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+    float situ_beta        = 0.0f;
+    float situ_linear_beta = 0.0f;
+
+    // block attention residuals: the number of layers per residual block (kimi-k3, inkling2)
+    uint32_t attn_res_block_size = 0;
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
 
     // this value n_pattern means that every nth layer is dense (i.e. non-SWA)
