@@ -665,6 +665,22 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+bool ggml_cuda_mmvq_moe_split16_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_MOE_SPLIT16");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+int ggml_cuda_mmvq_mmid_effective_max_batch(ggml_type type, int cc) {
+    const int base = get_mmvq_mmid_max_batch(type, cc);
+    if (base == MMVQ_MAX_BATCH_SIZE && ggml_cuda_mmvq_moe_split16_enabled()) {
+        return MMVQ_MOE_SPLIT16_MAX_BATCH;
+    }
+    return base;
+}
+
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -1815,14 +1831,36 @@ static void mul_mat_vec_q_moe_launch(
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
-    const dim3 block_dims(warp_size, ncols_dst);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+    if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+        // n <= 8: unchanged single launch.
+        const dim3 block_dims(warp_size, ncols_dst);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
+            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+        return;
+    }
+
+    // AK-MMID-SPLIT16: 9..16 tokens (only reachable with GGML_CUDA_MMVQ_MOE_SPLIT16=1). The MoE kernel has no
+    // cross-token weight reuse (one warp per token, each reading its own expert), so chunking the token columns into
+    // <= 8-wide launches costs the same weight bytes as one 16-warp launch and keeps the kernel's 8-warp launch bounds.
+    GGML_ASSERT(ncols_dst <= MMVQ_MOE_SPLIT16_MAX_BATCH);
+    for (uint32_t c0 = 0; c0 < ncols_dst; c0 += MMVQ_MAX_BATCH_SIZE) {
+        const uint32_t nc = std::min<uint32_t>(MMVQ_MAX_BATCH_SIZE, ncols_dst - c0);
+        const dim3 block_dims(warp_size, nc);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
+            vx, (const void *) ((const block_q8_1 *) vy + (size_t) c0*stride_col_y), ids + (size_t) c0*ids_stride,
+            dst + (size_t) c0*stride_col_dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            nc, ids_stride);
+    }
 }
 
 template <ggml_type type>
@@ -1836,7 +1874,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE || (ids != nullptr && ncols_dst <= MMVQ_MOE_SPLIT16_MAX_BATCH));
 
     // MMID-Q8-N1-ODDM: the multi-row (small_k / fixed small_k / DPP) store guards compare row0+row against
     // stride_col_dst. For MUL_MAT_ID the host passes s2 = ne0*n_used, so a tail CTA on a row count that is not
@@ -2400,7 +2438,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || (ggml_cuda_mmvq_moe_split16_enabled() && ne12 <= MMVQ_MOE_SPLIT16_MAX_BATCH));
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
