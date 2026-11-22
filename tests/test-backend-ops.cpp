@@ -4545,6 +4545,52 @@ struct test_ak_h15 : public test_case {
 };
 
 // GGML_OP_ARGMAX
+// [GPU-RESIDENT-ROUND-2f] GGML_OP_PHILOX_GUMBEL: device Philox-Gumbel selection noise, bitwise vs CPU.
+// ctr is a strided view of a control-block row (as the drafter reads it); some streams carry ctr < 0 (zeros).
+struct test_philox_gumbel : public test_case {
+    const int64_t ne0, ne1, n_b;
+    const int32_t skip;
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne0, ne1, n_b, skip);
+    }
+
+    test_philox_gumbel(int64_t ne0 = 8, int64_t ne1 = 16, int64_t n_b = 3, int32_t skip = 8)
+        : ne0(ne0), ne1(ne1), n_b(n_b), skip(skip) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * key = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_b);
+        ggml_set_name(key, "key");
+        ggml_tensor * cb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_b);
+        ggml_set_name(cb, "cb");
+        ggml_tensor * ctr = ggml_view_2d(ctx, cb, 1, n_b, cb->nb[1], 3*sizeof(float));
+        ggml_tensor * out = ggml_philox_gumbel(ctx, key, ctr, ne0, ne1, skip);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng = suite_seed_rng();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> d(ggml_nelements(t));
+                for (auto & x : d) x = (int32_t) rng();
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F32 && t->view_src == nullptr) {
+                std::vector<float> d(ggml_nelements(t), 9.0f);
+                for (int64_t b = 0; b < t->ne[1]; ++b) {
+                    d[b*t->ne[0] + 3] = (b % 3 == 2) ? -1.0f : (float) (rng() % 100000);
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(float));
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+};
+
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -13191,6 +13237,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4,  500, 1, 1}));
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4, 5000, 1, 1}));
 
+    test_cases.emplace_back(new test_philox_gumbel(8, 16, 3, 8));
+    test_cases.emplace_back(new test_philox_gumbel(20, 8, 4, 20));
+    test_cases.emplace_back(new test_philox_gumbel(32, 16, 6, 0));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32,    1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32,  513, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {100,  10, 1, 1}));
