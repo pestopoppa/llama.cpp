@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmq-q8-mf.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/q8-pc.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -816,6 +817,7 @@ struct ggml_backend_cuda_buffer_context {
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     ggml_cuda_q8ip_forget_range(ctx->dev_ptr, buffer->size);
+    ggml_cuda_q8_pc_forget_range(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -864,6 +866,9 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_q8ip_before_write(tensor, offset, size, cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_q8_pc_after_write(tensor, offset, size,   // AK-ASM-I8GEMM-PERCHANNEL load repack (GGML_HIP_Q8_PC=1)
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && !ggml_cuda_q8ip_any(), cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     ggml_cuda_q8ip_after_write(tensor, offset, size,
         ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS, cudaStreamPerThread);
@@ -941,6 +946,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_q8ip_forget_range(ctx->dev_ptr, buffer->size);
+    ggml_cuda_q8_pc_forget_range(ctx->dev_ptr, buffer->size);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -2077,6 +2083,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+    // AK-ASM-I8GEMM-PERCHANNEL: per-token x per-channel int8 MFMA GEMM on load-repacked Q8_0 (GGML_HIP_Q8_PC=1, default off)
+    if (ggml_cuda_q8_pc_mul_mat(ctx, src0, src1, dst)) {
+        ggml_cuda_log_mul_mat_route("Q8_PC", src0, src1, dst, cc, ne11);
+        return;
+    }
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -2698,6 +2709,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     ggml_cuda_q8ip_before_write(tensor, offset, size, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_q8_pc_after_write(tensor, offset, size,   // AK-ASM-I8GEMM-PERCHANNEL load repack (GGML_HIP_Q8_PC=1)
+        ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && !ggml_cuda_q8ip_any(), cuda_ctx->stream());
     ggml_cuda_q8ip_after_write(tensor, offset, size, ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
         cuda_ctx->stream());
 }

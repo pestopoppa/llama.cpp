@@ -6895,6 +6895,55 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
 }
 
 // GGML_OP_MUL_MAT_ID
+// AK-ASM-I8GEMM-PERCHANNEL: Q8_0 weights already in the per-channel layout (every block of a row carries the same
+// d = fp16(max|w_r|/127)), so the CPU reference and the GGML_HIP_Q8_PC GEMM read identical weights and the only
+// difference is the GEMM's per-token int8 activation quantize (vs q8_0 per-32 on CPU).
+struct q8pc_block { ggml_fp16_t d; int8_t qs[32]; };
+static_assert(sizeof(q8pc_block) == 34, "q8_0 block");
+
+struct test_mul_mat_q8pc : public test_mul_mat {
+    test_mul_mat_q8pc(int64_t m, int64_t n, int64_t k) : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return "pc," + test_mul_mat::vars();
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_Q8_0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t K = t->ne[0];
+            const int64_t R = ggml_nrows(t);
+            std::vector<q8pc_block> blocks(R*K/32);
+            std::vector<float> w(K);
+            for (int64_t r = 0; r < R; ++r) {
+                float mx = 0.0f;
+                for (int64_t i = 0; i < K; ++i) {
+                    w[i] = dist(rng) * (1.0f + 3.0f*(float) (r % 7)/7.0f);
+                    mx = std::max(mx, std::fabs(w[i]));
+                }
+                ggml_fp16_t sh = ggml_fp32_to_fp16(mx/127.0f);
+                if (ggml_fp16_to_fp32(sh) == 0.0f) {
+                    sh = ggml_fp32_to_fp16(1.0f);
+                }
+                const float sf = ggml_fp16_to_fp32(sh);
+                for (int64_t b = 0; b < K/32; ++b) {
+                    q8pc_block & blk = blocks[r*(K/32) + b];
+                    memcpy(&blk.d, &sh, sizeof(sh));
+                    for (int j = 0; j < 32; ++j) {
+                        blk.qs[j] = (int8_t) std::max(-127.0f, std::min(127.0f, std::nearbyint(w[b*32 + j]/sf)));
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, blocks.data(), 0, blocks.size()*sizeof(q8pc_block));
+        }
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -15144,6 +15193,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // AK-ASM-I8GEMM-PERCHANNEL (run with GGML_HIP_Q8_PC=1 GGML_HIP_Q8_PC_ASSUME=1): Qwen3.8-27B dense shapes (k, m),
+    // n 129 = first eligible batch, 512 / 2048 = prefill ubatches; ragged M / N tails.
+    {
+        const std::array<int64_t, 2> q8pc_shapes[] = { {5120, 6144}, {5120, 1024}, {6144, 5120}, {5120, 17408}, {17408, 5120}, {5120, 48} };
+        for (const auto & km : q8pc_shapes) {
+            for (int64_t n : {129, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_q8pc(km[1], n, km[0]));
+            }
+        }
+        for (int64_t n : {130, 300, 1000}) {
+            test_cases.emplace_back(new test_mul_mat_q8pc(1000, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_q8pc(77, n, 64));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -15609,6 +15673,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_topk_moe_hold({256, 131072, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
         }
     }
+    // AK-ASM-I8GEMM-PERCHANNEL op timing (27B dense shapes)
+    for (const auto & km : std::vector<std::array<int64_t, 2>>{ {5120, 6144}, {5120, 17408}, {17408, 5120}, {6144, 5120} }) {
+        for (int64_t n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_q8pc(km[1], n, km[0]));
+        }
+    }
+
     return test_cases;
 }
 
