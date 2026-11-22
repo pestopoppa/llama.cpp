@@ -217,6 +217,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv41-engram-gate.cpp)
     llama_build_and_test(test-spec-rng-poskey.cpp)
     llama_build_and_test(test-spec-dists-trunc.cpp) # SPEC-DISTS-TRUNC capped draft keeps rejection verify (no model)
+    llama_build_and_test(test-spec-accept-eog.cpp LABEL "model") # SPEC-STALE-1 (a): EOG stop in the accept loops; needs a model arg
     llama_build_and_test(test-dsv41-dspark-rollback.cpp)
     llama_build_and_test(test-dsv41-dspark-mask.cpp)
     llama_build_and_test(test-dsv41-dspark-width.cpp)
