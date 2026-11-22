@@ -3,6 +3,9 @@
 
 #include "speculative-tree.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -157,8 +160,31 @@ int32_t common_dtree_greedy_accept_len(
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
+    // DTREE-CUT2 (LLAMA_DTREE_DEVICE_ACCEPT=1, default off): read the per-row device argmax (result_argmax, ggml_argmax =
+    // first maximum, the same tie rule as std::max_element below) instead of the row's full-vocab logits. Under the
+    // C17 lazy logits download (LLAMA_DEVICE_ACCEPT default on) this keeps the tree verify from flushing W x n_vocab
+    // floats D2H: only W int32 ids cross. Any row without a device pick falls back to the host scan for that row.
+    static const bool dev = [] {
+        const char * e = getenv("LLAMA_DTREE_DEVICE_ACCEPT");
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) {
+            fprintf(stderr, "llama_dtree_device_accept: ENABLED (LLAMA_DTREE_DEVICE_ACCEPT=1; tree accept reads device argmax rows)\n");
+        }
+        return on;
+    }();
+
     int32_t n = 0;
     for (size_t i = 0; i < draft.size() && i < rows.size(); ++i) {
+        if (dev) {
+            const llama_token dam = llama_get_argmax_ith(ctx, rows[i]);
+            if (dam != LLAMA_TOKEN_NULL) {
+                if (dam != draft[i]) {
+                    break;
+                }
+                ++n;
+                continue;
+            }
+        }
         const float * l = llama_get_logits_ith(ctx, rows[i]);
         if (l == nullptr) {
             break;
