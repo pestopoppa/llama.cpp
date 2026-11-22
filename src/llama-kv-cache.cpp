@@ -1951,6 +1951,48 @@ void llama_kv_cache::set_input_kq_mask_tree(ggml_tensor * dst, const llama_ubatc
         return false;
     };
 
+    static const bool mcache = [] {
+        const char * e = getenv("LLAMA_DTREE_MASK_CACHE");
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) {
+            LLAMA_LOG_INFO("%s: LLAMA_DTREE_MASK_CACHE=1 (tree topology cache across rounds)\n", __func__);
+        }
+        return on;
+    }();
+
+    const uint32_t n_tok = ubatch->n_tokens;
+    bool hit = false;
+    if (mcache) {
+        hit = dtree_mc_nstream == n_stream && dtree_mc_parent.size() == n_tok &&
+              std::equal(dtree_mc_parent.begin(), dtree_mc_parent.end(), ubatch->parent);
+        for (uint32_t i = 0; hit && i < n_tok; ++i) {
+            hit = dtree_mc_seq[i] == ubatch->seq_id[i][0];
+        }
+        if (!hit) {
+            dtree_mc_parent.assign(ubatch->parent, ubatch->parent + n_tok);
+            dtree_mc_seq.resize(n_tok);
+            for (uint32_t i = 0; i < n_tok; ++i) {
+                dtree_mc_seq[i] = ubatch->seq_id[i][0];
+            }
+            dtree_mc_nstream = n_stream;
+            dtree_mc_keep.assign((size_t) n_tok*n_tps, 0);
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                for (uint32_t ii = 0; ii < n_tps; ++ii) {
+                    const uint32_t i = s*n_tps + ii;
+                    for (uint32_t jj = 0; jj < n_tps; ++jj) {
+                        dtree_mc_keep[(size_t) i*n_tps + jj] = is_anc((int32_t) (s*n_tps + jj), (int32_t) i) ? 1 : 0;
+                    }
+                }
+            }
+            dtree_mc_miss++;
+        } else {
+            dtree_mc_hits++;
+        }
+        if (((dtree_mc_hits + dtree_mc_miss) & 1023) == 1) {
+            LLAMA_LOG_DEBUG("%s: dtree mask cache hits=%lld miss=%lld\n", __func__, (long long) dtree_mc_hits, (long long) dtree_mc_miss);
+        }
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1964,7 +2006,7 @@ void llama_kv_cache::set_input_kq_mask_tree(ggml_tensor * dst, const llama_ubatc
                 if (j >= n_kv) {
                     continue;
                 }
-                const bool keep = is_anc((int32_t) a, (int32_t) i);
+                const bool keep = mcache ? dtree_mc_keep[(size_t) i*n_tps + jj] != 0 : is_anc((int32_t) a, (int32_t) i);
                 if (dst->type == GGML_TYPE_F16) {
                     ((ggml_fp16_t *) dst->data)[n_kv*i + j] = ggml_fp32_to_fp16(keep ? 0.0f : -INFINITY);
                 } else {

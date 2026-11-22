@@ -319,6 +319,16 @@ public:
 
 private:
     mutable int32_t fa_rows_key = 0; // UP-FAROWS-HIP C13: see get_fa_rows_key
+
+    // DTREE-CUT3 (LLAMA_DTREE_MASK_CACHE=1): tree topology cache for set_input_kq_mask_tree. Key = the ubatch's
+    // (parent, seq) arrays and the stream split; value = the ancestor-or-self matrix over ubatch rows. A round whose
+    // tree shape is unchanged skips the O(W^2 * depth) ancestor walk and only re-scatters into the new KV slots.
+    mutable std::vector<int32_t> dtree_mc_parent;
+    mutable std::vector<int32_t> dtree_mc_seq;
+    mutable uint32_t             dtree_mc_nstream = 0;
+    mutable std::vector<uint8_t> dtree_mc_keep;
+    mutable int64_t              dtree_mc_hits = 0;
+    mutable int64_t              dtree_mc_miss = 0;
     // [AK-DTREE-2] cells (stream, idx) of the last tree ubatch per seq, in tree column order
     std::unordered_map<llama_seq_id, std::vector<std::pair<uint32_t, uint32_t>>> tree_cells;
 
