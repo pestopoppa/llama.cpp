@@ -418,6 +418,15 @@ public:
     mutable std::vector<ctl_pend_t> ctl_pend;
     mutable int64_t ctl_out_base = 0; // pre-reorder output row of the first token of the ubatch being built
     mutable int64_t ctl_predicts = 0;
+    // [GPU-RESIDENT-ROUND-2f phase 3.2] LLAMA_DEVICE_VTOK=<T>: verify-token buffer F32 [T + 1, n_stream] the target's
+    // verify graph reads its token input from (the drafter writes d1..d(T-1), the verify graph the next bonus token);
+    // vtok_host mirrors it (NaN = unknown), the host writes a stream's T tokens only when the ubatch disagrees
+    ggml_tensor * vtok = nullptr;
+    int32_t       vtok_T = 0;
+    mutable std::vector<float> vtok_host;
+    mutable int64_t vtok_hits = 0, vtok_writes = 0, vtok_bonus_predicts = 0, vtok_mirror_sets = 0;
+    // the drafter graph wrote token tok to col i (1..T-1) of stream s
+    void vtok_mirror_set(int32_t s, int32_t i, int32_t tok) const;
     bool ctl_any_pending() const;
     // am(row) = device argmax of a pre-reorder output row of the previous decode (< 0 = unavailable)
     void ctl_resolve(const std::function<int32_t(int64_t)> & am) const;
@@ -544,6 +553,11 @@ public:
     // [GPU-RESIDENT-ROUND-2f phase 2.2] the ubatch's streams as a contiguous ascending range [s0, s0+n) of the
     // device control block (nullptr when disabled or not contiguous)
     ggml_tensor * ctl_range(const llama_ubatch & ubatch, int64_t & s0, int64_t & n) const;
+    // [GPU-RESIDENT-ROUND-2f phase 3.2] the verify-token buffer when this ubatch is n streams x T tokens of seq ids
+    // s0..s0+n-1 on the control-block path (nullptr otherwise); vtok_sync writes the streams whose mirror disagrees
+    ggml_tensor * vtok_range(const llama_ubatch & ubatch, int64_t & s0, int64_t & n) const;
+    int64_t       vtok_T() const;
+    void          vtok_sync(const llama_ubatch & ubatch, int64_t s0, bool bonus) const;
     // writes the control-block elements whose mirror disagrees with the ubatch, then advances the mirror by n_tps
     // accept = the graph advances by the device accept count: the mirror becomes pending (resolved by a 4-byte read)
     // mode: 0 = graph has no write-back (build_sampling not run), 1 = advances by n_tps, 2 = by the device accept count

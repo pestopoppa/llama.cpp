@@ -4684,6 +4684,27 @@ bool llama_dflash_feed_enabled(const llama_context * ctx) {
     return ctx->dflash_feed_enabled();
 }
 
+ggml_tensor * llama_get_vtok_device(llama_context * ctx, int32_t * T) {
+    llama_kv_cache * kv = ctx->get_ctl_kv();
+    if (!kv || !kv->vtok) {
+        return nullptr;
+    }
+    if (T) {
+        *T = kv->vtok_T;
+    }
+    return kv->vtok;
+}
+
+void llama_set_draft_vtok(llama_context * ctx, ggml_tensor * dst, int32_t T) {
+    ctx->set_draft_vtok(dst, T);
+}
+
+void llama_vtok_mirror_set(llama_context * ctx, llama_seq_id seq_id, int32_t i, llama_token tok) {
+    if (llama_kv_cache * kv = ctx->get_ctl_kv()) {
+        kv->vtok_mirror_set(seq_id, i, tok);
+    }
+}
+
 void llama_set_dflash_select(llama_context * ctx, const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
     ctx->set_dflash_select(inv_temp, n_blocks, noise, n_noise);
 }

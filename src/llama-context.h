@@ -356,6 +356,11 @@ public:
         dgather_inputs.rows.assign(rows, rows + (rows ? n_rows : 0));
         cparams.dgather = dgather_inputs.feats.empty() ? nullptr : &dgather_inputs;
     }
+    llama_kv_cache * get_ctl_kv() const { return ctl_kv(); }
+    void set_draft_vtok(ggml_tensor * dst, int32_t T) {
+        dsel_inputs.vtok_dst = dst;
+        dsel_inputs.vtok_T   = dst ? T : 0;
+    }
     void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
         dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
         dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));

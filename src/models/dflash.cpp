@@ -49,15 +49,30 @@ public:
         }
         ggml_backend_tensor_set(inv_temp, it.data(), 0, ggml_nbytes(inv_temp));
         ggml_backend_tensor_set(noise,    nz.data(), 0, ggml_nbytes(noise));
+        if (vidx && vidx->buffer) {
+            // [GPU-RESIDENT-ROUND-2f phase 3.2] block row i of seq s -> col i (1..T-1) of the target's verify-token
+            // buffer row s; row 0 and rows past T-1 go to the scratch col T
+            const int64_t T = vT, ld = vT + 1, n_rows = vidx->ne[0];
+            std::vector<int32_t> ix(n_rows);
+            for (int64_t r = 0; r < n_rows; ++r) {
+                const int64_t s = ubatch->seq_id[r][0];
+                const int64_t i = r % block;
+                ix[r] = (int32_t) (s >= 0 && s < vns ? s*ld + ((i >= 1 && i < T) ? i : T) : T);
+            }
+            ggml_backend_tensor_set(vidx, ix.data(), 0, ggml_nbytes(vidx));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
         const int64_t nb = params.ubatch.n_seqs_unq;
-        return inv_temp->ne[1] == nb && noise->ne[2] == nb && (int64_t) params.ubatch.n_tokens == nb*block;
+        return inv_temp->ne[1] == nb && noise->ne[2] == nb && (int64_t) params.ubatch.n_tokens == nb*block &&
+               (src && src->vtok_dst && src->vtok_T == block) == (vidx != nullptr);
     }
 
     ggml_tensor * inv_temp = nullptr; // F32 [1, n_blocks]
     ggml_tensor * noise    = nullptr; // F32 [top_k, block, n_blocks]
+    ggml_tensor * vidx     = nullptr; // I32 [n_rows] phase 3.2 set_rows targets in the verify-token buffer
+    int64_t vT = 0, vns = 0;
     const llama_dsel_inputs * src;
     int64_t top_k;
     int64_t block;
@@ -1495,6 +1510,27 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
 
         ggml_tensor * out = llama_build_dflash_dsel(ctx0, packed, inp->inv_temp, inp->noise, top_k, block_size, n_blocks);
         cb(out, "dflash2_dsel", -1);
+        // [GPU-RESIDENT-ROUND-2f phase 3.2] write the selected tokens (col 0 of each row) into the target context's
+        // verify-token buffer, so the target's verify batch needs no tokens H2D
+        if (cparams.dsel->vtok_dst && cparams.dsel->vtok_T == block_size && ggml_is_contiguous(out)) {
+            ggml_tensor * dst = cparams.dsel->vtok_dst;
+            const int64_t W = out->ne[0], n_rows = ggml_nelements(out) / W;
+            inp->vT  = block_size;
+            inp->vns = dst->ne[1];
+            inp->vidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+            ggml_set_input(inp->vidx);
+            ggml_set_name(inp->vidx, "dflash2_vtok_idx");
+            ggml_tensor * col = ggml_cont(ctx0, ggml_view_2d(ctx0, out, 1, n_rows, W*ggml_element_size(out), 0));
+            ggml_tensor * wv  = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, dst, 1, ggml_nelements(dst)), col, inp->vidx);
+            ggml_set_name(wv, "dflash2_vtok_wb");
+            ggml_build_forward_expand(gf, wv);
+            static bool logged_vtok = false;
+            if (!logged_vtok) {
+                logged_vtok = true;
+                fprintf(stderr, "%s: LLAMA_DEVICE_VTOK: drafter writes the verify tokens to the target device buffer ENABLED (T=%lld)\n",
+                        __func__, (long long) block_size);
+            }
+        }
         res->add_input(std::move(inp));
         res->t_h_nextn = out;
         ggml_build_forward_expand(gf, out);

@@ -98,4 +98,7 @@ struct llama_dgather_inputs {
 struct llama_dsel_inputs {
     std::vector<float> inv_temp;
     std::vector<float> noise;
+    // [GPU-RESIDENT-ROUND-2f phase 3.2] the target context's verify-token buffer F32 [T + 1, n_stream] (nullptr = off)
+    struct ggml_tensor * vtok_dst = nullptr;
+    int64_t              vtok_T   = 0;
 };

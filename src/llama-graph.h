@@ -142,6 +142,13 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    // [GPU-RESIDENT-ROUND-2f phase 3.2] tokens read from the KV cache's verify-token buffer (LLAMA_DEVICE_VTOK) from
+    // stream vtok_s0 (-1 = host input); vtok_bonus = this graph writes the next bonus token to col 0
+    int64_t                        vtok_s0    = -1;
+    bool                           vtok_bonus = false;
+    ggml_tensor *                  vtok_t     = nullptr;
+    const llama_kv_cache_context * vtok_kv    = nullptr;
+
     const int64_t n_embd = 0;
 };
 
@@ -1020,6 +1027,8 @@ public:
     std::vector<llm_graph_input_attn_kv *> ctl_inps;
     // phase 3.1: positions [n_tps, n_g] read from the control block by the positions input (nullptr = host input)
     ggml_tensor * ctl_pos_q = nullptr;
+    // phase 3.2: the token input that reads the verify-token buffer (nullptr = host tokens)
+    llm_graph_input_embd * vtok_inp = nullptr;
     // AK-GAP-1-STOCH-ACCEPT: per-output-row top-K candidates of t_logits (GGML_HIP_DEVICE_ACCEPT_STOCH=K), ids I32 [K, n_outputs], logits F32 [1, K, n_outputs]
     ggml_tensor * t_topk_ids    = nullptr;
     ggml_tensor * t_topk_vals   = nullptr;

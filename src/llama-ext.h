@@ -186,6 +186,15 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // the batch embd rows
 LLAMA_API bool llama_dflash_feed_enabled(const struct llama_context * ctx);
 
+// [GPU-RESIDENT-ROUND-2f phase 3.2] LLAMA_DEVICE_VTOK=<T> (default off; with LLAMA_DEVICE_CTL + LLAMA_DEVICE_CTL_POS):
+// target context: the persistent verify-token buffer F32 [T + 1, n_stream] its verify graphs read tokens from (nullptr
+// when absent). Drafter context (device lattice): llama_set_draft_vtok makes each draft decode write the selected
+// tokens d1..d(T-1) of seq s into row s; the caller reports them with llama_vtok_mirror_set on the target context so
+// the target writes a verify batch's tokens only when they differ from the buffer.
+LLAMA_API struct ggml_tensor * llama_get_vtok_device(struct llama_context * ctx, int32_t * T);
+LLAMA_API void llama_set_draft_vtok(struct llama_context * ctx, struct ggml_tensor * dst, int32_t T);
+LLAMA_API void llama_vtok_mirror_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t i, llama_token tok);
+
 // [GPU-RESIDENT-ROUND-2e] device target->drafter feature gather (LLAMA_DEVICE_DFLASH_GATHER=1 in common/speculative).
 // Target context: keep the extracted layer inputs (llama_set_embeddings_layer_inp) as device tensors [n_embd, n_batch]
 // instead of downloading them; returns false when no device backend exists. llama_get_embeddings_layer_inp is then

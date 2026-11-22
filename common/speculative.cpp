@@ -1344,6 +1344,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [GPU-RESIDENT-ROUND-2d] LLAMA_DEVICE_LATTICE=1: the drafter selects the path on the device (Gumbel-max with
     // host Philox noise); the host reads compact [token | ids | probs] rows instead of the lattice
     bool dev_lattice = false;
+    bool dev_vtok    = false; // phase 3.2
     bool dev_gather  = false; // [GPU-RESIDENT-ROUND-2e] LLAMA_DEVICE_DFLASH_GATHER=1 (needs the device feed)
     bool dev_gather_init = false;
     std::vector<ggml_tensor *> gather_feats;
@@ -1519,6 +1520,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             const char * e = getenv("LLAMA_DEVICE_LATTICE");
             dev_lattice = e != nullptr && strcmp(e, "1") == 0;
+        }
+        // [GPU-RESIDENT-ROUND-2f phase 3.2] the drafter writes the selected tokens into the target's verify-token buffer
+        if (dev_lattice && is_dflash2 && ctx_dft && this->params.ctx_tgt) {
+            int32_t T = 0;
+            ggml_tensor * vt = llama_get_vtok_device(this->params.ctx_tgt, &T);
+            if (vt && T == this->params.n_max + 1) {
+                llama_set_draft_vtok(ctx_dft, vt, T);
+                dev_vtok = true;
+                LOG_INF("%s: LLAMA_DEVICE_VTOK: drafter feeds the target verify-token buffer (T=%d)\n", __func__, T);
+            }
         }
         selector_reset.assign(n_seq, true);
 
@@ -1929,6 +1940,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = sel + (size_t) (beg + i) * W;
                     result.push_back((llama_token) row[0]);
+                    if (dev_vtok) {
+                        llama_vtok_mirror_set(params.ctx_tgt, seq_id, i, (llama_token) row[0]); // the graph wrote it
+                    }
                     if (dp.temperature > 0.0f) {
                         common_speculative_token_dist dist;
                         dist.ids.resize(selector_top_k);

@@ -31,6 +31,9 @@
 #include <string>
 #include <unordered_set>
 
+// [GPU-RESIDENT-ROUND-2f phase 3.1/3.2] the KV cache context of the attention memory (plain or hybrid), or nullptr
+static const llama_kv_cache_context * llama_ctl_kv_ctx_any(const llama_memory_context_i * mctx);
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -74,7 +77,9 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (vtok_s0 >= 0) {
+        vtok_kv->vtok_sync(*ubatch, vtok_s0, vtok_bonus); // writes only the streams whose mirror disagrees
+    } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -94,6 +99,19 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+
+    // [phase 3.2] the verify-token buffer decision and stream range must match a fresh build
+    {
+        const auto * kvc = llama_ctl_kv_ctx_any(params.mctx);
+        int64_t s0 = -1, n = 0;
+        if (kvc) {
+            kvc->vtok_range(params.ubatch, s0, n);
+        }
+        res &= s0 == vtok_s0;
+        if (res && vtok_s0 >= 0) {
+            vtok_kv = kvc;
+        }
+    }
 
     return res;
 }
@@ -190,6 +208,10 @@ static bool llama_pos_dev_eligible(const llama_ubatch & ub, uint32_t n_pos_per_e
 
 // [GPU-RESIDENT-ROUND-2f phase 3.1] the KV cache context of the attention memory (plain or hybrid), or nullptr
 static const llama_kv_cache_context * llama_ctl_kv_ctx(const llama_memory_context_i * mctx) {
+    return llama_ctl_kv_ctx_any(mctx);
+}
+
+static const llama_kv_cache_context * llama_ctl_kv_ctx_any(const llama_memory_context_i * mctx) {
     if (auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
         return k;
     }
@@ -1862,6 +1884,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     ctl_inps.clear();
     ctl_pos_q     = nullptr;
+    vtok_inp      = nullptr;
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -3066,9 +3089,30 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-    cb(inp->tokens, "inp_tokens", -1);
-    ggml_set_input(inp->tokens);
+    // [GPU-RESIDENT-ROUND-2f phase 3.2] verify batch: tokens from the persistent verify-token buffer (no tokens H2D
+    // when the drafter and the previous verify graph already wrote them)
+    int64_t vs0 = -1, vn = 0;
+    const llama_kv_cache_context * vkv = ubatch.token ? llama_ctl_kv_ctx_any(mctx) : nullptr;
+    ggml_tensor * vt = vkv ? vkv->vtok_range(ubatch, vs0, vn) : nullptr;
+    if (vt) {
+        const int64_t T = vkv->vtok_T();
+        ggml_tensor * v = ggml_cont(ctx0, ggml_view_2d(ctx0, vt, T, vn, vt->nb[1], vs0*vt->nb[1]));
+        inp->tokens  = ggml_cast(ctx0, ggml_reshape_1d(ctx0, v, ubatch.n_tokens), GGML_TYPE_I32);
+        cb(inp->tokens, "inp_tokens_vtok", -1);
+        inp->vtok_s0 = vs0;
+        inp->vtok_t  = vt;
+        inp->vtok_kv = vkv;
+        res->vtok_inp = inp.get();
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "llm_graph: LLAMA_DEVICE_VTOK: verify tokens from the device token buffer ENABLED (T=%lld)\n", (long long) T);
+        }
+    } else {
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        cb(inp->tokens, "inp_tokens", -1);
+        ggml_set_input(inp->tokens);
+    }
     res->t_inp_tokens = inp->tokens;
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
@@ -4853,6 +4897,20 @@ static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_
             ggml_tensor * q0  = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], 0));
             nv = ggml_add(ctx0, ggml_scale_bias(ctx0, acc, 1.0f, 1.0f), q0);                                       // p0 + n_acc + 1
             inp->dctl_accept = true;
+            auto * vi = res->vtok_inp;
+            if (vi && vi->vtok_s0 == inp->dctl_s0 && vi->vtok_t->ne[0] - 1 == n_tps) {
+                // [phase 3.2] bonus token argmax[n_acc] -> col 0 of the verify-token buffer (ordered after the token
+                // read: it depends on the logits)
+                ggml_tensor * ar = ggml_arange(ctx0, 0.0f, (float) n_tps, 1.0f);
+                ar = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, ar, n_tps, 1), am);                                    // [n_tps, n_str]
+                ggml_tensor * oh = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, ar, acc)), -1.0f, 0.5f));
+                ggml_tensor * bonus = ggml_sum_rows(ctx0, ggml_mul(ctx0, am, oh));                                   // [1, n_str]
+                ggml_tensor * dstv = ggml_view_2d(ctx0, vi->vtok_t, 1, n_str, vi->vtok_t->nb[1], vi->vtok_s0*vi->vtok_t->nb[1]);
+                ggml_tensor * wb = ggml_cpy(ctx0, bonus, dstv);
+                ggml_set_name(wb, "vtok_bonus_wb");
+                ggml_build_forward_expand(gf, wb);
+                vi->vtok_bonus = true;
+            }
         } else {
             ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
             nv = ggml_scale_bias(ctx0, last, 1.0f, 1.0f);                                                          // p0 + n_tps
