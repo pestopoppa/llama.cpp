@@ -8,7 +8,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
-// AK-MMID-SPLIT16 (default off): GGML_CUDA_MMVQ_MOE_SPLIT16=1 extends the multi-token MUL_MAT_ID MMVQ MoE path
+// AK-MMID-SPLIT16 (C18: default ON, GGML_CUDA_MMVQ_MOE_SPLIT16=0 disables): the knob extends the multi-token MUL_MAT_ID MMVQ MoE path
 // from ne2 <= 8 to ne2 <= 16 by launching the unchanged 8-column MoE kernel once per <= 8 token chunk, instead of
 // falling through to MMQ_MMID (which also disables CUDA graphs). Only for types whose mmid cap is the full 8.
 #define MMVQ_MOE_SPLIT16_MAX_BATCH 16

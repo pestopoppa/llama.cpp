@@ -668,7 +668,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 bool ggml_cuda_mmvq_moe_split16_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_MOE_SPLIT16");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0; // C18: default ON (=0 disables)
     }();
     return on;
 }
