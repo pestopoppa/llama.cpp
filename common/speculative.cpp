@@ -1348,6 +1348,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool dev_draft_in = false; // phase 3.4c LLAMA_DEVICE_DRAFT_IN=1
     bool dev_gather  = false; // [GPU-RESIDENT-ROUND-2e] LLAMA_DEVICE_DFLASH_GATHER=1 (needs the device feed)
     bool dev_gather_init = false;
+    // [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1 counters
+    int64_t n_fixed_t = 0, n_fixed_t_masked = 0, n_fixed_t_fallback = 0;
+    static bool fixed_t_knob() {
+        static const bool on = [] { const char * e = getenv("LLAMA_DEVICE_DFLASH_FIXED_T"); return e && strcmp(e, "1") == 0; }();
+        return on;
+    }
     std::vector<ggml_tensor *> gather_feats;
     std::vector<int32_t>       gather_rows;
     bool dev_feed    = false; // [GPU-RESIDENT-ROUND-2c] LLAMA_DEVICE_DFLASH_FEED=1 (not for LiLiCorr / DSpark)
@@ -1591,6 +1597,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (fixed_t_knob()) {
+            fprintf(stderr, "dflash: LLAMA_DEVICE_DFLASH_FIXED_T: fixed_t=%lld masked=%lld fallback=%lld\n",
+                    (long long) n_fixed_t, (long long) n_fixed_t_masked, (long long) n_fixed_t_fallback);
+        }
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
         if (is_lilicorr) {
@@ -1666,6 +1676,77 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (s >= 0 && s < (llama_seq_id) n_seq) {
                 seq_rows[s].push_back(k);
             }
+        }
+
+        // [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1: when every active seq (contiguous ids s0..)
+        // brings the same R position-contiguous rows, ONE encode + ONE injection decode of R*n_act rows replace the
+        // per-seq loop: a fixed-shape pair independent of the accept count. On a verify batch (every row an output) the
+        // injection masks rows i >= n_acc + 1 on the device from the target's control block row 2.
+        if (dev_gather && dev_feed && fixed_t_knob()) {
+            llama_seq_id s0 = -1;
+            int32_t n_act = 0, R = 0;
+            bool ok = true, verify = true;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq && ok; ++s) {
+                if (seq_rows[s].empty()) {
+                    continue; // an active seq after a gap fails the contiguity check below
+                }
+                if (s0 < 0) {
+                    s0 = s;
+                    R  = (int32_t) seq_rows[s].size();
+                }
+                ok = s == s0 + n_act && (int32_t) seq_rows[s].size() == R;
+                for (int32_t i = 1; ok && i < R; ++i) {
+                    ok = batch_in.pos[seq_rows[s][i]] == batch_in.pos[seq_rows[s][0]] + i;
+                }
+                for (int32_t i = 0; ok && i < R; ++i) {
+                    verify = verify && batch_in.logits && batch_in.logits[seq_rows[s][i]];
+                }
+                n_act++;
+            }
+            ok = ok && n_act > 0 && R > 0 && n_act*R <= n_ubatch;
+            if (ok) {
+                const int32_t N = n_act*R;
+                const int32_t * dev_row = llama_get_layer_inp_device_rows(ctx_tgt);
+                GGML_ASSERT(dev_row && "device layer-input row map missing");
+                gather_rows.resize(N);
+                bool iota = true;
+                for (int32_t a = 0; a < n_act; ++a) {
+                    for (int32_t i = 0; i < R; ++i) {
+                        gather_rows[a*R + i] = dev_row[seq_rows[s0 + a][i]];
+                        iota = iota && gather_rows[a*R + i] == a*R + i;
+                    }
+                }
+                llama_set_dflash_gather(ctx_dft, gather_feats.data(), (int32_t) gather_feats.size(), gather_rows.data(), N);
+                llama_set_dflash_inject(ctx_dft, ctx_tgt, verify && R > 1, s0, R, n_act, iota);
+                features_buf.resize((size_t) N * n_embd_enc);
+                llama_batch enc_batch = { N, nullptr, features_buf.data(), nullptr, nullptr, nullptr, nullptr };
+                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                if (rc == 0) {
+                    batch_inject.n_tokens = N;
+                    for (int32_t a = 0; a < n_act; ++a) {
+                        for (int32_t i = 0; i < R; ++i) {
+                            const int32_t k = a*R + i;
+                            batch_inject.pos[k]       = batch_in.pos[seq_rows[s0 + a][i]];
+                            batch_inject.n_seq_id[k]  = 1;
+                            batch_inject.seq_id[k][0] = s0 + a;
+                            batch_inject.logits[k]    = false;
+                        }
+                    }
+                    rc = llama_decode(ctx_dft, batch_inject);
+                }
+                llama_set_dflash_inject(ctx_dft, nullptr, false, -1, 0, 0, false);
+                if (rc != 0) {
+                    LOG_ERR("%s: DFLASH_FIXED_T encode/decode failed rc=%d (N=%d)\n", __func__, rc, (int) N);
+                    return false;
+                }
+                llama_synchronize(ctx_dft);
+                n_fixed_t++;
+                if (verify && R > 1) {
+                    n_fixed_t_masked++;
+                }
+                return true;
+            }
+            n_fixed_t_fallback++;
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

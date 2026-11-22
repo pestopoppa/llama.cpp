@@ -4672,6 +4672,14 @@ void llama_set_dflash_gather(llama_context * ctx, ggml_tensor * const * feats, i
     ctx->set_dflash_gather(feats, n_feats, rows, n_rows);
 }
 
+void llama_set_dflash_inject(llama_context * ctx_dft, llama_context * ctx_tgt, bool mask, int32_t s0, int32_t R, int32_t n_str, bool rows_iota) {
+    const llama_kv_cache * kv = ctx_tgt ? ctx_tgt->get_ctl_kv() : nullptr;
+    if (kv && (!kv->ctl || kv->ctl->ne[0] < 3 || kv->ctl_hw_row == 2 || s0 < 0 || s0 + n_str > kv->ctl->ne[1])) {
+        kv = nullptr; // no n_acc + 1 row (needs LLAMA_DEVICE_RS_REP=1): inject unmasked
+    }
+    ctx_dft->set_dflash_inject(kv, mask, s0, R, n_str, rows_iota);
+}
+
 bool llama_dflash_feed_enabled(const llama_context * ctx) {
     return ctx->dflash_feed_enabled();
 }

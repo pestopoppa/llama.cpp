@@ -24,7 +24,9 @@ public:
     explicit llm_graph_input_dflash_feed(int64_t n) : n_tokens(n) {}
     void set_input(const llama_ubatch * ubatch) override { GGML_UNUSED(ubatch); }
     bool can_reuse(const llm_graph_params & params) override {
-        return params.ubatch.embd && !params.ubatch.token && (int64_t) params.ubatch.n_tokens == n_tokens;
+        const auto * d = params.cparams.dinj; // [phase 3.5] a fixed-T injection builds its own graph
+        return params.ubatch.embd && !params.ubatch.token && (int64_t) params.ubatch.n_tokens == n_tokens &&
+               !(d && d->R*d->n_str == n_tokens);
     }
     int64_t n_tokens;
 };
@@ -831,8 +833,48 @@ public:
     std::vector<ggml_tensor *> feats;
 };
 
+// [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1: marker input of a fixed-T encode / injection graph;
+// no upload, reusable while the descriptor (shape, mask, first stream) is unchanged
+class llm_graph_input_dinj : public llm_graph_input_i {
+public:
+    llm_graph_input_dinj(const llama_dinj_inputs & d, bool embd_only) : d(d), embd_only(embd_only) {}
+    void set_input(const llama_ubatch * ubatch) override { GGML_UNUSED(ubatch); }
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * c = params.cparams.dinj;
+        return c && c->R == d.R && c->n_str == d.n_str && c->s0 == d.s0 && c->mask == d.mask && c->tgt_kv == d.tgt_kv &&
+               c->rows_iota == d.rows_iota && (int64_t) params.ubatch.n_tokens == d.R*d.n_str &&
+               (!embd_only || (params.ubatch.embd && !params.ubatch.token));
+    }
+    llama_dinj_inputs d;
+    bool embd_only;
+};
+
+static bool llama_dinj_rows_iota(const llama_cparams & cparams, int64_t n_tokens) {
+    const auto * d = cparams.dinj;
+    return d && d->rows_iota && d->R*d->n_str == n_tokens && cparams.dgather && (int64_t) cparams.dgather->rows.size() == n_tokens;
+}
+
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
+    if (llama_dinj_rows_iota(cparams, n_tokens) && !cparams.dgather->feats.empty()) {
+        // [phase 3.5] the gather rows are 0..n_tokens-1: built on the device, nothing to upload
+        ggml_tensor * rows = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_tokens, 1.0f), GGML_TYPE_I32);
+        ggml_set_name(rows, "dflash_dinj_rows_iota");
+        ggml_tensor * cur = nullptr;
+        for (ggml_tensor * f : cparams.dgather->feats) {
+            ggml_tensor * g = ggml_get_rows(ctx0, f, rows);
+            cur = cur ? ggml_concat(ctx0, cur, g, 0) : g;
+        }
+        GGML_ASSERT(cur->ne[0] == (int64_t) hparams.n_embd_inp_enc());
+        cb(cur, "inp_embd", -1);
+        res->add_input(std::make_unique<llm_graph_input_dinj>(*cparams.dinj, false));
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "dflash: LLAMA_DEVICE_DFLASH_FIXED_T: device iota gather rows ENABLED (%lld rows)\n", (long long) n_tokens);
+        }
+        return cur;
+    }
     if (cparams.dgather && !cparams.dgather->feats.empty() && (int64_t) cparams.dgather->rows.size() == n_tokens) {
         auto inp = std::make_unique<llm_graph_input_dgather>(cparams.dgather, cparams.dgather->feats);
         inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1263,7 +1305,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (cparams.dflash_feed && n_tokens <= cparams.dflash_feed->ne[1] && n_embd == cparams.dflash_feed->ne[0]) {
             // [GPU-RESIDENT-ROUND-2c] the encoder left the fused features on the device; the batch embd rows are ignored
             inp_g = ggml_view_2d(ctx0, cparams.dflash_feed, n_embd, n_tokens, cparams.dflash_feed->nb[1], 0);
-            res->add_input(std::make_unique<llm_graph_input_dflash_feed>(n_tokens));
+            if (cparams.dinj && cparams.dinj->R*cparams.dinj->n_str == n_tokens) {
+                res->add_input(std::make_unique<llm_graph_input_dinj>(*cparams.dinj, true));
+            } else {
+                res->add_input(std::make_unique<llm_graph_input_dflash_feed>(n_tokens));
+            }
         } else {
             auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
@@ -1276,6 +1322,33 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(inp_g, "inp_g_embeddings", -1);
 
         const auto & model_df = static_cast<const llama_model_dflash &>(model);
+
+        // [GPU-RESIDENT-ROUND-2f phase 3.5] device row mask m[i, s] = (i < ctl[2][s]) from the target's control block
+        // (n_acc + 1 of the last verify): rejected verify rows inject zeros, valid rows are multiplied by exactly 1
+        ggml_tensor * dinj_m = nullptr;
+        if (const auto * d = cparams.dinj; d && d->mask && d->tgt_kv && d->tgt_kv->ctl && d->R*d->n_str == n_tokens &&
+                (int64_t) ubatch.n_seqs_unq == d->n_str) {
+            bool order_ok = true;
+            for (int64_t s = 0; s < d->n_str; ++s) {
+                order_ok = order_ok && ubatch.n_seq_id[s*d->R] == 1 && ubatch.seq_id[s*d->R][0] == (llama_seq_id) (d->s0 + s);
+            }
+            if (order_ok) {
+                ggml_tensor * ctl = d->tgt_kv->ctl;
+                ggml_tensor * a1  = ggml_cont(ctx0, ggml_view_2d(ctx0, ctl, 1, d->n_str, ctl->nb[1],
+                        d->s0*ctl->nb[1] + 2*ggml_element_size(ctl)));                                  // [1, n_str] n_acc + 1
+                ggml_tensor * iv  = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) d->R, 1.0f), d->R, 1); // [R, 1]
+                ggml_tensor * dif = ggml_sub(ctx0, ggml_repeat_4d(ctx0, a1, d->R, d->n_str, 1, 1), iv);  // a1 - i
+                dinj_m = ggml_step(ctx0, ggml_scale_bias(ctx0, dif, 1.0f, -0.5f));                      // 1 iff i < a1
+                dinj_m = ggml_reshape_3d(ctx0, dinj_m, 1, 1, n_tokens);
+                ggml_set_name(dinj_m, "dflash_dinj_row_mask");
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    fprintf(stderr, "dflash: LLAMA_DEVICE_DFLASH_FIXED_T: device inject row mask from ctl row 2 ENABLED (R=%lld, n_str=%lld)\n",
+                            (long long) d->R, (long long) d->n_str);
+                }
+            }
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -1298,6 +1371,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
+            if (dinj_m) {
+                Kcur = ggml_mul(ctx0, Kcur, dinj_m);
+                Vcur = ggml_mul(ctx0, Vcur, dinj_m);
+            }
             cb(Kcur, "Kcur_injected", il);
             cb(Vcur, "Vcur_injected", il);
 

@@ -212,6 +212,13 @@ LLAMA_API const int32_t *      llama_get_layer_inp_device_rows(struct llama_cont
 // (concatenated in order) instead of the batch embd rows; n_feats == 0 restores the batch path.
 LLAMA_API void llama_set_dflash_gather(struct llama_context * ctx, struct ggml_tensor * const * feats, int32_t n_feats,
                                        const int32_t * rows, int32_t n_rows);
+// [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1 (drafter context): the next llama_encode + embd-only
+// llama_decode are one fixed-shape block of R rows for each of n_str seqs s0..s0+n_str-1 (seq-major). rows_iota: the
+// gather rows are 0..R*n_str-1 and are built in the graph. mask: row i of seq s is injected only if i < row 2 of the
+// target's (ctx_tgt) device control block for stream s (n_acc + 1 of the last verify); other rows write zeros.
+// R == 0 clears it.
+LLAMA_API void llama_set_dflash_inject(struct llama_context * ctx_dft, struct llama_context * ctx_tgt, bool mask,
+                                       int32_t s0, int32_t R, int32_t n_str, bool rows_iota);
 
 LLAMA_API void llama_set_dflash_select(struct llama_context * ctx, const float * inv_temp, int32_t n_blocks,
                                        const float * noise, int32_t n_noise);

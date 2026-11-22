@@ -84,6 +84,22 @@ struct llama_cparams {
 
     // [GPU-RESIDENT-ROUND-2e] device target->drafter feature gather (owned by the drafter context)
     struct llama_dgather_inputs * dgather = nullptr;
+
+    // [GPU-RESIDENT-ROUND-2f phase 3.5] LLAMA_DEVICE_DFLASH_FIXED_T=1: fixed-T multi-seq encode / KV injection
+    struct llama_dinj_inputs * dinj = nullptr;
+};
+
+// [GPU-RESIDENT-ROUND-2f phase 3.5] one fixed-shape encode + KV injection of R rows for each of n_str seqs s0..s0+n_str-1.
+// rows_iota: the gather rows are 0..R*n_str-1 (built in the graph, no host upload). mask: the injected K/V of row i of
+// seq s are multiplied by (i < ctl[2][s]) read from the target's control block (n_acc + 1 written by its verify graph),
+// so rejected verify rows never land in the drafter cache (they are zero) and no host n_acc is needed
+struct llama_dinj_inputs {
+    const class llama_kv_cache * tgt_kv = nullptr;
+    int64_t s0    = -1;
+    int64_t R     = 0;
+    int64_t n_str = 0;
+    bool    mask      = false;
+    bool    rows_iota = false;
 };
 
 // [GPU-RESIDENT-ROUND-2d] per decode: inverse temperature per draft block (1 = greedy) and Gumbel noise

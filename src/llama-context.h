@@ -359,6 +359,12 @@ public:
         cparams.dgather = dgather_inputs.feats.empty() ? nullptr : &dgather_inputs;
     }
     llama_kv_cache * get_ctl_kv() const { return ctl_kv(); }
+    // [phase 3.5] fixed-T encode / injection descriptor (R == 0 clears it)
+    llama_dinj_inputs dinj_inputs;
+    void set_dflash_inject(const llama_kv_cache * tgt_kv, bool mask, int64_t s0, int64_t R, int64_t n_str, bool rows_iota) {
+        dinj_inputs = llama_dinj_inputs{ tgt_kv, s0, R, n_str, mask && tgt_kv != nullptr, rows_iota };
+        cparams.dinj = R > 0 ? &dinj_inputs : nullptr;
+    }
     void set_draft_vtok(ggml_tensor * dst, int32_t T) {
         dsel_inputs.vtok_dst = dst;
         dsel_inputs.vtok_T   = dst ? T : 0;
