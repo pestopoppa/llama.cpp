@@ -4462,6 +4462,32 @@ private:
             }
         }
 
+        if (kround_k <= 1) {
+            update_slots_round();
+            return;
+        }
+        // K-round replay: round 1 always runs; rounds 2..K only while every busy slot is in steady generation.
+        kround_wakes++;
+        kround_hold = true;
+        int r = 0;
+        for (; r < kround_k; ++r) {
+            if (r > 0 && !kround_steady()) {
+                break;
+            }
+            update_slots_round();
+            kround_rounds++;
+        }
+        if (r < kround_k) {
+            kround_early_exit++;
+        }
+        kround_drain();
+        if (r < kround_k || kround_wakes % 64 == 1) {
+            SRV_INF("kround: ENABLED K=%d wakes=%" PRId64 " rounds=%" PRId64 " early_exit=%" PRId64 " drained=%" PRId64 "\n",
+                    kround_k, kround_wakes, kround_rounds, kround_early_exit, kround_drained);
+        }
+    }
+
+    void update_slots_round() {
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
