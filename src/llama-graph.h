@@ -468,6 +468,7 @@ public:
     bool          dcpos_dev = false;      // phase 3.4a: dmask_cpos / dmask_csel are device-computed (ring formula)
     ggml_tensor * dcpos_hw_wb = nullptr;  // phase 3.4a: high-water write-back node (expanded in build_sampling)
     bool          dcpos_hw_on = false;    // the write-back is in the graph
+    bool          dctl_no_accept = false; // phase 3.6: always advance by n_tps (drafter caches: never an accept count)
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 
@@ -604,6 +605,10 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+
+    // [GPU-RESIDENT-ROUND-2f phase 3.6] LLAMA_DEVICE_DFT_KV=1: the SWA sub-cache's K/V write indices from its device
+    // control block (self_k_idxs_swa / self_v_idxs_swa are then device-computed; nullptr = host-written)
+    std::unique_ptr<llm_graph_input_attn_kv> swa_dev;
 };
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {

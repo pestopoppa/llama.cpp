@@ -203,6 +203,12 @@ static bool llama_kv_idx_dev_enabled() {
     return e != nullptr && strcmp(e, "1") == 0;
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.6] LLAMA_DEVICE_DFT_KV=1 (default off; with LLAMA_DEVICE_KV_IDX + LLAMA_DEVICE_CTL)
+static bool llama_dft_kv_dev_enabled() {
+    const char * e = getenv("LLAMA_DEVICE_DFT_KV");
+    return e != nullptr && strcmp(e, "1") == 0 && llama_kv_idx_dev_enabled();
+}
+
 // n_g groups of equal size, each position-contiguous; fills the first position of each group
 static bool llama_pos_runs(const llama_ubatch & ub, int64_t n_g, std::vector<float> * p0) {
     if (n_g <= 0 || ub.n_tokens % n_g != 0 || !ub.pos || ub.parent) {
@@ -1285,7 +1291,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
-    if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+    if (swa_dev) {
+        swa_dev->set_input_kv_idx_any(mctx->get_swa(), ubatch); // [phase 3.6] control-block mirror sync only
+    } else if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
         if (self_v_idxs_swa) {
             mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
@@ -1338,6 +1346,17 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    // [phase 3.6] the device-index decision must match the one this graph was built with
+    if (llama_dft_kv_dev_enabled()) {
+        if (swa_dev) {
+            res &= swa_dev->can_reuse_kv_idx_dev(mctx->get_swa(), params.ubatch);
+        } else {
+            std::vector<float> p0, base;
+            int64_t size = 0, s0 = -1, n = 0;
+            res &= !(mctx->get_swa()->kv_idx_dev_info(params.ubatch, p0, base, size) && mctx->get_swa()->ctl_range(params.ubatch, s0, n));
+        }
     }
 
     return res;
@@ -3784,26 +3803,9 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
-           ggml_context * ctx0,
-     const llama_ubatch & ubatch,
-    const llama_hparams & hparams,
-    const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur,
-    ggml_backend_sched_t sched) {
-
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
-
-    {
-        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
-
-        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
-
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
-    }
-
+// [GPU-RESIDENT-ROUND-2f phase 2] device K/V write indices; also used for the SWA sub-cache of an iSWA cache (phase 3.6)
+static void llama_build_kv_idx_dev(ggml_context * ctx0, const llama_ubatch & ubatch, const llama_kv_cache_context * mctx_cur,
+        llm_graph_input_attn_kv * inp) {
     // [GPU-RESIDENT-ROUND-2f phase 2] device K/V write indices (ring layout): idx = base + q - size*floor(q/size), q = p0 + i
     {
         std::vector<float> p0, base;
@@ -3856,6 +3858,30 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             }
         }
     }
+
+}
+
+static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+           ggml_context * ctx0,
+     const llama_ubatch & ubatch,
+    const llama_hparams & hparams,
+    const llama_cparams & cparams,
+    const llama_kv_cache_context * mctx_cur,
+    ggml_backend_sched_t sched) {
+
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+
+    {
+        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
+
+        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+    }
+
+    llama_build_kv_idx_dev(ctx0, ubatch, mctx_cur, inp.get());
 
     // [GPU-RESIDENT-ROUND-2a] LLAMA_DEVICE_KQ_MASK=1: build the mask on the device from per-cell / per-token positions
     if (llama_kq_mask_dev_enabled() && cparams.dca_chunk_size == 0 && mctx_cur->kq_mask_dev_eligible(ubatch, cparams.causal_attn)) {
@@ -4634,6 +4660,25 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
     }
 
+    // [GPU-RESIDENT-ROUND-2f phase 3.6] the SWA sub-cache on the control-block path: K/V write indices from its own
+    // device control block (row 0 = n_past), written back as p0 + n_tps; the host writes it only on a mirror mismatch
+    if (llama_dft_kv_dev_enabled()) {
+        auto sd = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur->get_swa());
+        llama_build_kv_idx_dev(ctx0, ubatch, mctx_cur->get_swa(), sd.get());
+        if (sd->dctl_wb) {
+            sd->dctl_no_accept = true;
+            inp->self_k_idxs_swa = sd->self_k_idxs;
+            inp->self_v_idxs_swa = sd->self_v_idxs;
+            res->ctl_inps.push_back(sd.get());
+            inp->swa_dev = std::move(sd);
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_DFT_KV: iSWA SWA-cache K/V indices from the device control block ENABLED\n");
+            }
+        }
+    }
+
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
 
@@ -5142,7 +5187,7 @@ static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_
         ggml_tensor * q    = inp->dctl_q;
         const int64_t n_tps = q->ne[0], n_str = q->ne[1];
         ggml_tensor * nv = nullptr;
-        if (res->t_argmax && res->t_inp_tokens && n_outputs == n_tokens && n_tps > 1 && n_tps*n_str == n_tokens) {
+        if (!inp->dctl_no_accept && res->t_argmax && res->t_inp_tokens && n_outputs == n_tokens && n_tps > 1 && n_tps*n_str == n_tokens) {
             ggml_tensor * am  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, res->t_argmax,     n_tps, n_str), GGML_TYPE_F32);
             ggml_tensor * tk  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, res->t_inp_tokens, n_tps, n_str), GGML_TYPE_F32);
             ggml_tensor * amv = ggml_view_2d(ctx0, am, n_tps - 1, n_str, am->nb[1], 0);
