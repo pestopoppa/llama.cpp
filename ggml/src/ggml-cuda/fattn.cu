@@ -1123,9 +1123,12 @@ static best_fattn_kernel ggml_cuda_fattn_rows_kernel(const int device, const ggm
     return BEST_FATTN_KERNEL_NONE;
 }
 
-// KPF-41 FAROWS-INPLACE knob (default OFF): see ggml_cuda_fattn_rows_gather_run.
+// KPF-41 FAROWS-INPLACE knob (C18: default ON, GGML_CUDA_FA_ROWS_INPLACE=0 disables): see ggml_cuda_fattn_rows_gather_run.
 static bool ggml_cuda_fattn_rows_inplace_enabled() {
-    static const bool v = ggml_cuda_fattn_rows_env_flag("GGML_CUDA_FA_ROWS_INPLACE");
+    static const bool v = [] {
+        const char * env = getenv("GGML_CUDA_FA_ROWS_INPLACE");
+        return env == nullptr || atoi(env) != 0;
+    }();
     return v;
 }
 
