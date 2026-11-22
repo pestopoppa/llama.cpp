@@ -427,6 +427,14 @@ public:
     mutable int64_t vtok_hits = 0, vtok_writes = 0, vtok_bonus_predicts = 0, vtok_mirror_sets = 0;
     // the drafter graph wrote token tok to col i (1..T-1) of stream s
     void vtok_mirror_set(int32_t s, int32_t i, int32_t tok) const;
+    // [GPU-RESIDENT-ROUND-2f phase 3.3] LLAMA_DEVICE_RS_REP=1: control-block row 2 = the recurrent replay count of the
+    // next ubatch (n_accepted + 1 after a device accept advance). rsrep_host mirrors it (NaN = unknown); the host
+    // writes a stream's element only when the memory's replay count disagrees
+    int32_t ctl_rows = 2;
+    mutable std::vector<float> rsrep_host;
+    mutable int64_t rsrep_hits = 0, rsrep_writes = 0, rsrep_predicts = 0;
+    // rep[s] = replay count of stream s0 + s for this ubatch
+    void rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const;
     bool ctl_any_pending() const;
     // am(row) = device argmax of a pre-reorder output row of the previous decode (< 0 = unavailable)
     void ctl_resolve(const std::function<int32_t(int64_t)> & am) const;
@@ -562,6 +570,8 @@ public:
     // accept = the graph advances by the device accept count: the mirror becomes pending (resolved by a 4-byte read)
     // mode: 0 = graph has no write-back (build_sampling not run), 1 = advances by n_tps, 2 = by the device accept count
     void ctl_sync(const llama_ubatch & ubatch, int mode) const;
+    // [phase 3.3] writes control-block row 2 (recurrent replay count) of the streams whose mirror disagrees
+    void rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const;
     void set_input_dca_sel   (ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t chunk_len) const;
 
     // UP-FAROWS-HIP: see llama_kv_cache::get_kv_rows

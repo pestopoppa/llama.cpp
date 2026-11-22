@@ -308,7 +308,9 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers[0].k->buffer);
         ggml_init_params params = { 2*ggml_tensor_overhead(), NULL, true };
         ggml_context * cctx = ggml_init(params);
-        ctl = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, 2, n_stream);
+        // [phase 3.3] LLAMA_DEVICE_RS_REP=1: row 2 = recurrent replay count
+        ctl_rows = llama_rs_rep_dev_enabled() ? 3 : 2;
+        ctl = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, ctl_rows, n_stream);
         ggml_format_name(ctl, "cache_%sctl", name_tag);
         // [GPU-RESIDENT-ROUND-2f phase 3.2] LLAMA_DEVICE_VTOK=<T>: persistent verify-token buffer F32 [T + 1, n_stream]
         // (cols 0..T-1 = the verify batch [bonus, d1..d(T-1)], col T = scratch for rows the drafter does not place)
@@ -322,15 +324,16 @@ llama_kv_cache::llama_kv_cache(
         if (!cbuf) {
             throw std::runtime_error("failed to allocate kv control block");
         }
-        std::vector<float> init(2*n_stream);
+        std::vector<float> init((size_t) ctl_rows*n_stream, 0.0f);
         ctl_host.assign(n_stream, -1.0f);
         ctl_pend.assign(n_stream, ctl_pend_t{});
+        rsrep_host.assign(n_stream, 0.0f);
         if (vtok) {
             vtok_host.assign((size_t) (vtok_T + 1)*n_stream, NAN); // unknown: the first verify batch writes it
         }
         for (uint32_t s = 0; s < n_stream; ++s) {
-            init[2*s + 0] = -1.0f;
-            init[2*s + 1] = (float) ((int64_t) s*kv_size);
+            init[ctl_rows*s + 0] = -1.0f;
+            init[ctl_rows*s + 1] = (float) ((int64_t) s*kv_size);
         }
         ggml_backend_tensor_set(ctl, init.data(), 0, ggml_nbytes(ctl));
         ctxs_bufs.emplace_back(ggml_context_ptr(cctx), cbuf);
@@ -417,6 +420,10 @@ llama_kv_cache::~llama_kv_cache() {
             fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_VTOK: token_hits=%lld token_writes=%lld bonus_predicts=%lld drafter_rows=%lld\n",
                     (long long) vtok_hits, (long long) vtok_writes, (long long) vtok_bonus_predicts, (long long) vtok_mirror_sets);
         }
+        if (ctl_rows > 2) {
+            fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_RS_REP: rs_device_hits=%lld rs_host_writes=%lld rs_predicts=%lld\n",
+                    (long long) rsrep_hits, (long long) rsrep_writes, (long long) rsrep_predicts);
+        }
     }
 }
 
@@ -432,12 +439,13 @@ void llama_kv_cache::clear(bool data) {
         }
         if (ctl) {
             // [GPU-RESIDENT-ROUND-2f phase 2.2] restore the stream bases; p0 mirror = 0 (cleared)
-            std::vector<float> init(2*n_stream);
+            std::vector<float> init((size_t) ctl_rows*n_stream, 0.0f);
             for (uint32_t s = 0; s < n_stream; ++s) {
-                init[2*s + 0] = 0.0f;
-                init[2*s + 1] = (float) ((int64_t) s*get_size());
+                init[ctl_rows*s + 0] = 0.0f;
+                init[ctl_rows*s + 1] = (float) ((int64_t) s*get_size());
                 ctl_host[s] = 0.0f;
                 ctl_pend[s].on = false;
+                rsrep_host[s] = 0.0f;
             }
             for (auto & v : vtok_host) {
                 v = NAN;
@@ -3922,6 +3930,25 @@ void llama_kv_cache_context::vtok_sync(const llama_ubatch & ubatch, int64_t s0, 
     }
 }
 
+void llama_kv_cache_context::rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const {
+    kv->rsrep_sync(s0, rep);
+}
+
+void llama_kv_cache::rsrep_sync(int64_t s0, const std::vector<int32_t> & rep) const {
+    GGML_ASSERT(ctl && ctl_rows > 2);
+    for (size_t s = 0; s < rep.size(); ++s) {
+        float & m = rsrep_host[s0 + s];
+        const float v = (float) rep[s];
+        if (m == v) { // NaN (unknown) never matches
+            rsrep_hits++;
+        } else {
+            ggml_backend_tensor_set(ctl, &v, (s0 + s)*ctl->nb[1] + 2*ggml_element_size(ctl), sizeof(float));
+            m = v;
+            rsrep_writes++;
+        }
+    }
+}
+
 bool llama_kv_cache::ctl_any_pending() const {
     for (const auto & pd : ctl_pend) {
         if (pd.on) {
@@ -3945,6 +3972,11 @@ void llama_kv_cache::ctl_resolve(const std::function<int32_t(int64_t)> & am) con
             a[i] = am(pd.row0 + i);
             ok = a[i] >= 0;
         }
+        if (!ok) {
+            if (ctl_rows > 2) {
+                rsrep_host[s] = NAN; // [phase 3.3] the graph wrote n_acc + 1 to row 2, unknown here
+            }
+        }
         if (!ok || !std::isnan(ctl_host[s])) {
             continue; // stays pending: the next ctl_sync reads it
         }
@@ -3952,6 +3984,11 @@ void llama_kv_cache::ctl_resolve(const std::function<int32_t(int64_t)> & am) con
         int64_t acc = 0;
         while (acc < n - 1 && a[acc] == pd.tok[acc + 1]) {
             acc++;
+        }
+        if (ctl_rows > 2) {
+            // [phase 3.3] the verify graph wrote the replay count n_acc + 1 to row 2
+            rsrep_host[s] = (float) (acc + 1);
+            rsrep_predicts++;
         }
         ctl_host[s] = pd.p0 + (float) (acc + 1);
         ctl_predicts++;

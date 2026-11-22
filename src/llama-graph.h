@@ -331,6 +331,11 @@ public:
     ggml_tensor * rep_cols_r = nullptr;
     ggml_tensor * rep_cols_p = nullptr;
 
+    // [GPU-RESIDENT-ROUND-2f phase 3.3] LLAMA_DEVICE_RS_REP=1: rep_n / rep_cols are computed from row 2 of the KV device
+    // control block for streams rep_s0..rep_s0+n_seqs-1 (-1 = host inputs); rep_kv = the attention KV context
+    int64_t rep_s0 = -1;
+    const llama_kv_cache_context * rep_kv = nullptr;
+
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
 
     const llama_memory_recurrent_context * mctx;

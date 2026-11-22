@@ -33,6 +33,7 @@
 
 // [GPU-RESIDENT-ROUND-2f phase 3.1/3.2] the KV cache context of the attention memory (plain or hybrid), or nullptr
 static const llama_kv_cache_context * llama_ctl_kv_ctx_any(const llama_memory_context_i * mctx);
+static int64_t llama_rs_rep_dev_s0(const llama_kv_cache_context * kv, const llama_ubatch & ub);
 
 // dedup helpers
 
@@ -535,6 +536,17 @@ void llm_graph_input_rs::set_input_rep(const llama_memory_recurrent_context * mc
 
     const int64_t n_seqs = ubatch->n_seqs;
 
+    if (rep_s0 >= 0) {
+        // [phase 3.3] device-fed: write control-block row 2 only for streams whose mirror disagrees
+        std::vector<int32_t> rep(n_seqs);
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            rep[s] = (int32_t) mctx->get_rs_rep(s);
+            GGML_ASSERT(rep[s] <= n_pend);
+        }
+        rep_kv->rsrep_sync(rep_s0, rep);
+        return;
+    }
+
     int32_t * reps = (int32_t *) rep_n->data;
     int32_t * cols = (int32_t *) rep_cols->data;
 
@@ -568,6 +580,15 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    if (has_rep) {
+        // [phase 3.3] the replay counts must come from the same place (control block streams or host inputs)
+        const llama_kv_cache_context * kv = llama_ctl_kv_ctx_any(params.mctx);
+        res &= llama_rs_rep_dev_s0(kv, params.ubatch) == rep_s0;
+        if (rep_s0 >= 0) {
+            rep_kv = kv;
+        }
+    }
 
     return res;
 }
@@ -1690,6 +1711,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    if (inp_rs->has_rep) {
+        // [phase 3.3] the replay counts must come from the same place (control block streams or host inputs)
+        res &= llama_rs_rep_dev_s0(mctx->get_attn(), params.ubatch) == inp_rs->rep_s0;
+        inp_rs->rep_kv = mctx->get_attn();
+    }
 
     return res;
 }
@@ -4552,12 +4579,35 @@ ggml_tensor * llm_graph_context::build_rs(
     return output_states;
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.3] first control-block stream when the recurrent replay counts of this ubatch can be
+// read from control-block row 2: LLAMA_DEVICE_RS_REP=1, the KV control block has the row, and the ubatch is n_seqs
+// equal sequences with seq id == stream s0 + s (the recurrent cells follow the ubatch sequence order); else -1
+static int64_t llama_rs_rep_dev_s0(const llama_kv_cache_context * kv, const llama_ubatch & ub) {
+    if (!kv || !llama_rs_rep_dev_enabled() || ub.n_seqs == 0 || ub.n_seq_tokens == 0 ||
+        (int64_t) ub.n_tokens != (int64_t) ub.n_seqs*ub.n_seq_tokens) {
+        return -1;
+    }
+    int64_t s0 = -1, n = 0;
+    ggml_tensor * ctl = kv->ctl_range(ub, s0, n);
+    if (!ctl || ctl->ne[0] < 3 || n != (int64_t) ub.n_seqs) {
+        return -1;
+    }
+    for (int64_t s = 0; s < n; ++s) {
+        const int64_t i = s*ub.n_seq_tokens;
+        if (ub.n_seq_id[i] != 1 || ub.seq_id[i][0] != (llama_seq_id) (s0 + s)) {
+            return -1;
+        }
+    }
+    return s0;
+}
+
 static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_memory_recurrent_context * mctx_cur) {
+    const llama_memory_recurrent_context * mctx_cur,
+    const llama_kv_cache_context * kv_ctl = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
@@ -4582,9 +4632,28 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->n_conv = std::max(n_conv_r, n_conv_p);
         inp->n_pend = cparams.n_rs_seq + 1;
 
-        inp->rep_cols = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_conv, n_seqs);
-        ggml_set_input(inp->rep_cols);
-        ggml_set_name(inp->rep_cols, "rs_rep_cols");
+        inp->rep_kv = kv_ctl;
+        inp->rep_s0 = llama_rs_rep_dev_s0(kv_ctl, ubatch);
+        ggml_tensor * rep_f = nullptr; // F32 [1, n_seqs] replay counts from the control block
+        if (inp->rep_s0 >= 0) {
+            int64_t s0 = -1, n = 0;
+            ggml_tensor * ctl = kv_ctl->ctl_range(ubatch, s0, n);
+            rep_f = ggml_cont(ctx0, ggml_view_2d(ctx0, ctl, 1, n_seqs, ctl->nb[1], s0*ctl->nb[1] + 2*ggml_element_size(ctl)));
+            // cols[c, s] = n_rep[s] + c
+            ggml_tensor * ar = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) inp->n_conv, 1.0f), inp->n_conv, 1);
+            ggml_tensor * cf = ggml_add(ctx0, ggml_repeat(ctx0, ar, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, inp->n_conv, n_seqs)), rep_f);
+            inp->rep_cols = ggml_cast(ctx0, cf, GGML_TYPE_I32);
+            ggml_set_name(inp->rep_cols, "rs_rep_cols_dev");
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_RS_REP: recurrent replay counts from the device control block ENABLED\n");
+            }
+        } else {
+            inp->rep_cols = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_conv, n_seqs);
+            ggml_set_input(inp->rep_cols);
+            ggml_set_name(inp->rep_cols, "rs_rep_cols");
+        }
 
         const auto win = [&](int64_t n) {
             return n == inp->n_conv ? inp->rep_cols : ggml_view_2d(ctx0, inp->rep_cols, n, n_seqs, inp->rep_cols->nb[1], 0);
@@ -4593,9 +4662,14 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->rep_cols_r = win(n_conv_r);
         inp->rep_cols_p = n_conv_p > 0 ? win(n_conv_p) : nullptr;
 
-        inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
-        ggml_set_input(inp->rep_n);
-        ggml_set_name(inp->rep_n, "rs_rep_n");
+        if (rep_f) {
+            inp->rep_n = ggml_cast(ctx0, ggml_reshape_1d(ctx0, rep_f, n_seqs), GGML_TYPE_I32);
+            ggml_set_name(inp->rep_n, "rs_rep_n_dev");
+        } else {
+            inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+            ggml_set_input(inp->rep_n);
+            ggml_set_name(inp->rep_n, "rs_rep_n");
+        }
     }
 
     return inp;
@@ -4666,7 +4740,7 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, hparams, cparams, mctx_cur->get_recr());
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, hparams, cparams, mctx_cur->get_recr(), mctx_cur->get_attn());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
     if (inp_attn->dctl_wb) {
         res->ctl_inps.push_back(inp_attn.get());
@@ -4897,6 +4971,15 @@ static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_
             ggml_tensor * q0  = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], 0));
             nv = ggml_add(ctx0, ggml_scale_bias(ctx0, acc, 1.0f, 1.0f), q0);                                       // p0 + n_acc + 1
             inp->dctl_accept = true;
+            ggml_tensor * ctl = dst->view_src;
+            if (ctl && ctl->ne[0] >= 3) {
+                // [phase 3.3] row 2 = n_acc + 1: the recurrent replay count of the next ubatch (GDN replay keeps the
+                // accepted verify tokens pending). Ordered after this graph's read of row 2: it depends on the logits
+                ggml_tensor * r2 = ggml_view_2d(ctx0, ctl, 1, n_str, ctl->nb[1], inp->dctl_s0*ctl->nb[1] + 2*ggml_element_size(ctl));
+                ggml_tensor * wr = ggml_cpy(ctx0, ggml_scale_bias(ctx0, acc, 1.0f, 1.0f), r2);
+                ggml_set_name(wr, "rs_rep_ctl_wb");
+                ggml_build_forward_expand(gf, wr);
+            }
             auto * vi = res->vtok_inp;
             if (vi && vi->vtok_s0 == inp->dctl_s0 && vi->vtok_t->ne[0] - 1 == n_tps) {
                 // [phase 3.2] bonus token argmax[n_acc] -> col 0 of the verify-token buffer (ordered after the token
