@@ -216,6 +216,13 @@ LLAMA_API void llama_set_dflash_gather(struct llama_context * ctx, struct ggml_t
 LLAMA_API void llama_set_dflash_select(struct llama_context * ctx, const float * inv_temp, int32_t n_blocks,
                                        const float * noise, int32_t n_noise);
 
+// [GPU-RESIDENT-ROUND-2f phase 3.4d] LLAMA_DEVICE_DSEL_RNG=1 (needs LLAMA_DEVICE_LATTICE=1 + LLAMA_DEVICE_DRAFT_IN=1):
+// the wanted Philox key / draft counter (< 0 = greedy) / inverse temperature of seq for its next draft; the drafter
+// generates the Gumbel noise on the device (bit-identical to common/philox.h) and advances the counter itself, so the
+// host uploads nothing in steady state. Returns false when the device path is off (the caller keeps host noise).
+LLAMA_API bool llama_dflash_dsel_rng_enabled(void);
+LLAMA_API bool llama_set_dflash_rng(struct llama_context * ctx, int32_t seq, uint64_t key, int64_t ctr, float inv_temp);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

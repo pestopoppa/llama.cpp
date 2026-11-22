@@ -1243,6 +1243,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "GATHER_ROWS_E4M3_E8M0",
+    "PHILOX_GUMBEL",
 
     "UNARY",
 
@@ -1260,7 +1261,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1361,6 +1362,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "gather_rows_e4m3_e8m0(table, ids)",
+    "philox_gumbel(key, ctr)",
 
     "unary(x)",
 
@@ -1378,7 +1380,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6889,6 +6891,32 @@ struct ggml_tensor * ggml_gather_rows_e4m3_e8m0(
     result->op     = GGML_OP_GATHER_ROWS_E4M3_E8M0;
     result->src[0] = table;
     result->src[1] = ids;
+
+    return result;
+}
+
+// ggml_philox_gumbel
+
+struct ggml_tensor * ggml_philox_gumbel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * key,
+        struct ggml_tensor  * ctr,
+        int64_t               ne0,
+        int64_t               ne1,
+        int32_t               skip) {
+    GGML_ASSERT(key->type == GGML_TYPE_I32);
+    GGML_ASSERT(ctr->type == GGML_TYPE_F32);
+    GGML_ASSERT(key->ne[0] == 2 && ggml_is_contiguous(key));
+    const int64_t n_b = key->ne[1];
+    GGML_ASSERT(ggml_nelements(ctr) == n_b);
+    GGML_ASSERT(skip >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, n_b);
+    ggml_set_op_params_i32(result, 0, skip);
+
+    result->op     = GGML_OP_PHILOX_GUMBEL;
+    result->src[0] = key;
+    result->src[1] = ctr;
 
     return result;
 }

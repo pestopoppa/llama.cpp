@@ -39,7 +39,7 @@ static bool llama_dsel_draft_in_knob() {
 
 static bool llama_dsel_greedy_dev(const llama_cparams & cparams, const llama_ubatch & ub) {
     GGML_UNUSED(ub);
-    if (!llama_dsel_draft_in_knob() || !cparams.dsel) {
+    if (!llama_dsel_draft_in_knob() || !cparams.dsel || cparams.dsel->rng_any_temp) {
         return false;
     }
     for (float v : cparams.dsel->inv_temp) {
@@ -75,9 +75,35 @@ static bool llama_dsel_vidx_dev(const llama_cparams & cparams, const llama_ubatc
     return true;
 }
 
+// [phase 3.4d] LLAMA_DEVICE_DSEL_RNG=1: block b is seq q0 + b and the device selection state exists
+static bool llama_dsel_rng_dev(const llama_cparams & cparams, const llama_ubatch & ub, int64_t block, int64_t * q0p = nullptr) {
+    if (!cparams.dsel || !cparams.dsel->rng_key || block < 1 || ub.n_tokens == 0 || ub.n_tokens % block != 0) {
+        return false;
+    }
+    const int64_t q0 = ub.seq_id[0][0], nb = ub.n_tokens / block;
+    if (q0 < 0 || q0 + nb > cparams.dsel->rng_key->ne[1]) {
+        return false;
+    }
+    for (uint32_t r = 0; r < ub.n_tokens; ++r) {
+        if (ub.seq_id[r][0] != (llama_seq_id) (q0 + r / block)) {
+            return false;
+        }
+    }
+    if (q0p) {
+        *q0p = q0;
+    }
+    return true;
+}
+
 static bool llama_dsel_vidx_reuse(const llama_cparams & cparams, const llama_ubatch & ub, bool dev, int64_t q0) {
     int64_t q = -1;
     const bool d = llama_dsel_vidx_dev(cparams, ub, &q);
+    return d == dev && (!d || q == q0);
+}
+
+static bool llama_dflash_rng_reuse(const llama_cparams & cparams, const llama_ubatch & ub, int64_t block, bool dev, int64_t q0) {
+    int64_t q = -1;
+    const bool d = llama_dsel_rng_dev(cparams, ub, block, &q);
     return d == dev && (!d || q == q0);
 }
 
@@ -87,10 +113,36 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
-        if (greedy_dev && (!vidx || vidx_dev)) {
+        if (rng_dev) {
+            // [phase 3.4d] write a seq's device state only when the wanted state differs from the predicted mirror,
+            // then predict the device advance of the counter (temp > 0 blocks only)
+            auto * d = const_cast<llama_dsel_inputs *>(src);
+            const int64_t nb = inv_temp->ne[1];
+            for (int64_t b = 0; b < nb; ++b) {
+                const int64_t s = rng_q0 + b;
+                const bool same = d->key_w[2*s] == d->key_m[2*s] && d->key_w[2*s+1] == d->key_m[2*s+1] &&
+                                  d->st_w[2*s] == d->st_m[2*s] && d->st_w[2*s+1] == d->st_m[2*s+1];
+                if (same) {
+                    d->rng_hits++;
+                } else {
+                    d->rng_writes++;
+                    ggml_backend_tensor_set(d->rng_key, &d->key_w[2*s], 2*s*sizeof(int32_t), 2*sizeof(int32_t));
+                    ggml_backend_tensor_set(d->rng_st,  &d->st_w[2*s],  2*s*sizeof(float),   2*sizeof(float));
+                    d->key_m[2*s] = d->key_w[2*s]; d->key_m[2*s+1] = d->key_w[2*s+1];
+                    d->st_m[2*s+1] = d->st_w[2*s+1];
+                }
+                d->st_m[2*s] = d->st_w[2*s] >= 0.0f ? d->st_w[2*s] + 1.0f : d->st_w[2*s];
+            }
+            static uint64_t n_log = 0;
+            if ((++n_log & (n_log - 1)) == 0) {
+                fprintf(stderr, "llama_dsel: LLAMA_DEVICE_DSEL_RNG hits %llu writes %llu\n",
+                        (unsigned long long) d->rng_hits, (unsigned long long) d->rng_writes);
+            }
+        }
+        if ((greedy_dev || rng_dev) && (!vidx || vidx_dev)) {
             return; // [phase 3.4c] greedy constants and the set_rows index are built in the graph
         }
-        if (!greedy_dev && !inv_temp->buffer) {
+        if (!greedy_dev && !rng_dev && !inv_temp->buffer) {
             return;
         }
         const int64_t nb = inv_temp->ne[1];
@@ -102,7 +154,7 @@ public:
         if (src && src->noise.size() == nz.size()) {
             nz = src->noise;
         }
-        if (!greedy_dev) {
+        if (!greedy_dev && !rng_dev) {
             ggml_backend_tensor_set(inv_temp, it.data(), 0, ggml_nbytes(inv_temp));
             ggml_backend_tensor_set(noise,    nz.data(), 0, ggml_nbytes(noise));
         }
@@ -125,9 +177,12 @@ public:
         return inv_temp->ne[1] == nb && noise->ne[2] == nb && (int64_t) params.ubatch.n_tokens == nb*block &&
                (src && src->vtok_dst && src->vtok_T == block) == (vidx != nullptr) &&
                llama_dsel_greedy_dev(params.cparams, params.ubatch) == greedy_dev &&
+               (greedy_dev || llama_dflash_rng_reuse(params.cparams, params.ubatch, block, rng_dev, rng_q0)) &&
                (vidx == nullptr || llama_dsel_vidx_reuse(params.cparams, params.ubatch, vidx_dev, vidx_q0));
     }
 
+    bool rng_dev    = false; // [phase 3.4d] noise from the device Philox op, inv_temp + counter from rng_st
+    int64_t rng_q0  = -1;
     bool greedy_dev = false; // [phase 3.4c] inv_temp = 1 and noise = 0 are graph constants (every block greedy)
     bool vidx_dev   = false; // [phase 3.4c] the vtok set_rows index is derived on the device (block s = seq q0 + s)
     int64_t vidx_q0 = -1;
@@ -1596,6 +1651,20 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
                 logged_g = true;
                 fprintf(stderr, "%s: LLAMA_DEVICE_DRAFT_IN: greedy draft selection inputs as graph constants ENABLED\n", __func__);
             }
+        } else if (llama_dsel_rng_dev(cparams, ubatch, tokens_per_block, &inp->rng_q0)) {
+            // [phase 3.4d] Philox-Gumbel noise on the device from the persistent per-seq key / counter
+            inp->rng_dev = true;
+            ggml_tensor * rk = cparams.dsel->rng_key, * rs = cparams.dsel->rng_st;
+            ggml_tensor * key = ggml_view_2d(ctx0, rk, 2, n_blocks, rk->nb[1], inp->rng_q0*rk->nb[1]);
+            ggml_tensor * ctr = ggml_view_2d(ctx0, rs, 1, n_blocks, rs->nb[1], inp->rng_q0*rs->nb[1]);
+            it_src = ggml_view_2d(ctx0, rs, 1, n_blocks, rs->nb[1], inp->rng_q0*rs->nb[1] + rs->nb[0]);
+            nz_src = ggml_philox_gumbel(ctx0, key, ctr, top_k, tokens_per_block, (int32_t) top_k);
+            ggml_set_name(nz_src, "dflash2_dsel_noise_dev");
+            static bool logged_r = false;
+            if (!logged_r) {
+                logged_r = true;
+                fprintf(stderr, "%s: LLAMA_DEVICE_DSEL_RNG: device Philox-Gumbel selection noise ENABLED\n", __func__);
+            }
         } else {
             ggml_set_input(inp->inv_temp);
             ggml_set_input(inp->noise);
@@ -1603,6 +1672,16 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
 
         ggml_tensor * out = llama_build_dflash_dsel(ctx0, packed, it_src, nz_src, top_k, block_size, n_blocks);
         cb(out, "dflash2_dsel", -1);
+        if (inp->rng_dev) {
+            // counter += 1 for temp > 0 blocks (ctr >= 0), after the selection has read it
+            ggml_build_forward_expand(gf, out);
+            ggml_tensor * rs  = cparams.dsel->rng_st;
+            ggml_tensor * ctr = ggml_view_2d(ctx0, rs, 1, n_blocks, rs->nb[1], inp->rng_q0*rs->nb[1]);
+            ggml_tensor * nc  = ggml_add(ctx0, ctr, ggml_step(ctx0, ggml_scale_bias(ctx0, ctr, 1.0f, 0.5f)));
+            ggml_tensor * wb  = ggml_cpy(ctx0, nc, ctr);
+            ggml_set_name(wb, "dflash2_rng_ctr_wb");
+            ggml_build_forward_expand(gf, wb);
+        }
         // [GPU-RESIDENT-ROUND-2f phase 3.2] write the selected tokens (col 0 of each row) into the target context's
         // verify-token buffer, so the target's verify batch needs no tokens H2D
         if (cparams.dsel->vtok_dst && cparams.dsel->vtok_T == block_size && ggml_is_contiguous(out)) {

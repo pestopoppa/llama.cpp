@@ -103,4 +103,14 @@ struct llama_dsel_inputs {
     int64_t              vtok_T   = 0;
     // [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the target context's KV cache (control block + mirrors)
     const class llama_kv_cache * tgt_kv = nullptr;
+    // [GPU-RESIDENT-ROUND-2f phase 3.4d] LLAMA_DEVICE_DSEL_RNG=1: persistent per-seq selection state on the drafter's
+    // device: rng_key I32 [2, n_seq] (Philox key lo/hi), rng_st F32 [2, n_seq] (draft counter, -1 = greedy; inv_temp).
+    // The Gumbel noise is generated in the graph (GGML_OP_PHILOX_GUMBEL) and the counter advances on the device;
+    // the host mirrors (*_m, predicted after every draft) are written only when the wanted state (*_w) disagrees.
+    struct ggml_tensor * rng_key = nullptr;
+    struct ggml_tensor * rng_st  = nullptr;
+    std::vector<int32_t> key_w, key_m;
+    std::vector<float>   st_w,  st_m;
+    bool     rng_any_temp = false;
+    uint64_t rng_hits = 0, rng_writes = 0;
 };

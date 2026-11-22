@@ -13780,3 +13780,25 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_philox_gumbel [GPU-RESIDENT-ROUND-2f]
+
+#include "../ggml-philox.h"
+
+void ggml_compute_forward_philox_gumbel(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * key = dst->src[0];
+    const ggml_tensor * ctr = dst->src[1];
+    const int32_t skip = ggml_get_op_params_i32(dst, 0);
+    const int64_t ne0 = dst->ne[0], ne1 = dst->ne[1], n_b = dst->ne[2];
+    const size_t  cs  = ctr->ne[0] == n_b ? ctr->nb[0] : ctr->nb[1];
+    const int64_t nr  = ne1*n_b;
+    for (int64_t r = params->ith; r < nr; r += params->nth) {
+        const int64_t i1 = r % ne1, b = r / ne1;
+        const int32_t * k = (const int32_t *) ((const char *) key->data + b*key->nb[1]);
+        const float     c = *(const float *) ((const char *) ctr->data + b*cs);
+        float * y = (float *) ((char *) dst->data + i1*dst->nb[1] + b*dst->nb[2]);
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            y[i0] = ggml_philox_gumbel_at((uint32_t) k[0], (uint32_t) k[1], c, i0 + i1*ne0, skip);
+        }
+    }
+}

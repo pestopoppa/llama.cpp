@@ -75,6 +75,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/philox-gumbel.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
@@ -2649,6 +2650,9 @@ static bool ggml_cuda_compute_forward_impl(ggml_backend_cuda_context & ctx, stru
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
+            break;
+        case GGML_OP_PHILOX_GUMBEL:
+            ggml_cuda_op_philox_gumbel(ctx, dst);
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
@@ -5598,6 +5602,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
+        case GGML_OP_PHILOX_GUMBEL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:

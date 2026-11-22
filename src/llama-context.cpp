@@ -4718,6 +4718,53 @@ void llama_vtok_mirror_set(llama_context * ctx, llama_seq_id seq_id, int32_t i, 
     }
 }
 
+bool llama_dflash_dsel_rng_enabled(void) {
+    static const bool on = [] {
+        const char * a = getenv("LLAMA_DEVICE_DSEL_RNG");
+        const char * b = getenv("LLAMA_DEVICE_DRAFT_IN");
+        return a && strcmp(a, "1") == 0 && b && strcmp(b, "1") == 0 && [] { const char * l = getenv("LLAMA_DEVICE_LATTICE"); return l && strcmp(l, "1") == 0; }();
+    }();
+    return on;
+}
+
+bool llama_context::set_dflash_rng(int32_t seq, uint64_t key, int64_t ctr, float inv_temp) {
+    if (!llama_dflash_dsel_rng_enabled() || model.arch != LLM_ARCH_DFLASH || !model.dflash_selector_hidden ||
+        seq < 0 || seq >= (int32_t) cparams.n_seq_max || ctr >= (1 << 24)) {
+        return false;
+    }
+    auto & d = dsel_inputs;
+    if (!d.rng_key) {
+        const uint32_t ns = cparams.n_seq_max;
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * c = ggml_init(ip);
+        d.rng_key = ggml_new_tensor_2d(c, GGML_TYPE_I32, 2, ns);
+        d.rng_st  = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2, ns);
+        ggml_set_name(d.rng_key, "dflash2_rng_key");
+        ggml_set_name(d.rng_st,  "dflash2_rng_st");
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model.dflash_selector_hidden->buffer);
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+        if (!b) {
+            ggml_free(c);
+            d.rng_key = d.rng_st = nullptr;
+            return false;
+        }
+        dsel_rng_ctx.reset(c);
+        dsel_rng_buf.reset(b);
+        d.key_w.assign(2*ns, 0); d.key_m.assign(2*ns, 0);
+        d.st_w.assign(2*ns, -1.0f); d.st_m.assign(2*ns, NAN); // unknown: first use writes
+        LLAMA_LOG_INFO("%s: LLAMA_DEVICE_DSEL_RNG: device Philox-Gumbel draft selection ENABLED (%u seqs, %s)\n", __func__, ns, ggml_backend_buft_name(buft));
+    }
+    d.key_w[2*seq]     = (int32_t) (uint32_t) key;
+    d.key_w[2*seq + 1] = (int32_t) (uint32_t) (key >> 32);
+    d.st_w[2*seq]      = ctr < 0 ? -1.0f : (float) ctr;
+    d.st_w[2*seq + 1]  = ctr < 0 ? 1.0f : inv_temp;
+    return true;
+}
+
+bool llama_set_dflash_rng(llama_context * ctx, int32_t seq, uint64_t key, int64_t ctr, float inv_temp) {
+    return ctx->set_dflash_rng(seq, key, ctr, inv_temp);
+}
+
 void llama_set_dflash_select(llama_context * ctx, const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
     ctx->set_dflash_select(inv_temp, n_blocks, noise, n_noise);
 }

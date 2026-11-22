@@ -331,6 +331,8 @@ private:
     llama_dsel_inputs dsel_inputs;
 
     // [GPU-RESIDENT-ROUND-2c] owner of cparams.dflash_feed
+    ggml_context_ptr          dsel_rng_ctx;  // [phase 3.4d] owner of dsel_inputs.rng_key / rng_st
+    ggml_backend_buffer_ptr   dsel_rng_buf;
     ggml_context_ptr          dflash_feed_ctx;
     ggml_backend_buffer_ptr   dflash_feed_buf;
 
@@ -367,7 +369,13 @@ public:
     void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
         dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
         dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));
+        dsel_inputs.rng_any_temp = false;
+        for (size_t s = 0; s < dsel_inputs.st_w.size(); s += 2) {
+            dsel_inputs.rng_any_temp |= dsel_inputs.st_w[s] >= 0.0f;
+        }
     }
+    // [phase 3.4d] wanted device selection state of seq (ctr < 0 = greedy); false when the device path is unavailable
+    bool set_dflash_rng(int32_t seq, uint64_t key, int64_t ctr, float inv_temp);
 private:
 
     // host buffers for output layer input embeddings, per layer

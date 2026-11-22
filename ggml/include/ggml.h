@@ -611,6 +611,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_GATHER_ROWS_E4M3_E8M0,
+        GGML_OP_PHILOX_GUMBEL,
 
         GGML_OP_UNARY,
 
@@ -2825,6 +2826,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * table,
             struct ggml_tensor  * ids);
+
+    // [GPU-RESIDENT-ROUND-2f] philox_gumbel: counter-based Gumbel noise, bit-identical to common/philox.h.
+    // key [2, n_b] I32 (lo, hi of the 64-bit Philox key), ctr [n_b] F32 (exact integer < 2^24; ctr < 0 -> zeros)
+    // -> F32 [ne0, ne1, n_b]. Flat index j = i0 + i1*ne0 within block b: j < skip -> 0, else with
+    // base = skip + 4*((j - skip)/4): gumbel(philox4x32_10(key_b, (ctr_hi = ctr_b, ctr_lo = base))[(j - skip) % 4]).
+    GGML_API struct ggml_tensor * ggml_philox_gumbel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * key,
+            struct ggml_tensor  * ctr,
+            int64_t               ne0,
+            int64_t               ne1,
+            int32_t               skip);
 
     // custom operators
 

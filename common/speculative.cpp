@@ -1854,11 +1854,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 dsel_ctr[s] = 0;
                 selector_reset[s] = false;
             }
+            // [GPU-RESIDENT-ROUND-2f phase 3.4d] LLAMA_DEVICE_DSEL_RNG=1: the drafter generates the same Philox-Gumbel
+            // noise on the device from (key, ctr) and advances ctr itself; only the wanted state is handed over
+            const bool rng_dev = llama_dflash_dsel_rng_enabled() &&
+                llama_set_dflash_rng(params.ctx_dft, s, dsel_key[s], dp.temperature > 0.0f ? (int64_t) dsel_ctr[s] : -1,
+                                     dp.temperature > 0.0f ? 1.0f / dp.temperature : 1.0f);
             if (dp.temperature <= 0.0f) {
                 continue;
             }
             dsel_inv_temp[b] = 1.0f / dp.temperature;
             const uint64_t ctr = dsel_ctr[s]++;
+            GGML_UNUSED(rng_dev); // the host stream is still produced: it is the fallback when the graph cannot take
+                                  // the device path (block/seq layout), and it costs no transfer when unused
             float * nz = dsel_noise.data() + (size_t) b * block * selector_top_k;
             for (int32_t j = selector_top_k; j < block * selector_top_k; j += 4) {
                 uint32_t r[4];
