@@ -6960,6 +6960,35 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// AK-MMID-MF: MUL_MAT_ID with SKEWED routing. Every token selects the same n_used experts (0..n_used-1, rotated per token),
+// so each active expert carries ALL n tokens: exercises the expert-grouped path's multi-column-tile case (n > 16 -> up to
+// 4 MFMA column tiles per expert, 64 at n=64) and the per-expert pair lists at their maximum length. vars() tags it skew=1.
+struct test_mul_mat_id_skew : public test_mul_mat_id {
+    test_mul_mat_id_skew(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",skew=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    // first n_used entries = experts 0..n_used-1 rotated by r; the rest = the remaining experts
+                    data[i] = i < n_used ? (int32_t) ((i + r) % n_used) : i;
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // [option R, cpu-int8-prefill-port-20261105] iqk Q8_0 prefill route witness.
 // A Q8_0 x F32 MUL_MAT / MUL_MAT_ID case that, besides the usual NMSE comparison against the CPU
 // reference (use_ref: the iqk hooks are skipped there), proves WHICH path the tested CPU backend
@@ -15011,6 +15040,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 4, false, 256, n, 512));
+        }
+    }
+    // AK-MMID-MF correctness + perf (opt-in): A3B routed-expert shapes (256 experts, top-8; gate/up m512 k2048, down m2048 k512)
+    // at n = 1..64 tokens, uniform routing (b=0 per-slot activations as in the perf cells, b=1 broadcast as gate/up serve),
+    // SKEWED routing (all tokens on the same 8 experts: 1..4 column tiles per expert) and the Q4_K expert control (falls
+    // through to the unchanged path). Run OFF and with GGML_HIP_MMID_MF=1 GGML_HIP_MMID_MF_CAP=64.
+    if (test_backend_ops_extra_case_set("mmid_mf")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 24, 32, 33, 40, 48, 49, 56, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+        for (int64_t n : {1, 3, 12, 16, 32, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, true, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q8_0, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q8_0, 256, 8, false, 2048, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
+    // AK-MMID-MF perf cells: the a3b_moe_roofline shapes extended to n = 1..64 (the op perf unit of the MMID-MF row).
+    if (test_backend_ops_extra_case_set("mmid_mf_perf")) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
         }
     }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {

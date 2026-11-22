@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq-q8-skinny.cuh"
 #include "ggml-cuda/mmq-q8-wvsk.cuh"
 #include "ggml-cuda/mmq-q8-mf.cuh"
+#include "ggml-cuda/mmid-mf.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2139,6 +2140,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+        // AK-MMID-MF: expert-grouped Q8_0 stream for MIN..CAP tokens, only with GGML_HIP_MMID_MF=1 (default off).
+        if (ggml_cuda_mmid_mf_eligible(src0, src1, ids, dst, cc)) {
+            ggml_cuda_log_mul_mat_route("MMID_MF", src0, src1, dst, cc, ne2);
+            ggml_cuda_mul_mat_id_mf(ctx, src0, src1, ids, dst);
+            return;
+        }
         // AK-MMID-SPLIT16: only for ne2 in 9..16 with GGML_CUDA_MMVQ_MOE_SPLIT16=1; ne2 <= 8 dispatch below is the original.
         if (ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_SPLIT16_MAX_BATCH && ggml_is_quantized(src0->type) &&
                 ggml_cuda_mmvq_moe_split16_enabled() && ggml_cuda_mmvq_mmid_effective_max_batch(src0->type, cc) >= ne2) {
@@ -2865,7 +2872,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             // AK-MMID-SPLIT16: the raised cap applies only to ne2 > 8 (ne2 <= 8 keeps the original cap).
             const int mmvq_mmid_max = node->ne[2] > MMVQ_MAX_BATCH_SIZE ?
                 ggml_cuda_mmvq_mmid_effective_max_batch(node->src[0]->type, cc) : get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            // AK-MMID-MF: the expert-grouped path never synchronises the stream, so it keeps CUDA graphs on at any n it takes.
+            if ((!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) &&
+                    !ggml_cuda_mmid_mf_eligible(node->src[0], node->src[1], node->src[2], node, cc)) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
