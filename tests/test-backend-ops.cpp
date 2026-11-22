@@ -6395,6 +6395,9 @@ struct test_gated_delta_net : public test_case {
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
     const ggml_type state_type; // [TAG_GDN_STATE_BF16] F32 (default) or BF16 recurrent state
+    // [GDN-MILDGATE] lower bound of the log-gate (upstream #32456); a mild gate (-0.05) keeps the state
+    // alive over the whole sequence, where the -20 default decays it to zero and hides state-survival bugs
+    const float   g_min;
     ggml_tensor * state_input = nullptr;
     ggml_tensor * final_state = nullptr;
 
@@ -6404,15 +6407,18 @@ struct test_gated_delta_net : public test_case {
         if (state_type != GGML_TYPE_F32) {
             s += "," + VAR_TO_STR(state_type);
         }
+        if (g_min != -20.0f) {
+            s += "," + VAR_TO_STR(g_min);
+        }
         return s;
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
-            ggml_type state_type = GGML_TYPE_F32)
+            ggml_type state_type = GGML_TYPE_F32, float g_min = -20.0f)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), state_type(state_type) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), state_type(state_type), g_min(g_min) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -6519,7 +6525,7 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, g_min, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -15062,6 +15068,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [GDN-MILDGATE] upstream #32456: mild decay keeps the state alive across the sequence;
+    // qwen35 layout (16 qk heads x3) with K=5 snapshots
+    for (int64_t n : { 5, 300, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, /*K=*/5, GGML_TYPE_F32, /*g_min=*/-0.05f));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 300, 2, 2, true,  false, /*K=*/1, GGML_TYPE_F32, /*g_min=*/-0.05f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  64, 200, 1, 1, false, false, /*K=*/5, GGML_TYPE_F32, /*g_min=*/-0.05f));
+    // a backend may pick its kernel by head count: few and many heads, per head size, plain and KDA
+    for (int64_t s : { 16, 32, 64, 128 }) {
+        for (int64_t h : { 4 * 128 / s, 64 * 128 / s }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, h, s, 37, 1, 1, false, false, /*K=*/4, GGML_TYPE_F32, /*g_min=*/-0.05f));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, h, s, 37, 1, 1, false, true,  /*K=*/1, GGML_TYPE_F32, /*g_min=*/-0.05f));
+        }
+    }
+    // [GDN-MILDGATE] verify shapes (48 v-heads, np1/np4, 1-16 rows) under the mild gate, F32 and BF16 state
+    for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int64_t ns : { 1, 4 }) {
+            for (int64_t nt : { 4, 16 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, ns, 3, false, false, /*K=*/nt, st, /*g_min=*/-0.05f));
+            }
+        }
+    }
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -15545,6 +15574,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // [GDN-VERIFY-BASE] recurrent GDN at verify shapes (intake-2796): 48 v-heads (16 qk x3) x n_seqs {1,4},
+    // S_v {128,64}, n_tokens {1,4,8,16}, F32/BF16 state, K=1 and K=n_tokens (snapshot). Opt-in set.
+    if (test_backend_ops_extra_case_set("gdn_verify_base")) {
+        for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+            for (int64_t sv : { 128, 64 }) {
+                for (int64_t ns : { 1, 4 }) {
+                    for (int64_t nt : { 1, 4, 8, 16 }) {
+                        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, sv, nt, ns, 3, false, false, /*K=*/1, st));
+                        if (nt > 1) {
+                            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, sv, nt, ns, 3, false, false, /*K=*/nt, st));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // [RS-REPLAY] np4 verify at the 27B dims (16 qk heads x3), n_max 7 (8 rows) and n_max 15 (16 rows):
     // snapshot op (K = rows) vs replay op (keep, n_pend = rows, n_rep random <= n_pend)
     for (int64_t rows : { 8, 16 }) {
