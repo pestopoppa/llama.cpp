@@ -4166,6 +4166,9 @@ private:
     // GPU-ZOS-2 sub-timers of the speculative post_decode/decode work. They accumulate only under DEBUG_TIMINGS
     // (scoped_timer is a no-op otherwise); the greedy-fast row counts accumulate whenever greedy-fast runs.
     int64_t t_zos2_verify      = 0; // verification sampling (chain or greedy-fast), per slot-round
+    // DTREE-V5I-ROUND-BUDGET: per-iteration phase sums (DEBUG_TIMINGS builds), printed per round when
+    // LLAMA_DTREE_PHASE_LOG=1: drafter+tree build (common_speculative_draft), tree resolve (greedy tree accept)
+    int64_t t_dt_draft = 0, n_dt_draft = 0, t_dt_resolve = 0, n_dt_resolve = 0;
     int64_t n_zos2_verify      = 0;
     int64_t t_zos2_clone       = 0; // common_sampler_clone (smpl_save), per slot-round
     int64_t n_zos2_clone       = 0;
@@ -4495,6 +4498,26 @@ private:
             }
         }
 
+#ifdef DEBUG_TIMINGS
+        {
+            static const bool phase_log = [] {
+                const char * e = getenv("LLAMA_DTREE_PHASE_LOG");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            static int64_t p_pre = 0, p_dec = 0, p_post = 0, p_dd = 0, p_dr = 0, p_ver = 0, p_proc = 0, p_rb = 0;
+            if (phase_log && t_dt_draft + t_decode > 0) {
+                SRV_INF("dtree-phase: iter_us=%" PRId64 " pre_us=%" PRId64 " draft_us=%" PRId64 " decode_us=%" PRId64
+                        " post_us=%" PRId64 " resolve_us=%" PRId64 " verify_us=%" PRId64 " process_us=%" PRId64
+                        " rollback_us=%" PRId64 "\n",
+                        ggml_time_us() - t_iter_start, t_pre_decode - p_pre, t_dt_draft - p_dd, t_decode - p_dec,
+                        t_post_decode - p_post, t_dt_resolve - p_dr, t_zos2_verify - p_ver, t_zos2_process - p_proc,
+                        t_zos2_rollback - p_rb);
+            }
+            p_pre = t_pre_decode; p_dec = t_decode; p_post = t_post_decode; p_dd = t_dt_draft; p_dr = t_dt_resolve;
+            p_ver = t_zos2_verify; p_proc = t_zos2_process; p_rb = t_zos2_rollback;
+        }
+#endif
+
         rs_rebuild_slots();
 
         prefill_budget_on_iter(ggml_time_us() - t_iter_start);
@@ -4702,6 +4725,7 @@ private:
 
         // generate the actual drafts (if any)
         {
+            scoped_timer t_dd(t_dt_draft, n_dt_draft);
             common_speculative_draft(spec.get());
         }
 
@@ -5812,7 +5836,11 @@ private:
 
         // AK-DTREE-1: pick the winning path and promote it before the drafter consumes the target features
         llama_batch proc_view = batch_view;
-        const bool tree_round = spec_tree_resolve(off, batch_view, proc_view);
+        bool tree_round = false;
+        {
+            scoped_timer t_dr(t_dt_resolve, n_dt_resolve);
+            tree_round = spec_tree_resolve(off, batch_view, proc_view);
+        }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
