@@ -6344,6 +6344,10 @@ private:
             // DS41-T4.1.2: per-token captures from the serial verify loop (one per accepted token).
             std::vector<completion_token_output> serial_probs;
 
+            // SPEC-STALE-1 (b): this round's rollback and verify mode, read by the stop trim after the emit loop
+            uint32_t n_rollback_round = 0;
+            bool     serial_round     = false;
+
             // verify and try to accept the draft
             {
                 const bool serial_verify = use_serial_speculative_verify(slot);
@@ -6438,6 +6442,8 @@ private:
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                n_rollback_round = n_rollback;
+                serial_round     = serial_verify;
 
                 const bool use_ckpt_tgt =
                     !serial_verify && (
@@ -6522,18 +6528,30 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            {
+            // SPEC-STALE-1 (b) (upstream #32771 shape): the memory is trimmed ONCE per round, at the final position,
+            // after the stop check -- a recurrent partial rollback can be done only once before the next decode
+            auto trim_memory = [&]() {
                 scoped_timer t_rollback(t_zos2_rollback, n_zos2_rollback);
-            if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1)) {
-                // never continue from the unrolled state: drop it and rebuild before the next decode
-                SLT_WRN(slot, "target memory refused the rollback to pos %d, scheduling a state rebuild\n", slot.prompt.tokens.pos_next());
-                common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
-                slot.rs_rebuild = true;
-            }
-            if (slot.ctx_dft) {
-                common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
-            }
-            }
+                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                    // never continue from the unrolled state: drop it and rebuild before the next decode
+                    SLT_WRN(slot, "target memory refused the rollback to pos %d, scheduling a state rebuild\n", slot.prompt.tokens.pos_next());
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+                    slot.rs_rebuild = true;
+                }
+                if (slot.ctx_dft) {
+                    common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
+            };
+
+            // true when the target (and draft) can drop n_rb decoded positions by a position trim, i.e. OUR
+            // use_ckpt_tgt predicate (n_rollback-based, serial verify exempt) is false for that rollback
+            auto can_trim_by_pos = [&](uint32_t n_rb) {
+                const bool ckpt_tgt = !serial_round && (
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rb > llama_n_rs_seq(ctx_tgt)));
+                const bool dft_full = slot.ctx_dft && ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                return !ckpt_tgt && !dft_full;
+            };
 
             scoped_timer t_emit(t_zos2_emit, n_zos2_emit);
             for (size_t i = 0; i < ids.size(); ++i) {
@@ -6582,6 +6600,16 @@ private:
                 slot.n_decoded += 1;
 
                 if (!process_token(result, slot)) {
+                    // generation stopped inside the accepted draft (stop string, EOG, n_predict): ids[i..n-2] are in
+                    // prompt.tokens and decoded in the memory, but the non-speculative run never caches the stopping
+                    // token or anything after it -- drop them so the slot cache matches spec-off
+                    const size_t n_stale = ids.size() - 1 - i;
+                    if (n_stale > 0 && can_trim_by_pos(n_rollback_round + (uint32_t) n_stale)) {
+                        slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_stale);
+                        SLT_DBG(slot, "stop inside accepted draft: trimmed %zu stale tokens, n_tokens = %d\n", n_stale, slot.prompt.n_tokens());
+                    }
+                    trim_memory();
+
                     slot.print_timings();
                     send_final_response(slot);
                     checkpoint_after_generation(slot);
@@ -6591,6 +6619,8 @@ private:
                     return;
                 }
             }
+
+            trim_memory();
 
             slot.print_timings_tg();
 
