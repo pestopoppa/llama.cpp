@@ -79,11 +79,14 @@ static bool can_reuse_kq_mask(
 
 // [phase 3.4c] witness counters, printed at exit when any is non-zero
 struct llama_draft_in_stats {
-    int64_t tok_dev = 0, pos_dev = 0;
+    int64_t tok_dev = 0, pos_dev = 0, inj_pos_dev = 0;
     ~llama_draft_in_stats() {
         if (tok_dev || pos_dev) {
             fprintf(stderr, "llama_graph: LLAMA_DEVICE_DRAFT_IN: drafter_token_rounds_device=%lld drafter_pos_rounds_device=%lld\n",
                     (long long) tok_dev, (long long) pos_dev);
+        }
+        if (inj_pos_dev) {
+            fprintf(stderr, "llama_graph: LLAMA_DEVICE_DFT_INJ_POS: drafter_inject_pos_rounds_device=%lld\n", (long long) inj_pos_dev);
         }
     }
 };
@@ -237,6 +240,35 @@ static int llama_dft_p0_mode(const llama_cparams & cparams, const llama_ubatch &
     return 3;
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.8] LLAMA_DEVICE_DFT_INJ_POS=1 (default off; with LLAMA_DEVICE_DFLASH_FIXED_T): the
+// positions of a masked fixed-T injection are p0 = ctl_tgt[0] - ctl_tgt[2] (the target's verify p0) + i, read on the
+// device. The host vouches with the target's mirrors (n_past, n_acc + 1); unknown or mismatching -> host positions
+static bool llama_dinj_pos_ok(const llama_cparams & cparams, const llama_ubatch & ub, int64_t n_g, int64_t n_tps) {
+    const char * e = getenv("LLAMA_DEVICE_DFT_INJ_POS");
+    if (!e || strcmp(e, "1") != 0 || !ub.embd || !ub.pos) {
+        return false;
+    }
+    const auto * d = cparams.dinj;
+    if (!d || !d->mask || !d->tgt_kv || !d->tgt_kv->ctl || d->tgt_kv->ctl->ne[0] < 3 || d->n_str != n_g || d->R != n_tps ||
+            n_g*n_tps != (int64_t) ub.n_tokens || d->s0 < 0 || d->s0 + n_g > (int64_t) d->tgt_kv->ctl_host.size() ||
+            d->s0 + n_g > (int64_t) d->tgt_kv->rsrep_host.size()) {
+        return false;
+    }
+    for (int64_t s = 0; s < n_g; ++s) {
+        const float np = d->tgt_kv->ctl_host[d->s0 + s], a1 = d->tgt_kv->rsrep_host[d->s0 + s];
+        if (std::isnan(np) || std::isnan(a1)) {
+            return false;
+        }
+        for (int64_t i = 0; i < n_tps; ++i) {
+            const int64_t r = s*n_tps + i;
+            if (ub.n_seq_id[r] != 1 || ub.seq_id[r][0] != (llama_seq_id) (d->s0 + s) || (float) ub.pos[r] != np - a1 + (float) i) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // n_g groups of equal size, each position-contiguous; fills the first position of each group
 static bool llama_pos_runs(const llama_ubatch & ub, int64_t n_g, std::vector<float> * p0) {
     if (n_g <= 0 || ub.n_tokens % n_g != 0 || !ub.pos || ub.parent) {
@@ -384,6 +416,10 @@ void llm_graph_input_pos_dev::set_input(const llama_ubatch * ubatch) {
     if (dft_p0) {
         g_draft_in_stats.pos_dev++;
     }
+    if (dinj_p0) {
+        g_draft_in_stats.inj_pos_dev++;
+        return; // [phase 3.8] device-fed from the target control block
+    }
     if (ctl_s0 >= 0 || dft_p0 || !p0->buffer) {
         return; // device-fed from the control block
     }
@@ -398,6 +434,10 @@ bool llm_graph_input_pos_dev::can_reuse(const llm_graph_params & params) {
     llama_ctl_pos_src(params.mctx, ub, n_g, s0);
     int64_t q0 = -1;
     if (llama_draft_in_ok(params.cparams, ub, nullptr, &q0) != dft_p0 || (dft_p0 && q0 != dft_q0)) {
+        return false;
+    }
+    const bool dinj = llama_dinj_pos_ok(params.cparams, ub, n_g, n_tps);
+    if (dinj != dinj_p0 || (dinj && params.cparams.dinj->s0 != dft_q0)) {
         return false;
     }
     return llama_pos_dev_eligible(ub, n_pos_per_embd) && std::max<int64_t>(1, ub.n_seqs_unq) == n_g &&
@@ -3423,6 +3463,21 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
             if (!logged_dft) {
                 logged_dft = true;
                 fprintf(stderr, "llm_graph: LLAMA_DEVICE_DRAFT_IN: drafter positions from the target control block ENABLED\n");
+            }
+        } else if (llama_dinj_pos_ok(cparams, ubatch, n_g, n_tps)) {
+            // [phase 3.8] drafter injection: p0 = target n_past - (n_acc + 1) = the verify p0 (no host input)
+            const auto * d = cparams.dinj;
+            ggml_tensor * tc = d->tgt_kv->ctl;
+            inp->dinj_p0 = true;
+            inp->dft_q0  = d->s0;
+            inp->p0 = ggml_view_2d(ctx0, tc, 1, n_g, tc->nb[1], d->s0*tc->nb[1]);
+            ggml_tensor * r2 = ggml_view_2d(ctx0, tc, 1, n_g, tc->nb[1], d->s0*tc->nb[1] + 2*ggml_element_size(tc));
+            p0_src  = ggml_sub(ctx0, ggml_cont(ctx0, inp->p0), ggml_cont(ctx0, r2));
+            ctl     = nullptr;
+            static bool logged_inj = false;
+            if (!logged_inj) {
+                logged_inj = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_DFT_INJ_POS: drafter injection positions from the target control block ENABLED\n");
             }
         } else if (ctl) {
             // [GPU-RESIDENT-ROUND-2f phase 3.1] p0 is the control block's n_past row (no host input)

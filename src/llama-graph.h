@@ -204,6 +204,7 @@ public:
     int64_t ctl_s0 = -1;        // phase 3.1: p0 is a view of the KV device control block from this stream (-1 = host input)
     bool    dft_p0 = false;     // phase 3.4c: p0 is a view of the TARGET context's control block (drafter)
     int64_t dft_q0 = -1;        //             from this seq id / stream
+    bool    dinj_p0 = false;    // phase 3.8: p0 = target ctl row 0 - row 2 (the verify p0) for a fixed-T injection
     const uint32_t n_pos_per_embd;
     const int64_t  n_g, n_tps;
 };
