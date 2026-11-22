@@ -28,6 +28,14 @@ static inline bool llama_kq_mask_dev_enabled() {
     return e != nullptr && std::strcmp(e, "1") == 0;
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.1] LLAMA_DEVICE_CTL_POS=1 (default off; needs LLAMA_DEVICE_CTL=1): positions input
+// p0 and the device-mask token positions come from the KV device control block; accept advances are predicted on the
+// host from the downloaded argmax rows instead of read back
+static inline bool llama_ctl_pos_enabled() {
+    const char * e = std::getenv("LLAMA_DEVICE_CTL_POS");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+}
+
 // cpos [n_kv, n_seq_rows] F32, csel [n_tokens] I32, tpos [1, n_tps, 1, n_stream] F32 -> mask [n_kv, n_tps, 1, n_stream]
 static inline ggml_tensor * llama_build_kq_mask_dev(
         ggml_context * ctx,

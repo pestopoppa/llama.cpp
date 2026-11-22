@@ -316,6 +316,7 @@ llama_kv_cache::llama_kv_cache(
         }
         std::vector<float> init(2*n_stream);
         ctl_host.assign(n_stream, -1.0f);
+        ctl_pend.assign(n_stream, ctl_pend_t{});
         for (uint32_t s = 0; s < n_stream; ++s) {
             init[2*s + 0] = -1.0f;
             init[2*s + 1] = (float) ((int64_t) s*kv_size);
@@ -399,8 +400,8 @@ llama_kv_cache::llama_kv_cache(
 
 llama_kv_cache::~llama_kv_cache() {
     if (ctl) {
-        fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CTL: device_hits=%lld host_writes=%lld reads=%lld\n",
-                (long long) ctl_device_hits, (long long) ctl_host_writes, (long long) ctl_reads);
+        fprintf(stderr, "llama_kv_cache: LLAMA_DEVICE_CTL: device_hits=%lld host_writes=%lld reads=%lld predicts=%lld\n",
+                (long long) ctl_device_hits, (long long) ctl_host_writes, (long long) ctl_reads, (long long) ctl_predicts);
     }
 }
 
@@ -421,6 +422,7 @@ void llama_kv_cache::clear(bool data) {
                 init[2*s + 0] = 0.0f;
                 init[2*s + 1] = (float) ((int64_t) s*get_size());
                 ctl_host[s] = 0.0f;
+                ctl_pend[s].on = false;
             }
             ggml_backend_tensor_set(ctl, init.data(), 0, ggml_nbytes(ctl));
         }
@@ -2139,18 +2141,18 @@ bool llama_kv_cache::kq_mask_dev_eligible(const llama_ubatch & ubatch, bool caus
 void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * csel, ggml_tensor * tpos, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(cpos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(csel->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(tpos->buffer));
+    GGML_ASSERT(!tpos || ggml_backend_buffer_is_host(tpos->buffer));
 
     const uint32_t n_tokens   = ubatch->n_tokens;
     const int64_t  n_kv       = cpos->ne[0];
     const int64_t  n_seq_rows = cpos->ne[1];
 
     GGML_ASSERT(csel->ne[0] == (int64_t) n_tokens);
-    GGML_ASSERT(ggml_nelements(tpos) == (int64_t) n_tokens);
+    GGML_ASSERT(!tpos || ggml_nelements(tpos) == (int64_t) n_tokens);
 
     float   * cp = (float   *) cpos->data;
     int32_t * cs = (int32_t *) csel->data;
-    float   * tp = (float   *) tpos->data;
+    float   * tp = tpos ? (float *) tpos->data : nullptr; // nullptr: device-fed from the control block (phase 3.1)
 
     bool done[LLAMA_MAX_SEQ] = {};
 
@@ -2159,7 +2161,9 @@ void llama_kv_cache::set_input_kq_mask_dev(ggml_tensor * cpos, ggml_tensor * cse
         GGML_ASSERT(seq_id >= 0 && seq_id < n_seq_rows && seq_id < LLAMA_MAX_SEQ);
 
         cs[i] = seq_id;
-        tp[i] = (float) ubatch->pos[i];
+        if (tp) {
+            tp[i] = (float) ubatch->pos[i];
+        }
 
         if (done[seq_id]) {
             continue;
@@ -3817,7 +3821,7 @@ void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode) con
     for (int64_t s = 0; s < n; ++s) {
         float & m = kv->ctl_host[s0 + s];
         if (std::isnan(m)) {
-            // pending after a device accept advance: read what the device computed
+            // pending after a device accept advance that the host could not predict: read what the device computed
             ggml_backend_tensor_get(kv->ctl, &m, (s0 + s)*kv->ctl->nb[1], sizeof(float));
             kv->ctl_reads++;
         }
@@ -3828,6 +3832,51 @@ void llama_kv_cache_context::ctl_sync(const llama_ubatch & ubatch, int mode) con
             kv->ctl_device_hits++;
         }
         m = mode == 2 ? NAN : mode == 1 ? p0[s] + n_tps : p0[s]; // the graph writes this back
+        // [phase 3.1] remember the verify tokens: the next decode predicts the accept count from the argmax rows
+        auto & pd = kv->ctl_pend[s0 + s];
+        pd.on = mode == 2 && llama_ctl_pos_enabled() && ubatch.token != nullptr;
+        if (pd.on) {
+            const int64_t k = (int64_t) n_tps;
+            pd.p0   = p0[s];
+            pd.row0 = kv->ctl_out_base + s*k;
+            pd.tok.assign(ubatch.token + s*k, ubatch.token + (s + 1)*k);
+        }
+    }
+}
+
+bool llama_kv_cache::ctl_any_pending() const {
+    for (const auto & pd : ctl_pend) {
+        if (pd.on) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_kv_cache::ctl_resolve(const std::function<int32_t(int64_t)> & am) const {
+    for (size_t s = 0; s < ctl_pend.size(); ++s) {
+        auto & pd = ctl_pend[s];
+        if (!pd.on) {
+            continue;
+        }
+        pd.on = false;
+        const int64_t n = (int64_t) pd.tok.size();
+        std::vector<int32_t> a(n);
+        bool ok = true;
+        for (int64_t i = 0; i < n && ok; ++i) {
+            a[i] = am(pd.row0 + i);
+            ok = a[i] >= 0;
+        }
+        if (!ok || !std::isnan(ctl_host[s])) {
+            continue; // stays pending: the next ctl_sync reads it
+        }
+        // the device's count: leading i with argmax[i] == token[i+1] (exact in F32 for ids < 2^24)
+        int64_t acc = 0;
+        while (acc < n - 1 && a[acc] == pd.tok[acc + 1]) {
+            acc++;
+        }
+        ctl_host[s] = pd.p0 + (float) (acc + 1);
+        ctl_predicts++;
     }
 }
 

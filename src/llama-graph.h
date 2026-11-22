@@ -184,6 +184,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
     ggml_tensor * p0 = nullptr; // F32 [1, n_g]
+    int64_t ctl_s0 = -1;        // phase 3.1: p0 is a view of the KV device control block from this stream (-1 = host input)
     const uint32_t n_pos_per_embd;
     const int64_t  n_g, n_tps;
 };
@@ -438,6 +439,7 @@ public:
     ggml_tensor * dctl_p0src = nullptr; // contiguous copy of the p0 view [1, n_str]
     ggml_tensor * dctl_q     = nullptr; // positions [n_tps, n_str]
     bool          dctl_accept = false;  // the write-back is p0 + n_accepted + 1 (device leading-match count)
+    bool          dmask_tpos_ctl = false; // phase 3.1: dmask_tpos is the control-block positions (no host input)
     void set_input_kv_idx_any(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
     bool can_reuse_kv_idx_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const;
 
@@ -1016,6 +1018,8 @@ public:
     ggml_tensor * t_argmax      = nullptr;
     // [GPU-RESIDENT-ROUND-2f phase 2.2] attention inputs whose device control block write-back is still to be built
     std::vector<llm_graph_input_attn_kv *> ctl_inps;
+    // phase 3.1: positions [n_tps, n_g] read from the control block by the positions input (nullptr = host input)
+    ggml_tensor * ctl_pos_q = nullptr;
     // AK-GAP-1-STOCH-ACCEPT: per-output-row top-K candidates of t_logits (GGML_HIP_DEVICE_ACCEPT_STOCH=K), ids I32 [K, n_outputs], logits F32 [1, K, n_outputs]
     ggml_tensor * t_topk_ids    = nullptr;
     ggml_tensor * t_topk_vals   = nullptr;

@@ -9,6 +9,7 @@
 #include "llama-kv-host-mirror-bind.h"
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1040,6 +1041,17 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+llama_kv_cache * llama_context::ctl_kv() const {
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        return kv->ctl ? kv : nullptr;
+    }
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        llama_kv_cache * kv = h->get_mem_attn();
+        return kv && kv->ctl ? kv : nullptr;
+    }
+    return nullptr;
 }
 
 llama_token llama_context::get_argmax_ith(int32_t i) {
@@ -2251,6 +2263,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         kv_mirror->on_decode_begin();
     }
 
+    // [GPU-RESIDENT-ROUND-2f phase 3.1] predict the device accept advances of the previous decode from its argmax rows
+    llama_kv_cache * kv_ctl = ctl_kv();
+    if (kv_ctl && kv_ctl->ctl_any_pending()) {
+        synchronize();
+        kv_ctl->ctl_resolve([this](int64_t r) -> int32_t {
+            if (r < 0 || r >= (int64_t) ctl_out_ids.size()) {
+                return -1;
+            }
+            return get_argmax_ith((int32_t) ctl_out_ids[r]);
+        });
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2424,6 +2448,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
+
+        if (kv_ctl) {
+            kv_ctl->ctl_out_base = n_outputs_prev; // phase 3.1: pre-reorder output row of this ubatch's first token
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
@@ -2634,6 +2662,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto & out_ids = balloc->get_out_ids();
 
         GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
+
+        if (kv_ctl && kv_ctl->ctl) {
+            ctl_out_ids.assign(out_ids.begin(), out_ids.end()); // phase 3.1: pre-reorder output row -> batch index
+        }
 
         for (int64_t i = 0; i < n_outputs; ++i) {
             int64_t out_id = out_ids[i];

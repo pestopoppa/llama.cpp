@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -405,6 +406,21 @@ public:
     mutable int64_t ctl_host_writes = 0;
     mutable int64_t ctl_device_hits = 0;
     mutable int64_t ctl_reads = 0;
+    // [GPU-RESIDENT-ROUND-2f phase 3.1] LLAMA_DEVICE_CTL_POS=1: after a device accept advance the host predicts the
+    // new n_past from the argmax rows it downloads anyway (same leading-match count as the device), instead of a
+    // 4-byte read. ctl_pend[s]: the verify tokens and the pre-reorder output row of the first one
+    struct ctl_pend_t {
+        bool                 on   = false;
+        float                p0   = 0.0f;
+        int64_t              row0 = 0;
+        std::vector<int32_t> tok;
+    };
+    mutable std::vector<ctl_pend_t> ctl_pend;
+    mutable int64_t ctl_out_base = 0; // pre-reorder output row of the first token of the ubatch being built
+    mutable int64_t ctl_predicts = 0;
+    bool ctl_any_pending() const;
+    // am(row) = device argmax of a pre-reorder output row of the previous decode (< 0 = unavailable)
+    void ctl_resolve(const std::function<int32_t(int64_t)> & am) const;
 private:
 
     // model layer id -> KV cache layer id

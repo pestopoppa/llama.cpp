@@ -188,9 +188,58 @@ static bool llama_pos_dev_eligible(const llama_ubatch & ub, uint32_t n_pos_per_e
            llama_pos_runs(ub, std::max<int64_t>(1, ub.n_seqs_unq), nullptr);
 }
 
+// [GPU-RESIDENT-ROUND-2f phase 3.1] the KV cache context of the attention memory (plain or hybrid), or nullptr
+static const llama_kv_cache_context * llama_ctl_kv_ctx(const llama_memory_context_i * mctx) {
+    if (auto * k = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return k;
+    }
+    if (auto * h = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return h->get_attn();
+    }
+    return nullptr;
+}
+
+// the device control block when this ubatch's attention input reads it for n_g streams (same rule as
+// build_attn_inp_kv_impl), and LLAMA_DEVICE_CTL_POS=1; s0 = first stream
+static ggml_tensor * llama_ctl_pos_src(const llama_memory_context_i * mctx, const llama_ubatch & ub, int64_t n_g, int64_t & s0) {
+    s0 = -1;
+    if (!llama_ctl_pos_enabled() || !llama_kv_idx_dev_enabled()) {
+        return nullptr;
+    }
+    const auto * kv = llama_ctl_kv_ctx(mctx);
+    if (!kv) {
+        return nullptr;
+    }
+    std::vector<float> p0, base;
+    int64_t size = 0, n = 0;
+    if (!kv->kv_idx_dev_info(ub, p0, base, size)) {
+        return nullptr;
+    }
+    ggml_tensor * ctl = kv->ctl_range(ub, s0, n);
+    if (!ctl || n != n_g || (int64_t) p0.size() != n_g) {
+        s0 = -1;
+        return nullptr;
+    }
+    return ctl;
+}
+
+// the device mask's token positions come from the control block (same streams and per-stream token count)
+static bool llama_tpos_ctl_ok(const llama_kv_cache_context * kv, const llama_ubatch & ub, const llama_cparams & cparams) {
+    if (!llama_ctl_pos_enabled() || !llama_kv_idx_dev_enabled()) {
+        return false;
+    }
+    std::vector<float> p0, base;
+    int64_t size = 0, s0 = -1, n = 0;
+    if (!kv->kv_idx_dev_info(ub, p0, base, size) || !kv->ctl_range(ub, s0, n)) {
+        return false;
+    }
+    const int64_t n_stream = cparams.kv_unified ? 1 : ub.n_seqs_unq;
+    return n == n_stream;
+}
+
 void llm_graph_input_pos_dev::set_input(const llama_ubatch * ubatch) {
-    if (!p0->buffer) {
-        return;
+    if (ctl_s0 >= 0 || !p0->buffer) {
+        return; // device-fed from the control block
     }
     std::vector<float> v;
     GGML_ASSERT(llama_pos_runs(*ubatch, n_g, &v));
@@ -199,8 +248,10 @@ void llm_graph_input_pos_dev::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_pos_dev::can_reuse(const llm_graph_params & params) {
     const auto & ub = params.ubatch;
+    int64_t s0 = -1;
+    llama_ctl_pos_src(params.mctx, ub, n_g, s0);
     return llama_pos_dev_eligible(ub, n_pos_per_embd) && std::max<int64_t>(1, ub.n_seqs_unq) == n_g &&
-           (int64_t) ub.n_tokens == n_g*n_tps;
+           (int64_t) ub.n_tokens == n_g*n_tps && s0 == ctl_s0;
 }
 
 // positions p0[g] + i as I32 [n_g*n_tps]
@@ -888,7 +939,7 @@ void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context
     if (dmask_cpos) {
         // device-built mask: only its inputs live on the host (unallocated when the graph does not attend)
         if (dmask_cpos->buffer) {
-            kv->set_input_kq_mask_dev(dmask_cpos, dmask_csel, dmask_tpos, ubatch);
+            kv->set_input_kq_mask_dev(dmask_cpos, dmask_csel, dmask_tpos_ctl ? nullptr : dmask_tpos, ubatch);
         }
         return;
     }
@@ -900,6 +951,9 @@ void llm_graph_input_attn_kv::set_input_kq_mask_any(const llama_kv_cache_context
 bool llm_graph_input_attn_kv::can_reuse_kq_mask_dev(const llama_kv_cache_context * kv, const llama_ubatch & ubatch) const {
     const bool want = llama_kq_mask_dev_enabled() && cparams.dca_chunk_size == 0 && kv->kq_mask_dev_eligible(ubatch, cparams.causal_attn);
     if (want != (dmask_cpos != nullptr)) {
+        return false;
+    }
+    if (want && llama_tpos_ctl_ok(kv, ubatch, cparams) != dmask_tpos_ctl) {
         return false;
     }
     return !want || (dmask_csel->ne[0] == (int64_t) ubatch.n_tokens && dmask_cpos->ne[0] == (int64_t) kv->get_n_kv());
@@ -1807,6 +1861,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 
 void llm_graph_result::reset() {
     ctl_inps.clear();
+    ctl_pos_q     = nullptr;
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
@@ -3116,10 +3171,30 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
         const int64_t n_g   = std::max<int64_t>(1, ubatch.n_seqs_unq);
         const int64_t n_tps = n_tokens / n_g;
         auto inp = std::make_unique<llm_graph_input_pos_dev>(hparams.n_pos_per_embd(), n_g, n_tps);
-        inp->p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_g);
-        ggml_set_input(inp->p0);
-        ggml_set_name(inp->p0, "inp_pos_dev_p0");
-        ggml_tensor * p = ggml_reshape_1d(ctx0, llama_build_pos_dev(ctx0, inp->p0, n_tps, n_g), n_tokens);
+        int64_t ctl_s0 = -1;
+        ggml_tensor * ctl = llama_ctl_pos_src(mctx, ubatch, n_g, ctl_s0);
+        ggml_tensor * p0_src = nullptr;
+        if (ctl) {
+            // [GPU-RESIDENT-ROUND-2f phase 3.1] p0 is the control block's n_past row (no host input)
+            inp->ctl_s0 = ctl_s0;
+            inp->p0 = ggml_view_2d(ctx0, ctl, 1, n_g, ctl->nb[1], ctl_s0*ctl->nb[1]);
+            p0_src  = ggml_cont(ctx0, inp->p0);
+            static bool logged_ctl = false;
+            if (!logged_ctl) {
+                logged_ctl = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_CTL_POS: positions from the device control block ENABLED\n");
+            }
+        } else {
+            inp->p0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_g);
+            ggml_set_input(inp->p0);
+            ggml_set_name(inp->p0, "inp_pos_dev_p0");
+            p0_src = inp->p0;
+        }
+        ggml_tensor * pq = llama_build_pos_dev(ctx0, p0_src, n_tps, n_g);
+        if (ctl) {
+            res->ctl_pos_q = pq; // the control-block write-back is ordered after this read
+        }
+        ggml_tensor * p = ggml_reshape_1d(ctx0, pq, n_tokens);
         if (hparams.n_pos_per_embd() == 4) {
             // M-RoPE text tokens: [p, p, p, 0]
             p = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, p, p, 0), p, 0), ggml_scale(ctx0, p, 0.0f), 0);
@@ -3597,9 +3672,21 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         ggml_set_input(inp->dmask_csel);
         ggml_set_name(inp->dmask_csel, "attn_inp_kq_mask_dev_csel");
 
-        inp->dmask_tpos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, m->ne[1], 1, m->ne[3]);
-        ggml_set_input(inp->dmask_tpos);
-        ggml_set_name(inp->dmask_tpos, "attn_inp_kq_mask_dev_tpos");
+        if (inp->dctl_q && llama_tpos_ctl_ok(mctx_cur, ubatch, cparams)) {
+            // [GPU-RESIDENT-ROUND-2f phase 3.1] token positions = the control-block positions of the K/V indices
+            GGML_ASSERT(inp->dctl_q->ne[0] == m->ne[1] && inp->dctl_q->ne[1] == m->ne[3]);
+            inp->dmask_tpos = ggml_reshape_4d(ctx0, inp->dctl_q, 1, m->ne[1], 1, m->ne[3]);
+            inp->dmask_tpos_ctl = true;
+            static bool logged_tpos = false;
+            if (!logged_tpos) {
+                logged_tpos = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_CTL_POS: device-mask token positions from the control block ENABLED\n");
+            }
+        } else {
+            inp->dmask_tpos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, m->ne[1], 1, m->ne[3]);
+            ggml_set_input(inp->dmask_tpos);
+            ggml_set_name(inp->dmask_tpos, "attn_inp_kq_mask_dev_tpos");
+        }
 
         ggml_tensor * dm = llama_build_kq_mask_dev(ctx0, inp->dmask_cpos, inp->dmask_csel, inp->dmask_tpos, m->type);
         ggml_set_name(dm, "attn_kq_mask_dev");
@@ -4770,6 +4857,11 @@ static void llama_build_ctl_wb(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_
             ggml_tensor * last = ggml_cont(ctx0, ggml_view_2d(ctx0, q, 1, n_str, q->nb[1], (n_tps - 1)*q->nb[0]));
             nv = ggml_scale_bias(ctx0, last, 1.0f, 1.0f);                                                          // p0 + n_tps
             inp->dctl_accept = false;
+        }
+        if (res->ctl_pos_q && res->ctl_pos_q->ne[1] == n_str) {
+            // + 0*pos[0]: also order the write after the positions input's read of the control block (phase 3.1)
+            ggml_tensor * pq0 = ggml_cont(ctx0, ggml_view_2d(ctx0, res->ctl_pos_q, 1, n_str, res->ctl_pos_q->nb[1], 0));
+            nv = ggml_add(ctx0, nv, ggml_scale(ctx0, pq0, 0.0f));
         }
         inp->dctl_wb = ggml_cpy(ctx0, nv, dst);
         ggml_set_name(inp->dctl_wb, "attn_kv_ctl_wb");

@@ -18,6 +18,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_kv_cache;
 
 // HSF-5.P host KV mirror (experimental), see llama-kv-host-mirror-bind.h
 struct llama_kv_mirror;
@@ -397,6 +398,10 @@ private:
     // DTREE-A: device argmax per output row (LLAMA_DEVICE_ARGMAX=1); empty / -1 when not computed
     std::vector<int32_t> argmax_out;
     bool                 argmax_valid = false;
+    // [GPU-RESIDENT-ROUND-2f phase 3.1] last decode's pre-reorder output row -> batch index; the attention KV cache
+    // when it owns a device control block
+    std::vector<int64_t> ctl_out_ids;
+    llama_kv_cache * ctl_kv() const;
     // AK-GAP-1-STOCH-ACCEPT: device top-K candidates per output row (GGML_HIP_DEVICE_ACCEPT_STOCH=K); K == 0 when absent
     std::vector<int32_t> topk_ids_out;
     std::vector<float>   topk_vals_out;
