@@ -659,6 +659,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, std::vector<std::vector<llama_token_data>> * out_dists) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -706,6 +708,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         }
 
         if (draft[i] != id) {
+            break;
+        }
+
+        // SPEC-STALE-1 (upstream #29638): stop at an accepted EOG that is not the last draft token, so
+        // nothing past the end of generation is accepted into the slot. A trailing EOG (checkpoint replay
+        // draft) is still accepted and followed by the bonus row.
+        if (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size()) {
             break;
         }
     }
@@ -938,7 +947,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
         return result;
     }
 
-    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     auto sample_row = [&](int idx) -> llama_token {
         llama_synchronize(ctx);
@@ -990,6 +1000,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
         if (draft[i] != id) {
             break;
         }
+
+        // SPEC-STALE-1: same EOG stop as common_sampler_sample_and_accept_n
+        if (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size()) {
+            break;
+        }
     }
 
     if (i == draft.size()) {
@@ -1013,6 +1028,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         std::vector<std::vector<llama_token_data>> * out_dists) {
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(dists.size() == draft.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1057,6 +1074,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             if (out_dists) {
                 const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
                 out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+            }
+
+            // SPEC-STALE-1 (philippesic ed1254a): stop at an accepted EOG that is not the last draft token,
+            // same as common_sampler_sample_and_accept_n; after the out_dists capture so dists stay aligned
+            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                break;
             }
 
             continue;
