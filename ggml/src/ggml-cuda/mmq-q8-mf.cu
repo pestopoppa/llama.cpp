@@ -1336,6 +1336,8 @@ void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s) {
 // ---------------------------------------------------------------------------------------------------------------------
 static const char q8mf6_build_marker[] __attribute__((used)) =
     "ggml-cuda: V5 4-WG/CU half-tile packed Q8_0 small-M kernel (GGML_HIP_Q8_MF=6)";
+static const char q8mf6_det_marker[] __attribute__((used)) =
+    "ggml-cuda: GGML_DETERMINISTIC V5 fixed-order split half-tile reduction";
 
 #define Q8MF6_HB    (32 * Q8MF_ROWB)   // 8704 B: half a packed stage
 #define Q8MF6_RED   2048
@@ -1343,7 +1345,8 @@ static const char q8mf6_build_marker[] __attribute__((used)) =
 template <int P, int AUX>
 static __global__ void __launch_bounds__(Q8MF_NT, 4)
 q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
-              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
+              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1,
+              int * __restrict__ tick) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     __shared__ __attribute__((aligned(16))) char lds[Q8MF6_HB + Q8MF_A1 + Q8MF6_RED];
     const int tid  = threadIdx.x;
@@ -1439,9 +1442,21 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
                 }
             }
             Q8MF_LDS_BARRIER();
+            const int  ts   = cht * S;
+            const bool full = ts >= u0 && ts + S <= u1;
+            // GGML_DETERMINISTIC: split half-tiles are reduced in fixed WG order. tick[ht] counts the units of the
+            // half-tile already added; this WG waits until every unit before its range start is in (lower WGs only).
+            const bool ordered = tick != nullptr && !full;
+            if (ordered) {
+                if (tid == 0) {
+                    const int want = (ts >= u0 ? ts : u0) - ts;
+                    while (__hip_atomic_load(tick + cht, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != want) {
+                        __builtin_amdgcn_s_sleep(1);
+                    }
+                }
+                __syncthreads();
+            }
             if (kh == 0) {
-                const int  ts   = cht * S;
-                const bool full = ts >= u0 && ts + S <= u1;
                 const int  row  = (cht >> 1) * Q8MF_RT + (cht & 1) * 32 + 16 * rg + j;   // packed => N % 64 == 0
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
@@ -1450,10 +1465,22 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
                         float * o = out + (int64_t) (c0 + r) * out_s1 + row;
                         if (full) {
                             *o = v;
+                        } else if (ordered) {
+                            const float prev = __hip_atomic_load(o, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                            __hip_atomic_store(o, prev + v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                         } else {
                             unsafeAtomicAdd(o, v);
                         }
                     }
+                }
+            }
+            if (ordered) {
+                __threadfence();
+                __syncthreads();
+                if (tid == 0) {
+                    const int lo = ts >= u0 ? ts : u0;
+                    const int hi = ts + S <= u1 ? ts + S : u1;
+                    __hip_atomic_fetch_add(tick + cht, hi - lo, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
                 }
             }
 #pragma unroll
@@ -1490,7 +1517,7 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
     } while (u < u1);
 #else
     GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S); GGML_UNUSED(U);
-    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1); GGML_UNUSED(tick);
     NO_DEVICE_CODE;
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
@@ -1519,13 +1546,24 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     const size_t abytes = (size_t) S * Q8MF_A1;
     ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
     float * d = (float *) dst->data;
+    const bool det = ggml_cuda_deterministic();
+    const int  nht = U / S;   // half-tiles
+    ggml_cuda_pool_alloc<int> tick(ctx.pool());
+    if (det) {
+        tick.alloc((size_t) nht);
+        static std::atomic<int64_t> n_det{0};
+        if (n_det.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V5 fixed-order split reduction engaged (%s)\n", q8mf6_det_marker);
+        }
+    }
     {
         const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
-        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(),
+                                              det ? tick.get() : nullptr, det ? nht : 0, d, dst_s1, N);
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1, det ? tick.get() : nullptr)
     if (cfg.slc) {
         Q8MF6_L(2, 2);
     } else {
