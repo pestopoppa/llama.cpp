@@ -1988,8 +1988,8 @@ void llama_kv_cache::set_input_kq_mask_tree(ggml_tensor * dst, const llama_ubatc
         } else {
             dtree_mc_hits++;
         }
-        if (((dtree_mc_hits + dtree_mc_miss) & 1023) == 1) {
-            LLAMA_LOG_DEBUG("%s: dtree mask cache hits=%lld miss=%lld\n", __func__, (long long) dtree_mc_hits, (long long) dtree_mc_miss);
+        if ((hit && dtree_mc_hits == 1) || ((dtree_mc_hits + dtree_mc_miss) & 1023) == 1) {
+            LLAMA_LOG_INFO("%s: dtree mask cache hits=%lld miss=%lld\n", __func__, (long long) dtree_mc_hits, (long long) dtree_mc_miss);
         }
     }
 
