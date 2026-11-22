@@ -101,4 +101,6 @@ struct llama_dsel_inputs {
     // [GPU-RESIDENT-ROUND-2f phase 3.2] the target context's verify-token buffer F32 [T + 1, n_stream] (nullptr = off)
     struct ggml_tensor * vtok_dst = nullptr;
     int64_t              vtok_T   = 0;
+    // [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the target context's KV cache (control block + mirrors)
+    const class llama_kv_cache * tgt_kv = nullptr;
 };

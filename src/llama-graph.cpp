@@ -77,9 +77,24 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+// [phase 3.4c] witness counters, printed at exit when any is non-zero
+struct llama_draft_in_stats {
+    int64_t tok_dev = 0, pos_dev = 0;
+    ~llama_draft_in_stats() {
+        if (tok_dev || pos_dev) {
+            fprintf(stderr, "llama_graph: LLAMA_DEVICE_DRAFT_IN: drafter_token_rounds_device=%lld drafter_pos_rounds_device=%lld\n",
+                    (long long) tok_dev, (long long) pos_dev);
+        }
+    }
+};
+static llama_draft_in_stats g_draft_in_stats;
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (vtok_s0 >= 0) {
         vtok_kv->vtok_sync(*ubatch, vtok_s0, vtok_bonus); // writes only the streams whose mirror disagrees
+    } else if (dft_mask >= 0.0f) {
+        // [phase 3.4c] device-built drafter batch: nothing to upload
+        g_draft_in_stats.tok_dev++;
     } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -112,6 +127,15 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
         if (res && vtok_s0 >= 0) {
             vtok_kv = kvc;
         }
+    }
+    if (vtok_s0 < 0) {
+        float mk = -1.0f;
+        int64_t q0 = -1;
+        if (!llama_draft_in_ok(params.cparams, params.ubatch, &mk, &q0)) {
+            mk = -1.0f;
+            q0 = -1;
+        }
+        res &= mk == dft_mask && (mk < 0.0f || q0 == dft_q0); // [phase 3.4c] same mode, mask id and seqs as a fresh build
     }
 
     return res;
@@ -260,8 +284,73 @@ static bool llama_tpos_ctl_ok(const llama_kv_cache_context * kv, const llama_uba
     return n == n_stream;
 }
 
+
+ggml_tensor * llama_build_draft_tokens(ggml_context * ctx0, const llama_cparams & cparams, const llama_ubatch & ubatch, float mk, int64_t q0) {
+    // [bonus, mask, .., mask] per block, bonus = the target's verify-token col 0 (exact in F32 for ids < 2^24)
+    const int64_t T = cparams.dsel->vtok_T, n = ubatch.n_tokens / T;
+    ggml_tensor * vd = cparams.dsel->vtok_dst;
+    ggml_tensor * b  = ggml_cont(ctx0, ggml_view_2d(ctx0, vd, 1, n, vd->nb[1], q0*vd->nb[1]));       // [1, n]
+    ggml_tensor * d  = ggml_scale_bias(ctx0, b, 1.0f, -mk);                                       // bonus - mask
+    ggml_tensor * ar = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) T, 1.0f), T, 1);
+    ggml_tensor * e0 = ggml_step(ctx0, ggml_scale_bias(ctx0, ar, -1.0f, 0.5f));                   // 1 at i = 0
+    ggml_tensor * tf = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_repeat_4d(ctx0, e0, T, n, 1, 1), d), 1.0f, mk);
+    ggml_tensor * t  = ggml_cast(ctx0, ggml_reshape_1d(ctx0, tf, ubatch.n_tokens), GGML_TYPE_I32);
+    ggml_set_name(t, "inp_tokens_dft");
+    return t;
+}
+
+bool llama_draft_in_ok(const llama_cparams & cparams, const llama_ubatch & ub, float * mask, int64_t * q0p) {
+    const char * e = std::getenv("LLAMA_DEVICE_DRAFT_IN");
+    if (!e || std::strcmp(e, "1") != 0 || !cparams.dsel || !cparams.dsel->tgt_kv || !cparams.dsel->vtok_dst || !ub.token || ub.embd) {
+        return false;
+    }
+    const llama_kv_cache * tk = cparams.dsel->tgt_kv;
+    const int64_t T = cparams.dsel->vtok_T;
+    if (!tk->ctl || !tk->vtok || tk->vtok != cparams.dsel->vtok_dst || T < 2 || ub.n_tokens % T != 0) {
+        return false;
+    }
+    const int64_t n = ub.n_tokens / T, ld = T + 1;
+    const int64_t q0 = ub.seq_id[0][0]; // blocks are seqs q0..q0+n-1 (seq id == target stream)
+    if (n < 1 || q0 < 0 || q0 + n > (int64_t) tk->ctl_host.size() || (int64_t) ub.n_seqs_unq != n) {
+        return false;
+    }
+    const llama_token mk = ub.token[1];
+    for (int64_t s = 0; s < n; ++s) {
+        const float p0 = tk->ctl_host[q0 + s];
+        const float b  = tk->vtok_host[(q0 + s)*ld];
+        if (std::isnan(p0) || std::isnan(b) || (float) ub.token[s*T] != b) {
+            if (std::getenv("LLAMA_DRAFT_IN_DEBUG")) {
+                fprintf(stderr, "draft_in miss s=%lld p0=%g pos=%d b=%g tok=%d T=%lld n=%lld\n", (long long) s, p0, ub.pos[s*T], b,
+                        ub.token[s*T], (long long) T, (long long) n);
+            }
+            return false; // NaN (pending / unknown) never matches
+        }
+        for (int64_t i = 0; i < T; ++i) {
+            const int64_t r = s*T + i;
+            if (ub.n_seq_id[r] != 1 || ub.seq_id[r][0] != (llama_seq_id) (q0 + s) || (float) ub.pos[r] != p0 + (float) i ||
+                    (i > 0 && ub.token[r] != mk)) {
+                if (std::getenv("LLAMA_DRAFT_IN_DEBUG")) {
+                    fprintf(stderr, "draft_in miss2 s=%lld i=%lld seq=%d pos=%d p0=%g tok=%d mk=%d\n", (long long) s, (long long) i,
+                            ub.seq_id[r][0], ub.pos[r], p0, ub.token[r], mk);
+                }
+                return false;
+            }
+        }
+    }
+    if (mask) {
+        *mask = (float) mk;
+    }
+    if (q0p) {
+        *q0p = q0;
+    }
+    return true;
+}
+
 void llm_graph_input_pos_dev::set_input(const llama_ubatch * ubatch) {
-    if (ctl_s0 >= 0 || !p0->buffer) {
+    if (dft_p0) {
+        g_draft_in_stats.pos_dev++;
+    }
+    if (ctl_s0 >= 0 || dft_p0 || !p0->buffer) {
         return; // device-fed from the control block
     }
     std::vector<float> v;
@@ -273,6 +362,10 @@ bool llm_graph_input_pos_dev::can_reuse(const llm_graph_params & params) {
     const auto & ub = params.ubatch;
     int64_t s0 = -1;
     llama_ctl_pos_src(params.mctx, ub, n_g, s0);
+    int64_t q0 = -1;
+    if (llama_draft_in_ok(params.cparams, ub, nullptr, &q0) != dft_p0 || (dft_p0 && q0 != dft_q0)) {
+        return false;
+    }
     return llama_pos_dev_eligible(ub, n_pos_per_embd) && std::max<int64_t>(1, ub.n_seqs_unq) == n_g &&
            (int64_t) ub.n_tokens == n_g*n_tps && s0 == ctl_s0;
 }
@@ -3145,6 +3238,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
             logged = true;
             fprintf(stderr, "llm_graph: LLAMA_DEVICE_VTOK: verify tokens from the device token buffer ENABLED (T=%lld)\n", (long long) T);
         }
+    } else if (float mk = 0.0f; llama_draft_in_ok(cparams, ubatch, &mk, &inp->dft_q0)) {
+        // [phase 3.4c] drafter batch [bonus, mask, .., mask] per block: bonus = the target's verify-token col 0
+        const int64_t T = cparams.dsel->vtok_T;
+        inp->tokens   = llama_build_draft_tokens(ctx0, cparams, ubatch, mk, inp->dft_q0);
+        inp->dft_mask = mk;
+        cb(inp->tokens, "inp_tokens_dft", -1);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "llm_graph: LLAMA_DEVICE_DRAFT_IN: drafter tokens from the target verify-token buffer ENABLED (T=%lld)\n", (long long) T);
+        }
     } else {
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
@@ -3255,7 +3359,21 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
         int64_t ctl_s0 = -1;
         ggml_tensor * ctl = llama_ctl_pos_src(mctx, ubatch, n_g, ctl_s0);
         ggml_tensor * p0_src = nullptr;
-        if (ctl) {
+        int64_t dq0 = -1;
+        if (llama_draft_in_ok(cparams, ubatch, nullptr, &dq0) && n_tps == cparams.dsel->vtok_T) {
+            // [phase 3.4c] drafter: block s starts at the target's n_past of stream q0 + s (no host input)
+            ggml_tensor * tc = cparams.dsel->tgt_kv->ctl;
+            inp->dft_p0 = true;
+            inp->dft_q0 = dq0;
+            inp->p0 = ggml_view_2d(ctx0, tc, 1, n_g, tc->nb[1], dq0*tc->nb[1]);
+            p0_src  = ggml_cont(ctx0, inp->p0);
+            ctl     = nullptr;
+            static bool logged_dft = false;
+            if (!logged_dft) {
+                logged_dft = true;
+                fprintf(stderr, "llm_graph: LLAMA_DEVICE_DRAFT_IN: drafter positions from the target control block ENABLED\n");
+            }
+        } else if (ctl) {
             // [GPU-RESIDENT-ROUND-2f phase 3.1] p0 is the control block's n_past row (no host input)
             inp->ctl_s0 = ctl_s0;
             inp->p0 = ggml_view_2d(ctx0, ctl, 1, n_g, ctl->nb[1], ctl_s0*ctl->nb[1]);

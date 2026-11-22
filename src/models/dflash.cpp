@@ -29,13 +29,68 @@ public:
     int64_t n_tokens;
 };
 
+// [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: with every draft block greedy (inv_temp 1, noise 0) the
+// selection inputs are graph constants; when block s is seq s for every block, the vtok set_rows index
+// s*(T+1) + (i in 1..T-1 ? i : T) is derived from the row number on the device
+static bool llama_dsel_draft_in_knob() {
+    const char * e = getenv("LLAMA_DEVICE_DRAFT_IN");
+    return e != nullptr && strcmp(e, "1") == 0;
+}
+
+static bool llama_dsel_greedy_dev(const llama_cparams & cparams, const llama_ubatch & ub) {
+    GGML_UNUSED(ub);
+    if (!llama_dsel_draft_in_knob() || !cparams.dsel) {
+        return false;
+    }
+    for (float v : cparams.dsel->inv_temp) {
+        if (v != 1.0f) {
+            return false;
+        }
+    }
+    for (float v : cparams.dsel->noise) {
+        if (v != 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool llama_dsel_vidx_dev(const llama_cparams & cparams, const llama_ubatch & ub, int64_t * q0p = nullptr) {
+    if (!llama_dsel_draft_in_knob() || !cparams.dsel || !cparams.dsel->vtok_dst) {
+        return false;
+    }
+    const int64_t T = cparams.dsel->vtok_T;
+    const int64_t q0 = ub.n_tokens > 0 ? ub.seq_id[0][0] : -1;
+    if (T < 2 || ub.n_tokens % T != 0 || q0 < 0 || q0 + ub.n_tokens / T > cparams.dsel->vtok_dst->ne[1]) {
+        return false;
+    }
+    for (uint32_t r = 0; r < ub.n_tokens; ++r) {
+        if (ub.seq_id[r][0] != (llama_seq_id) (q0 + r / T)) {
+            return false;
+        }
+    }
+    if (q0p) {
+        *q0p = q0;
+    }
+    return true;
+}
+
+static bool llama_dsel_vidx_reuse(const llama_cparams & cparams, const llama_ubatch & ub, bool dev, int64_t q0) {
+    int64_t q = -1;
+    const bool d = llama_dsel_vidx_dev(cparams, ub, &q);
+    return d == dev && (!d || q == q0);
+}
+
 class llm_graph_input_dsel : public llm_graph_input_i {
 public:
     llm_graph_input_dsel(const llama_dsel_inputs * src, int64_t top_k, int64_t block) : src(src), top_k(top_k), block(block) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
-        if (!inv_temp->buffer) {
+        if (greedy_dev && (!vidx || vidx_dev)) {
+            return; // [phase 3.4c] greedy constants and the set_rows index are built in the graph
+        }
+        if (!greedy_dev && !inv_temp->buffer) {
             return;
         }
         const int64_t nb = inv_temp->ne[1];
@@ -47,9 +102,11 @@ public:
         if (src && src->noise.size() == nz.size()) {
             nz = src->noise;
         }
-        ggml_backend_tensor_set(inv_temp, it.data(), 0, ggml_nbytes(inv_temp));
-        ggml_backend_tensor_set(noise,    nz.data(), 0, ggml_nbytes(noise));
-        if (vidx && vidx->buffer) {
+        if (!greedy_dev) {
+            ggml_backend_tensor_set(inv_temp, it.data(), 0, ggml_nbytes(inv_temp));
+            ggml_backend_tensor_set(noise,    nz.data(), 0, ggml_nbytes(noise));
+        }
+        if (vidx && vidx->buffer && !vidx_dev) {
             // [GPU-RESIDENT-ROUND-2f phase 3.2] block row i of seq s -> col i (1..T-1) of the target's verify-token
             // buffer row s; row 0 and rows past T-1 go to the scratch col T
             const int64_t T = vT, ld = vT + 1, n_rows = vidx->ne[0];
@@ -66,8 +123,14 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         const int64_t nb = params.ubatch.n_seqs_unq;
         return inv_temp->ne[1] == nb && noise->ne[2] == nb && (int64_t) params.ubatch.n_tokens == nb*block &&
-               (src && src->vtok_dst && src->vtok_T == block) == (vidx != nullptr);
+               (src && src->vtok_dst && src->vtok_T == block) == (vidx != nullptr) &&
+               llama_dsel_greedy_dev(params.cparams, params.ubatch) == greedy_dev &&
+               (vidx == nullptr || llama_dsel_vidx_reuse(params.cparams, params.ubatch, vidx_dev, vidx_q0));
     }
+
+    bool greedy_dev = false; // [phase 3.4c] inv_temp = 1 and noise = 0 are graph constants (every block greedy)
+    bool vidx_dev   = false; // [phase 3.4c] the vtok set_rows index is derived on the device (block s = seq q0 + s)
+    int64_t vidx_q0 = -1;
 
     ggml_tensor * inv_temp = nullptr; // F32 [1, n_blocks]
     ggml_tensor * noise    = nullptr; // F32 [top_k, block, n_blocks]
@@ -1229,8 +1292,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         tok_embd = model_other->tok_embd;
     }
 
-    ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp_tokens);
+    // [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the noise block's tokens are built on the device
+    float dft_mask = -1.0f;
+    int64_t dft_q0 = -1;
+    ggml_tensor * inp_tokens = nullptr;
+    if (!ubatch.embd && llama_draft_in_ok(cparams, ubatch, &dft_mask, &dft_q0)) {
+        inp_tokens = llama_build_draft_tokens(ctx0, cparams, ubatch, dft_mask, dft_q0);
+        static bool logged_dt = false;
+        if (!logged_dt) {
+            logged_dt = true;
+            fprintf(stderr, "%s: LLAMA_DEVICE_DRAFT_IN: drafter tokens from the target verify-token buffer ENABLED\n", __func__);
+        }
+    } else {
+        dft_mask = -1.0f;
+        inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp_tokens);
+    }
     res->t_inp_tokens = inp_tokens;
 
     if (ubatch.embd) {
@@ -1245,7 +1322,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->add_input(std::move(inp));
     } else {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-        inp->tokens = inp_tokens;
+        inp->tokens   = inp_tokens;
+        inp->dft_mask = dft_mask;
+        inp->dft_q0   = dft_q0;
         res->add_input(std::move(inp));
     }
 
@@ -1502,13 +1581,27 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
     if (llama_dflash_device_lattice_enabled() && block_size == tokens_per_block && cparams.dsel) {
         auto inp = std::make_unique<llm_graph_input_dsel>(cparams.dsel, top_k, tokens_per_block);
         inp->inv_temp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks);
-        ggml_set_input(inp->inv_temp);
         ggml_set_name(inp->inv_temp, "dflash2_dsel_inv_temp");
         inp->noise = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, top_k, tokens_per_block, n_blocks);
-        ggml_set_input(inp->noise);
         ggml_set_name(inp->noise, "dflash2_dsel_noise");
+        ggml_tensor * it_src = inp->inv_temp;
+        ggml_tensor * nz_src = inp->noise;
+        inp->greedy_dev = llama_dsel_greedy_dev(cparams, ubatch);
+        if (inp->greedy_dev) {
+            // [phase 3.4c] greedy: constants, no host input
+            it_src = ggml_fill(ctx0, inp->inv_temp, 1.0f);
+            nz_src = ggml_fill(ctx0, inp->noise, 0.0f);
+            static bool logged_g = false;
+            if (!logged_g) {
+                logged_g = true;
+                fprintf(stderr, "%s: LLAMA_DEVICE_DRAFT_IN: greedy draft selection inputs as graph constants ENABLED\n", __func__);
+            }
+        } else {
+            ggml_set_input(inp->inv_temp);
+            ggml_set_input(inp->noise);
+        }
 
-        ggml_tensor * out = llama_build_dflash_dsel(ctx0, packed, inp->inv_temp, inp->noise, top_k, block_size, n_blocks);
+        ggml_tensor * out = llama_build_dflash_dsel(ctx0, packed, it_src, nz_src, top_k, block_size, n_blocks);
         cb(out, "dflash2_dsel", -1);
         // [GPU-RESIDENT-ROUND-2f phase 3.2] write the selected tokens (col 0 of each row) into the target context's
         // verify-token buffer, so the target's verify batch needs no tokens H2D
@@ -1518,10 +1611,24 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
             inp->vT  = block_size;
             inp->vns = dst->ne[1];
             inp->vidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
-            ggml_set_input(inp->vidx);
             ggml_set_name(inp->vidx, "dflash2_vtok_idx");
+            ggml_tensor * vix = inp->vidx;
+            inp->vidx_dev = llama_dsel_vidx_dev(cparams, ubatch, &inp->vidx_q0);
+            if (inp->vidx_dev) {
+                // [phase 3.4c] r -> s = floor(r / T), i = r - s*T: s*(T+1) + i + T*[i == 0] (T = block_size, ld = T + 1)
+                const float T = (float) block_size;
+                ggml_tensor * r  = ggml_arange(ctx0, 0.0f, (float) n_rows, 1.0f);
+                ggml_tensor * sb = ggml_floor(ctx0, ggml_scale_bias(ctx0, r, 1.0f/T, 0.5f/T));
+                ggml_tensor * i  = ggml_sub(ctx0, r, ggml_scale(ctx0, sb, T));
+                ggml_tensor * z  = ggml_step(ctx0, ggml_scale_bias(ctx0, i, -1.0f, 0.5f));
+                ggml_tensor * f  = ggml_add(ctx0, ggml_add(ctx0, ggml_scale_bias(ctx0, sb, T + 1.0f, (float) inp->vidx_q0*(T + 1.0f)), i), ggml_scale(ctx0, z, T));
+                vix = ggml_cast(ctx0, f, GGML_TYPE_I32);
+                ggml_set_name(vix, "dflash2_vtok_idx_dev");
+            } else {
+                ggml_set_input(inp->vidx);
+            }
             ggml_tensor * col = ggml_cont(ctx0, ggml_view_2d(ctx0, out, 1, n_rows, W*ggml_element_size(out), 0));
-            ggml_tensor * wv  = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, dst, 1, ggml_nelements(dst)), col, inp->vidx);
+            ggml_tensor * wv  = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, dst, 1, ggml_nelements(dst)), col, vix);
             ggml_set_name(wv, "dflash2_vtok_wb");
             ggml_build_forward_expand(gf, wv);
             static bool logged_vtok = false;

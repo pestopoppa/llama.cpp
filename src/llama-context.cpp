@@ -2264,16 +2264,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // [GPU-RESIDENT-ROUND-2f phase 3.1] predict the device accept advances of the previous decode from its argmax rows
+    ctl_resolve_pending();
     llama_kv_cache * kv_ctl = ctl_kv();
-    if (kv_ctl && kv_ctl->ctl_any_pending()) {
-        synchronize();
-        kv_ctl->ctl_resolve([this](int64_t r) -> int32_t {
-            if (r < 0 || r >= (int64_t) ctl_out_ids.size()) {
-                return -1;
-            }
-            return get_argmax_ith((int32_t) ctl_out_ids[r]);
-        });
-    }
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -4693,6 +4685,27 @@ ggml_tensor * llama_get_vtok_device(llama_context * ctx, int32_t * T) {
         *T = kv->vtok_T;
     }
     return kv->vtok;
+}
+
+void llama_context::ctl_resolve_pending() {
+    llama_kv_cache * kv_ctl = ctl_kv();
+    if (kv_ctl && kv_ctl->ctl_any_pending()) {
+        synchronize();
+        kv_ctl->ctl_resolve([this](int64_t r) -> int32_t {
+            if (r < 0 || r >= (int64_t) ctl_out_ids.size()) {
+                return -1;
+            }
+            return get_argmax_ith((int32_t) ctl_out_ids[r]);
+        });
+    }
+}
+
+void llama_set_draft_target(llama_context * ctx_dft, llama_context * ctx_tgt) {
+    ctx_dft->set_draft_target(ctx_tgt ? ctx_tgt->get_ctl_kv() : nullptr);
+}
+
+void llama_ctl_resolve(llama_context * ctx) {
+    ctx->ctl_resolve_pending();
 }
 
 void llama_set_draft_vtok(llama_context * ctx, ggml_tensor * dst, int32_t T) {

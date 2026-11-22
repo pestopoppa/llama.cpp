@@ -361,6 +361,9 @@ public:
         dsel_inputs.vtok_dst = dst;
         dsel_inputs.vtok_T   = dst ? T : 0;
     }
+    void set_draft_target(const llama_kv_cache * kv) { dsel_inputs.tgt_kv = kv; }
+    // [phase 3.4c] predict the pending control-block advances of the last decode now (normally done at the next decode)
+    void ctl_resolve_pending();
     void set_dflash_select(const float * inv_temp, int32_t n_blocks, const float * noise, int32_t n_noise) {
         dsel_inputs.inv_temp.assign(inv_temp, inv_temp + (inv_temp ? n_blocks : 0));
         dsel_inputs.noise.assign(noise, noise + (noise ? n_noise : 0));

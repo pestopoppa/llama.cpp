@@ -194,6 +194,11 @@ LLAMA_API bool llama_dflash_feed_enabled(const struct llama_context * ctx);
 LLAMA_API struct ggml_tensor * llama_get_vtok_device(struct llama_context * ctx, int32_t * T);
 LLAMA_API void llama_set_draft_vtok(struct llama_context * ctx, struct ggml_tensor * dst, int32_t T);
 LLAMA_API void llama_vtok_mirror_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t i, llama_token tok);
+// [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the drafter reads its token batch [bonus, mask..] from the
+// target's verify-token buffer col 0 and its positions from the target's control block (both checked on the host
+// against the target's mirrors); llama_ctl_resolve predicts the target's pending accept advance before the draft
+LLAMA_API void llama_set_draft_target(struct llama_context * ctx_dft, struct llama_context * ctx_tgt);
+LLAMA_API void llama_ctl_resolve(struct llama_context * ctx);
 
 // [GPU-RESIDENT-ROUND-2e] device target->drafter feature gather (LLAMA_DEVICE_DFLASH_GATHER=1 in common/speculative).
 // Target context: keep the extracted layer inputs (llama_set_embeddings_layer_inp) as device tensors [n_embd, n_batch]

@@ -1345,6 +1345,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // host Philox noise); the host reads compact [token | ids | probs] rows instead of the lattice
     bool dev_lattice = false;
     bool dev_vtok    = false; // phase 3.2
+    bool dev_draft_in = false; // phase 3.4c LLAMA_DEVICE_DRAFT_IN=1
     bool dev_gather  = false; // [GPU-RESIDENT-ROUND-2e] LLAMA_DEVICE_DFLASH_GATHER=1 (needs the device feed)
     bool dev_gather_init = false;
     std::vector<ggml_tensor *> gather_feats;
@@ -1529,6 +1530,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 llama_set_draft_vtok(ctx_dft, vt, T);
                 dev_vtok = true;
                 LOG_INF("%s: LLAMA_DEVICE_VTOK: drafter feeds the target verify-token buffer (T=%d)\n", __func__, T);
+                // [phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the drafter also reads its batch from the target's buffers
+                if (const char * ed = getenv("LLAMA_DEVICE_DRAFT_IN"); ed && strcmp(ed, "1") == 0) {
+                    llama_set_draft_target(ctx_dft, this->params.ctx_tgt);
+                    dev_draft_in = true;
+                }
             }
         }
         selector_reset.assign(n_seq, true);
@@ -1906,6 +1912,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         if (is_dflash2 && dev_lattice) {
             dsel_set_inputs(dparams, i_block_beg, n_block);
+        }
+        if (dev_draft_in) {
+            // [GPU-RESIDENT-ROUND-2f phase 3.4c] predict the target's accept advance now, so its mirrors (bonus token,
+            // n_past) can vouch for the device-built drafter batch
+            llama_ctl_resolve(params.ctx_tgt);
         }
 
         // decode all sequence's noise block in a single batch

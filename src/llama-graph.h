@@ -148,6 +148,10 @@ public:
     bool                           vtok_bonus = false;
     ggml_tensor *                  vtok_t     = nullptr;
     const llama_kv_cache_context * vtok_kv    = nullptr;
+    // [GPU-RESIDENT-ROUND-2f phase 3.4c] drafter token batch built on the device from the target's verify-token col 0
+    // and this mask id (-1 = off)
+    float                          dft_mask   = -1.0f;
+    int64_t                        dft_q0     = -1; // first seq id of the drafter blocks (seq ids q0..q0+n-1)
 
     const int64_t n_embd = 0;
 };
@@ -185,6 +189,12 @@ public:
 
 // [GPU-RESIDENT-ROUND-2f phase 2] LLAMA_DEVICE_KV_IDX=1: token positions computed on the device as p0[g] + i for
 // n_g position-contiguous groups of n_tps tokens; the host uploads only p0 (one float per group)
+// [GPU-RESIDENT-ROUND-2f phase 3.4c] LLAMA_DEVICE_DRAFT_IN=1: the drafter ubatch is n blocks x T tokens of seqs 0..n-1,
+// [bonus, mask, ..] at positions n_past + i, and the target's mirrors (verify-token col 0, control-block n_past) predict
+// both exactly; *mask = the mask token id
+bool llama_draft_in_ok(const llama_cparams & cparams, const llama_ubatch & ubatch, float * mask = nullptr, int64_t * q0 = nullptr);
+ggml_tensor * llama_build_draft_tokens(ggml_context * ctx0, const llama_cparams & cparams, const llama_ubatch & ubatch, float mask, int64_t q0);
+
 class llm_graph_input_pos_dev : public llm_graph_input_i {
 public:
     llm_graph_input_pos_dev(uint32_t n_pos_per_embd, int64_t n_g, int64_t n_tps) : n_pos_per_embd(n_pos_per_embd), n_g(n_g), n_tps(n_tps) {}
@@ -192,6 +202,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
     ggml_tensor * p0 = nullptr; // F32 [1, n_g]
     int64_t ctl_s0 = -1;        // phase 3.1: p0 is a view of the KV device control block from this stream (-1 = host input)
+    bool    dft_p0 = false;     // phase 3.4c: p0 is a view of the TARGET context's control block (drafter)
+    int64_t dft_q0 = -1;        //             from this seq id / stream
     const uint32_t n_pos_per_embd;
     const int64_t  n_g, n_tps;
 };
