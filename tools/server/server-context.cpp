@@ -1346,6 +1346,53 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // [GPU-RESIDENT-ROUND-2f phase 4] server K-round replay (LLAMA_SERVER_KROUNDS=K, default 1 = off).
+    // While K > 1 and every busy slot is in steady generation, update_slots runs up to K speculative rounds
+    // (draft -> verify -> accept) back to back per host wake without returning to the task queue. Results
+    // produced inside those rounds go to an in-order token ring and are drained once after the last round, so
+    // streaming clients see bursts of up to K rounds of tokens. A slot that stops (EOS / limit / stop string)
+    // is marked done and is skipped by later rounds (pre_decode only batches GENERATING slots); the loop exits
+    // early when no slot is left. Cancellations and new tasks wait at most K rounds.
+    int32_t kround_k = [] {
+        const char * e = getenv("LLAMA_SERVER_KROUNDS");
+        const int v = e ? atoi(e) : 1;
+        return v < 1 ? 1 : (v > 64 ? 64 : v);
+    }();
+    bool kround_hold = false;
+    std::vector<server_task_result_ptr> kround_ring;
+    int64_t kround_wakes = 0, kround_rounds = 0, kround_early_exit = 0, kround_drained = 0;
+
+    void emit_result(server_task_result_ptr && res) {
+        if (kround_hold) {
+            kround_ring.push_back(std::move(res));
+        } else {
+            queue_results.send(std::move(res));
+        }
+    }
+
+    void kround_drain() {
+        kround_hold = false;
+        kround_drained += (int64_t) kround_ring.size();
+        for (auto & r : kround_ring) {
+            queue_results.send(std::move(r));
+        }
+        kround_ring.clear();
+    }
+
+    bool kround_steady() const {
+        bool any = false;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
+                return false;
+            }
+            any = true;
+        }
+        return any;
+    }
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -3044,7 +3091,7 @@ private:
         res->n_prompt_tokens = n_prompt_tokens;
         res->n_ctx           = n_ctx;
 
-        queue_results.send(std::move(res));
+        emit_result(std::move(res));
     }
 
     // Gate slot save/restore/erase on slot content (does it hold media),
@@ -3099,7 +3146,7 @@ private:
             res->timings = slot.get_timings();
         }
 
-        queue_results.send(std::move(res));
+        emit_result(std::move(res));
     }
 
     void send_final_response(server_slot & slot) {
@@ -3162,7 +3209,7 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
-        queue_results.send(std::move(res));
+        emit_result(std::move(res));
     }
 
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
@@ -3207,7 +3254,7 @@ private:
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
-        queue_results.send(std::move(res));
+        emit_result(std::move(res));
     }
 
     void send_rerank(const server_slot & slot, const llama_batch & batch) {
@@ -3238,7 +3285,7 @@ private:
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
-        queue_results.send(std::move(res));
+        emit_result(std::move(res));
     }
 
     //
@@ -3774,7 +3821,7 @@ private:
                                 task.params.control_action.c_str(), task.params.control_cmpl_id.c_str());
                         res->success = false;
                         res->message = "no active completion for this id";
-                        queue_results.send(std::move(res));
+                        emit_result(std::move(res));
                         break;
                     }
 
@@ -3783,7 +3830,7 @@ private:
                         if (!slot->task->params.sampling.reasoning_control) {
                             res->success = false;
                             res->message = "reasoning control not enabled for this completion";
-                            queue_results.send(std::move(res));
+                            emit_result(std::move(res));
                             break;
                         }
                         // act on the live slot mid generation, never defer
@@ -3794,7 +3841,7 @@ private:
                         res->message = "unknown control action";
                     }
 
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
@@ -3846,7 +3893,7 @@ private:
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
@@ -3926,7 +3973,7 @@ private:
                     res->n_tokens = n_saved;
                     res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
@@ -3993,7 +4040,7 @@ private:
                     res->n_tokens = token_count;
                     res->n_bytes  = nread + nread_ckpt + nread_dft;
                     res->t_ms     = t_restore_ms;
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
@@ -4032,7 +4079,7 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_COMPACT:
                 {
@@ -4076,7 +4123,7 @@ private:
                     res->pos_max_after = new_pos_max;
                     res->compact_positions = ea_params.compact_positions;
                     res->logical_context_reclaimed = false;
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
@@ -4102,7 +4149,7 @@ private:
                             alora_invocation_tokens,
                         });
                     }
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
@@ -4115,7 +4162,7 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
-                    queue_results.send(std::move(res));
+                    emit_result(std::move(res));
                 } break;
         }
     }
