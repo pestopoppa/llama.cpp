@@ -71,6 +71,11 @@ bool ggml_cuda_q8_skinny_eligible(const ggml_tensor * src0, const ggml_tensor * 
     if (!cfg.enabled || !GGML_CUDA_CC_IS_CDNA2(cc)) {
         return false;
     }
+    // GGML_DETERMINISTIC: the flush below is an unordered f32 unsafeAtomicAdd across waves (summation order not
+    // deterministic, see header); route to the C6 MMVQ/MMQ fallback instead of reducing it under the knob.
+    if (ggml_cuda_deterministic()) {
+        return false;
+    }
     return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= cfg.mmin && src1->ne[1] <= cfg.mmax &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
