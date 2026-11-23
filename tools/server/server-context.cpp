@@ -5583,7 +5583,10 @@ private:
         if (slot.spec_tree_batch && !slot.task->params.sampling.grammar.grammar.empty()) {
             return 0;
         }
-        if (slot.task->params.sampling.temp > 0.0f || slot.task->params.sampling.n_probs > 0 ||
+        // SPEC-DTREE-DICE V2: LLAMA_DTREE_SAMPLED=1 lifts the T > 0 guard (spec_tree_resolve walks the target's own
+        // samples through the tree; grammar stays excluded above, probabilities / exact modes stay excluded here)
+        const bool t_ok = slot.task->params.sampling.temp <= 0.0f || common_dtree_sampled_enabled();
+        if (!t_ok || slot.task->params.sampling.n_probs > 0 ||
             spec_exact != SPEC_EXACT_OFF || use_serial_speculative_verify(slot) ||
             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             return 0;
@@ -5640,6 +5643,27 @@ private:
             if (ok) {
                 // DTREE-DEVICE-TREE-ACCEPT: device picks only for a provably greedy sampler (else host scan, unchanged)
                 dev_ok = common_sampler_device_greedy_eligible(slot.smpl.get());
+                if (slot.task->params.sampling.temp > 0.0f && common_dtree_sampled_enabled()) {
+                    // SPEC-DTREE-DICE V2: replay the accept pass on a clone of the slot's sampler (same RNG state, or
+                    // the (seed, position) keyed draw with --rng-poskey), so the winner chosen here is exactly the path
+                    // the unchanged accept pass below walks with the real sampler: it draws the same samples on the
+                    // same rows and accepts the same prefix. Lossless: every emitted token is a target sample.
+                    common_sampler_ptr probe(common_sampler_clone(slot.smpl.get()));
+                    std::vector<const std::vector<int32_t> *>     prow { &slot.spec_i_batch };
+                    std::vector<const std::vector<llama_token> *> ptok { &slot.spec_draft };
+                    for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
+                        prow.push_back(&slot.spec_tree_i_batch[a]);
+                        ptok.push_back(&slot.spec_tree_alts[a]);
+                    }
+                    int32_t k = 0;
+                    best_n = common_dtree_sampled_walk(prow, ptok,
+                        [&](int32_t row) { return common_sampler_sample(probe.get(), ctx_tgt, row, false); },
+                        [&](llama_token tok) { common_sampler_accept(probe.get(), tok, true); }, &k);
+                    best = k - 1;
+                    // the rejection-sampling accept reads the MAIN chain's draft dists; the winner is accepted by
+                    // the plain sample-and-compare pass the probe replayed
+                    slot.spec_dists.clear();
+                } else {
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
                 for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
                     const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a], dev_ok);
@@ -5647,6 +5671,7 @@ private:
                         best   = (int32_t) a;
                         best_n = n;
                     }
+                }
                 }
                 slot.n_tree_rounds++;
             }
