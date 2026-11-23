@@ -370,6 +370,59 @@ int32_t common_dtree_greedy_accept_len(
     return n;
 }
 
+int32_t common_dtree_sampled_walk(
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::function<llama_token(int32_t row)>        & sample,
+        const std::function<void(llama_token tok)>           & accept,
+        int32_t * best) {
+    std::vector<int32_t> live;
+    for (size_t k = 0; k < paths.size(); ++k) {
+        if (rows[k]->size() == paths[k]->size() + 1) {
+            live.push_back((int32_t) k);
+        }
+    }
+    if (best) {
+        *best = live.empty() ? 0 : live[0];
+    }
+    if (live.empty()) {
+        return 0;
+    }
+    int32_t d = 0;
+    std::vector<int32_t> next;
+    for (;;) {
+        const llama_token tok = sample((*rows[live[0]])[d]);
+        next.clear();
+        for (const int32_t k : live) {
+            if ((size_t) d < paths[k]->size() && (*paths[k])[d] == tok) {
+                next.push_back(k);
+            }
+        }
+        if (next.empty()) {
+            break; // tok is the bonus: not a child of the current node
+        }
+        accept(tok);
+        live.swap(next);
+        ++d;
+        if (best) {
+            *best = live[0];
+        }
+    }
+    return d;
+}
+
+bool common_dtree_sampled_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DTREE_SAMPLED");
+        const bool v = e != nullptr && e[0] == '1';
+        if (v) {
+            fprintf(stderr, "llama_dtree_sampled: ENABLED (LLAMA_DTREE_SAMPLED=1; T>0 tree verify, V2 target-sample walk)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 void common_dtree_fork(llama_context * ctx, llama_seq_id src, llama_seq_id dst) {
     llama_memory_t mem = llama_get_memory(ctx);
     llama_memory_seq_rm(mem, dst, -1, -1);

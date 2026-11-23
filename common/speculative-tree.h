@@ -108,6 +108,25 @@ llama_token common_dtree_row_argmax(const float * logits, int32_t n_vocab);
 // accept walk over per-row picks (picks[i] = argmax of row i): number of leading i with picks[i] == draft[i]
 int32_t common_dtree_accept_walk(const std::vector<llama_token> & picks, const std::vector<llama_token> & draft);
 
+// SPEC-DTREE-DICE V2 (LLAMA_DTREE_SAMPLED=1, default off): sampled (T > 0) tree accept walk.
+// paths[k] are the verified root-to-leaf paths (k = 0 is the main chain), rows[k][d] is the batch row whose logits
+// give the target distribution after the anchor + paths[k][0..d) (rows[k].size() == paths[k].size() + 1). Paths
+// that agree on their first d tokens share the same context at depth d, so any of their rows[k][d] serves.
+// The walk (V2 of scripts/kernel_rnd/dice_replay/dice_replay.py): at depth d draw the TARGET's own sample
+// `sample(row)` at the current node; if it equals the depth-d token of a still-live path, `accept(tok)` and
+// descend, else stop (the sampled token is the bonus the caller's accept pass emits). Every emitted token is a
+// target sample, so the emitted distribution equals the target's (lossless). Returns the accepted length;
+// *best = the lowest live path index at the stop (0 = the main chain when it is still live).
+int32_t common_dtree_sampled_walk(
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::function<llama_token(int32_t row)>        & sample,
+        const std::function<void(llama_token tok)>           & accept,
+        int32_t * best);
+
+// LLAMA_DTREE_SAMPLED=1 read once (lifts the T > 0 guard of the tree verify; the accept walk is the V2 walk above)
+bool common_dtree_sampled_enabled();
+
 // LLAMA_DTREE_DEVICE_ACCEPT=1 read once; witness counters (rows decided by the device pick / by the host scan)
 bool    common_dtree_device_accept_enabled();
 void    common_dtree_device_accept_counts(int64_t * n_dev_rows, int64_t * n_host_rows);
