@@ -4767,8 +4767,14 @@ static void ggml_compute_forward_mul_mat_siblings(
     }
 
     if (ith == 0) {
-        if (ggml_cpu_mm_sibling_fuse_calls++ == 0) {
-            fprintf(stderr, "[mm-sibling] ACTIVE: GGML_Q38FN_GDNPROJ_FUSE fused %d sibling MUL_MATs (first ne00=%lld total_bytes=%lld nth=%d)\n",
+        // log every NEW maximum group size, not only the first group in time: the first fused
+        // group of a run can be a 2-sibling pair (e.g. shared-expert gate/up) while the GDN
+        // in-projections fuse as 4 in the same graphs. Thread 0 only, so no race.
+        static int max_k_logged = 0;
+        ggml_cpu_mm_sibling_fuse_calls++;
+        if (k > max_k_logged) {
+            max_k_logged = k;
+            fprintf(stderr, "[mm-sibling] ACTIVE: GGML_Q38FN_GDNPROJ_FUSE fused %d sibling MUL_MATs (max so far; ne00=%lld total_bytes=%lld nth=%d)\n",
                     k, (long long) ne10, (long long) total, nth);
         }
     }
