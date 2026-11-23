@@ -1330,7 +1330,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm;
+
+    // AK-MMQ-SK2 (upstream #30553 port, default OFF): cap the stream-k grid at the number of useful
+    // (tile, K-chunk) work units. GGML_HIP_MMQ_SK_CAP=1 enables it.
+    static const bool sk_cap_env = [] {
+        const char * e = getenv("GGML_HIP_MMQ_SK_CAP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const int64_t k_chunks = (args.ncols_x + config.K_vram - 1) / config.K_vram;
+    const int64_t nwork    = (int64_t) ntiles_dst * k_chunks;
+    if (sk_cap_env && nblocks_stream_k != ntiles_dst && nwork < nblocks_stream_k) {
+        nblocks_stream_k = (int) nwork;
+    }
+
+    const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 

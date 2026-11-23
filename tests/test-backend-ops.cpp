@@ -13750,6 +13750,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // AK-MMQ-SK2: MMQ grid-shape cases for the default-off CDNA stream-k knobs (GGML_HIP_MMQ_SK_CAP=1,
+    // GGML_HIP_MMQ_CDNA_FORCE_TILING=1) and the GGML_HIP_MMQ_CDNA_SMALL_TILE build. Run the same cases once per
+    // knob: tiny nwork (cap bites, grid < nsm), served small-n dense shapes (fixup on/off), many tiles (force-tiling
+    // fires) and MoE MUL_MAT_ID above the MMVQ cap. A grid change regroups FP32 sums, so NMSE (not bits) is the gate.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {5, 8, 16, 17, 32, 36, 64}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  128, n,  512, {1, 1}, {1, 1})); // nwork 2..4
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1})); // attn K/V-like
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4352, n, 1280, {1, 1}, {1, 1})); // many tiles
+        }
+    }
+    for (int n : {16, 64}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 4, false, 512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, false, 512, n, 2048));
+    }
+
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
