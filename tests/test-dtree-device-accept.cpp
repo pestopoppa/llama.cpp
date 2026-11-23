@@ -55,7 +55,12 @@ static int run_case(ggml_backend_t backend, int64_t n_vocab, int64_t n_rows, std
             continue;
         }
         for (const int64_t c : cols) {
-            row[c] = 9.5f;
+            // [C19 fix-up] stress columns are fixed offsets (5 + 1024, 5 + 256, ...): skip those outside a narrow row. Writing them
+            // unchecked overflowed the host buffer for n_vocab 97 / 1025 (AddressSanitizer heap-buffer-overflow at this line, CPU)
+            // and corrupted the heap, which is what crashed the ROCm runs in free() (c19-fold-gpu-20261123-r2 phase 0, 2/8).
+            if (c >= 0 && c < n_vocab) {
+                row[c] = 9.5f;
+            }
         }
     }
 
