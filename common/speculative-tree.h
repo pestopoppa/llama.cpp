@@ -157,6 +157,14 @@ std::vector<std::vector<int32_t>> common_dtree_build_sampled(
         int32_t D, int32_t K, const common_dtree_scores_fn & scores, const std::vector<int32_t> & main,
         const std::vector<std::vector<float>> & q, int32_t n_nodes, int32_t max_paths);
 
+// SPEC-DTREE-SAMPLED-V2: whether the tree accept may run the served REJECTION step on the main chain (the draft
+// dists cover the whole main chain and the target can roll back a partial main chain). false = every node falls back
+// to sample-and-compare, the downgrade the V1 build suffered; the server counts such rounds (tree_rrs_noq).
+bool common_dtree_rrs_q_ok(size_t n_dists, size_t n_main, bool seq_rm_part, bool seq_rm_rs, int32_t n_rs_seq);
+
+// SPEC-DTREE-SAMPLED-V2: verify columns a sibling path adds beyond the main chain (its length past the shared prefix)
+int32_t common_dtree_new_cols(const std::vector<int32_t> & main, const std::vector<int32_t> & alt);
+
 // LLAMA_DTREE_SAMPLED_W (paths incl. main, default COMMON_DTREE_MAX_PATHS) for the T > 0 sibling builders
 int32_t common_dtree_sampled_max_paths();
 

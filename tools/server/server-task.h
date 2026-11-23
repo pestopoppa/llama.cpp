@@ -313,6 +313,12 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    // SPEC-DTREE-SAMPLED-V2 per-request round counters (only with draft_n > 0)
+    int32_t draft_rounds    = 0; // verify rounds
+    int64_t draft_nodes     = 0; // drafted verify columns incl. siblings past the shared prefix
+    int64_t tree_rrs_rounds = 0; // rounds decided by the RRS tree accept
+    int64_t tree_rrs_noq    = 0; // ... run without draft dists (sample-and-compare downgrade; must be 0)
+    int64_t tree_rrs_alt    = 0; // rounds that left the main chain through a sibling
 
     // Optional reorder-planner outcome - only included when the request asked for it (null otherwise)
     json kv_reorder = nullptr;
