@@ -12796,9 +12796,19 @@ struct test_mul_mat_shared_q81 : public test_case {
     }
 };
 
+// AK-A3B-VERIFY-CHUNK: the Qwen3.6-35B-A3B F32 router (ffn_gate_inp 256 x 2048) and BF16 MTP router at every verify
+// width 1..16; GGML_HIP_MMVF_CHUNK=N moves ne11 > the MMVF cap (C19 default 8) from MMF onto chunked MMVF.
+static void a3b_add_router_chunk_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t n = 1; n <= 16; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 256, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, n, 2048, {1, 1}, {1, 1}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
+    a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
@@ -15262,6 +15272,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
+    a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
     // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
