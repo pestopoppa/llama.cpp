@@ -15090,6 +15090,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // [GDN-FUSED-VARIANT] the remaining verify rows the fused kernel (GGML_HIP_GDN_FUSED=1) covers, F32 state, np1:
+    // K=1 at 1/4/8/12/16 rows and K=rows at 8/12 (4/16 above). Run once with the knob off and once on.
+    for (int64_t nt : { 1, 4, 8, 12, 16 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, /*K=*/1, GGML_TYPE_F32, /*g_min=*/-0.05f));
+        if (nt == 8 || nt == 12) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, false, false, /*K=*/nt, GGML_TYPE_F32, /*g_min=*/-0.05f));
+        }
+    }
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -15585,6 +15593,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                         if (nt > 1) {
                             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, sv, nt, ns, 3, false, false, /*K=*/nt, st));
                         }
+                    }
+                }
+            }
+        }
+    }
+    // [GDN-FUSED-VARIANT] fused-kernel screen set (opt-in): S_v 128, 48 v-heads, n_seqs {1,4}, n_tokens {1,4,8,12,16},
+    // F32/BF16 state, K=1 and K=n_tokens; run with GGML_HIP_GDN_FUSED unset vs =1.
+    if (test_backend_ops_extra_case_set("gdn_fused")) {
+        for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+            for (int64_t ns : { 1, 4 }) {
+                for (int64_t nt : { 1, 4, 8, 12, 16 }) {
+                    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, ns, 3, false, false, /*K=*/1, st));
+                    if (nt > 1) {
+                        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, ns, 3, false, false, /*K=*/nt, st));
                     }
                 }
             }
