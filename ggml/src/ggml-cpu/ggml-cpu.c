@@ -4605,8 +4605,8 @@ size_t ggml_cpu_fused_moe_upgate_q8_work_size(const struct ggml_cgraph * cgraph,
 // stripe instead of costing a barrier each).
 //
 // Bit-exactness: only nodes the stock path computes with the generic per-row vec_dot are taken
-// (Q8_0 below the iqk Q8_0 route, F32 at ne11 == 1 which tinyBLAS refuses, nrows == 1, no extra/
-// repack traits). Each output element is the same vec_dot over the same quantized activation
+// (Q8_0 below the iqk Q8_0 route, F32 at ne11 == 1 which tinyBLAS refuses, single-row vec_dot
+// calls since ne11 == 1 is odd, no extra/repack traits). Each output element is the same vec_dot over the same quantized activation
 // (D1's batch-1 path quantizes the whole row with the same from_float), so the result is
 // bit-identical to the unfused graph; only the row-to-thread assignment changes.
 #define GGML_CPU_MM_SIBLING_MAX 8
@@ -4622,7 +4622,9 @@ static bool ggml_cpu_mm_sibling_ok(const struct ggml_tensor * t, const struct gg
     if (w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_F32) {
         return false;
     }
-    if (type_traits_cpu[w->type].nrows != 1 || type_traits_cpu[w->type].vec_dot == NULL) {
+    // nrows may be 2 (Q8_0 on AVX2/i8mm), but the stock path drops to single-row vec_dot calls
+    // whenever ne11 is odd, i.e. always at ne11 == 1 -- the only case taken here
+    if (type_traits_cpu[w->type].vec_dot == NULL) {
         return false;
     }
     if (ggml_get_op_params_i32(t, 1) != 0) {   // hadamard / other hints take their own path
