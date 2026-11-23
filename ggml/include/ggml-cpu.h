@@ -42,6 +42,8 @@ extern "C" {
 
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    // AK-CPU-GDN-STATE-FWD: GATED_DELTA_NET nodes forwarded in place so far (GGML_GDN_STATE_FWD=1)
+    GGML_BACKEND_API long long ggml_cpu_gdn_state_fwd_count(void);
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

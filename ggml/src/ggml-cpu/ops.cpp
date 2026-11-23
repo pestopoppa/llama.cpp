@@ -12424,6 +12424,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // AK-CPU-GDN-STATE-FWD: when forwarded, the state is read from the cache row named by the
+    // GET_ROWS index and written to the CPY destination row. Setup only forwards the identity case
+    // (both rows are the same memory), so the memcpy below is elided and the update runs in place.
+    const ggml_tensor * fwd_R = nullptr;
+    const ggml_tensor * fwd_C = nullptr;
+    const bool fwd = (dst->flags & GGML_CPU_TFLAG_GDN_FWD) && K == 1 && !keep && par_d == nullptr &&
+                     ggml_cpu_gdn_fwd_lookup(params, dst, &fwd_R, &fwd_C);
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
@@ -12443,7 +12451,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (fwd) {
+            const int32_t row = ((const int32_t *) fwd_R->src[1]->data)[iv3];
+            s_in  = (const float *) ((const char *) fwd_R->src[0]->data + (size_t) row * fwd_R->src[0]->nb[1]) + iv1 * S_v * S_v;
+            s_out = (float *) fwd_C->data + (iv3 * H + iv1) * S_v * S_v;
+        }
+        if (s_out != s_in) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         if (src_pk) {
             const int64_t n_r = ((const int32_t *) src_n_rep->data)[iv3];

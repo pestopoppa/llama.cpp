@@ -98,6 +98,7 @@ static uint64_t ggml_cpu_prof_barriers   = 0;   // ggml_barrier() calls seen by 
 static uint64_t ggml_cpu_prof_solo_runs  = 0;   // INF-70 SYNC-2 collapsed tiny-op runs
 static uint64_t ggml_cpu_prof_solo_nodes = 0;   // nodes inside those runs
 static uint64_t ggml_cpu_prof_empty_skipped = 0; // zero-element nodes skipped with their barrier
+static uint64_t ggml_cpu_prof_gdn_fwd = 0;       // AK-CPU-GDN-STATE-FWD forwarded GDN nodes
 static int      ggml_cpu_prof_barrier_on = 0;   // set by thread 0 for accumulated graphs only
 static inline int ggml_cpu_prof_mm_enabled(void) {
     if (ggml_cpu_prof_mm_flag < 0) {
@@ -606,6 +607,8 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
+#define GGML_GDN_FWD_MAX 256
+
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -630,6 +633,10 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    // AK-CPU-GDN-STATE-FWD: forwarded (GDN, GET_ROWS, CPY) triples for the graph being computed
+    int n_gdn_fwd;
+    struct { const struct ggml_tensor * gdn, * R, * C; } gdn_fwd[GGML_GDN_FWD_MAX];
 };
 
 // Per-thread state
@@ -2804,6 +2811,249 @@ static int64_t ggml_get_rows_min_bytes(void) {
 // with no rebuild.  GGML_TINY_SOLO_MAX caps dst elements.
 static bool    ggml_cpu_tiny_solo     = true;   // set once in ggml_cpu_init(), read-only after
 static bool    ggml_cpu_empty_skip    = true;   // INF-70 SYNC-9: drop zero-element nodes + their barrier
+
+// ---------------------------------------------------------------------------------------------
+// AK-CPU-GDN-STATE-FWD (GGML_GDN_STATE_FWD, default OFF; marker GDN_STATE_FWD).
+// The recurrent-layer graph is GET_ROWS(states_all, s_copy) -> GATED_DELTA_NET(src[5]) ->
+// CPY(view(result, state), view(states_all, kv_head)): three full state copies per layer plus the
+// kernel's own memcpy. When, at compute time, the GET_ROWS source row of every sequence IS the
+// CPY destination row (the identity case: the decode steady state), the kernel can update the
+// cache row in place. The GET_ROWS and CPY are then skipped (no compute, no barrier) and the
+// kernel's memcpy vanishes because s_in == s_out. The arithmetic is unchanged -> bit-identical.
+// Anything else (permuted index, K > 1, keep/replay, tree, extra consumers, other readers or
+// writers of the cache rows between the GET_ROWS and the CPY) keeps the stock copy path.
+// ---------------------------------------------------------------------------------------------
+static bool ggml_cpu_gdn_state_fwd = false;       // set once in ggml_cpu_init()
+static atomic_llong ggml_cpu_gdn_fwd_total = 0;   // forwarded GDN nodes, process lifetime
+
+static inline bool ggml_cpu_node_fwd_skipped(const struct ggml_tensor * t) {
+    return (t->flags & GGML_CPU_TFLAG_FWD_SKIP) != 0;
+}
+
+static bool ggml_cpu_ranges_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    const char * pa = (const char *) a;
+    const char * pb = (const char *) b;
+    return pa < pb + nb && pb < pa + na;
+}
+
+static bool ggml_cpu_tensor_touches(const struct ggml_tensor * t, const void * lo, size_t n) {
+    if (t == NULL || t->data == NULL) {
+        return false;
+    }
+    return ggml_cpu_ranges_overlap(t->data, ggml_nbytes(t), lo, n);
+}
+
+struct ggml_gdn_fwd_cand {
+    int gi, ri, ci;
+    struct ggml_tensor * gdn, * T, * R, * S, * C;
+    size_t attn_bytes, state_bytes, row_bytes;
+    int64_t n_seqs;
+    bool ok;
+};
+
+static void ggml_cpu_gdn_fwd_setup(struct ggml_threadpool * tp, struct ggml_cgraph * g) {
+    tp->n_gdn_fwd = 0;
+    if (!ggml_cpu_gdn_state_fwd) {
+        return;
+    }
+
+    static struct ggml_gdn_fwd_cand cand[GGML_GDN_FWD_MAX];
+    int nc = 0;
+    const int n = g->n_nodes;
+
+    // pass 1: structural candidates
+    for (int i = 0; i < n && nc < GGML_GDN_FWD_MAX; i++) {
+        struct ggml_tensor * gdn = g->nodes[i];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || (gdn->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (ggml_get_op_params_i32(gdn, 0) != 1 || ggml_get_op_params_i32(gdn, 1) > 0 || gdn->src[6] != NULL) {
+            continue; // K > 1, replay/keep, or tree: stock path
+        }
+        if (gdn->type != GGML_TYPE_F32 || gdn->src[5] == NULL || gdn->src[5]->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const int64_t S_v = gdn->src[2]->ne[0], H = gdn->src[2]->ne[1];
+        const int64_t nt  = gdn->src[2]->ne[2], ns = gdn->src[2]->ne[3];
+        const int64_t row_elems = S_v * S_v * H;
+
+        struct ggml_tensor * T = gdn->src[5];
+        if (!ggml_is_contiguous(T) || ggml_nelements(T) != row_elems * ns || (T->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        struct ggml_tensor * R = T->view_src ? T->view_src : T;
+        if (T->view_src && T->view_offs != 0) {
+            continue;
+        }
+        if (R->op != GGML_OP_GET_ROWS || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) ||
+            R->ne[0] != row_elems || R->ne[1] != ns || R->ne[2] != 1 || R->ne[3] != 1 ||
+            (R->flags & GGML_TENSOR_FLAG_OUTPUT) || (R->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        const struct ggml_tensor * rs = R->src[0];
+        const struct ggml_tensor * ri = R->src[1];
+        if (rs == NULL || ri == NULL || rs->type != GGML_TYPE_F32 || rs->nb[0] != sizeof(float) ||
+            rs->ne[0] != row_elems || ri->type != GGML_TYPE_I32 || ri->ne[0] != ns ||
+            !ggml_is_contiguous(ri) || rs->data == NULL || ri->data == NULL) {
+            continue;
+        }
+        int rpos = -1;
+        for (int j = i - 1; j >= 0 && j >= i - 4096; j--) {
+            if (g->nodes[j] == R) { rpos = j; break; }
+        }
+        if (rpos < 0) {
+            continue;
+        }
+        const size_t attn_bytes  = (size_t) (S_v * H * nt * ns) * sizeof(float);
+        const size_t state_bytes = (size_t) (row_elems * ns) * sizeof(float);
+        int cpos = -1;
+        for (int j = i + 1; j < n && j <= i + 64; j++) {
+            struct ggml_tensor * c = g->nodes[j];
+            if (c->op != GGML_OP_CPY) {
+                continue;
+            }
+            const struct ggml_tensor * s = c->src[0];
+            if (s && s->view_src == gdn && s->view_offs == attn_bytes && ggml_is_contiguous(s) &&
+                ggml_nbytes(s) == state_bytes && c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) &&
+                ggml_nbytes(c) == state_bytes && (c->flags & GGML_TENSOR_FLAG_COMPUTE) && c->data != NULL &&
+                (s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                cpos = j;
+                break;
+            }
+        }
+        if (cpos < 0) {
+            continue;
+        }
+        struct ggml_gdn_fwd_cand * cd = &cand[nc++];
+        cd->gi = i; cd->ri = rpos; cd->ci = cpos;
+        cd->gdn = gdn; cd->T = T; cd->R = R; cd->S = g->nodes[cpos]->src[0]; cd->C = g->nodes[cpos];
+        cd->attn_bytes = attn_bytes; cd->state_bytes = state_bytes;
+        cd->row_bytes = (size_t) row_elems * sizeof(float); cd->n_seqs = ns;
+        cd->ok = true;
+    }
+    if (nc == 0) {
+        return;
+    }
+
+    // pass 2: use scan -- R, T, the GDN dst and its state view S may have no consumer but the triple
+    for (int k = 0; k < nc; k++) {
+        cand[k].R->flags   |= GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].T->flags   |= GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].gdn->flags |= GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].S->flags   |= GGML_CPU_TFLAG_FWD_WATCH;
+    }
+    for (int i = 0; i < n; i++) {
+        const struct ggml_tensor * m = g->nodes[i];
+        const struct ggml_tensor * refs[GGML_MAX_SRC + 1];
+        int nr = 0;
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (m->src[j]) refs[nr++] = m->src[j];
+        }
+        if (m->view_src) refs[nr++] = m->view_src;
+        for (int j = 0; j < nr; j++) {
+            const struct ggml_tensor * p = refs[j];
+            if ((p->flags & GGML_CPU_TFLAG_FWD_WATCH) == 0 || p == m) {
+                continue;
+            }
+            for (int k = 0; k < nc; k++) {
+                struct ggml_gdn_fwd_cand * cd = &cand[k];
+                if (!cd->ok) continue;
+                bool allowed = true;
+                if (p == cd->R) {
+                    allowed = (cd->T != cd->R) ? (m == cd->T) : (m == cd->gdn);
+                } else if (p == cd->T) {
+                    allowed = (m == cd->gdn);
+                } else if (p == cd->S) {
+                    allowed = (m == cd->C);
+                } else if (p == cd->gdn) {
+                    if (m == cd->S) {
+                        allowed = true;
+                    } else if (m->view_src == cd->gdn) {
+                        allowed = (m != cd->S) && (m->view_offs + ggml_nbytes(m) <= cd->attn_bytes);
+                    } else {
+                        allowed = false; // direct (non-view) consumer of the whole dst
+                    }
+                } else {
+                    continue;
+                }
+                if (!allowed) cd->ok = false;
+            }
+        }
+    }
+    for (int k = 0; k < nc; k++) {
+        cand[k].R->flags   &= ~GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].T->flags   &= ~GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].gdn->flags &= ~GGML_CPU_TFLAG_FWD_WATCH;
+        cand[k].S->flags   &= ~GGML_CPU_TFLAG_FWD_WATCH;
+    }
+
+    // pass 3: run-time checks -- identity rows, and no other reader/writer of the cache rows
+    for (int k = 0; k < nc; k++) {
+        struct ggml_gdn_fwd_cand * cd = &cand[k];
+        if (!cd->ok) continue;
+        const struct ggml_tensor * rs = cd->R->src[0];
+        const int32_t * idx = (const int32_t *) cd->R->src[1]->data;
+        bool ok = true;
+        for (int64_t s = 0; s < cd->n_seqs && ok; s++) {
+            if (idx[s] < 0 || idx[s] >= rs->ne[1]) { ok = false; break; }
+            const char * src_row = (const char *) rs->data + (size_t) idx[s] * rs->nb[1];
+            const char * dst_row = (const char *) cd->C->data + (size_t) s * cd->row_bytes;
+            ok = (src_row == dst_row);
+        }
+        const void * lo = cd->C->data;
+        for (int j = cd->ri + 1; ok && j < cd->ci; j++) {
+            const struct ggml_tensor * m = g->nodes[j];
+            if (j == cd->gi || m == cd->T || m == cd->S) continue;
+            // views/no-ops move no bytes; their compute consumers are range-checked below
+            if (ggml_op_is_empty(m->op) || ggml_nelements(m) == 0) continue;
+            if ((m->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
+            if (ggml_cpu_tensor_touches(m, lo, cd->state_bytes)) { ok = false; break; }
+            for (int q = 0; q < GGML_MAX_SRC; q++) {
+                if (ggml_cpu_tensor_touches(m->src[q], lo, cd->state_bytes)) { ok = false; break; }
+            }
+        }
+        if (!ok || tp->n_gdn_fwd >= GGML_GDN_FWD_MAX) continue;
+        tp->gdn_fwd[tp->n_gdn_fwd].gdn = cd->gdn;
+        tp->gdn_fwd[tp->n_gdn_fwd].R   = cd->R;
+        tp->gdn_fwd[tp->n_gdn_fwd].C   = cd->C;
+        tp->n_gdn_fwd++;
+        cd->R->flags   |= GGML_CPU_TFLAG_FWD_SKIP;
+        cd->C->flags   |= GGML_CPU_TFLAG_FWD_SKIP;
+        cd->gdn->flags |= GGML_CPU_TFLAG_GDN_FWD;
+    }
+    if (tp->n_gdn_fwd > 0) {
+        atomic_fetch_add_explicit(&ggml_cpu_gdn_fwd_total, tp->n_gdn_fwd, memory_order_relaxed);
+    }
+}
+
+static void ggml_cpu_gdn_fwd_teardown(struct ggml_threadpool * tp) {
+    for (int k = 0; k < tp->n_gdn_fwd; k++) {
+        ((struct ggml_tensor *) tp->gdn_fwd[k].R)->flags   &= ~GGML_CPU_TFLAG_FWD_SKIP;
+        ((struct ggml_tensor *) tp->gdn_fwd[k].C)->flags   &= ~GGML_CPU_TFLAG_FWD_SKIP;
+        ((struct ggml_tensor *) tp->gdn_fwd[k].gdn)->flags &= ~GGML_CPU_TFLAG_GDN_FWD;
+    }
+    tp->n_gdn_fwd = 0;
+}
+
+bool ggml_cpu_gdn_fwd_lookup(const struct ggml_compute_params * params, const struct ggml_tensor * gdn,
+                             const struct ggml_tensor ** R, const struct ggml_tensor ** C) {
+    const struct ggml_threadpool * tp = params->threadpool;
+    if (tp == NULL || (gdn->flags & GGML_CPU_TFLAG_GDN_FWD) == 0) {
+        return false;
+    }
+    for (int k = 0; k < tp->n_gdn_fwd; k++) {
+        if (tp->gdn_fwd[k].gdn == gdn) {
+            *R = tp->gdn_fwd[k].R;
+            *C = tp->gdn_fwd[k].C;
+            return true;
+        }
+    }
+    return false;
+}
+
+long long ggml_cpu_gdn_state_fwd_count(void) {
+    return atomic_load_explicit(&ggml_cpu_gdn_fwd_total, memory_order_relaxed);
+}
 static int64_t ggml_cpu_tiny_solo_max = 4096;   // keep big single-row nodes available to GGML_ROWCOL_SPLIT
 
 // INF-70 SYNC-15: GGML_TINY_SOLO_ROWS — the largest ggml_nrows() a node may have and still be
@@ -2910,7 +3160,8 @@ static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) 
     while (i < cgraph->n_nodes &&
            (ggml_op_is_empty(cgraph->nodes[i]->op) ||
             (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            (ggml_cpu_empty_skip && ggml_nelements(cgraph->nodes[i]) == 0))) {
+            (ggml_cpu_empty_skip && ggml_nelements(cgraph->nodes[i]) == 0) ||
+            ggml_cpu_node_fwd_skipped(cgraph->nodes[i]))) {
         i++;
     }
     return i;
@@ -4261,6 +4512,7 @@ static void ggml_cpu_prof_write_json(void) {
     fprintf(f, "  \"solo_runs\": %.3f,\n",               ggml_cpu_prof_solo_runs/g);
     fprintf(f, "  \"solo_nodes\": %.3f,\n",              ggml_cpu_prof_solo_nodes/g);
     fprintf(f, "  \"empty_skipped\": %.3f,\n",           ggml_cpu_prof_empty_skipped/g);
+    fprintf(f, "  \"gdn_fwd\": %.3f,\n",                 ggml_cpu_prof_gdn_fwd/g);
     fprintf(f, "  \"fused\": {\"count\": %.3f, \"compute_us\": %.3f, \"wall_us\": %.3f},\n",
             ggml_cpu_prof_fused_cnt/g, ggml_cpu_prof_fused_ns/g, ggml_cpu_prof_fused_wall_ns/g);
 
@@ -5111,6 +5363,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     (unsigned long long) gi, cgraph->n_nodes, params.nth, prof_acc);
         }
         ggml_cpu_prof_shape_seen(cgraph->n_nodes, prof_acc);
+        if (prof_acc) {
+            ggml_cpu_prof_gdn_fwd += (uint64_t) tp->n_gdn_fwd;
+        }
         ggml_cpu_prof_last_nth = params.nth; ggml_cpu_prof_eval_open(cgraph, gi, params.nth, prof_acc);
     }
 #endif
@@ -5124,6 +5379,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // AK-CPU-GDN-STATE-FWD: a forwarded GET_ROWS/CPY -- the GDN kernel does its work in place.
+        // The flag is set before the team starts, so every thread skips it (and its barrier) alike.
+        if (ggml_cpu_node_fwd_skipped(node)) {
             continue;
         }
 
@@ -5166,7 +5427,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     for (int k = node_n; k <= last; k++) {
                         struct ggml_tensor * nk = cgraph->nodes[k];
                         if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0)) {
+                            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0) || ggml_cpu_node_fwd_skipped(nk)) {
                             continue;
                         }
                         ggml_compute_forward(&sp, nk);
@@ -5548,6 +5809,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    // AK-CPU-GDN-STATE-FWD: single-threaded plan-time forwarding analysis (no-op with the knob off)
+    ggml_cpu_gdn_fwd_setup(threadpool, cgraph);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -5587,6 +5851,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    ggml_cpu_gdn_fwd_teardown(threadpool);
 
     enum ggml_status ret = threadpool->ec;
 
@@ -6051,6 +6317,15 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            // AK-CPU-GDN-STATE-FWD: default OFF; =1 lets GATED_DELTA_NET update the state cache in place
+            const char * env = getenv("GGML_GDN_STATE_FWD");
+            ggml_cpu_gdn_state_fwd = (env != NULL && atoi(env) != 0);
+            if (ggml_cpu_gdn_state_fwd && getenv("GGML_GDN_STATE_FWD_QUIET") == NULL) {
+                fprintf(stderr, "[gdn-state-fwd] GDN_STATE_FWD enabled\n");
+            }
         }
 
         {

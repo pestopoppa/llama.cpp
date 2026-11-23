@@ -538,6 +538,16 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
+// AK-CPU-GDN-STATE-FWD (GGML_GDN_STATE_FWD, default off): CPU-private tensor flag bits set for the
+// duration of one ggml_graph_compute. FWD_SKIP marks a GET_ROWS/CPY whose work the GDN kernel does
+// in place; GDN_FWD marks a GATED_DELTA_NET that reads/writes the recurrent-state cache directly.
+#define GGML_CPU_TFLAG_FWD_SKIP  (1 << 28)
+#define GGML_CPU_TFLAG_GDN_FWD   (1 << 29)
+#define GGML_CPU_TFLAG_FWD_WATCH (1 << 30)
+// returns true and sets R (GET_ROWS) and C (CPY) when gdn is forwarded in the current graph
+bool ggml_cpu_gdn_fwd_lookup(const struct ggml_compute_params * params, const struct ggml_tensor * gdn,
+                             const struct ggml_tensor ** R, const struct ggml_tensor ** C);
+
 #if defined(GGML_USE_IQK_MULMAT)
 // iqk port: dense quantized-GEMM fast path (ik_llama kernels); returns true if it
 // handled the mul_mat (env GGML_IQK=1 + supported type/dims), false to fall through.
