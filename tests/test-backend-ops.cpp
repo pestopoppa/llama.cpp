@@ -4447,6 +4447,10 @@ struct test_ak_h15 : public test_case {
     const int64_t hk, n_k_heads, n_v_heads, n_tokens, n_seqs, d_conv, n_slots;
     const bool with_cont; // qwen4exp emits ggml_cont(tail) before the snapshot cpy
     const bool with_gap;  // independent nodes between the last snapshot CPY and SSM_CONV (build_rs of the recurrent state)
+    // C19: n_kv > 0 builds the model's allocation pattern -- conv state from a GET_ROWS and qkv from a compute node, so
+    // both die at CONCAT and the allocator may hand their memory to silu / l2q / l2k (the fb1cd406f output-over-input race)
+    // -- with a gap whose scratch is sized by n_kv (the attention layers' n_kv 256 -> 512 pad step moves this layout).
+    const int64_t n_kv;
 
     ggml_tensor * silu_out = nullptr;
     ggml_tensor * l2q      = nullptr;
@@ -4466,8 +4470,12 @@ struct test_ak_h15 : public test_case {
                 continue;
             }
             if (t->type == GGML_TYPE_I32) {
-                const int32_t ids[2] = { 3, 1 };
-                ggml_backend_tensor_set(t, ids, 0, sizeof(ids));
+                // rs_ids {3, 1}; st_ids (n_kv cases) pick distinct state rows
+                std::vector<int32_t> ids(ggml_nelements(t));
+                for (size_t r = 0; r < ids.size(); ++r) {
+                    ids[r] = ids.size() == 2 && n_kv == 0 ? (r == 0 ? 3 : 1) : (int32_t) ((3*r + 1) % (ids.size() + 2));
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -4484,21 +4492,36 @@ struct test_ak_h15 : public test_case {
     std::string vars() override {
         return "hk=" + std::to_string(hk) + ",n_k_heads=" + std::to_string(n_k_heads) + ",n_v_heads=" + std::to_string(n_v_heads) +
                ",n_tokens=" + std::to_string(n_tokens) + ",n_seqs=" + std::to_string(n_seqs) + ",d_conv=" + std::to_string(d_conv) +
-               ",n_slots=" + std::to_string(n_slots) + ",cont=" + std::to_string(with_cont) + ",gap=" + std::to_string(with_gap);
+               ",n_slots=" + std::to_string(n_slots) + ",cont=" + std::to_string(with_cont) + ",gap=" + std::to_string(with_gap) +
+               (n_kv > 0 ? ",n_kv=" + std::to_string(n_kv) : std::string());
     }
 
     test_ak_h15(int64_t hk, int64_t n_k_heads, int64_t n_v_heads, int64_t n_tokens, int64_t n_seqs, int64_t d_conv = 4, int64_t n_slots = 1,
-                bool with_cont = false, bool with_gap = false)
+                bool with_cont = false, bool with_gap = false, int64_t n_kv = 0)
         : hk(hk), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_tokens(n_tokens), n_seqs(n_seqs), d_conv(d_conv), n_slots(n_slots),
-          with_cont(with_cont), with_gap(with_gap) {}
+          with_cont(with_cont), with_gap(with_gap || n_kv > 0), n_kv(n_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         cpys.clear();
         const int64_t C = 2*n_k_heads*hk + n_v_heads*hk;
 
-        ggml_tensor * conv_states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, C, n_seqs);
+        ggml_tensor * conv_states = nullptr;
+        ggml_tensor * qkv         = nullptr;
+        if (n_kv > 0) {
+            // model form: build_rs() gather of the conv state rows + a computed qkv (both intermediates)
+            ggml_tensor * cs_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*C, n_seqs + 2);
+            ggml_set_name(cs_all, "conv_states_all");
+            ggml_tensor * st_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(st_ids, "st_ids");
+            conv_states = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cs_all, st_ids), d_conv - 1, C, n_seqs);
+            ggml_tensor * qkv_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens, n_seqs);
+            ggml_set_name(qkv_in, "qkv_in");
+            qkv = ggml_scale(ctx, qkv_in, 1.0f);
+        } else {
+            conv_states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, C, n_seqs);
+            qkv         = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens, n_seqs);
+        }
         ggml_set_name(conv_states, "conv_states");
-        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens, n_seqs);
         ggml_set_name(qkv, "qkv_mixed");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, C);
         ggml_set_name(w, "conv_w");
@@ -4529,7 +4552,7 @@ struct test_ak_h15 : public test_case {
         ggml_tensor * tail = ggml_sum(ctx, ggml_concat(ctx, l2q, l2k, 0));
         if (with_gap) {
             // visited before the conv tail: SCALE + GET_ROWS + SUM like the recurrent-state build_rs()
-            ggml_tensor * rs  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 4);
+            ggml_tensor * rs  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv > 0 ? 16*n_kv : 4096, 4);
             ggml_set_name(rs, "rs_states");
             ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
             ggml_set_name(ids, "rs_ids");
@@ -13532,6 +13555,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ak_h15(128, 16, 32, nt, 1, 4, 2, true,  true));
     }
     test_cases.emplace_back(new test_ak_h15(128, 16, 48, 16, 64)); // large batch: also the gate smoke's VRAM-resident case
+    // C19-AK-H15: model allocation pattern across the n_kv 256 -> 512 pad step, Q38FN shape (hk 128, 16 k / 48 v heads,
+    // d_conv 4, qwen4exp CONT form, build_rs gap) plus the 27B / A3B shapes; decode (1) and MTP verify (4) widths
+    for (int64_t n_kv : { 255, 256, 257, 511, 512, 513 }) {
+        for (int64_t nt : { 1, 4 }) {
+            test_cases.emplace_back(new test_ak_h15(128, 16, 48, nt, 1, 4, 1, true,  true, n_kv)); // Q38FN
+            test_cases.emplace_back(new test_ak_h15(128, 16, 48, nt, 1, 4, 4, true,  true, n_kv)); // Q38FN, 4 rollback slots
+            test_cases.emplace_back(new test_ak_h15(128, 16, 48, nt, 1, 4, 1, false, true, n_kv)); // Qwen3.8-27B
+            test_cases.emplace_back(new test_ak_h15(128, 16, 32, nt, 2, 4, 1, false, true, n_kv)); // A3B, 2 sequences
+        }
+    }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
