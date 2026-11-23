@@ -462,6 +462,18 @@ if (UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         PASS_REGULAR_EXPRESSION "MoE mul_mat_id via ik kernels"
         FAIL_REGULAR_EXPRESSION "0/1 tests passed|0/1 backends passed|FAIL")
 
+    # AK-Q38FN-CPU-MMID-GATEUP-FUSE: GGML_MMID_GATEUP_FUSE=1 fused up+gate+SwiGLU slab (iqk, non-Q8_0)
+    llama_build(test-mmid-gateup-fuse.cpp)
+    llama_test(test-mmid-gateup-fuse NAME test-mmid-gateup-fuse-on)
+    set_tests_properties(test-mmid-gateup-fuse-on PROPERTIES
+        ENVIRONMENT "GGML_IQK=1;GGML_MMID_GATEUP_FUSE=1"
+        PASS_REGULAR_EXPRESSION "GGML_MMID_GATEUP_FUSE fused"
+        FAIL_REGULAR_EXPRESSION "FAIL")
+    llama_test(test-mmid-gateup-fuse NAME test-mmid-gateup-fuse-off)
+    set_tests_properties(test-mmid-gateup-fuse-off PROPERTIES
+        ENVIRONMENT "GGML_IQK=1"
+        FAIL_REGULAR_EXPRESSION "FAIL|GGML_MMID_GATEUP_FUSE fused")
+
     llama_build(test-iqk-ser.cpp)
     llama_test(test-iqk-ser NAME test-iqk-ser ARGS --invalid-iqk)
     set_tests_properties(test-iqk-ser PROPERTIES
