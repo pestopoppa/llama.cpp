@@ -1721,6 +1721,121 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// AK-A3B-VERIFY lever 2 (GGML_HIP_MMID_DEDUP=1, default off): expert-dedup multi-token MUL_MAT_ID for 4..16 tokens.
+// Grid: (ceil(nrows_x / c_rows_per_block), ncols_dst*nchannels_dst); block: one warp. Block y = (token, slot) pair
+// p = token*nchannels_dst + slot. Only the FIRST pair (flattened order) routed to an expert runs; it gathers every
+// later token routed to the same expert (top-k ids of one token are distinct, so at most one slot per token) and
+// reads that expert's weight blocks once for all of them. Per (row, token) the k-loop split, accumulation order and
+// warp reduction are those of mul_mat_vec_q_moe, so outputs are bit-identical to the default path.
+template <ggml_type type, int c_rows_per_block, int c_max_tokens>
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_dedup(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint32_t nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t nchannels_dst, const uint32_t ids_stride) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(c_max_tokens <= warp_size, "one lane per token");
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int      row0             = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    const uint32_t pair  = blockIdx.y;
+    const uint32_t token = pair / nchannels_dst;
+    const uint32_t slot  = pair - token*nchannels_dst;
+    const int lane = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    const int32_t expert = ids[slot + token*ids_stride];
+
+    // Skip unless this is the first (token, slot) pair routed to this expert.
+    int dup = 0;
+    for (uint32_t q = lane; q < pair; q += warp_size) {
+        const uint32_t tq = q / nchannels_dst;
+        dup |= ids[(q - tq*nchannels_dst) + tq*ids_stride] == expert;
+    }
+    if (warp_reduce_sum<warp_size>(dup) != 0) {
+        ggml_cuda_pdl_lc();
+        return;
+    }
+
+    // Lane t finds the slot through which token t (>= token) routes to this expert, or -1.
+    int my_slot = -1;
+    if (uint32_t(lane) < ncols_dst && uint32_t(lane) >= token) {
+        for (uint32_t s = 0; s < nchannels_dst; ++s) {
+            if (ids[s + lane*ids_stride] == expert) {
+                my_slot = s;
+                break;
+            }
+        }
+    }
+
+    int slot_j[c_max_tokens];
+    const block_q8_1 * y_j[c_max_tokens];
+#pragma unroll
+    for (int j = 0; j < c_max_tokens; ++j) {
+        slot_j[j] = __shfl_sync(0xffffffff, my_slot, j, warp_size);
+        const uint32_t channel_y = slot_j[j] >= 0 ? uint32_t(slot_j[j]) % nchannels_y : 0;
+        y_j[j] = ((const block_q8_1 *) vy_ptr) + channel_y*stride_channel_y + j*stride_col_y;
+    }
+
+    const int kbx_offset = expert*stride_channel_x + row0*stride_row_x;
+
+    float tmp[c_max_tokens][c_rows_per_block] = {{0.0f}};
+
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (lane % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < c_max_tokens; ++j) {
+            if (slot_j[j] < 0) {
+                continue; // warp-uniform
+            }
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[j][i] += vec_dot_q_cuda(vx, &y_j[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+#pragma unroll
+    for (int j = 0; j < c_max_tokens; ++j) {
+        if (slot_j[j] < 0) {
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+        }
+        if (lane < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + lane) < nrows_x)) {
+            dst[slot_j[j]*stride_channel_dst + j*stride_col_dst + row0 + lane] = tmp[j][lane];
+        }
+    }
+}
+
+static bool ggml_cuda_mmid_dedup_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_MMID_DEDUP");
+        return e != nullptr && atoi(e) != 0; // default OFF
+    }();
+    return on;
+}
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1832,6 +1947,27 @@ static void mul_mat_vec_q_moe_launch(
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst);
+
+    // AK-A3B-VERIFY lever 2: GGML_HIP_MMID_DEDUP=1 reads each unique expert once for 4..16 tokens.
+    if (ncols_dst >= 4 && ncols_dst <= MMVQ_MOE_SPLIT16_MAX_BATCH && ggml_cuda_mmid_dedup_enabled()) {
+        const dim3 dd_block_nums(nblocks_rows, ncols_dst*nchannels_dst);
+        const dim3 dd_block_dims(warp_size, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dd_block_nums, dd_block_dims, 0, stream);
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_dedup<type, rows_per_block, MMVQ_MAX_BATCH_SIZE>, launch_params,
+                vx, vy, ids, dst, ncols_x, nchannels_y.z, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, (uint32_t) nchannels_dst, ids_stride);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_dedup<type, rows_per_block, MMVQ_MOE_SPLIT16_MAX_BATCH>, launch_params,
+                vx, vy, ids, dst, ncols_x, nchannels_y.z, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, (uint32_t) nchannels_dst, ids_stride);
+        }
+        return;
+    }
 
     if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         // n <= 8: unchanged single launch.

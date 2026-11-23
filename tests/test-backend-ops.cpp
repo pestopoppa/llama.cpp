@@ -12805,10 +12805,23 @@ static void a3b_add_router_chunk_cases(std::vector<std::unique_ptr<test_case>> &
     }
 }
 
+// AK-A3B-VERIFY lever 2 (GGML_HIP_MMID_DEDUP): Qwen3.6-35B-A3B expert shapes (Q8_0, 256 experts, top-8; gate/up 512x2048
+// with broadcast src1, down 2048x512 per-slot src1) at tree-verify widths n = 4, 8, 12, 16. n_mats 256 = served
+// routing (random ids, low overlap); n_mats 16 and 8 force heavy/total expert overlap so the dedup gather is exercised.
+static void a3b_add_mmid_dedup_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int n_mats : {256, 16, 8}) {
+        for (int64_t n : {4, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_mats, 8, true,  512,  n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_mats, 8, false, 2048, n, 512));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
+    a3b_add_mmid_dedup_cases(test_cases);       // AK-A3B-VERIFY-DEDUP
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
@@ -15273,6 +15286,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
+    a3b_add_mmid_dedup_cases(test_cases);       // AK-A3B-VERIFY-DEDUP
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
     // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
