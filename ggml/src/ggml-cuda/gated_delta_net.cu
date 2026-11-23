@@ -1500,6 +1500,12 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         return false;
     }
     const bool keep_rs = K > 1;
+    // [C19 GDN-K1] GGML_HIP_GDN_FUSED_K1=0: K = 1 ops are left to the pre-fused dispatch (C18 route: rows only when
+    // GGML_HIP_GDN_ROWS=1, else the recurrent kernel); the fused kernel then covers K > 1 only. Default 1 (r2 route).
+    static const bool k1_route = [] { const char * e = getenv("GGML_HIP_GDN_FUSED_K1"); return e == nullptr || e[0] != '0'; }();
+    if (!keep_rs && !k1_route) {
+        return false;
+    }
     // [r2] K = 1: the DTREE-0 rows kernel (16 lanes/column, 512 threads) measured 6-20 % faster than the fused kernel
     // at T >= 4 in ak-gdn-fused-gpu-20261123; route it there. K > 1: the fused kernel (it won every K = T cell).
     if (!keep_rs && gdn_rows_try<state_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs, kda, K,
