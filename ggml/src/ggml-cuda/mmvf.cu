@@ -787,11 +787,11 @@ void ggml_cuda_op_mul_mat_vec_f(
 // MMF (64-row blocks: only ne01/64 workgroups, e.g. 4 for a 2048x256 MoE router) or, when ne01 % 64 != 0
 // (shared-expert gate, ne01 = 1), to hipBLAS. That is the only CDNA dispatch threshold between ne11 = 3 and 4 on
 // the Qwen3.6-35B-A3B verify path (40 F32 ffn_gate_inp + 1 BF16 MTP router). GGML_HIP_MMVF_CDNA_MAX_NE11 = N
-// (1..MMVF_MAX_BATCH_SIZE) keeps F32/BF16 on MMVF up to ne11 = N on CDNA. Unset/invalid = upstream (3). Default-off.
+// (1..MMVF_MAX_BATCH_SIZE) keeps F32/BF16 on MMVF up to ne11 = N on CDNA. [C19] Unset = 8 (default ON); invalid = upstream (3).
 static int ggml_cuda_mmvf_cdna_max_ne11() {
     static const int v = []() {
         const char * s = getenv("GGML_HIP_MMVF_CDNA_MAX_NE11");
-        const int n = s ? atoi(s) : 0;
+        const int n = s ? atoi(s) : 8;   // [C19] default 8 (operator decision 2026-11-22); =3 restores upstream
         return (n >= 1 && n <= MMVF_MAX_BATCH_SIZE) ? n : 3;
     }();
     return v;
