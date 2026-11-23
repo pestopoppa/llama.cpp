@@ -3121,6 +3121,17 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     return n_max;
 }
 
+void common_speculative_cap_draft(llama_tokens & draft, std::vector<common_speculative_token_dist> * dists, int32_t cap) {
+    if (cap < 0 || (int32_t) draft.size() <= cap) {
+        return;
+    }
+    // dists[i] belongs to draft[i]: truncate the prefix-aligned pair together (only when they were aligned)
+    if (dists && dists->size() == draft.size()) {
+        dists->resize(cap);
+    }
+    draft.resize(cap);
+}
+
 int32_t common_speculative_ngram_mod_width(const common_params_speculative * spec) {
     // 0 => not widened (legacy: every impl capped by draft.n_max)
     if (!spec->ngram_mod.n_max_set || spec->draft.n_max <= 0) {
@@ -3553,7 +3564,9 @@ void common_speculative_draft(common_speculative * spec) {
                         ? dp.n_max_ngram_mod : dp.n_max;
                     if (cap > 0 && !result.empty() && (int) result.size() > cap) {
                         SPC_DBG("truncating draft to %d tokens\n", cap);
-                        result.resize(cap);
+                        // SPEC-DISTS-TRUNC: keep the draft distributions aligned, else the verify step loses
+                        // rejection sampling (dists.size() != draft.size()) on every capped (tail) round
+                        common_speculative_cap_draft(result, dp.dists, cap);
                     }
                 }
 

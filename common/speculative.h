@@ -25,6 +25,10 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// SPEC-DISTS-TRUNC: truncate a draft to `cap` tokens and its per-token draft distributions with it (when aligned),
+// so a capped draft keeps the rejection-sampling verify path
+void common_speculative_cap_draft(llama_tokens & draft, std::vector<common_speculative_token_dist> * dists, int32_t cap);
+
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 int32_t common_speculative_ngram_mod_width(const common_params_speculative * spec);
