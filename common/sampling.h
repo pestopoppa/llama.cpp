@@ -138,6 +138,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // device path, so callers must not read them (n_probs == 0 guarantees the server does not).
 llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
 
+// DTREE-DEVICE-TREE-ACCEPT: true when the device argmax row is provably this sampler's greedy pick
+bool common_sampler_device_greedy_eligible(const struct common_sampler * gsmpl);
+
 std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,

@@ -3,6 +3,9 @@
 
 #include "speculative-tree.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -295,18 +298,70 @@ common_dtree_flat common_dtree_flatten(llama_token anchor, const std::vector<std
     return t;
 }
 
+llama_token common_dtree_row_argmax(const float * logits, int32_t n_vocab) {
+    return (llama_token) std::distance(logits, std::max_element(logits, logits + n_vocab));
+}
+
+int32_t common_dtree_accept_walk(const std::vector<llama_token> & picks, const std::vector<llama_token> & draft) {
+    int32_t n = 0;
+    for (size_t i = 0; i < draft.size() && i < picks.size(); ++i) {
+        if (picks[i] == LLAMA_TOKEN_NULL || picks[i] != draft[i]) {
+            break;
+        }
+        ++n;
+    }
+    return n;
+}
+
+static std::atomic<int64_t> g_dtree_dev_rows  {0};
+static std::atomic<int64_t> g_dtree_host_rows {0};
+
+bool common_dtree_device_accept_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DTREE_DEVICE_ACCEPT");
+        const bool v = e != nullptr && e[0] == '1';
+        if (v) {
+            fprintf(stderr, "llama_dtree_device_accept: ENABLED (LLAMA_DTREE_DEVICE_ACCEPT=1; greedy tree accept reads device argmax rows, host fallback per row)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+void common_dtree_device_accept_counts(int64_t * n_dev_rows, int64_t * n_host_rows) {
+    if (n_dev_rows)  { *n_dev_rows  = g_dtree_dev_rows.load(); }
+    if (n_host_rows) { *n_host_rows = g_dtree_host_rows.load(); }
+}
+
 int32_t common_dtree_greedy_accept_len(
-        llama_context * ctx, const std::vector<int32_t> & rows, const std::vector<llama_token> & draft) {
+        llama_context * ctx, const std::vector<int32_t> & rows, const std::vector<llama_token> & draft, bool allow_device) {
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const bool dev = allow_device && common_dtree_device_accept_enabled();
 
     int32_t n = 0;
     for (size_t i = 0; i < draft.size() && i < rows.size(); ++i) {
-        const float * l = llama_get_logits_ith(ctx, rows[i]);
-        if (l == nullptr) {
-            break;
+        llama_token am = LLAMA_TOKEN_NULL;
+        if (dev) {
+            // ggml_argmax ties to the lowest index (argmax.cu DTREE-A rule) == common_dtree_row_argmax; -1 (all -inf
+            // or NaN row) comes back as LLAMA_TOKEN_NULL and takes the host scan, so edge rows match the host exactly
+            am = llama_get_argmax_ith(ctx, rows[i]);
+            if (am != LLAMA_TOKEN_NULL && (am < 0 || am >= n_vocab)) {
+                am = LLAMA_TOKEN_NULL;
+            }
         }
-        const llama_token am = (llama_token) std::distance(l, std::max_element(l, l + n_vocab));
+        if (am != LLAMA_TOKEN_NULL) {
+            g_dtree_dev_rows.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const float * l = llama_get_logits_ith(ctx, rows[i]);
+            if (l == nullptr) {
+                break;
+            }
+            am = common_dtree_row_argmax(l, n_vocab);
+            if (dev) {
+                g_dtree_host_rows.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (am != draft[i]) {
             break;
         }

@@ -92,8 +92,25 @@ constexpr int32_t COMMON_DTREE_MAX_PATHS = 3;
 // greedy acceptance length of `draft` given the target logits rows `rows` (rows.size() == draft.size() + 1,
 // rows[0] is the anchor's row): the number of draft tokens d such that argmax(rows[i]) == draft[i] for all i < d.
 // Pure argmax over the raw logits; the caller's sampler remains the authority on what is accepted.
+//
+// DTREE-DEVICE-TREE-ACCEPT (LLAMA_DTREE_DEVICE_ACCEPT=1, default off): when `allow_device` is true (the caller has
+// proven its sampler greedy: no grammar / reasoning budget, temp <= 0, ban-only logit bias) each row's pick is the
+// device argmax (result_argmax, first maximum on ties == std::max_element), so only T int32 ids cross D2H and the
+// lazy full-vocab logits download is never flushed by the accept walk. A row without a device pick falls back to
+// the host scan for that row. With the knob off or allow_device false the function is the host path, unchanged.
 int32_t common_dtree_greedy_accept_len(
-        llama_context * ctx, const std::vector<int32_t> & rows, const std::vector<llama_token> & draft);
+        llama_context * ctx, const std::vector<int32_t> & rows, const std::vector<llama_token> & draft,
+        bool allow_device = false);
+
+// host greedy pick over one raw logits row: first maximum (lowest index on ties), exactly the host accept rule
+llama_token common_dtree_row_argmax(const float * logits, int32_t n_vocab);
+
+// accept walk over per-row picks (picks[i] = argmax of row i): number of leading i with picks[i] == draft[i]
+int32_t common_dtree_accept_walk(const std::vector<llama_token> & picks, const std::vector<llama_token> & draft);
+
+// LLAMA_DTREE_DEVICE_ACCEPT=1 read once; witness counters (rows decided by the device pick / by the host scan)
+bool    common_dtree_device_accept_enabled();
+void    common_dtree_device_accept_counts(int64_t * n_dev_rows, int64_t * n_host_rows);
 
 // fork: make seq `dst` an exact copy of seq `src` (attention KV + recurrent state, including a pending recurrent
 // rollback of src) so that `dst` can be decoded from src's next position. Requires a unified KV cache.

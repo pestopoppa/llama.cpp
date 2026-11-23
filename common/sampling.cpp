@@ -835,6 +835,20 @@ static llama_token device_argmax_pick(const common_params_sampling & p, llama_co
     return dam;
 }
 
+// DTREE-DEVICE-TREE-ACCEPT: the device argmax row equals this sampler's pick (no grammar / reasoning budget, provably
+// greedy params, logit bias only as -inf bans). The tree accept uses it to decide whether it may read device picks.
+bool common_sampler_device_greedy_eligible(const struct common_sampler * gsmpl) {
+    if (gsmpl == nullptr || gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr || !greedy_fast_params_ok(gsmpl->params)) {
+        return false;
+    }
+    for (const auto & lb : gsmpl->params.logit_bias) {
+        if (!(std::isinf(lb.bias) && lb.bias < 0.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 llama_token common_sampler_sample_device_greedy(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
     static const bool dev_accept = [] {
         const char * e = getenv("LLAMA_DEVICE_ACCEPT");

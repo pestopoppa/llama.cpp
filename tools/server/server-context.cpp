@@ -5622,10 +5622,13 @@ private:
 
             int32_t best = -1;
             int32_t best_n = 0;
+            bool    dev_ok = false;
             if (ok) {
-                best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // DTREE-DEVICE-TREE-ACCEPT: device picks only for a provably greedy sampler (else host scan, unchanged)
+                dev_ok = common_sampler_device_greedy_eligible(slot.smpl.get());
+                best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
                 for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
-                    const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a]);
+                    const int32_t n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_tree_i_batch[a], slot.spec_tree_alts[a], dev_ok);
                     if (n > best_n) {
                         best   = (int32_t) a;
                         best_n = n;
@@ -5679,7 +5682,7 @@ private:
             }
 
             if (best >= 0) {
-                const int32_t n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const int32_t n_main = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
                 const llama_seq_id seq_win = slot.spec_tree_seq0 + best;
 
                 if (!slot.spec_tree_batch) {
