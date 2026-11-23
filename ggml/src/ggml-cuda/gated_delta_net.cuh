@@ -21,3 +21,6 @@ bool     ggml_cuda_gdn_chunked_usable(int device);
 
 // [DTREE-0-GDN-ROWS] few-row verify kernel (GGML_HIP_GDN_ROWS=1): launches since process start. Test witness.
 uint64_t ggml_cuda_gdn_rows_n_calls();
+
+// [GDN-FUSED-VARIANT] fused float2-reduction verify kernel (GGML_HIP_GDN_FUSED=1): launches since process start. Test witness.
+uint64_t ggml_cuda_gdn_fused_n_calls();
