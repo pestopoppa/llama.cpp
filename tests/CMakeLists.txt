@@ -199,6 +199,7 @@ llama_build_and_test(test-dtree-greedy.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/dtre
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
+    llama_build_and_test(test-server-pit.cpp) # SPEC-PIT.1 per-token PIT masses (tools/server/server-pit.h)
     llama_build_and_test(test-sampling-greedy-fast.cpp) # GPU-ZOS-2.1 (C2a greedy-fast row kernel == sampler chain)
     llama_build_and_test(test-spec-dtree-paths.cpp) # AK-DTREE-1 path decomposition (no model)
     llama_build_and_test(test-dtree-device-accept.cpp) # DTREE-DEVICE-TREE-ACCEPT device vs host tree accept, forced ties (no model)

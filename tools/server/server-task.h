@@ -80,6 +80,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool pit_probs           = false; // SPEC-PIT.1: emit pit_less/pit_tie per token (needs n_probs>0, post_sampling_probs)
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -364,6 +365,9 @@ struct completion_token_output {
     llama_token tok;
     float prob;
     std::string text_to_send;
+    // SPEC-PIT.1 (pit_probs): post-chain mass strictly below / tied with the sampled token; -1 = not set
+    float pit_less = -1.0f;
+    float pit_tie  = -1.0f;
     struct prob_info {
         llama_token tok;
         std::string txt;

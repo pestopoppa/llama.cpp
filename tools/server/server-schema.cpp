@@ -274,6 +274,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
 
+    add((new field_bool("pit_probs", params.pit_probs))
+        ->set_desc("Diagnostic (SPEC-PIT.1, default off): with n_probs > 0 and post_sampling_probs, also return pit_less / pit_tie per token: the post-chain mass of candidates strictly less probable than / tied with the sampled token, over the full candidate set"));
+
     //
     // Speculative decoding params
     //

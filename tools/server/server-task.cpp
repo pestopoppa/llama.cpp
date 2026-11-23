@@ -82,6 +82,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.draft.n_max},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
+            {"pit_probs",                 pit_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"rng_poskey",                sampling.rng_poskey},
             {"lora",                      lora},
@@ -143,6 +144,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.draft.n_max},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
+        {"pit_probs",                 pit_probs},
         {"backend_sampling",          sampling.backend_sampling},
         {"rng_poskey",                sampling.rng_poskey},
         {"lora",                      lora},
@@ -345,6 +347,10 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
                 p.to_json(post_sampling_probs)
             },
         });
+        if (p.pit_less >= 0.0f) {
+            out.back()["pit_less"] = p.pit_less;
+            out.back()["pit_tie"]  = p.pit_tie;
+        }
     }
     return out;
 }

@@ -1,3 +1,4 @@
+#include "server-pit.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -3000,6 +3001,10 @@ private:
             const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
             const size_t max_probs = cur_p->size;
             const size_t n_probs = std::min(max_probs, n_probs_request);
+
+            if (slot.task->params.pit_probs) {
+                server_pit_masses(cur_p->data, cur_p->size, result.tok, result.pit_less, result.pit_tie);
+            }
 
             // set probability for sampled token
             for (size_t i = 0; i < max_probs; i++) {
@@ -6551,8 +6556,14 @@ private:
                     // sample_and_accept_dspark_serial); already post- or pre-sampling as requested.
                     result.prob  = serial_probs[i].prob;
                     result.probs = std::move(serial_probs[i].probs);
+                    result.pit_less = serial_probs[i].pit_less;
+                    result.pit_tie  = serial_probs[i].pit_tie;
                 } else if (want_post_sampling_dist && i < verify_dists.size()) {
                     const auto & cur_p = verify_dists[i];
+
+                    if (slot.task->params.pit_probs) {
+                        server_pit_masses(cur_p.data(), cur_p.size(), result.tok, result.pit_less, result.pit_tie);
+                    }
 
                     for (const auto & cand : cur_p) {
                         if (cand.id == result.tok) {
