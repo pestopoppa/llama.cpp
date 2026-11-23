@@ -1209,6 +1209,7 @@ static bool gdn_rows_try(const float * q_d, const float * k_d, const float * v_d
 #define GDN_FU_WMAX    16
 #define GDN_FU_LPC     8
 #define GDN_FU_THREADS 256
+#define GDN_FU_CH      8      // [r3] rows per q/k/v LDS staging chunk
 #define GDN_FU_CPB     (GDN_FU_THREADS / GDN_FU_LPC)
 
 static std::atomic<uint64_t> g_gdn_fused_n_calls{0};
@@ -1308,12 +1309,15 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
     constexpr int WARP = ggml_cuda_get_physical_warp_size();
     static_assert(RPL % 4 == 0, "S_v must be a multiple of 4*LPC");
 
-    __shared__ float q_s[GDN_FU_WMAX][S_v];
-    __shared__ float k_s[GDN_FU_WMAX][S_v];
-    __shared__ float v_s[GDN_FU_WMAX][CPB];
+    // [r3] q/k/v are staged in chunks of GDN_FU_CH rows through one reused buffer (~9 KB at S_v 128, was ~18 KB for
+    // all 16 rows), so LDS no longer caps occupancy at 3 waves/SIMD; exp(g)/beta for all rows stay resident (128 B).
+    constexpr int CH = GDN_FU_CH;
+    __shared__ float q_s[CH][S_v];
+    __shared__ float k_s[CH][S_v];
+    __shared__ float v_s[CH][CPB];
+    __shared__ float kq_s[CH];
     __shared__ float eg_s[GDN_FU_WMAX];
     __shared__ float b_s[GDN_FU_WMAX];
-    __shared__ float kq_s[GDN_FU_WMAX];
 
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -1341,94 +1345,94 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
 
     const float * qh = q + iq3 * sq3 + iq1 * sq1;
     const float * kh = k + iq3 * sq3 + iq1 * sq1;
-    for (int idx = tid; idx < n_tokens * S_v; idx += TPB) {
-        const int t = idx / S_v;
-        const int i = idx % S_v;
-        q_s[t][i] = qh[t * sq2 + i];
-        k_s[t][i] = kh[t * sq2 + i];
-    }
     const float * vh = v + sequence * sv3 + h_idx * sv1 + col0;
-    for (int idx = tid; idx < n_tokens * CPB; idx += TPB) {
-        const int t = idx / CPB;
-        const int c = idx % CPB;
-        v_s[t][c] = vh[t * sv2 + c];
-    }
     if (tid < n_tokens) {
         const int64_t gb = sequence * sb3 + tid * sb2 + h_idx * sb1;
         eg_s[tid] = expf(g[gb]);
         b_s[tid]  = beta[gb];
     }
-    __syncthreads();
-    // k_t . q_t, one wave per row
-    {
-        const int wv = tid / WARP;
-        const int wl = tid % WARP;
-        for (int t = wv; t < n_tokens; t += TPB / WARP) {
-            float a = 0.0f;
-            for (int i = wl; i < S_v; i += WARP) {
-                a += k_s[t][i] * q_s[t][i];
-            }
-            a = warp_reduce_sum<WARP>(a);
-            if (wl == 0) {
-                kq_s[t] = a;
-            }
-        }
-    }
-    __syncthreads();
 
-    float att[GDN_FU_WMAX];
-#pragma unroll
-    for (int t = 0; t < GDN_FU_WMAX; t++) {
-        if (t >= n_tokens) {
-            break;
+    for (int t0 = 0; t0 < n_tokens; t0 += CH) {
+        const int nc = min(CH, n_tokens - t0);
+        if (t0 > 0) {
+            __syncthreads();   // previous chunk fully consumed before the buffer is overwritten
         }
-        float kr[RPL];
-        float2 acc = make_float2(0.0f, 0.0f);   // (S^T k, S^T q) partials on the OLD state, one pass
-#pragma unroll
-        for (int c = 0; c < NCH; c++) {
-            const float4 k4 = *(const float4 *) &k_s[t][c * 4 * LPC + 4 * lane];
-            const float4 q4 = *(const float4 *) &q_s[t][c * 4 * LPC + 4 * lane];
-            kr[4 * c + 0] = k4.x; kr[4 * c + 1] = k4.y; kr[4 * c + 2] = k4.z; kr[4 * c + 3] = k4.w;
-            acc.x += s[4 * c + 0] * k4.x; acc.y += s[4 * c + 0] * q4.x;
-            acc.x += s[4 * c + 1] * k4.y; acc.y += s[4 * c + 1] * q4.y;
-            acc.x += s[4 * c + 2] * k4.z; acc.y += s[4 * c + 2] * q4.z;
-            acc.x += s[4 * c + 3] * k4.w; acc.y += s[4 * c + 3] * q4.w;
+        for (int idx = tid; idx < nc * S_v; idx += TPB) {
+            const int t = idx / S_v;
+            const int i = idx % S_v;
+            q_s[t][i] = qh[(t0 + t) * sq2 + i];
+            k_s[t][i] = kh[(t0 + t) * sq2 + i];
         }
-        acc = gdn_fu_sum8x2(acc);
-
-        const float g_val = eg_s[t];
-        const float delta = (v_s[t][cl] - g_val * acc.x) * b_s[t];
-        att[t] = g_val * acc.y + delta * kq_s[t];
-
-#pragma unroll
-        for (int r = 0; r < RPL; r++) {
-            s[r] = g_val * s[r] + kr[r] * delta;
+        for (int idx = tid; idx < nc * CPB; idx += TPB) {
+            const int t = idx / CPB;
+            const int c = idx % CPB;
+            v_s[t][c] = vh[(t0 + t) * sv2 + c];
         }
-
-        if constexpr (keep_rs_t) {
-            const int slot = n_tokens - 1 - t;
-            if (slot < K) {
-                state_t * snap = state + (int64_t) slot * state_slot_stride;
-#pragma unroll
-                for (int c = 0; c < NCH; c++) {
-                    // slot 0 (the final state) is re-read by the next op: keep it cached
-                    if (slot == 0) {
-                        gdn_fu_st4<state_t, false>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
-                    } else {
-                        gdn_fu_st4<state_t, NT>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
-                    }
+        __syncthreads();
+        // k_t . q_t, one wave per row
+        {
+            const int wv = tid / WARP;
+            const int wl = tid % WARP;
+            for (int t = wv; t < nc; t += TPB / WARP) {
+                float a = 0.0f;
+                for (int i = wl; i < S_v; i += WARP) {
+                    a += k_s[t][i] * q_s[t][i];
+                }
+                a = warp_reduce_sum<WARP>(a);
+                if (wl == 0) {
+                    kq_s[t] = a;
                 }
             }
         }
-    }
+        __syncthreads();
 
-    if (lane == 0) {
 #pragma unroll
-        for (int t = 0; t < GDN_FU_WMAX; t++) {
-            if (t >= n_tokens) {
+        for (int tt = 0; tt < CH; tt++) {
+            if (tt >= nc) {
                 break;
             }
-            dst[(int64_t) t * S_v * H] = gdn_store<state_t>(att[t] * scale);
+            const int t = t0 + tt;
+            float kr[RPL];
+            float2 acc = make_float2(0.0f, 0.0f);   // (S^T k, S^T q) partials on the OLD state, one pass
+#pragma unroll
+            for (int c = 0; c < NCH; c++) {
+                const float4 k4 = *(const float4 *) &k_s[tt][c * 4 * LPC + 4 * lane];
+                const float4 q4 = *(const float4 *) &q_s[tt][c * 4 * LPC + 4 * lane];
+                kr[4 * c + 0] = k4.x; kr[4 * c + 1] = k4.y; kr[4 * c + 2] = k4.z; kr[4 * c + 3] = k4.w;
+                acc.x += s[4 * c + 0] * k4.x; acc.y += s[4 * c + 0] * q4.x;
+                acc.x += s[4 * c + 1] * k4.y; acc.y += s[4 * c + 1] * q4.y;
+                acc.x += s[4 * c + 2] * k4.z; acc.y += s[4 * c + 2] * q4.z;
+                acc.x += s[4 * c + 3] * k4.w; acc.y += s[4 * c + 3] * q4.w;
+            }
+            acc = gdn_fu_sum8x2(acc);
+
+            const float g_val = eg_s[t];
+            const float delta = (v_s[tt][cl] - g_val * acc.x) * b_s[t];
+            // [r3] attention row stored immediately (no 16-entry register array): frees ~16 VGPRs
+            if (lane == 0) {
+                dst[(int64_t) t * S_v * H] = gdn_store<state_t>((g_val * acc.y + delta * kq_s[tt]) * scale);
+            }
+
+#pragma unroll
+            for (int r = 0; r < RPL; r++) {
+                s[r] = g_val * s[r] + kr[r] * delta;
+            }
+
+            if constexpr (keep_rs_t) {
+                const int slot = n_tokens - 1 - t;
+                if (slot < K) {
+                    state_t * snap = state + (int64_t) slot * state_slot_stride;
+#pragma unroll
+                    for (int c = 0; c < NCH; c++) {
+                        // slot 0 (the final state) is re-read by the next op: keep it cached
+                        if (slot == 0) {
+                            gdn_fu_st4<state_t, false>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
+                        } else {
+                            gdn_fu_st4<state_t, NT>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1474,10 +1478,10 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
 #define GDN_FU_ARGS lp, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, (int) n_tokens, sq1, sq2, sq3, \
         sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K
     if (keep_rs) {
-        // [r2] K = T is store-bound (one full state per row): 128-thread blocks (16 columns) double the waves in flight
-        // to hide the snapshot store latency. Snapshot slots > 0: nontemporal by default (r1);
+        // [r2/r3] K = T is store-bound (one full state per row): more waves in flight hide the snapshot store latency;
+        // r3 gets them from the smaller LDS footprint (chunked staging) and fewer VGPRs at 256 threads. Snapshot slots > 0: nontemporal by default (r1);
         // GGML_HIP_GDN_FUSED_NT=0 selects plain cached 16-byte stores (screen arm).
-        constexpr int TPB = GDN_FU_THREADS / 2;
+        constexpr int TPB = GDN_FU_THREADS;   // [r3] back to r1's 256 threads; LDS cut instead (r2's 128 was LDS-bound)
         const char * nte = getenv("GGML_HIP_GDN_FUSED_NT");
         const bool   nt  = !(nte != nullptr && nte[0] == '0');
         const dim3   grid(H, n_seqs, S_v / (TPB / GDN_FU_LPC));
