@@ -62,6 +62,9 @@ static outputs run(bool full, int64_t T, int64_t B, int64_t K, const inputs & in
         dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         for (ggml_tensor * t : { x, wb, wa, dt, a }) ggml_set_input(t);
+        // keep x live to the anchor: in this tiny graph gallocr otherwise reuses its memory at ntok=1 (r0 smoke), and the
+        // planner's C7R guard then (correctly) runs the chain unfused, which this test would read as a route failure
+        ggml_set_output(x);
         // exactly the qwen35.cpp build_layer_attn_linear order
         beta = ggml_mul_mat(ctx, wb, x);
         beta = ggml_reshape_4d(ctx, beta, 1, H, T, B);
