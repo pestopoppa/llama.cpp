@@ -1030,13 +1030,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * alpha_mm = nullptr;
+
+    // AK-Q38FN-CPU-GDNPROJ-FUSE (GGML_Q38FN_GDNPROJ_FUSE=1, default off): place the four
+    // in-projections of `cur` (qkv, gate z, beta, alpha) back to back in the graph so the CPU
+    // backend can compute them as one fused single-row pass. Graph order only: same ops, same
+    // operands; with the knob off the graph is unchanged.
+    static const bool gdnproj_fuse = []() {
+        const char * s = getenv("GGML_Q38FN_GDNPROJ_FUSE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    if (gdnproj_fuse) {
+        alpha_mm = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        ggml_tensor * qkv_mm = qkv_mixed->op == GGML_OP_RESHAPE ? qkv_mixed->src[0] : qkv_mixed;
+        ggml_build_forward_expand(gf, qkv_mm);
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, alpha_mm);
+    }
+
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_tensor * alpha = alpha_mm ? alpha_mm
+                                   : build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
