@@ -2913,6 +2913,14 @@ private:
 
         if (incomplete) {
             slot.has_next_token = true;
+
+            // SPEC-PIT.1-fix: a token that leaves a partial UTF-8 sequence still was generated and
+            // still carries its own target distribution - record it (with no text; the bytes are
+            // sent with the token that completes the character) so that completion_probabilities
+            // holds exactly one record per generated token. Before this, every byte-fallback token
+            // but the last of a multi-byte character silently lost its prob/pit record.
+            result.text_to_send = "";
+            slot.add_token(result);
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
