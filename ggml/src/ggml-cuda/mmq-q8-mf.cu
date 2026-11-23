@@ -1087,9 +1087,28 @@ static const ggml_tensor * q8ip_packed_base(const ggml_tensor * t) {
     return ggml_cuda_q8ip_is_packed(b) ? b : nullptr;
 }
 
+// AK-BW-27B-DRAFT-Q8IP-PERMUTE: GET_ROWS-only weights (DFlash2 selector_successor, rank x n_vocab) cannot read the
+// packed layout, so packing them makes every draft graph unpack the whole tensor into a transient copy
+// (ggml_cuda_q8ip_substitute; 4.4 x 96 us per draft segment on C18). GGML_HIP_Q8IP_NOPACK_GETROWS=1 leaves them
+// natural. Default off (C18 behaviour). Bit-identical: GET_ROWS reads the same natural bytes either way.
+static bool q8ip_nopack_getrows() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_HIP_Q8IP_NOPACK_GETROWS");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 static bool q8ip_shape_ok(const ggml_tensor * t) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     const int64_t nbytes = (int64_t) ggml_nbytes(t);
+    if (q8ip_nopack_getrows() && strstr(t->name, "selector_successor") != nullptr) {
+        static std::atomic<int> n_skip{0};
+        if (n_skip.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8ip: NOPACK_GETROWS leaves %s natural (GET_ROWS consumer)\n", t->name);
+        }
+        return false;
+    }
     return t->type == GGML_TYPE_Q8_0 && t->view_src == nullptr && t->ne[2] == 1 && t->ne[3] == 1 &&
         ggml_is_contiguous(t) && t->ne[0] % 256 == 0 && t->ne[1] % Q8MF_RT == 0 && ((uintptr_t) t->data) % 16 == 0 &&
         nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096 && strncmp(t->name, "token_embd", 10) != 0;
