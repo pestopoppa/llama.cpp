@@ -15288,6 +15288,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // AK-MMQ-SK2: opt-in perf cells for the CDNA stream-k knobs (TEST_BACKEND_OPS_EXTRA_CASES=mmq_sk2):
+    // Q4_K n 5/8/16/32 and Q8_0 n 17/36/64 on the 27B FFN 17408x5120 / 5120x17408, A3B Q8_0 MUL_MAT_ID n 16/64,
+    // and n=512 guards on each.
+    if (test_backend_ops_extra_case_set("mmq_sk2")) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}}) {
+            for (int64_t n : {5, 8, 16, 32, 512}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+            }
+            for (int64_t n : {17, 36, 64, 512}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+            }
+        }
+        for (int64_t n : {16, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
+        }
+    }
+
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
     for (int64_t kv : {8192, 32768, 81920}) {

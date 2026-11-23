@@ -1361,6 +1361,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         nblocks_stream_k = force_tiling ? ntiles_dst : grid_sk;
     }
 
+    // AK-MMQ-SK2 knob-honoured witness (default OFF): GGML_HIP_MMQ_SK2_LOG=1 prints the stream-k launch geometry.
+    static const bool sk2_log_env = [] {
+        const char * e = getenv("GGML_HIP_MMQ_SK2_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (sk2_log_env) {
+        fprintf(stderr, "MMQ_SK2 type=%d J=%d I=%d nthreads=%d occ=%d ntiles=%d k_chunks=%lld nwork=%lld grid=%d cap=%d ft=%d\n",
+            (int) type, J, config.I, config.nthreads, config.occupancy, ntiles_dst, (long long) k_chunks, (long long) nwork,
+            nblocks_stream_k, (int) sk_cap_env, (int) force_tiling_env);
+    }
+
     const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
