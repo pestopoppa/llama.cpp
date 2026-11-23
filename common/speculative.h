@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "dice-capture.h"
 
 struct common_speculative;
 
@@ -71,6 +72,14 @@ struct common_speculative_draft_params {
 
     // CAFE-3: per-round chain width cap set by the adaptive controller (-1: off); chain drafters stop at it
     int32_t n_max_cafe3 = -1;
+    // SPEC-DTREE-DICE capture (LLAMA_DICE_CAPTURE, default off; see dice-capture.h). dice_draft: when set, the drafter
+    // writes its round's candidates as JSON fields (no braces) into it. dice_tree: when set together with tree_alts and
+    // tree_nodes > 0, the DFlash2 drafter at T > 0 builds the forced superset tree into it and its non-chain leaves into
+    // tree_alts. dice_seed / dice_n_acc0 key the DICE Gumbel draws (dist seed, absolute position of the first draft token).
+    std::string * dice_draft = nullptr;
+    std::vector<common_dice_node> * dice_tree = nullptr;
+    uint32_t dice_seed   = 0;
+    uint64_t dice_n_acc0 = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

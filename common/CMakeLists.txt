@@ -100,6 +100,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative-tree.cpp
+    dice-capture.cpp
+    dice-capture.h
     speculative-tree.h
     speculative-cafe3.h
     speculative.h
