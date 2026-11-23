@@ -2082,11 +2082,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // runs the Qwen3.6-35B-A3B F32 router (ffn_gate_inp, 256 x 2048) at ~114 us/layer vs ~11 us on MMVF (~4.4 ms per
     // verify step; tree verify at 12 columns pays it under C19). GGML_HIP_MMVF_CHUNK=N (1..MMVF_MAX_BATCH_SIZE,
     // 0/unset = off) splits a 2D src1 with N < ne11 <= 2*MMVF_MAX_BATCH_SIZE into column chunks of <= N, each on MMVF;
-    // src0 (<= 4 MiB) is re-read from L2. Default OFF.
+    // src0 (<= 4 MiB) is re-read from L2. [C20] Default 8 (=0 off); inert when ne11 <= 8 (np1 verify).
     {
         static const int chunk_n = []() {
             const char * s = getenv("GGML_HIP_MMVF_CHUNK");
-            const int n = s ? atoi(s) : 0;
+            const int n = s ? atoi(s) : 8;   // [C20] default 8 (497f13679 KEEP: served A3B np4+MTP +8.2 %); =0 turns it off
             return (n >= 1 && n <= MMVF_MAX_BATCH_SIZE) ? n : 0;
         }();
         if (chunk_n > 0 && GGML_CUDA_CC_IS_AMD(cc) &&
