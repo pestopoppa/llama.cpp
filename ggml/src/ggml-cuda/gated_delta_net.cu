@@ -1135,9 +1135,13 @@ static bool gdn_rows_try(const float * q_d, const float * k_d, const float * v_d
         int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, bool kda, int K,
         int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3, int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride,
-        cudaStream_t stream, const int32_t * parent) {
+        cudaStream_t stream, const int32_t * parent, bool force = false) {
     int lo, hi;
     gdn_rows_range(lo, hi);
+    if (force) {
+        lo = 1;
+        hi = GDN_ROWS_WMAX;   // [GDN-FUSED-VARIANT r2] K=1 route under GGML_HIP_GDN_FUSED=1
+    }
     if (n_tokens < lo || n_tokens > hi) {
         return false;
     }
@@ -1286,8 +1290,8 @@ static __device__ __forceinline__ void gdn_fu_st4(state_t * p, const float * o) 
     }
 }
 
-template <int S_v, bool keep_rs_t, typename state_t>
-__global__ void __launch_bounds__(GDN_FU_THREADS, 2)
+template <int S_v, bool keep_rs_t, typename state_t, int TPB, bool NT>
+__global__ void __launch_bounds__(TPB, 2)
 gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
                const float * __restrict__ g, const float * __restrict__ beta,
                const state_t * curr_state, state_t * dst, state_t * state,
@@ -1298,7 +1302,7 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
                const uint3 neqk1_magic, const uint3 rq3_magic, const float scale,
                const int64_t state_slot_stride, const int K) {
     constexpr int LPC  = GDN_FU_LPC;
-    constexpr int CPB  = GDN_FU_CPB;
+    constexpr int CPB  = TPB / GDN_FU_LPC;
     constexpr int RPL  = S_v / LPC;  // state rows per lane
     constexpr int NCH  = RPL / 4;    // 4-element chunks per lane: row i = c*4*LPC + 4*lane + e
     constexpr int WARP = ggml_cuda_get_physical_warp_size();
@@ -1337,14 +1341,14 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
 
     const float * qh = q + iq3 * sq3 + iq1 * sq1;
     const float * kh = k + iq3 * sq3 + iq1 * sq1;
-    for (int idx = tid; idx < n_tokens * S_v; idx += GDN_FU_THREADS) {
+    for (int idx = tid; idx < n_tokens * S_v; idx += TPB) {
         const int t = idx / S_v;
         const int i = idx % S_v;
         q_s[t][i] = qh[t * sq2 + i];
         k_s[t][i] = kh[t * sq2 + i];
     }
     const float * vh = v + sequence * sv3 + h_idx * sv1 + col0;
-    for (int idx = tid; idx < n_tokens * CPB; idx += GDN_FU_THREADS) {
+    for (int idx = tid; idx < n_tokens * CPB; idx += TPB) {
         const int t = idx / CPB;
         const int c = idx % CPB;
         v_s[t][c] = vh[t * sv2 + c];
@@ -1359,7 +1363,7 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
     {
         const int wv = tid / WARP;
         const int wl = tid % WARP;
-        for (int t = wv; t < n_tokens; t += GDN_FU_THREADS / WARP) {
+        for (int t = wv; t < n_tokens; t += TPB / WARP) {
             float a = 0.0f;
             for (int i = wl; i < S_v; i += WARP) {
                 a += k_s[t][i] * q_s[t][i];
@@ -1411,7 +1415,7 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
                     if (slot == 0) {
                         gdn_fu_st4<state_t, false>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
                     } else {
-                        gdn_fu_st4<state_t, true>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
+                        gdn_fu_st4<state_t, NT>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
                     }
                 }
             }
@@ -1455,24 +1459,43 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         return false;
     }
     const bool keep_rs = K > 1;
+    // [r2] K = 1: the DTREE-0 rows kernel (16 lanes/column, 512 threads) measured 6-20 % faster than the fused kernel
+    // at T >= 4 in ak-gdn-fused-gpu-20261123; route it there. K > 1: the fused kernel (it won every K = T cell).
+    if (!keep_rs && gdn_rows_try<state_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs, kda, K,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, stream, nullptr, true)) {
+        if (g_gdn_fused_n_calls.fetch_add(1) == 0) {
+            GGML_LOG_WARN("GDN_FUSED: ggml_cuda_gdn_fused GDN-FUSED-VARIANT r2 route K=1 -> rows kernel (call 1, n_tokens %d,"
+                          " GGML_HIP_GDN_FUSED=1)\n", (int) n_tokens);
+        }
+        return true;
+    }
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
-    const dim3  grid(H, n_seqs, S_v / GDN_FU_CPB);
-    const dim3  block(GDN_FU_THREADS, 1, 1);
-    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
 #define GDN_FU_ARGS lp, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, (int) n_tokens, sq1, sq2, sq3, \
         sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K
     if (keep_rs) {
+        // [r2] K = T is store-bound (one full state per row): 128-thread blocks (16 columns) double the waves in flight
+        // to hide the snapshot store latency. Snapshot slots > 0: nontemporal by default (r1);
+        // GGML_HIP_GDN_FUSED_NT=0 selects plain cached 16-byte stores (screen arm).
+        constexpr int TPB = GDN_FU_THREADS / 2;
+        const char * nte = getenv("GGML_HIP_GDN_FUSED_NT");
+        const bool   nt  = !(nte != nullptr && nte[0] == '0');
+        const dim3   grid(H, n_seqs, S_v / (TPB / GDN_FU_LPC));
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, dim3(TPB, 1, 1), 0, stream);
         if (S_v == 128) {
-            ggml_cuda_kernel_launch(gdn_fused_cuda<128, true, state_t>, GDN_FU_ARGS);
+            if (nt) { ggml_cuda_kernel_launch(gdn_fused_cuda<128, true, state_t, TPB, true>,  GDN_FU_ARGS); }
+            else    { ggml_cuda_kernel_launch(gdn_fused_cuda<128, true, state_t, TPB, false>, GDN_FU_ARGS); }
         } else {
-            ggml_cuda_kernel_launch(gdn_fused_cuda<64, true, state_t>, GDN_FU_ARGS);
+            if (nt) { ggml_cuda_kernel_launch(gdn_fused_cuda<64, true, state_t, TPB, true>,  GDN_FU_ARGS); }
+            else    { ggml_cuda_kernel_launch(gdn_fused_cuda<64, true, state_t, TPB, false>, GDN_FU_ARGS); }
         }
     } else {
+        const dim3 grid(H, n_seqs, S_v / GDN_FU_CPB);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, dim3(GDN_FU_THREADS, 1, 1), 0, stream);
         if (S_v == 128) {
-            ggml_cuda_kernel_launch(gdn_fused_cuda<128, false, state_t>, GDN_FU_ARGS);
+            ggml_cuda_kernel_launch(gdn_fused_cuda<128, false, state_t, GDN_FU_THREADS, false>, GDN_FU_ARGS);
         } else {
-            ggml_cuda_kernel_launch(gdn_fused_cuda<64, false, state_t>, GDN_FU_ARGS);
+            ggml_cuda_kernel_launch(gdn_fused_cuda<64, false, state_t, GDN_FU_THREADS, false>, GDN_FU_ARGS);
         }
     }
 #undef GDN_FU_ARGS
