@@ -1297,6 +1297,33 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// AK-CPU-A3B-SHEXP-VERIFY-GAP (2026-11-23): small-batch mul_mat without the internal barrier.
+// At 1 < src1 rows <= GGML_MM_SMALLN every thread quantizes ALL src1 rows into its own private
+// slice of wdata (the D1 batch-1 idea extended to N rows), so the full-team ggml_barrier that
+// publishes the shared quantized src1 disappears. GGML_MM_SMALLN_NTH (0 = all) additionally caps
+// how many threads take part. Quantization is per 32-block (independent of who does it) and the
+// tinyBLAS / vec_dot output of every element is independent of the thread partition, so the
+// result is bit-identical to the default path. Default OFF (GGML_MM_SMALLN unset/0).
+static int ggml_cpu_mm_smalln(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * s = getenv("GGML_MM_SMALLN");
+        n = s ? atoi(s) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+static int ggml_cpu_mm_smalln_nth(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * s = getenv("GGML_MM_SMALLN_NTH");
+        n = s ? atoi(s) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
 // INF-70 D1: the mul_mat chunk plan, factored out unchanged so the batch-1 fast path
 // can decide *before* quantizing src1 whether the shared chunk counter is ever read.
 static inline void ggml_mul_mat_chunk_plan(
@@ -1557,6 +1584,56 @@ UseGgmlGemm1:;
 
     int64_t nchunk0 = 0, nchunk1 = 0;
     ggml_mul_mat_chunk_plan(ne0, ne1*ne2*ne3, nth, &nchunk0, &nchunk1);
+
+    // AK-CPU-A3B-SHEXP-VERIFY-GAP: barrier-free small-N path (see ggml_cpu_mm_smalln).
+    {
+        const int smalln = ggml_cpu_mm_smalln();
+        if (smalln > 1 && src0->type == GGML_TYPE_Q8_0 && src1_nrows_total > 1 && src1_nrows_total <= smalln && ne12 == 1 && ne13 == 1 &&
+                src1->type == GGML_TYPE_F32 && src1->type != vec_dot_type && ggml_is_contiguous(src1) &&
+                !params->use_ref && !ggml_cpu_rowexact_batch(params, ne11) &&
+                nth >= nchunk0*nchunk1) {
+            const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+            if (params->wsize >= (size_t) nth * (size_t) ne11 * nbw1) {
+                const int cap = ggml_cpu_mm_smalln_nth();
+                const int nact = (cap > 0 && cap < nth) ? cap : nth;
+                if (ith >= nact) {
+                    return;
+                }
+                char * wpriv = (char *) params->wdata + (size_t) ith * (size_t) ne11 * nbw1;
+                for (int64_t i11 = 0; i11 < ne11; i11++) {
+                    from_float((const float *) ((const char *) src1->data + i11*nb11), (void *) (wpriv + i11*nbw1), ne10);
+                }
+#if GGML_USE_LLAMAFILE
+                {
+                    struct ggml_compute_params p2 = *params;
+                    p2.ith = ith;
+                    p2.nth = nact;
+                    if (llamafile_sgemm(&p2, ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                        (const char *) src0->data, nb01/ggml_type_size(src0->type),
+                                        wpriv, nbw1/ggml_type_size(vec_dot_type),
+                                        (char *) dst->data, nb1/ggml_type_size(dst->type),
+                                        src0->type, vec_dot_type, dst->type)) {
+                        return;
+                    }
+                }
+#endif
+                // generic fallback: static chunk stride over the active threads, private src1 copy
+                const int64_t nr0s = ne0, nr1s = ne1;
+                const int64_t dr0s = (nr0s + nchunk0 - 1) / nchunk0;
+                const int64_t dr1s = (nr1s + nchunk1 - 1) / nchunk1;
+                for (int64_t ch = ith; ch < nchunk0*nchunk1; ch += nact) {
+                    const int64_t a0 = (ch % nchunk0) * dr0s, a1 = (ch / nchunk0) * dr1s;
+                    const int64_t b0 = MIN(a0 + dr0s, nr0s), b1 = MIN(a1 + dr1s, nr1s);
+                    int64_t nrv = vec_dot_num_rows;
+                    if ((nr0s % 2 != 0) || (ne11 % 2 != 0) || ((b0 - a0) % 2 != 0) || ((b1 - a1) % 2 != 0)) {
+                        nrv = 1;
+                    }
+                    ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, nrv, a0, b0, a1, b1, wpriv);
+                }
+                return;
+            }
+        }
+    }
 
     const bool mm_batch1 =
         src1_nrows_total == 1 &&
@@ -3578,6 +3655,11 @@ struct ggml_cplan ggml_graph_plan(
                             // n_tasks copies of it. This is a superset of the runtime predicate:
                             // the forward falls back to the shared path if wsize is short.
                             if (node->src[1]->ne[1]*node->src[1]->ne[2]*node->src[1]->ne[3] == 1) {
+                                cur *= n_tasks;
+                            }
+                            // AK-CPU-A3B-SHEXP-VERIFY-GAP: GGML_MM_SMALLN private per-thread src1 copies.
+                            else if (ggml_cpu_mm_smalln() > 1 && node->src[0]->type == GGML_TYPE_Q8_0 && node->src[1]->ne[2]*node->src[1]->ne[3] == 1 &&
+                                     node->src[1]->ne[1] <= ggml_cpu_mm_smalln()) {
                                 cur *= n_tasks;
                             }
                         }
