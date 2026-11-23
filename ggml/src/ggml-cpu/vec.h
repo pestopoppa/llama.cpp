@@ -1671,11 +1671,13 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+    // DTREE-DEVICE-TREE-ACCEPT: first maximum (lowest index on ties), the host greedy rule (std::max_element) and the
+    // CUDA/HIP argmax_f32 rule; the previous MAX/== form returned the LAST maximum, so a CPU device-argmax accept could
+    // pick a different token than the host scan on an exact logit tie
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {
-        max = MAX(max, x[i]);
-        if (max == x[i]) { idx = i; }
+        if (x[i] > max) { max = x[i]; idx = i; }
     }
     *s = idx;
 }
