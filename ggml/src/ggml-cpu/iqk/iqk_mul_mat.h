@@ -48,6 +48,13 @@ IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int un
         const char * up_b, const char * gate_b,
         float * C, long nb1, long nb2, const void * vrow_mapping, float limit, int ith, int nth);
 
+// AK-Q38FN-CPU-MMID-GATEUP-FUSE: rows [first_x, first_x + nrc_x) of ONE expert's up and gate slabs,
+// C = SiLU(gate) * up (unary_op), no thread split. Direct-kernel path only; nrc_x == 0 = preflight.
+IQK_API bool iqk_moe_fused_up_gate_rows(long Nx, long Ny, long ne00, int ne11, int unary_op,
+        int typeA, const void * Aup, const void * Agate, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, long first_x, long nrc_x);
+
 IQK_API int iqk_dequant_type(int type, int Ny);
 
 struct ggml_tensor;

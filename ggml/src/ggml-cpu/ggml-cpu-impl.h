@@ -547,6 +547,10 @@ bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * params, struct g
 // CH-19 Q8_0 single-token up+gate fusion; false preserves the unfused path.
 bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * params,
         struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu);
+// AK-Q38FN-CPU-MMID-GATEUP-FUSE: GGML_MMID_GATEUP_FUSE=1 (default OFF) single-token
+// up+gate+SwiGLU fusion for the non-Q8_0 iqk types, flat (expert,row) slab over all threads.
+bool ggml_iqk_try_moe_up_gate_slab(const struct ggml_compute_params * params,
+        struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu);
 // Option R: smallest logical row count at which a Q8_0 MUL_MAT / MUL_MAT_ID can take the iqk
 // route in this process (compiled prefill threshold, legacy GGML_IQK_Q8_0 env route, GGML_IQK
 // gate), or INT64_MAX when it never can. ggml_graph_plan sizes the Q8_0 work buffer for the iqk

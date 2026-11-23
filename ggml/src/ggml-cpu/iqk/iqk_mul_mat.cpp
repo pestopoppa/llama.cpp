@@ -930,6 +930,41 @@ extern "C" IQK_API bool iqk_mul_mat_moe_rows(long Nx, long Ny, long ne00, int ne
     return true;
 }
 
+// AK-Q38FN-CPU-MMID-GATEUP-FUSE: rows [first_x, first_x + nrc_x) of ONE expert's up AND gate
+// slabs in one pass, SiLU(gate)*up written straight into C (the GLU output), no thread split —
+// the caller partitions the flat (expert, row) space across all threads. Direct-kernel path only
+// (iqk_dequant_type(typeA, Ny) == typeA); first_x/nrc_x multiples of
+// iqk_mul_mat_moe_row_granularity(typeA). Kernel selection happens before the empty-range return,
+// so every thread of a partition observes the same verdict; nrc_x == 0 is a pure preflight.
+extern "C" IQK_API bool iqk_moe_fused_up_gate_rows(long Nx, long Ny, long ne00, int ne11, int unary_op,
+        int typeA, const void * Aup, const void * Agate, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, long first_x, long nrc_x) {
+    const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
+    assert(row_mapping != nullptr);
+
+    auto etypeA = ggml_type(typeA);
+    if (MulMat::is_dequant_better(etypeA, Ny) != etypeA) {
+        return false;
+    }
+    MulMat mm;
+    if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+        return false;
+    }
+    const auto num_rows = MulMat::num_rows(etypeA);
+    GGML_ASSERT(Nx % num_rows == 0 && first_x % num_rows == 0 && nrc_x % num_rows == 0);
+    GGML_ASSERT(first_x >= 0 && nrc_x >= 0 && first_x + nrc_x <= Nx);
+    if (nrc_x == 0) {
+        return true;
+    }
+    const size_t row_size_qx = strideA;
+    DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
+        (size_t) strideB, 0, ne11, row_mapping, nb2/sizeof(float)};
+    mm.mul_mat_up_gate_NxM(ne00, (const char *)Aup + row_size_qx*first_x, (const char *)Agate + row_size_qx*first_x, row_size_qx,
+            nullptr, nullptr, info, (int) nrc_x, (int) Ny, unary_op, 0.0f);
+    return true;
+}
+
 extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,
@@ -1933,6 +1968,11 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long /*Nx*/, long /*Ny*/, long /*n
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
         float * /*C*/, long /*nb1*/, long /*nb2*/, const void * /*vrow_mapping*/, float, int /*ith*/, int /*nth*/) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+
+extern "C" IQK_API bool iqk_moe_fused_up_gate_rows(long, long, long, int, int, int, const void *, const void *, long,
+        int, const void *, long, float *, long, long, const void *, long, long) {
     return false;
 }
 

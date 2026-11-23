@@ -4583,6 +4583,17 @@ size_t ggml_cpu_fused_moe_upgate_q8_work_size(const struct ggml_cgraph * cgraph,
     return required;
 }
 
+#if defined(GGML_USE_IQK_MULMAT) && defined(IQK_IMPLEMENT)
+static bool ggml_cpu_mmid_gateup_fuse_enabled(void) {
+    static int flag = -1;
+    if (flag < 0) {
+        const char * s = getenv("GGML_MMID_GATEUP_FUSE");
+        flag = (s != NULL && atoi(s) != 0) ? 1 : 0;
+    }
+    return flag == 1;
+}
+#endif
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4796,6 +4807,19 @@ static int ggml_cpu_try_fuse_ops(
                     return 2;
                 }
             }
+        }
+    }
+    // AK-Q38FN-CPU-MMID-GATEUP-FUSE: GGML_MMID_GATEUP_FUSE=1 (default OFF; read once) fuses the
+    // single-token MUL_MAT_ID(up) + MUL_MAT_ID(gate) + GLU(SWIGLU) of the non-Q8_0 iqk types into one
+    // node with a flat (expert, row) slab over all threads. With the knob off nothing here runs.
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cpu_mmid_gateup_fuse_enabled() &&
+            node_n + 2 < cgraph->n_nodes) {
+        struct ggml_tensor * up = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (ggml_cpu_can_fuse_moe_up_gate(cgraph, node_n, &up, &gate) &&
+                up->src[0] && up->src[0]->type != GGML_TYPE_Q8_0 &&
+                ggml_iqk_try_moe_up_gate_slab(params, up, gate, cgraph->nodes[node_n + 2])) {
+            return 2;
         }
     }
     // CH-19 Q8_0 extension: leave the established Q4_K/Q5_K block above unchanged.
