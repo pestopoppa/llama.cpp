@@ -3024,6 +3024,15 @@ static void ggml_cpu_gdn_fwd_setup(struct ggml_threadpool * tp, struct ggml_cgra
     if (tp->n_gdn_fwd > 0) {
         atomic_fetch_add_explicit(&ggml_cpu_gdn_fwd_total, tp->n_gdn_fwd, memory_order_relaxed);
     }
+    // engagement witness for non-PROF builds: one line per new maximum forwarded-per-graph count
+    static int max_seen = 0;
+    if (tp->n_gdn_fwd > max_seen) {
+        max_seen = tp->n_gdn_fwd;
+        if (getenv("GGML_GDN_STATE_FWD_QUIET") == NULL) {
+            fprintf(stderr, "[gdn-state-fwd] GDN_STATE_FWD engaged: %d of %d GATED_DELTA_NET candidates forwarded in a graph of %d nodes\n",
+                    tp->n_gdn_fwd, nc, n);
+        }
+    }
 }
 
 static void ggml_cpu_gdn_fwd_teardown(struct ggml_threadpool * tp) {
