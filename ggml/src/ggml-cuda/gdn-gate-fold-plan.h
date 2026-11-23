@@ -155,7 +155,13 @@ inline bool anchor_safe(const hc_ctx & c, const ggml_cuda_gdn_gate_plan & plan, 
     for (const ggml_tensor * x : ins) {
         if (!x->data) return fail("input-no-data", x, nullptr);
         for (const ggml_tensor * o : outs) {
-            if (overlaps(o, x)) return fail("sink-overlaps-input", o, x);
+            // an exact same-index alias of g with ssm_dt / ssm_a is harmless: the fold thread that writes g[t*H + h] reads
+            // dt[h] / a[h] just before, and only ntok == 1 (index t*H + h == h) can produce it. ggml-alloc makes it when the
+            // [H, 1, 1] ADD(alpha, dt) runs in place on an input-leaf dt (host debug, test-gdn-gate-fold ntok=1 graph);
+            // served models keep dt / a in the weight buffer, which is never an in-place target.
+            const bool same_index = o == an.g && (x == an.dt || x == an.a) && an.ntok == 1 && o->data == x->data &&
+                                    ggml_nbytes(o) == ggml_nbytes(x);
+            if (overlaps(o, x) && !same_index) return fail("sink-overlaps-input", o, x);
         }
         const ggml_tensor * r  = root_of(x);
         const auto          ip = c.pos.find(r);
