@@ -2170,6 +2170,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // AK-A3B-VERIFY-OVERLAP (measurement only): GGML_HIP_MMID_OVERLAP_LOG=1 copies ids to the host for every MUL_MAT_ID
+    // with n_tokens (ids->ne[1]) >= 4 and logs the unique experts vs the (row, expert) pairs, to size an expert-dedup
+    // kernel. It synchronizes the stream, so it is skipped while a graph is being captured (run with graphs off).
+    // Default OFF; the dispatch below is unchanged.
+    {
+        static const bool overlap_log = []() {
+            const char * s = getenv("GGML_HIP_MMID_OVERLAP_LOG");
+            return s != nullptr && atoi(s) != 0;
+        }();
+        if (overlap_log && ids->type == GGML_TYPE_I32 && ids->ne[1] >= 4 && ids->ne[2] == 1 && ids->ne[3] == 1) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+            if (capture_status == cudaStreamCaptureStatusNone) {
+                const int64_t k = ids->ne[0];
+                const int64_t n = ids->ne[1];
+                std::vector<int32_t> h((size_t) (k*n));
+                for (int64_t r = 0; r < n; ++r) {
+                    CUDA_CHECK(cudaMemcpyAsync(h.data() + r*k, (const char *) ids->data + r*ids->nb[1], k*sizeof(int32_t),
+                                               cudaMemcpyDeviceToHost, ctx.stream()));
+                }
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                std::vector<int32_t> u(h);
+                std::sort(u.begin(), u.end());
+                const int64_t n_unique = std::unique(u.begin(), u.end()) - u.begin();
+                GGML_LOG_INFO("GGML_HIP_MMID_OVERLAP name=%s n=%" PRId64 " k=%" PRId64 " pairs=%" PRId64 " unique=%" PRId64 "\n",
+                              dst->name, n, k, n*k, n_unique);
+            }
+        }
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
