@@ -5962,6 +5962,8 @@ struct test_ssm_conv_tree_fused : public test_case {
 // [DTREE-0-GDN-ROWS] route witness for the few-row GDN verify kernel: with GGML_HIP_GDN_ROWS=1 on a ROCm backend,
 // a non-KDA head_size 64/128 case with n_tokens in [GGML_HIP_GDN_ROWS_MIN (1), GGML_HIP_GDN_ROWS_MAX (16)] that the
 // chunked path does not take MUST run the rows kernel; with the knob off it must NOT run. Prints GDN_ROWS_WITNESS.
+// [GDN-FUSED-VARIANT r2] with GGML_HIP_GDN_FUSED=1 the non-tree route (fused_route) is: eligible K <= 1, n_tokens 1..16
+// MUST run the rows kernel; K > 1 runs the fused kernel and the rows kernel must NOT run (whatever GGML_HIP_GDN_ROWS says).
 struct gdn_rows_witness {
     using n_calls_t = uint64_t (*)();
     n_calls_t n_calls = nullptr;
@@ -5975,7 +5977,7 @@ struct gdn_rows_witness {
         return s != nullptr && s[0] != '\0' ? atoi(s) : def;
     }
 
-    void begin(ggml_backend_t backend, bool eligible, int64_t n_tokens) {
+    void begin(ggml_backend_t backend, bool eligible, int64_t n_tokens, int64_t K = 1, bool fused_route = false) {
         armed = false;
         if (ggml_backend_is_cpu(backend)) {
             return;
@@ -5989,6 +5991,9 @@ struct gdn_rows_witness {
         const int lo = std::max(1, env_int("GGML_HIP_GDN_ROWS_MIN", 1));
         const int hi = std::min(16, env_int("GGML_HIP_GDN_ROWS_MAX", 16));
         expect = rocm && env_int("GGML_HIP_GDN_ROWS", 0) == 1 && eligible && n_tokens >= lo && n_tokens <= hi;
+        if (fused_route && rocm && env_int("GGML_HIP_GDN_FUSED", 0) == 1) {
+            expect = eligible && K <= 1 && n_tokens >= 1 && n_tokens <= 16;
+        }
         before = n_calls();
         armed  = true;
     }
@@ -6499,7 +6504,7 @@ struct test_gated_delta_net : public test_case {
                         n_seq_tokens >= min_tokens() && n_seq_tokens > kt && kt <= 64;
         gdn_ch_before = gdn_ch_n_calls();
         gdn_ch_armed  = true;
-        rows_witness.begin(backend, !gdn_ch_expect && !kda && (head_size == 64 || head_size == 128), n_seq_tokens);
+        rows_witness.begin(backend, !gdn_ch_expect && !kda && (head_size == 64 || head_size == 128), n_seq_tokens, K, true);
     }
 
     std::string witness_check(ggml_backend_t backend) override {
