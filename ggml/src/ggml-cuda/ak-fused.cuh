@@ -10,7 +10,7 @@
 // H15: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 //      -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k)
 //      gated-DeltaNet conv1d state update + conv + silu + q/k l2 norm in one launch.
-//      Kill switch: GGML_CUDA_AK_H15=0.
+//      Default OFF since C19; GGML_CUDA_AK_H15=1 opts in.
 // GGML_CUDA_AK_FUSE_LOG=1 prints one line the first time each fusion fires.
 //
 // Both return the number of graph nodes to skip (0 = pattern not taken, run unfused).
