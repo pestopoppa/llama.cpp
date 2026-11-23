@@ -531,6 +531,18 @@ int32_t common_dtree_sampled_max_paths() {
     return w;
 }
 
+bool common_dtree_rrs_q_ok(size_t n_dists, size_t n_main, bool seq_rm_part, bool seq_rm_rs, int32_t n_rs_seq) {
+    return n_main > 0 && n_dists == n_main && (seq_rm_part || (seq_rm_rs && (int64_t) n_main <= (int64_t) n_rs_seq));
+}
+
+int32_t common_dtree_new_cols(const std::vector<int32_t> & main, const std::vector<int32_t> & alt) {
+    size_t j = 0;
+    while (j < main.size() && j < alt.size() && main[j] == alt[j]) {
+        ++j;
+    }
+    return (int32_t) (alt.size() - j);
+}
+
 bool common_dtree_sampled_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_DTREE_SAMPLED");

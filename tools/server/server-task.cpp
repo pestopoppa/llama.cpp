@@ -271,6 +271,11 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["draft_rounds"]     = draft_rounds;
+        base["draft_nodes"]      = draft_nodes;
+        base["tree_rrs_rounds"]  = tree_rrs_rounds;
+        base["tree_rrs_noq"]     = tree_rrs_noq;
+        base["tree_rrs_alt"]     = tree_rrs_alt;
     }
 
     if (!kv_reorder.is_null()) {

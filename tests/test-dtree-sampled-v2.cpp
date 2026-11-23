@@ -192,6 +192,19 @@ int main() {
         CHECK(msg.find("recursive rejection (RRS)") != std::string::npos);
         CHECK(msg.find("target-sample walk") == std::string::npos);
     }
+    // rejection accept is used only when the dists cover the main chain and the target can roll it back
+    {
+        CHECK(common_dtree_rrs_q_ok(7, 7, true, false, 0));
+        CHECK(common_dtree_rrs_q_ok(7, 7, false, true, 7));
+        CHECK(!common_dtree_rrs_q_ok(7, 7, false, true, 6));   // RS bound too small -> downgrade
+        CHECK(!common_dtree_rrs_q_ok(0, 7, true, false, 0));   // dists cleared (the V1 defect) -> downgrade
+        CHECK(!common_dtree_rrs_q_ok(6, 7, true, false, 0));
+        CHECK(!common_dtree_rrs_q_ok(0, 0, true, false, 0));
+        CHECK(common_dtree_new_cols({1, 2, 3, 4}, {1, 2, 9, 5}) == 2);
+        CHECK(common_dtree_new_cols({1, 2, 3, 4}, {7, 2, 3, 4}) == 4);
+        CHECK(common_dtree_new_cols({1, 2, 3, 4}, {1, 2, 3, 4}) == 0);
+        CHECK(common_dtree_new_cols({1, 2}, {1, 2, 3}) == 1);
+    }
     const std::vector<int> ctx0 = {3, 1};
     const int N = 200000;
     const double crit = 66.62; // chi-square df = 35, p = 0.001

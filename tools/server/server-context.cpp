@@ -523,6 +523,9 @@ struct server_slot {
     int32_t n_tree_alt_extra = 0;      // tokens gained over the main path in those rounds
     int64_t n_tree_rrs_alt      = 0;   // SPEC-DTREE-SAMPLED-V2: rounds the RRS walk left the main chain via a sibling
     int64_t n_tree_alts_drafted = 0;   // SPEC-DTREE-SAMPLED-V2: sibling paths verified at T > 0
+    int64_t n_tree_rrs_rounds   = 0;   // SPEC-DTREE-SAMPLED-V2: rounds decided by the RRS tree accept
+    int64_t n_tree_rrs_noq      = 0;   // ... of which ran WITHOUT the main-chain draft dists (sample-and-compare downgrade)
+    int64_t n_draft_nodes       = 0;   // drafted verify columns: main draft + sibling columns past the shared prefix
     llama_tokens       spec_tree_rrs_tokens; // SPEC-DTREE-SAMPLED-V2: this round's tokens decided by the RRS walk
     common_sampler_ptr spec_tree_rrs_smpl;   // ... and the sampler that accepted them (adopted by the accept pass)
 
@@ -721,6 +724,9 @@ struct server_slot {
         n_tree_alt_extra = 0;
         n_tree_rrs_alt      = 0;
         n_tree_alts_drafted = 0;
+        n_tree_rrs_rounds   = 0;
+        n_tree_rrs_noq      = 0;
+        n_draft_nodes       = 0;
         spec_tree_rrs_tokens.clear();
         spec_tree_rrs_smpl.reset();
 
@@ -1021,6 +1027,11 @@ struct server_slot {
         if (n_draft_total > 0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_rounds     = n_draft_verif_steps;
+            timings.draft_nodes      = n_draft_nodes;
+            timings.tree_rrs_rounds  = n_tree_rrs_rounds;
+            timings.tree_rrs_noq     = n_tree_rrs_noq;
+            timings.tree_rrs_alt     = n_tree_rrs_alt;
         }
 
         return timings;
@@ -1144,8 +1155,10 @@ struct server_slot {
                     spec_tree_auto.rate[0], spec_tree_auto.rate[1], spec_tree_auto.rate[2],
                     spec_tree_auto.n_obs[0], spec_tree_auto.n_obs[1], spec_tree_auto.n_obs[2]);
                 if (n_tree_alts_drafted > 0 || common_dtree_sampled_enabled()) {
-                    SLT_INF(*this, "draft tree sampled (RRS): sibling paths drafted = %lld, alternative accepted (RRS) = %lld\n",
-                        (long long) n_tree_alts_drafted, (long long) n_tree_rrs_alt);
+                    SLT_INF(*this, "draft tree sampled (RRS): sibling paths drafted = %lld, alternative accepted (RRS) = %lld, "
+                        "RRS rounds = %lld, sample-and-compare (no q) rounds = %lld, drafted nodes = %lld\n",
+                        (long long) n_tree_alts_drafted, (long long) n_tree_rrs_alt, (long long) n_tree_rrs_rounds,
+                        (long long) n_tree_rrs_noq, (long long) n_draft_nodes);
                 }
             }
         }
@@ -4753,6 +4766,7 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.n_draft_total += draft.size();
+            slot.n_draft_nodes += (int64_t) draft.size();
 
             // AK-DTREE-1: alternatives follow the (possibly truncated) main draft's length; duplicates of the
             // main path after truncation are dropped
@@ -5681,9 +5695,17 @@ private:
                     // SERVED rejection step against the drafter's dists (spec_dists intact, same condition as the
                     // served verify), sibling / off-chain nodes take the served sample-and-compare draw. The probe
                     // decides AND accepts the whole round; the accept pass below adopts its tokens and sampler.
-                    const bool use_q = slot.spec_dists.size() == slot.spec_draft.size() &&
-                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
-                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && slot.spec_draft.size() <= llama_n_rs_seq(ctx_tgt)));
+                    const bool use_q = common_dtree_rrs_q_ok(slot.spec_dists.size(), slot.spec_draft.size(),
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART,
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS, (int32_t) llama_n_rs_seq(ctx_tgt));
+                    slot.n_tree_rrs_rounds += 1;
+                    slot.n_tree_rrs_noq    += use_q ? 0 : 1;
+                    {
+                        const std::vector<int32_t> mainv(slot.spec_draft.begin(), slot.spec_draft.end());
+                        for (const auto & alt : slot.spec_tree_alts) {
+                            slot.n_draft_nodes += common_dtree_new_cols(mainv, std::vector<int32_t>(alt.begin(), alt.end()));
+                        }
+                    }
                     int32_t k = 0;
                     slot.spec_tree_rrs_tokens = common_sampler_tree_accept(probe.get(), ctx_tgt, prow, ptok,
                                                                            use_q ? &slot.spec_dists : nullptr, &k, &slot.n_tree_rrs_alt);
