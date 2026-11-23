@@ -1087,7 +1087,7 @@ static const ggml_tensor * q8ip_packed_base(const ggml_tensor * t) {
     return ggml_cuda_q8ip_is_packed(b) ? b : nullptr;
 }
 
-// AK-BW-27B-DRAFT-Q8IP-PERMUTE: GET_ROWS-only weights (DFlash2 selector_successor, rank x n_vocab) cannot read the
+// AK-BW-27B-DRAFT-Q8IP-PERMUTE: GET_ROWS-only weights (DFlash2 selector_predecessor/successor, rank x n_vocab) cannot read the
 // packed layout, so packing them makes every draft graph unpack the whole tensor into a transient copy
 // (ggml_cuda_q8ip_substitute; 4.4 x 96 us per draft segment on C18). GGML_HIP_Q8IP_NOPACK_GETROWS=1 leaves them
 // natural. Default off (C18 behaviour). Bit-identical: GET_ROWS reads the same natural bytes either way.
@@ -1102,7 +1102,10 @@ static bool q8ip_nopack_getrows() {
 static bool q8ip_shape_ok(const ggml_tensor * t) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     const int64_t nbytes = (int64_t) ggml_nbytes(t);
-    if (q8ip_nopack_getrows() && strstr(t->name, "selector_successor") != nullptr) {
+    // both DFlash2 GET_ROWS selectors (llama-arch.cpp: SELECTOR_PREV/NEXT -> GGML_OP_GET_ROWS); selector_hidden is a
+    // MUL_MAT weight and stays packed
+    if (q8ip_nopack_getrows() &&
+        (strstr(t->name, "selector_successor") != nullptr || strstr(t->name, "selector_predecessor") != nullptr)) {
         static std::atomic<int> n_skip{0};
         if (n_skip.fetch_add(1) == 0) {
             GGML_LOG_INFO("ggml_cuda_q8ip: NOPACK_GETROWS leaves %s natural (GET_ROWS consumer)\n", t->name);
