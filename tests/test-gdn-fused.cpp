@@ -95,6 +95,9 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
     const std::vector<float> ref = run(S, H_k, H, T, B, K, st, in);
     const uint64_t c0 = g_fused_calls ? g_fused_calls() : 0;
     setenv("GGML_HIP_GDN_FUSED", "1", 1);
+    if (K <= 1) {
+        setenv("GGML_HIP_GDN_FUSED_K1", "1", 1);   // [C19] the K=1 rows route is opt-in (default off); test it explicitly
+    }
     char cbuf[8]; snprintf(cbuf, sizeof(cbuf), "%d", cols);
     if (cols > 0) {
         setenv("GGML_HIP_GDN_FUSED_COLS", cbuf, 1);
@@ -104,6 +107,7 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
     const std::vector<float> cand = run(S, H_k, H, T, B, K, st, in);
     unsetenv("GGML_HIP_GDN_FUSED");
     unsetenv("GGML_HIP_GDN_FUSED_COLS");
+    unsetenv("GGML_HIP_GDN_FUSED_K1");
     const uint64_t c1 = g_fused_calls ? g_fused_calls() : 0;
 
     const bool bf = st == GGML_TYPE_BF16;

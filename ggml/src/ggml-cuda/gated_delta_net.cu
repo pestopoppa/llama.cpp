@@ -1500,9 +1500,13 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         return false;
     }
     const bool keep_rs = K > 1;
-    // [C19 GDN-K1] GGML_HIP_GDN_FUSED_K1=0: K = 1 ops are left to the pre-fused dispatch (C18 route: rows only when
-    // GGML_HIP_GDN_ROWS=1, else the recurrent kernel); the fused kernel then covers K > 1 only. Default 1 (r2 route).
-    static const bool k1_route = [] { const char * e = getenv("GGML_HIP_GDN_FUSED_K1"); return e == nullptr || e[0] != '0'; }();
+    // [C19 GDN-K1] K = 1 ops go to the pre-fused dispatch by DEFAULT (C18 route: rows only when GGML_HIP_GDN_ROWS=1, else the
+    // recurrent kernel); the fused kernel covers K > 1. GGML_HIP_GDN_FUSED_K1=1 restores the r2 K=1 -> rows route.
+    // c19attr-a3b-gpu-20261123: the K=1 rows route cost A3B np1 decode 1.3-1.5 % (vs C19: GDN_FUSED=0 1.013 [1.004, 1.023],
+    // K1=0 1.015 [0.998, 1.032]) and did nothing for np4; the 27B served gates that made GDN_FUSED default-on were K=T.
+    // Read per call, like GGML_HIP_GDN_FUSED, so a test can flip it between two launches in one process.
+    const char * k1e = getenv("GGML_HIP_GDN_FUSED_K1");
+    const bool k1_route = k1e != nullptr && k1e[0] == '1';
     if (!keep_rs && !k1_route) {
         return false;
     }

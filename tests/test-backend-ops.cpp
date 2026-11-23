@@ -6014,7 +6014,7 @@ struct gdn_rows_witness {
         const int lo = std::max(1, env_int("GGML_HIP_GDN_ROWS_MIN", 1));
         const int hi = std::min(16, env_int("GGML_HIP_GDN_ROWS_MAX", 16));
         expect = rocm && env_int("GGML_HIP_GDN_ROWS", 0) == 1 && eligible && n_tokens >= lo && n_tokens <= hi;
-        if (fused_route && rocm && env_int("GGML_HIP_GDN_FUSED", 1) != 0 /* [C19] default ON */ && env_int("GGML_HIP_GDN_FUSED_K1", 1) != 0) {
+        if (fused_route && rocm && env_int("GGML_HIP_GDN_FUSED", 1) != 0 /* [C19] default ON */ && env_int("GGML_HIP_GDN_FUSED_K1", 0) == 1 /* [C19] K=1 rows route default OFF */) {
             expect = eligible && K <= 1 && n_tokens >= 1 && n_tokens <= 16;
         }
         before = n_calls();
