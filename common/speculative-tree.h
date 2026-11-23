@@ -108,6 +108,61 @@ llama_token common_dtree_row_argmax(const float * logits, int32_t n_vocab);
 // accept walk over per-row picks (picks[i] = argmax of row i): number of leading i with picks[i] == draft[i]
 int32_t common_dtree_accept_walk(const std::vector<llama_token> & picks, const std::vector<llama_token> & draft);
 
+// SPEC-DTREE-DICE V2 (LLAMA_DTREE_SAMPLED=1, default off): sampled (T > 0) tree accept walk.
+// paths[k] are the verified root-to-leaf paths (k = 0 is the main chain), rows[k][d] is the batch row whose logits
+// give the target distribution after the anchor + paths[k][0..d) (rows[k].size() == paths[k].size() + 1). Paths
+// that agree on their first d tokens share the same context at depth d, so any of their rows[k][d] serves.
+// The walk (V2 of scripts/kernel_rnd/dice_replay/dice_replay.py): at depth d draw the TARGET's own sample
+// `sample(row)` at the current node; if it equals the depth-d token of a still-live path, `accept(tok)` and
+// descend, else stop (the sampled token is the bonus the caller's accept pass emits). Every emitted token is a
+// target sample, so the emitted distribution equals the target's (lossless). Returns the accepted length;
+// *best = the lowest live path index at the stop (0 = the main chain when it is still live).
+int32_t common_dtree_sampled_walk(
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::function<llama_token(int32_t row)>        & sample,
+        const std::function<void(llama_token tok)>           & accept,
+        int32_t * best);
+
+// SPEC-DTREE-SAMPLED-V2: recursive rejection-sampling tree walk (multi-draft, replay V1; intake-2846#02).
+// Same rows/paths contract as common_dtree_sampled_walk. At each node (depth d, live paths L):
+//  - main-chain node (path 0 live, d < |path 0|) and `reject` set: the SERVED single-draft rejection step decides
+//    the main child against the draft distribution q_d (reject(row, d, &y) returns true = main child accepted,
+//    y = main token); on rejection y is the residual sample norm(max(p - q, 0)) the served path would emit.
+//  - any other node (or reject unset): y = sample(row), the served sample-and-compare draw (p, or the current
+//    residual implicitly: the sibling proposals are point masses, so "accept sibling x w.p. r(x), else renormalise
+//    r without x" is the same law as "draw y ~ r, accept the sibling equal to y").
+//  Then: if y is the depth-d token of a live path (main excluded after a main rejection), accept(y) and descend
+//  into those paths; else y is the bonus. Every emitted token has exactly the served path's law at that node, so
+//  the round is lossless; with no siblings (W = 1) the draws, tokens and stop are the served path's, bit for bit.
+// Returns the accepted length; *bonus = the final token (not passed to accept); *best = lowest live path at the stop;
+// *n_alt += 1 when the walk left the main chain through a sibling ("alternative accepted").
+int32_t common_dtree_rrs_walk(
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::function<llama_token(int32_t row)>        & sample,
+        const std::function<bool(int32_t row, int32_t d, llama_token * y)> & reject,
+        const std::function<void(llama_token tok)>           & accept,
+        llama_token * bonus,
+        int32_t * best,
+        int64_t * n_alt);
+
+// SPEC-DTREE-SAMPLED-V2: sibling paths around a SAMPLED main chain (T > 0). main[j] is the candidate index the
+// drafter sampled at depth j, q[j][k] its draft probability of candidate k at depth j (given main[0..j)), scores
+// the lattice (continuations are greedy from the sibling, as common_dtree_build_paths). Candidates are siblings
+// (k != main[j], q > 0) ranked by log q(main[0..j)) + log q[j][k] (top-q per depth, best-first across depths), each
+// path = main[0..j) + k + greedy continuation to D, taken while its D - j new columns fit n_nodes - (D + 1) and
+// fewer than max_paths paths exist. Returns the alternatives only (path 0 = main is implied).
+std::vector<std::vector<int32_t>> common_dtree_build_sampled(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, const std::vector<int32_t> & main,
+        const std::vector<std::vector<float>> & q, int32_t n_nodes, int32_t max_paths);
+
+// LLAMA_DTREE_SAMPLED_W (paths incl. main, default COMMON_DTREE_MAX_PATHS) for the T > 0 sibling builders
+int32_t common_dtree_sampled_max_paths();
+
+// LLAMA_DTREE_SAMPLED=1 read once (lifts the T > 0 guard of the tree verify; the accept walk is the V2 walk above)
+bool common_dtree_sampled_enabled();
+
 // LLAMA_DTREE_DEVICE_ACCEPT=1 read once; witness counters (rows decided by the device pick / by the host scan)
 bool    common_dtree_device_accept_enabled();
 void    common_dtree_device_accept_counts(int64_t * n_dev_rows, int64_t * n_host_rows);

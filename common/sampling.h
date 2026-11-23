@@ -100,6 +100,28 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         bool grammar_first = false,
         std::vector<std::vector<llama_token_data>> * out_dists = nullptr);
 
+// SPEC-DTREE-SAMPLED-V2: the served single-draft rejection step for one row (target p at idx vs draft dist q):
+// *accepted = true -> returns draft_tok; else returns the residual sample norm(max(p - q, 0)). Does not accept.
+llama_token common_sampler_spec_reject_step(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        llama_token draft_tok,
+        const common_speculative_token_dist & q,
+        bool * accepted);
+
+// SPEC-DTREE-SAMPLED-V2: recursive rejection-sampling tree accept (common_dtree_rrs_walk) on this sampler; every
+// returned token is accepted into gsmpl. dists = the main chain's draft dists (nullptr / size mismatch: sample-and-
+// compare at every node). rows/paths: path 0 = main chain. Returns accepted drafts + the bonus.
+std::vector<llama_token> common_sampler_tree_accept(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::vector<common_speculative_token_dist> * dists,
+        int32_t * best,
+        int64_t * n_alt);
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
