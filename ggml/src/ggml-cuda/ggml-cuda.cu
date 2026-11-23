@@ -3535,7 +3535,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    // AK-ASM-H15: concat + conv-state cpy + ssm_conv + silu + q/k l2_norm (GGML_CUDA_AK_H15=0 disables)
+    // AK-ASM-H15: concat + conv-state cpy + ssm_conv + silu + q/k l2_norm (default off since C19; GGML_CUDA_AK_H15=1 enables)
     // (at SSM_CONV it only skips a tail the fused kernel already computed at the CONCAT position)
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
         const int n_skip = ggml_cuda_ak_h15_try(*cuda_ctx, cgraph, i);

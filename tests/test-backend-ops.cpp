@@ -15292,7 +15292,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // AK-ASM-H14 / H15 op-level perf at the Qwen3.8-27B / Qwen3.6-35B-A3B / Q38FN-class shapes.
-    // Compare the same binary with GGML_CUDA_AK_H14=0 / GGML_CUDA_AK_H15=0 (unfused path).
+    // Compare the same binary with GGML_CUDA_AK_H14=1 / GGML_CUDA_AK_H15=1 (fused, both opt-in) against the default (unfused).
     for (int64_t nt : { 1, 4, 16 }) {
         test_cases.emplace_back(new test_ak_h14(256, 24, nt, 64, GGML_ROPE_TYPE_IMROPE, GGML_TYPE_COUNT, true)); // 27B Q
         test_cases.emplace_back(new test_ak_h14(256,  4, nt, 64, GGML_ROPE_TYPE_IMROPE, GGML_TYPE_F16,  false)); // 27B K f16 cache

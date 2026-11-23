@@ -442,7 +442,9 @@ static int ak_h15_reject(int id, const ggml_tensor * concat) {
 }
 
 int ggml_cuda_ak_h15_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    static const bool enabled = ak_env_enabled("GGML_CUDA_AK_H15");
+    // C19: default OFF (Q38FN GPU greedy loops past position 256 with H15 on, ak-c10-fusion-bisect-20261122 on C12;
+    // kernel-champion-and-promotion.md:C19-AK-H15-DEFAULT-OFF-AND-FIX). GGML_CUDA_AK_H15=1 opts in.
+    static const bool enabled = ak_env_opt_in("GGML_CUDA_AK_H15");
     static std::atomic<bool> logged{false};
     if (!enabled) {
         return 0;
