@@ -9,6 +9,7 @@
 #include "server-stream.h"
 #include "server-chunk-store.h"
 #include "speculative-tree.h"
+#include "dice-capture.h"
 #include "server-chunk-recompute.h"
 
 #include "build-info.h"
@@ -23,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <cerrno>
 #include <numeric>
@@ -515,6 +517,18 @@ struct server_slot {
     int32_t spec_tree_cols  = 0;       // [AK-DTREE-2] tree columns budgeted this round (batch mode pads to it)
     bool    spec_tree_batch_round = false; // [AK-DTREE-2] this round's verify was emitted as a tree batch
     std::vector<int32_t> spec_tree_cols_pending; // [AK-DTREE-2] winner's tree columns, committed after sampling
+    // SPEC-DTREE-DICE capture (LLAMA_DICE_CAPTURE, default off): this round's drafter candidates, forced superset tree,
+    // target rows and RNG keys; one JSON line per verify round, written after the accept
+    bool        dice_on         = false;  // capture armed for this round
+    bool        dice_tree_round = false;  // the round verifies the forced superset tree (DFlash2, T > 0)
+    std::string dice_draft_js;
+    std::string dice_rows_js;             // per-node target rows, filled at resolve (tree) or before the chain verify
+    std::string dice_tree_js;             // node list with batch rows (tree rounds)
+    std::vector<common_dice_node> dice_tree;
+    uint64_t    dice_n_acc0  = 0;
+    llama_pos   dice_pos0    = 0;
+    llama_token dice_id_last = -1;
+    int32_t     dice_round   = 0;
     int32_t spec_tree_arm  = -1;       // auto arm of the current round (-1: not timed)
     int64_t t_spec_tree_round = 0;
     common_dtree_auto spec_tree_auto;  // per slot, kept across tasks (same model, same recipe)
@@ -897,7 +911,7 @@ struct server_slot {
                 const llama_pos pa = prompt.tokens.pos_next(); // anchor position
                 // DTREE-TREE-QUALITY greedy tree: an alternative also shares its longest prefix with any EARLIER
                 // alternative (a best-first tree branches off branches), and never exceeds the round's column budget
-                const bool greedy = common_dtree_policy() == 1;
+                const bool greedy = common_dtree_policy() == 1 || dice_tree_round; // SPEC-DTREE-DICE: share prefixes too
                 int32_t n_cols = (int32_t) (spec_draft.size() + 1);
                 std::vector<llama_tokens>         alts_kept;
                 std::vector<std::vector<int32_t>> rows_kept;
@@ -970,6 +984,20 @@ struct server_slot {
             GGML_ASSERT(task);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            if (common_dice_capture_enabled()) {
+                // SPEC-DTREE-DICE capture: the finished task's token stream (prompt + generated)
+                const llama_tokens toks = prompt.tokens.get_text_tokens();
+                std::string js = string_format("{\"k\":\"task\",\"v\":\"dice.v1\",\"slot\":%d,\"task\":%d,\"n_rounds\":%d,"
+                        "\"n_decoded\":%d,\"n_prompt\":%d,\"n_tokens\":%zu,\"tokens\":[",
+                        id, task->id, dice_round, n_decoded, n_prompt_tokens_processed, toks.size());
+                for (size_t i = 0; i < toks.size(); ++i) {
+                    js += string_format(i ? ",%d" : "%d", (int) toks[i]);
+                }
+                js += "]}";
+                common_dice_capture_line(js);
+                dice_round = 0;
+            }
 
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
@@ -4712,6 +4740,23 @@ private:
                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
+                        // SPEC-DTREE-DICE capture (default off): arm this round's capture and key its Gumbel draws
+                        slot.dice_on         = common_dice_capture_enabled() && !use_serial_speculative_verify(slot);
+                        slot.dice_tree_round = false;
+                        slot.dice_draft_js.clear();
+                        slot.dice_rows_js.clear();
+                        slot.dice_tree_js.clear();
+                        slot.dice_tree.clear();
+                        if (slot.dice_on) {
+                            auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                            slot.dice_n_acc0 = common_sampler_get_n_accepted(slot.smpl.get());
+                            slot.dice_pos0   = slot.prompt.n_tokens();
+                            slot.dice_id_last = slot.sampled;
+                            dp.dice_draft    = &slot.dice_draft_js;
+                            dp.dice_seed     = common_sampler_get_seed(slot.smpl.get());
+                            dp.dice_n_acc0   = slot.dice_n_acc0;
+                        }
+
                         // AK-DTREE-1: tree width of this round (0 = chain)
                         slot.spec_tree_alts.clear();
                         slot.spec_tree_arm     = -1;
@@ -4722,6 +4767,9 @@ private:
                             auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
                             dp.tree_nodes = tree_nodes;
                             dp.tree_alts  = &slot.spec_tree_alts;
+                            if (slot.dice_tree_round) {
+                                dp.dice_tree = &slot.dice_tree;
+                            }
                         }
 
                         drafting.push_back(&slot);
@@ -4746,8 +4794,11 @@ private:
             // main path after truncation are dropped
             {
                 common_speculative_get_draft_params(spec.get(), slot.id).tree_alts = nullptr;
+                common_speculative_get_draft_params(spec.get(), slot.id).dice_tree = nullptr;
+                common_speculative_get_draft_params(spec.get(), slot.id).dice_draft = nullptr;
                 std::vector<llama_tokens> keep;
-                if (!draft.empty() && !use_serial_speculative_verify(slot) && common_dtree_policy() == 1) {
+                // SPEC-DTREE-DICE capture: the forced superset tree keeps its leaves' own lengths, as the greedy tree does
+                if (!draft.empty() && !use_serial_speculative_verify(slot) && (common_dtree_policy() == 1 || slot.dice_tree_round)) {
                     // DTREE-TREE-QUALITY greedy tree: alternatives keep their own length (a leaf may be deeper or
                     // shallower than the main chain); drop empties, prefixes of the main draft and duplicates.
                     // The paths mode verifies one sequence per path, so it keeps only as many as it has sequences.
@@ -5530,6 +5581,9 @@ private:
         if (!spec || off != 0 || batch_view.n_tokens != batch.size() || spec_exact != SPEC_EXACT_OFF) {
             return false;
         }
+        if (common_dice_capture_enabled()) {
+            return false; // SPEC-DTREE-DICE capture reads the verify rows before the accept, on the main thread
+        }
         if (batch_view.token == nullptr || batch_view.embd != nullptr) {
             return false;
         }
@@ -5579,6 +5633,17 @@ private:
         if (cfg == 0 || (slot.spec_tree_seq0 < 0 && !slot.spec_tree_batch) || !slot.task) {
             return 0;
         }
+        // SPEC-DTREE-DICE capture (LLAMA_DICE_CAPTURE, default off): at T > 0 a DFlash2 slot in batch tree mode verifies a
+        // forced superset tree of cfg columns while the round commits through the unchanged chain accept path
+        if (slot.dice_on && slot.spec_tree_batch && cfg > 0 && slot.task->params.sampling.temp > 0.0f &&
+            slot.task->params.sampling.grammar.grammar.empty() && slot.task->params.sampling.n_probs == 0 &&
+            spec_exact == SPEC_EXACT_OFF && !use_serial_speculative_verify(slot) &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end()) {
+            slot.dice_tree_round = true;
+            return cfg;
+        }
         // [AK-DTREE-2] the batch accept commits the greedy path, so constrained sampling stays on the chain
         if (slot.spec_tree_batch && !slot.task->params.sampling.grammar.grammar.empty()) {
             return 0;
@@ -5609,6 +5674,47 @@ private:
     std::vector<llama_seq_id>   tree_seq_store;
     std::vector<llama_seq_id *> tree_seq_ptrs;
 
+    // SPEC-DTREE-DICE capture: map the drafter's superset-tree nodes to this round's batch rows (via the (parent row, token)
+    // edges the batch builder emitted) and read every node's target row before any sampler accept
+    void dice_capture_tree_rows(server_slot & slot) {
+        std::map<std::pair<int32_t, llama_token>, int32_t> child;
+        const auto & ib = slot.spec_i_batch;
+        for (size_t j = 0; j < slot.spec_draft.size() && j + 1 < ib.size(); ++j) {
+            child[{ib[j], slot.spec_draft[j]}] = ib[j + 1];
+        }
+        for (size_t a = 0; a < slot.spec_tree_alts.size() && a < slot.spec_tree_i_batch.size(); ++a) {
+            const auto & rows = slot.spec_tree_i_batch[a];
+            const auto & alt  = slot.spec_tree_alts[a];
+            for (size_t j = 0; j < alt.size() && j + 1 < rows.size(); ++j) {
+                child[{rows[j], alt[j]}] = rows[j + 1];
+            }
+        }
+        const auto & nodes = slot.dice_tree;
+        std::vector<int32_t> node_row(nodes.size(), -1);
+        if (!nodes.empty() && !ib.empty()) {
+            node_row[0] = ib[0];
+        }
+        for (size_t i = 1; i < nodes.size(); ++i) {
+            const int32_t pr = nodes[i].par >= 0 ? node_row[nodes[i].par] : -1;
+            if (pr < 0) {
+                continue;
+            }
+            const auto it = child.find({pr, nodes[i].tok});
+            if (it != child.end()) {
+                node_row[i] = it->second;
+            }
+        }
+        std::string js = "[";
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const auto & n = nodes[i];
+            js += string_format(i ? ",[%d,%d,%d,%d,%d,%d,%d,%d]" : "[%d,%d,%d,%d,%d,%d,%d,%d]",
+                    n.par, n.depth, n.k, (int) n.tok, n.src, n.pr, n.dr, node_row[i]);
+        }
+        js += "]";
+        slot.dice_tree_js = std::move(js);
+        slot.dice_rows_js = common_dice_rows_json(slot.smpl.get(), ctx_tgt, node_row, 64);
+    }
+
     bool spec_tree_resolve(int32_t off, const llama_batch & batch_view, llama_batch & proc_view) {
         bool any = false;
         bool relabel = false;
@@ -5637,7 +5743,12 @@ private:
             int32_t best = -1;
             int32_t best_n = 0;
             bool    dev_ok = false;
-            if (ok) {
+            if (ok && slot.dice_tree_round) {
+                // SPEC-DTREE-DICE capture: read every tree node's target row, then commit the CHAIN (best = -1, the main
+                // path): the unchanged accept path below samples the chain rows exactly as in a chain round
+                dice_capture_tree_rows(slot);
+                slot.n_tree_rounds++;
+            } else if (ok) {
                 // DTREE-DEVICE-TREE-ACCEPT: device picks only for a provably greedy sampler (else host scan, unchanged)
                 dev_ok = common_sampler_device_greedy_eligible(slot.smpl.get());
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
@@ -6349,6 +6460,7 @@ private:
                 const bool serial_verify = use_serial_speculative_verify(slot);
                 llama_tokens accepted;
                 bool exact_handled = false; // INF-70 E2a: drop/redecode already restored and re-decoded
+                const char * dice_verify = "none"; // SPEC-DTREE-DICE capture: which accept rule ran
 
                 // save the sampler state only for the parallel path, where a
                 // checkpoint restore may need to replay verification.
@@ -6379,6 +6491,11 @@ private:
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
+                    if (slot.dice_on && slot.dice_rows_js.empty()) {
+                        // SPEC-DTREE-DICE capture: chain round, every verified row (anchor + drafts) before the accept
+                        slot.dice_rows_js = common_dice_rows_json(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, 64);
+                    }
+
                     if (want_probs) {
                         verify_idxs = slot.spec_i_batch;
                     }
@@ -6396,6 +6513,8 @@ private:
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 &n_zos2_gf_fast, &n_zos2_gf_fallback);
                     } else {
+                    dice_verify = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                    slot.spec_dists.size() == slot.spec_draft.size() ? "rejection" : "sample_compare";
                     accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
                                     slot.spec_dists.size() == slot.spec_draft.size()
                         ? common_sampler_sample_and_accept_n(
@@ -6427,6 +6546,42 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (slot.dice_on) {
+                    // SPEC-DTREE-DICE capture: one line per verify round (schema dice.v1)
+                    slot.dice_on = false;
+                    slot.dice_round++;
+                    const auto & sp = slot.task->params.sampling;
+                    const bool is_dflash = std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+                    const bool is_mtp = std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                    std::string js = string_format(
+                            "{\"k\":\"round\",\"v\":\"dice.v1\",\"drafter\":\"%s\",\"slot\":%d,\"task\":%d,\"round\":%d,"
+                            "\"T\":%.6g,\"top_k\":%d,\"top_p\":%.6g,\"min_p\":%.6g,\"seed\":%u,\"seed_dist\":%u,\"seed_spec\":%u,"
+                            "\"poskey\":%s,\"n_acc0\":%llu,\"pos0\":%d,\"id_last\":%d,\"verify\":\"%s\",\"tree\":%s,\"n_draft\":%zu,",
+                            is_dflash ? "dflash2" : (is_mtp ? "mtp" : "other"), slot.id, slot.task->id, slot.dice_round,
+                            (double) sp.temp, sp.top_k, (double) sp.top_p, (double) sp.min_p, sp.seed,
+                            common_sampler_get_seed(slot.smpl.get()), common_sampler_get_spec_seed(slot.smpl.get()),
+                            sp.rng_poskey ? "true" : "false", (unsigned long long) slot.dice_n_acc0, (int) slot.dice_pos0,
+                            (int) slot.dice_id_last,
+                            dice_verify, slot.dice_tree_js.empty() ? "false" : "true", (size_t) n_draft);
+                    if (!slot.dice_draft_js.empty()) {
+                        js += slot.dice_draft_js + ",";
+                    }
+                    js += "\"nodes\":" + (slot.dice_tree_js.empty() ? std::string("null") : slot.dice_tree_js) + ",";
+                    js += "\"rows\":" + (slot.dice_rows_js.empty() ? std::string("null") : slot.dice_rows_js) + ",\"acc\":[";
+                    for (size_t i = 0; i < accepted.size(); ++i) {
+                        js += string_format(i ? ",%d" : "%d", (int) accepted[i]);
+                    }
+                    js += "]}";
+                    common_dice_capture_line(js);
+                    slot.dice_draft_js.clear();
+                    slot.dice_rows_js.clear();
+                    slot.dice_tree_js.clear();
+                    slot.dice_tree.clear();
+                    slot.dice_tree_round = false;
+                }
 
                 // [AK-DTREE-2] batch-mode tree round: commit exactly the anchor + the drafts the sampler accepted
                 if (!slot.spec_tree_cols_pending.empty()) {

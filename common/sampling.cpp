@@ -1144,6 +1144,14 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+uint32_t common_sampler_get_spec_seed(const struct common_sampler * gsmpl) {
+    return gsmpl->speculative_seed;
+}
+
+uint64_t common_sampler_get_n_accepted(const struct common_sampler * gsmpl) {
+    return gsmpl->n_accepted;
+}
+
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return false;

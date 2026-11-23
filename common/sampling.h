@@ -163,6 +163,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
 llama_token common_sampler_greedy_fast_select(const struct common_params_sampling & params, const float * logits, int32_t n_vocab);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+// SPEC-DTREE-DICE capture: the speculative verifier seed and the absolute position counter (tokens accepted so far)
+uint32_t common_sampler_get_spec_seed(const struct common_sampler * gsmpl);
+uint64_t common_sampler_get_n_accepted(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);

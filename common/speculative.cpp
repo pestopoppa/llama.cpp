@@ -1,5 +1,6 @@
 #include "speculative.h"
 #include "speculative-tree.h"
+#include "dice-capture.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1804,6 +1805,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
+                std::vector<int32_t> dice_chain_k; // SPEC-DTREE-DICE capture: the chain's candidate indices
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
@@ -1830,6 +1832,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         predecessor = (int32_t) std::distance(scores,
                                 std::max_element(scores, scores + selector_top_k));
                         result.push_back((llama_token) row[predecessor]);
+                    }
+                    if (dp.dice_draft) {
+                        dice_chain_k.push_back(predecessor);
                     }
                 }
 
@@ -1861,6 +1866,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                if (dp.dice_draft && n_block_tokens > 1) {
+                    // SPEC-DTREE-DICE capture: the round's full lattice + the chain's indices; at T > 0 with a tree budget,
+                    // the forced superset tree (chain U probability-greedy U DICE-style), verified but never committed
+                    const int32_t D = n_block_tokens - 1;
+                    const int32_t K = selector_top_k;
+                    const common_dice_scores_fn sc_fn = [&](int32_t j, int32_t pred) {
+                        return lattice + (size_t) (beg + j + 1) * n_embd_dec + K + (size_t) pred * K;
+                    };
+                    const common_dice_tok_fn tok_fn = [&](int32_t j, int32_t k) {
+                        return (llama_token) lattice[(size_t) (beg + j + 1) * n_embd_dec + k];
+                    };
+                    std::string & js = *dp.dice_draft;
+                    js = string_format("\"D\":%d,\"K\":%d,\"chain\":[", D, K);
+                    for (size_t j = 0; j < result.size(); ++j) {
+                        js += string_format(j ? ",%d" : "%d", (int) result[j]);
+                    }
+                    js += "],\"ck\":[";
+                    for (size_t j = 0; j < dice_chain_k.size(); ++j) {
+                        js += string_format(j ? ",%d" : "%d", dice_chain_k[j]);
+                    }
+                    js += "],\"lat_tok\":[";
+                    for (int32_t j = 0; j < D; ++j) {
+                        js += j ? ",[" : "[";
+                        for (int32_t k = 0; k < K; ++k) {
+                            js += string_format(k ? ",%d" : "%d", (int) tok_fn(j, k));
+                        }
+                        js += "]";
+                    }
+                    js += "],\"lat_sc\":[";
+                    for (int32_t j = 0; j < D; ++j) {
+                        js += j ? ",[" : "[";
+                        const int32_t n_pred = j == 0 ? 1 : K;
+                        for (int32_t q = 0; q < n_pred; ++q) {
+                            js += q ? ",[" : "[";
+                            const float * sc = sc_fn(j, q);
+                            for (int32_t k = 0; k < K; ++k) {
+                                js += string_format(k ? ",%.6g" : "%.6g", (double) sc[k]);
+                            }
+                            js += "]";
+                        }
+                        js += "]";
+                    }
+                    js += "]";
+                    if (dp.dice_tree) {
+                        dp.dice_tree->clear();
+                    }
+                    if (dp.dice_tree && dp.tree_alts && dp.tree_nodes > 0 && dp.temperature > 0.0f && !result.empty()) {
+                        *dp.dice_tree = common_dice_build_tree(D, K, sc_fn, tok_fn, dice_chain_k, dp.temperature,
+                                dp.dice_seed, dp.dice_n_acc0, dp.tree_nodes);
+                        *dp.tree_alts = common_dice_tree_alts(*dp.dice_tree);
+                    }
+                }
+
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                     if (dp.dists) {
@@ -1868,6 +1926,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     if (dp.tree_alts) {
                         dp.tree_alts->clear();
+                    }
+                    if (dp.dice_tree) {
+                        dp.dice_tree->clear();
                     }
                 }
                 continue;
@@ -2325,6 +2386,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // AK-DTREE-1: per seq, per drafted position, the top candidates (id, logit) of the MTP head
         std::vector<std::vector<std::vector<std::pair<llama_token, float>>>> tree_cands(n_seq);
+        // SPEC-DTREE-DICE capture: per drafted position, the head sampler's top-10 (id, logit, p), incl. a stop position
+        std::vector<std::string> dice_cands(n_seq);
+        std::vector<int32_t>     dice_n_pos(n_seq, 0);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -2399,6 +2463,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
+
+                if (dparams.at(seq_id).dice_draft) {
+                    std::string & dc = dice_cands[seq_id];
+                    dc += dice_n_pos[seq_id]++ ? ",[" : "[";
+                    for (int k = 0; k < std::min(10, (int) cur_p->size); ++k) {
+                        dc += string_format(k ? ",[%d,%.6g,%.6g]" : "[%d,%.6g,%.6g]", cur_p->data[k].id,
+                                (double) cur_p->data[k].logit, (double) cur_p->data[k].p);
+                    }
+                    dc += "]";
+                }
 
                 {
                     const auto & dpt = dparams.at(seq_id);
@@ -2475,6 +2549,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.tree_alts) {
                 dp.tree_alts->clear();
+            }
+            if (dp.dice_draft) {
+                // SPEC-DTREE-DICE capture: the drafted chain and the head's top-10 per position (the last entry may be the
+                // position where drafting stopped on p_min, which drafted no token)
+                std::string & js = *dp.dice_draft;
+                js = string_format("\"D\":%d,\"chain\":[", (int) dp.result->size());
+                for (size_t j = 0; j < dp.result->size(); ++j) {
+                    js += string_format(j ? ",%d" : "%d", (int) (*dp.result)[j]);
+                }
+                js += "],\"mtp_top\":[" + dice_cands[seq_id] + "]";
             }
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
