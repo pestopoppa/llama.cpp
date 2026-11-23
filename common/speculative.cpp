@@ -3532,7 +3532,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     auto * result = new common_speculative {
         /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
         /* .impls     = */ std::move(impls),
-        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
+        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+        /* .cafe3_on  = */ false,
+        /* .cafe3_max_w = */ 0,
+        /* .cafe3     = */ {},
+        /* .cafe3_sel_hist = */ {},
+        /* .cafe3_n_probe = */ 0,
     };
 
     if (common_cafe3_ctrl::env_enabled()) {
