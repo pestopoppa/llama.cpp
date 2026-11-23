@@ -5724,6 +5724,21 @@ private:
                     best_n = (int32_t) slot.spec_tree_rrs_tokens.size() - 1;
                     best   = k - 1;
                     slot.spec_tree_rrs_smpl = std::move(probe);
+                    // DTREE-B at T > 0: narrower arms' emission by coupling (common_dtree_arm_cover)
+                    {
+                        const int32_t Dm = (int32_t) slot.spec_draft.size();
+                        const std::vector<int32_t> mv(slot.spec_draft.begin(), slot.spec_draft.end());
+                        std::vector<std::vector<int32_t>> av;
+                        for (const auto & alt : slot.spec_tree_alts) {
+                            av.emplace_back(alt.begin(), alt.end());
+                        }
+                        const std::vector<int32_t> acc(slot.spec_tree_rrs_tokens.begin(),
+                                                       slot.spec_tree_rrs_tokens.end() - (slot.spec_tree_rrs_tokens.empty() ? 0 : 1));
+                        for (int32_t q = 0; q < common_dtree_auto::N_ARMS; ++q) {
+                            const int32_t bud = q == 0 ? 0 : common_dtree_auto::arm_nodes(q, Dm) - (Dm + 1);
+                            best_by_arm[q] = common_dtree_arm_cover(mv, av, acc, bud);
+                        }
+                    }
                 } else {
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
                 // DTREE-B: what each narrower arm would have emitted. Paths are added best first, so arm a's tree is

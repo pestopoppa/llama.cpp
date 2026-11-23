@@ -543,6 +543,27 @@ int32_t common_dtree_new_cols(const std::vector<int32_t> & main, const std::vect
     return (int32_t) (alt.size() - j);
 }
 
+int32_t common_dtree_arm_cover(const std::vector<int32_t> & main, const std::vector<std::vector<int32_t>> & alts,
+                               const std::vector<int32_t> & acc, int32_t extra_budget) {
+    auto cover = [&](const std::vector<int32_t> & p) {
+        size_t j = 0;
+        while (j < acc.size() && j < p.size() && p[j] == acc[j]) {
+            ++j;
+        }
+        return (int32_t) j;
+    };
+    int32_t best = cover(main);
+    int32_t used = 0;
+    for (const auto & a : alts) {
+        used += common_dtree_new_cols(main, a);
+        if (used > extra_budget) {
+            break;
+        }
+        best = std::max(best, cover(a));
+    }
+    return best;
+}
+
 bool common_dtree_sampled_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_DTREE_SAMPLED");
