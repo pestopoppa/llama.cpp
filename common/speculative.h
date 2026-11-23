@@ -68,6 +68,9 @@ struct common_speculative_draft_params {
     // (DFlash2, greedy) also writes up to 2 alternative root-to-leaf paths, each the same length as *result
     int32_t tree_nodes = 0;
     std::vector<llama_tokens> * tree_alts = nullptr;
+
+    // CAFE-3: per-round chain width cap set by the adaptive controller (-1: off); chain drafters stop at it
+    int32_t n_max_cafe3 = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

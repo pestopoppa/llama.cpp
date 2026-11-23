@@ -101,6 +101,7 @@ add_library(${TARGET}
     speculative.cpp
     speculative-tree.cpp
     speculative-tree.h
+    speculative-cafe3.h
     speculative.h
     unicode.cpp
     unicode.h

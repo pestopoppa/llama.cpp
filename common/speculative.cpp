@@ -1,5 +1,6 @@
 #include "speculative.h"
 #include "speculative-tree.h"
+#include "speculative-cafe3.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1203,7 +1204,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() ||
+                        (dp.n_max_cafe3 > 0 && dp.n_max_cafe3 <= (int) result.size())) { // CAFE-3 cap (off: -1)
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2426,7 +2428,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() ||
+                        (dp.n_max_cafe3 > 0 && dp.n_max_cafe3 <= (int) result.size())) { // CAFE-3 cap (off: -1)
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2978,6 +2981,22 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // CAFE-3 online chain-width controller (default off: LLAMA_CAFE3_ADAPTIVE=1)
+    struct cafe3_seq {
+        common_cafe3_ctrl ctrl;
+        bool    pending  = false;
+        bool    in_round = false;
+        int     sel      = -1;
+        int     drafted  = 0;
+        int     accepted = 0;
+        int64_t t0       = 0;
+    };
+    bool cafe3_on = false;
+    int  cafe3_max_w = 0;
+    std::vector<cafe3_seq> cafe3;
+    std::vector<uint64_t>  cafe3_sel_hist; // rounds per selected cap
+    uint64_t cafe3_n_probe = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3432,6 +3451,27 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
     };
 
+    if (common_cafe3_ctrl::env_enabled()) {
+        const auto t0 = result->impls.front()->type;
+        if (t0 == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t0 == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                t0 == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            result->cafe3_on    = true;
+            result->cafe3_max_w = std::max(1, std::min(64, params.draft.n_max));
+            result->cafe3.resize(n_seq);
+            for (auto & cs : result->cafe3) {
+                cs.ctrl.init(result->cafe3_max_w, common_cafe3_ctrl::env_alpha(), common_cafe3_ctrl::env_gap());
+            }
+            result->cafe3_sel_hist.assign(result->cafe3_max_w + 1, 0);
+            LOG_INF("%s: CAFE-3 adaptive chain width ON (impl %s, max width %d, alpha %.3f, gap %u)\n", __func__,
+                    common_speculative_type_to_str(t0).c_str(), result->cafe3_max_w,
+                    result->cafe3.empty() ? 0.0 : result->cafe3[0].ctrl.alpha,
+                    result->cafe3.empty() ? 0u : result->cafe3[0].ctrl.gap);
+        } else {
+            LOG_WRN("%s: LLAMA_CAFE3_ADAPTIVE=1 ignored: first impl %s is not a model chain drafter\n", __func__,
+                    common_speculative_type_to_str(t0).c_str());
+        }
+    }
+
     return result;
 }
 
@@ -3455,6 +3495,14 @@ common_speculative_draft_params & common_speculative_get_draft_params(
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->cafe3_on && seq_id >= 0 && seq_id < (llama_seq_id) spec->cafe3.size()) {
+        auto & cs = spec->cafe3[seq_id];
+        const double a = cs.ctrl.alpha;
+        const uint32_t g = cs.ctrl.gap;
+        cs = {};
+        cs.ctrl.init(spec->cafe3_max_w, a, g); // one controller per request
     }
 
     for (auto & impl : spec->impls) {
@@ -3529,6 +3577,44 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    if (spec->cafe3_on) {
+        // close the previous round of each drafting sequence (draft-call to draft-call wall time) and select this
+        // round's cap; cap 0 = target-only round (the sequence does not draft)
+        const int64_t t_now = ggml_time_us();
+        int n_drafting = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            auto & cs = spec->cafe3[seq_id];
+            cs.in_round = false;
+            if (!dp.drafting) {
+                continue;
+            }
+            if (cs.pending) {
+                cs.ctrl.observe(cs.sel, cs.drafted, cs.accepted, (double) (t_now - cs.t0));
+            }
+            const int cap = dp.n_max > 0 ? dp.n_max : spec->cafe3_max_w;
+            const uint64_t n_probe0 = cs.ctrl.n_probe;
+            cs.sel      = cs.ctrl.select(cap);
+            spec->cafe3_n_probe += cs.ctrl.n_probe - n_probe0;
+            spec->cafe3_sel_hist[cs.sel]++;
+            cs.pending  = true;
+            cs.in_round = true;
+            cs.drafted  = 0;
+            cs.accepted = 0;
+            cs.t0       = t_now;
+            if (cs.sel == 0) {
+                dp.drafting = false;
+            } else {
+                dp.n_max       = cs.sel;
+                dp.n_max_cafe3 = cs.sel;
+                n_drafting++;
+            }
+        }
+        if (n_drafting == 0) {
+            return;
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3553,7 +3639,11 @@ void common_speculative_draft(common_speculative * spec) {
                         ? dp.n_max_ngram_mod : dp.n_max;
                     if (cap > 0 && !result.empty() && (int) result.size() > cap) {
                         SPC_DBG("truncating draft to %d tokens\n", cap);
+                        const size_t n0 = result.size();
                         result.resize(cap);
+                        if (spec->cafe3_on && dp.dists && dp.dists->size() == n0) {
+                            dp.dists->resize(cap); // keep the rejection path (dists aligned with the draft)
+                        }
                     }
                 }
 
@@ -3599,10 +3689,19 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+
+        if (spec->cafe3_on && spec->cafe3[seq_id].in_round) {
+            spec->cafe3[seq_id].drafted = dp.result ? (int) dp.result->size() : 0;
+            dp.n_max_cafe3 = -1;
+        }
     }
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec->cafe3_on && spec->cafe3[seq_id].pending) {
+        spec->cafe3[seq_id].accepted = n_accepted;
+    }
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     GGML_ASSERT(impl);
@@ -3672,6 +3771,15 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->cafe3_on) {
+        std::ostringstream h;
+        for (size_t w = 0; w < spec->cafe3_sel_hist.size(); ++w) {
+            h << (w ? "," : "") << spec->cafe3_sel_hist[w];
+        }
+        LOG_INF("statistics cafe3: selected-cap rounds [0..%d] = %s, probes = %" PRIu64 "\n",
+                spec->cafe3_max_w, h.str().c_str(), spec->cafe3_n_probe);
     }
 
     for (const auto & impl : spec->impls) {
