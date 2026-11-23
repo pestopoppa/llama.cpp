@@ -69,10 +69,16 @@ static int run_case(ggml_backend_t backend, int64_t n_vocab, int64_t n_rows, std
     ggml_backend_tensor_set(x, host.data(), 0, host.size() * sizeof(float));
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "graph compute failed\n");
+        ggml_backend_synchronize(backend);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
         return 1;
     }
     std::vector<int32_t> dev((size_t) n_rows);
     ggml_backend_tensor_get(am, dev.data(), 0, dev.size() * sizeof(int32_t));
+    // [C19 fix-up] quiesce the device before releasing this case's device memory, then free in reverse order of creation
+    // (buffer, then context). Every device object the test creates is released before the next case starts.
+    ggml_backend_synchronize(backend);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 
@@ -154,8 +160,15 @@ int main() {
             }
         }
     }
-    ggml_backend_free(backend);
-
+    // [C19 fix-up] c19-dtree-gpu-diag-20261123-r2: on ROCm the process crashed at EXIT in 4/8 runs (SIGSEGV in free() inside
+    // libamdhip64's __cxa_finalize while an HSA thread was still in ioctl) after a correct 930/930 PASS. Release the backend
+    // explicitly before main returns and after the device is idle, so no ggml-owned HIP object (stream, graph, pool buffer)
+    // is still alive when the HIP runtime finalizes; report and flush before teardown so the result survives any exit fault.
     printf("test-dtree-device-accept: %lld rows checked, %d failures -> %s\n", (long long) n_checked, fails, fails ? "FAIL" : "PASS");
+    fflush(stdout);
+    fflush(stderr);
+    ggml_backend_synchronize(backend);
+    ggml_backend_free(backend);
+    backend = nullptr;
     return fails ? 1 : 0;
 }
