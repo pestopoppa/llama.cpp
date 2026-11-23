@@ -557,6 +557,8 @@ int64_t ggml_iqk_q8_0_route_min_rows(void);
 // (0 = GGML_IQK_Q8_0_PREFILL=OFF).
 uint64_t ggml_cpu_iqk_q8_0_n_calls(void);
 int64_t  ggml_cpu_iqk_q8_0_prefill_min_rows(void);
+// AK-Q38FN-CPU-GDNPROJ-FUSE test witness: fused single-row sibling MUL_MAT groups since process start.
+uint64_t ggml_cpu_mm_sibling_fuse_n_calls(void);
 
 #endif
 // Additional activation workspace for the optional Q8_0 fusion; zero if no matching graph.

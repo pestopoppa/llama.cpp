@@ -170,6 +170,11 @@ extern "C" {
     typedef uint64_t (*ggml_backend_cpu_iqk_q8_0_n_calls_t)(void);
     typedef int64_t  (*ggml_backend_cpu_iqk_q8_0_prefill_min_rows_t)(void);
 
+    // AK-Q38FN-CPU-GDNPROJ-FUSE (GGML_Q38FN_GDNPROJ_FUSE=1, default off) test witness:
+    //   "ggml_backend_cpu_mm_sibling_fuse_n_calls" -> ggml_backend_cpu_mm_sibling_fuse_n_calls_t
+    //       (adjacent single-row sibling MUL_MAT groups computed as one fused pass since process start)
+    typedef uint64_t (*ggml_backend_cpu_mm_sibling_fuse_n_calls_t)(void);
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     // Run fn(ith, nth, user_data) on a team of n_threads CPU threads and return when all have

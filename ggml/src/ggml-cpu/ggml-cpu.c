@@ -3805,6 +3805,16 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+// AK-Q38FN-CPU-GDNPROJ-FUSE: single-row sibling MUL_MAT fusion, opt-in via GGML_Q38FN_GDNPROJ_FUSE=1
+// (default OFF; initialized once in ggml_cpu_init(), read-only afterwards).
+static bool ggml_cpu_mm_sibling_fuse = false;
+// test witness: fused sibling groups computed since process start (thread 0, once per group)
+static uint64_t ggml_cpu_mm_sibling_fuse_calls = 0;
+
+uint64_t ggml_cpu_mm_sibling_fuse_n_calls(void) {
+    return ggml_cpu_mm_sibling_fuse_calls;
+}
+
 #ifdef GGML_CPU_PROF
 // per-op wall-time profiling, profiling build only; enabled via GGML_CPU_PROF=1
 //
@@ -4583,6 +4593,185 @@ size_t ggml_cpu_fused_moe_upgate_q8_work_size(const struct ggml_cgraph * cgraph,
     return required;
 }
 
+// AK-Q38FN-CPU-GDNPROJ-FUSE: single-row sibling MUL_MAT fusion.
+//
+// A Qwen3.8-Flash-Next GDN layer projects the same activation through four weights (attn_qkv Q8_0
+// 10240 rows, attn_gate Q8_0 6144, ssm_beta / ssm_alpha F32 48 each). At decode each is its own
+// node: its own activation quantization and its own graph barrier, each thread a 1/nth row
+// stripe of that weight only. When the graph places such siblings back to back (the qwen4exp
+// builder does under the same env knob), this computes the whole run in ONE pass: one Q8_0
+// activation quantization per thread, one barrier, and the rows of all siblings split across the
+// team as one concatenated byte range (byte-balanced, so the 48-row F32 tails ride inside a
+// stripe instead of costing a barrier each).
+//
+// Bit-exactness: only nodes the stock path computes with the generic per-row vec_dot are taken
+// (Q8_0 below the iqk Q8_0 route, F32 at ne11 == 1 which tinyBLAS refuses, nrows == 1, no extra/
+// repack traits). Each output element is the same vec_dot over the same quantized activation
+// (D1's batch-1 path quantizes the whole row with the same from_float), so the result is
+// bit-identical to the unfused graph; only the row-to-thread assignment changes.
+#define GGML_CPU_MM_SIBLING_MAX 8
+
+static bool ggml_cpu_mm_sibling_ok(const struct ggml_tensor * t, const struct ggml_tensor * x) {
+    if (t->op != GGML_OP_MUL_MAT || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const struct ggml_tensor * w = t->src[0];
+    if (t->src[1] != x || w == NULL || w->extra != NULL || w->data == NULL || t->data == NULL) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (type_traits_cpu[w->type].nrows != 1 || type_traits_cpu[w->type].vec_dot == NULL) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(t, 1) != 0) {   // hadamard / other hints take their own path
+        return false;
+    }
+    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (w->ne[0] != x->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != ggml_type_size(w->type)) {
+        return false;
+    }
+    if (t->ne[0] != w->ne[1] || t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] <= 0) {
+        return false;
+    }
+    if (w->type == GGML_TYPE_Q8_0) {
+        if (x->ne[0] % QK8_0 != 0) {
+            return false;
+        }
+#if defined(GGML_USE_IQK_MULMAT)
+        // the iqk Q8_0 route would compute this node with a different kernel: keep it stock
+        if (ggml_iqk_q8_0_route_min_rows() <= 1) {
+            return false;
+        }
+#endif
+    }
+    return true;
+}
+
+static bool ggml_cpu_mm_ranges_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    const char * a1 = a0 + ggml_nbytes(a);
+    const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// number of adjacent sibling MUL_MAT nodes starting at node_n (>= 2 to fuse), 0 otherwise.
+// Every thread evaluates the same predicate on the same graph metadata, so the team agrees.
+static int ggml_cpu_mm_sibling_group(
+        const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params) {
+    const struct ggml_tensor * first = cgraph->nodes[node_n];
+    const struct ggml_tensor * x     = first->src[1];
+    if (x == NULL || x->type != GGML_TYPE_F32 || x->data == NULL || !ggml_is_contiguous(x) ||
+        x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
+        return 0;
+    }
+    if (!ggml_cpu_mm_sibling_ok(first, x)) {
+        return 0;
+    }
+    int k = 1;
+    bool any_q8 = first->src[0]->type == GGML_TYPE_Q8_0;
+    while (k < GGML_CPU_MM_SIBLING_MAX && node_n + k < cgraph->n_nodes) {
+        const struct ggml_tensor * t = cgraph->nodes[node_n + k];
+        if (!ggml_cpu_mm_sibling_ok(t, x)) {
+            break;
+        }
+        any_q8 = any_q8 || t->src[0]->type == GGML_TYPE_Q8_0;
+        k++;
+    }
+    if (k < 2) {
+        return 0;
+    }
+    // the allocator never aliases live tensors; verify anyway, the fused pass reads x while
+    // writing every sibling's dst
+    for (int i = 0; i < k; i++) {
+        const struct ggml_tensor * ti = cgraph->nodes[node_n + i];
+        if (ggml_cpu_mm_ranges_overlap(ti, x)) {
+            return 0;
+        }
+        for (int j = i + 1; j < k; j++) {
+            if (ggml_cpu_mm_ranges_overlap(ti, cgraph->nodes[node_n + j])) {
+                return 0;
+            }
+        }
+    }
+    if (any_q8 && (params->wdata == NULL ||
+                   params->wsize < (size_t) params->nth * ggml_row_size(GGML_TYPE_Q8_0, x->ne[0]))) {
+        return 0;
+    }
+    return k;
+}
+
+static inline int64_t ggml_cpu_mm_ceil_div_nonneg(int64_t a, int64_t b) {
+    return a <= 0 ? 0 : (a + b - 1) / b;
+}
+
+static void ggml_compute_forward_mul_mat_siblings(
+        const struct ggml_compute_params * params,
+        const struct ggml_cgraph         * cgraph,
+        int node_n, int k) {
+    const struct ggml_tensor * x = cgraph->nodes[node_n]->src[1];
+    const int64_t ne10 = x->ne[0];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // byte-balanced split of the concatenated weight rows
+    int64_t row_bytes[GGML_CPU_MM_SIBLING_MAX];
+    int64_t total = 0;
+    for (int s = 0; s < k; s++) {
+        const struct ggml_tensor * w = cgraph->nodes[node_n + s]->src[0];
+        row_bytes[s] = (int64_t) ggml_row_size(w->type, w->ne[0]);
+        total += row_bytes[s] * w->ne[1];
+    }
+    const int64_t b0 = (total * ith) / nth;
+    const int64_t b1 = (total * (ith + 1)) / nth;
+
+    // private Q8_0 activation (D1 batch-1 layout: one whole row per thread, no barrier)
+    const void * xq = NULL;
+    int64_t off = 0;
+    for (int s = 0; s < k; s++) {
+        struct ggml_tensor * t = cgraph->nodes[node_n + s];
+        const struct ggml_tensor * w = t->src[0];
+        const int64_t nr = w->ne[1];
+        int64_t r0 = ggml_cpu_mm_ceil_div_nonneg(b0 - off, row_bytes[s]);
+        int64_t r1 = ggml_cpu_mm_ceil_div_nonneg(b1 - off, row_bytes[s]);
+        off += row_bytes[s] * nr;
+        if (r0 > nr) r0 = nr;
+        if (r1 > nr) r1 = nr;
+        if (r0 >= r1) {
+            continue;
+        }
+        const enum ggml_type vdt = type_traits_cpu[w->type].vec_dot_type;
+        const void * xr = x->data;
+        if (vdt != x->type) {
+            GGML_ASSERT(vdt == GGML_TYPE_Q8_0);
+            if (xq == NULL) {
+                char * wp = (char *) params->wdata + (size_t) ith * ggml_row_size(vdt, ne10);
+                type_traits_cpu[vdt].from_float((const float *) x->data, wp, ne10);
+                xq = wp;
+            }
+            xr = xq;
+        }
+        ggml_vec_dot_t const vec_dot = type_traits_cpu[w->type].vec_dot;
+        const char * wrow = (const char *) w->data;
+        const size_t nb01 = w->nb[1];
+        float * dst = (float *) t->data;
+        for (int64_t r = r0; r < r1; r++) {
+            vec_dot((int) ne10, &dst[r], 0, wrow + r * nb01, 0, xr, 0, 1);
+        }
+    }
+
+    if (ith == 0) {
+        if (ggml_cpu_mm_sibling_fuse_calls++ == 0) {
+            fprintf(stderr, "[mm-sibling] ACTIVE: GGML_Q38FN_GDNPROJ_FUSE fused %d sibling MUL_MATs (first ne00=%lld total_bytes=%lld nth=%d)\n",
+                    k, (long long) ne10, (long long) total, nth);
+        }
+    }
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4812,6 +5001,15 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 #endif
+
+    // AK-Q38FN-CPU-GDNPROJ-FUSE: adjacent single-row MUL_MATs sharing src1 -> one pass, one barrier
+    if (node->op == GGML_OP_MUL_MAT && ggml_cpu_mm_sibling_fuse && node_n + 1 < cgraph->n_nodes) {
+        const int k = ggml_cpu_mm_sibling_group(cgraph, node_n, params);
+        if (k >= 2) {
+            ggml_compute_forward_mul_mat_siblings(params, cgraph, node_n, k);
+            return k - 1;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -5845,6 +6043,12 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            // AK-Q38FN-CPU-GDNPROJ-FUSE: default OFF; =1 fuses adjacent single-row MUL_MATs sharing src1
+            const char * env = getenv("GGML_Q38FN_GDNPROJ_FUSE");
+            ggml_cpu_mm_sibling_fuse = (env != NULL && atoi(env) != 0);
         }
 
         {

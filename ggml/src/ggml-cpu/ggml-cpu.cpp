@@ -14,6 +14,8 @@ bool     ggml_cpu_iqk_fa_get_enabled(void);
 uint64_t ggml_cpu_iqk_fa_n_calls(void);
 }
 #endif
+// AK-Q38FN-CPU-GDNPROJ-FUSE: defined in ggml-cpu.c
+extern "C" uint64_t ggml_cpu_mm_sibling_fuse_n_calls(void);
 
 #include <cctype>
 #include <string>
@@ -792,6 +794,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_fused_moe_upgate") == 0) {
         return (void *)ggml_backend_cpu_set_fused_moe_upgate;
+    }
+    if (strcmp(name, "ggml_backend_cpu_mm_sibling_fuse_n_calls") == 0) {
+        ggml_backend_cpu_mm_sibling_fuse_n_calls_t fct = ggml_cpu_mm_sibling_fuse_n_calls;
+        return (void *)fct;
     }
 #if defined(GGML_USE_IQK_MULMAT)
     // Option R test witnesses (NULL = the build has no iqk GEMM at all)
