@@ -2078,6 +2078,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // AK-A3B-VERIFY-CHUNK: on CDNA a float/half src0 whose ne11 exceeds the MMVF cap (C19 default 8) falls to MMF, which
+    // runs the Qwen3.6-35B-A3B F32 router (ffn_gate_inp, 256 x 2048) at ~114 us/layer vs ~11 us on MMVF (~4.4 ms per
+    // verify step; tree verify at 12 columns pays it under C19). GGML_HIP_MMVF_CHUNK=N (1..MMVF_MAX_BATCH_SIZE,
+    // 0/unset = off) splits a 2D src1 with N < ne11 <= 2*MMVF_MAX_BATCH_SIZE into column chunks of <= N, each on MMVF;
+    // src0 (<= 4 MiB) is re-read from L2. Default OFF.
+    {
+        static const int chunk_n = []() {
+            const char * s = getenv("GGML_HIP_MMVF_CHUNK");
+            const int n = s ? atoi(s) : 0;
+            return (n >= 1 && n <= MMVF_MAX_BATCH_SIZE) ? n : 0;
+        }();
+        if (chunk_n > 0 && GGML_CUDA_CC_IS_AMD(cc) &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+            ne11 > chunk_n && ne11 <= 2*MMVF_MAX_BATCH_SIZE &&
+            !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) &&
+            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, chunk_n) &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_nbytes(src0) <= (4u << 20) &&
+            !bad_padding_clear && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_log_mul_mat_route("MMVF_CHUNK", src0, src1, dst, cc, ne11);
+            for (int64_t i1 = 0; i1 < ne11; i1 += chunk_n) {
+                const int64_t n1 = std::min<int64_t>(chunk_n, ne11 - i1);
+                ggml_tensor s1 = *src1;
+                ggml_tensor d  = *dst;
+                s1.ne[1] = n1; s1.data = (char *) src1->data + i1*src1->nb[1];
+                d.ne[1]  = n1; d.data  = (char *) dst->data  + i1*dst->nb[1];
+                for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+                    s1.nb[i] = s1.nb[1]*n1;
+                    d.nb[i]  = d.nb[1]*n1;
+                }
+                ggml_cuda_mul_mat_vec_f(ctx, src0, &s1, nullptr, &d);
+            }
+            return;
+        }
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
