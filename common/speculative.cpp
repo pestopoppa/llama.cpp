@@ -1804,6 +1804,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
+                std::vector<int32_t> main_idx; // SPEC-DTREE-SAMPLED-V2: sampled candidate index per depth (T > 0)
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
@@ -1824,6 +1825,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
                         predecessor = sample(selector_rng[seq_id]);
+                        main_idx.push_back(predecessor);
                         result.push_back(dist.ids[predecessor]);
                         dp.dists->push_back(std::move(dist));
                     } else {
@@ -1835,6 +1837,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (dp.tree_alts) {
                     dp.tree_alts->clear();
+                }
+                if (dp.tree_alts && dp.tree_nodes > 0 && dp.temperature > 0.0f && n_block_tokens > 1 &&
+                        common_dtree_sampled_enabled() && dp.dists && (int32_t) main_idx.size() == n_block_tokens - 1 &&
+                        dp.dists->size() >= main_idx.size()) {
+                    // SPEC-DTREE-SAMPLED-V2: siblings of the SAMPLED main chain from the drafter's own distribution
+                    // (top-q per depth, greedy continuation over the lattice); the tree verify decides them by
+                    // recursive rejection sampling against these same dists (path 0 keeps the served rejection)
+                    const int32_t D = n_block_tokens - 1;
+                    const common_dtree_scores_fn scores = [&](int32_t j, int32_t pred) {
+                        return lattice + (size_t) (beg + j + 1) * n_embd_dec + selector_top_k + (size_t) pred * selector_top_k;
+                    };
+                    std::vector<std::vector<float>> q(D);
+                    const size_t q0 = dp.dists->size() - (size_t) D; // this block's dists are the last D entries
+                    for (int32_t j = 0; j < D; ++j) {
+                        q[j] = (*dp.dists)[q0 + j].probs;
+                    }
+                    const auto paths = common_dtree_build_sampled(D, selector_top_k, scores, main_idx, q, dp.tree_nodes,
+                                                                  common_dtree_sampled_max_paths());
+                    for (const auto & path : paths) {
+                        llama_tokens alt;
+                        alt.reserve(path.size());
+                        for (size_t j = 0; j < path.size(); ++j) {
+                            alt.push_back((llama_token) lattice[(size_t) (beg + j + 1) * n_embd_dec + path[j]]);
+                        }
+                        dp.tree_alts->push_back(std::move(alt));
+                    }
                 }
                 if (dp.tree_alts && dp.tree_nodes > 0 && dp.temperature <= 0.0f && n_block_tokens > 1) {
                     // AK-DTREE-1: alternative root-to-leaf paths over the same lattice (path 0 == result)
@@ -2402,7 +2430,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 {
                     const auto & dpt = dparams.at(seq_id);
-                    if (dpt.tree_alts && dpt.tree_nodes > 0 && dpt.temperature <= 0.0f && cur_p->size >= 2) {
+                    // SPEC-DTREE-SAMPLED-V2: LLAMA_DTREE_SAMPLED=1 also collects the alternatives at T > 0 (top of the
+                    // drafter's own candidates; the target-side walk samples them, so any proposal set is lossless)
+                    if (dpt.tree_alts && dpt.tree_nodes > 0 && (dpt.temperature <= 0.0f || common_dtree_sampled_enabled()) &&
+                        cur_p->size >= 2) {
                         std::vector<std::pair<llama_token, float>> c;
                         for (int k = 0; k < std::min(4, (int) cur_p->size); ++k) {
                             c.emplace_back(cur_p->data[k].id, cur_p->data[k].logit);

@@ -521,6 +521,10 @@ struct server_slot {
     int32_t n_tree_rounds    = 0;      // rounds verified with >= 1 alternative path
     int32_t n_tree_alt_wins  = 0;      // rounds an alternative path was accepted
     int32_t n_tree_alt_extra = 0;      // tokens gained over the main path in those rounds
+    int64_t n_tree_rrs_alt      = 0;   // SPEC-DTREE-SAMPLED-V2: rounds the RRS walk left the main chain via a sibling
+    int64_t n_tree_alts_drafted = 0;   // SPEC-DTREE-SAMPLED-V2: sibling paths verified at T > 0
+    llama_tokens       spec_tree_rrs_tokens; // SPEC-DTREE-SAMPLED-V2: this round's tokens decided by the RRS walk
+    common_sampler_ptr spec_tree_rrs_smpl;   // ... and the sampler that accepted them (adopted by the accept pass)
 
     // the target refused a partial rollback: its memory for this sequence was cleared and must be rebuilt
     // from prompt.tokens before the next decode (see rs_rebuild_slots)
@@ -715,6 +719,10 @@ struct server_slot {
         n_tree_rounds    = 0;
         n_tree_alt_wins  = 0;
         n_tree_alt_extra = 0;
+        n_tree_rrs_alt      = 0;
+        n_tree_alts_drafted = 0;
+        spec_tree_rrs_tokens.clear();
+        spec_tree_rrs_smpl.reset();
 
         task_prev = std::move(task);
         task.reset();
@@ -1135,6 +1143,10 @@ struct server_slot {
                     n_tree_rounds, n_draft_verif_steps, n_tree_alt_wins, n_tree_alt_extra,
                     spec_tree_auto.rate[0], spec_tree_auto.rate[1], spec_tree_auto.rate[2],
                     spec_tree_auto.n_obs[0], spec_tree_auto.n_obs[1], spec_tree_auto.n_obs[2]);
+                if (n_tree_alts_drafted > 0 || common_dtree_sampled_enabled()) {
+                    SLT_INF(*this, "draft tree sampled (RRS): sibling paths drafted = %lld, alternative accepted (RRS) = %lld\n",
+                        (long long) n_tree_alts_drafted, (long long) n_tree_rrs_alt);
+                }
             }
         }
 
@@ -5505,6 +5517,14 @@ private:
 
         scoped_timer t_verify(t_zos2_verify, n_zos2_verify);
 
+        if (!slot.spec_tree_rrs_tokens.empty()) {
+            // SPEC-DTREE-SAMPLED-V2: decided and accepted by the tree resolve's RRS walk
+            llama_tokens acc = std::move(slot.spec_tree_rrs_tokens);
+            slot.spec_tree_rrs_tokens.clear();
+            slot.smpl = std::move(slot.spec_tree_rrs_smpl);
+            return acc;
+        }
+
         if (zos2_greedy_fast_engaged(slot)) {
             return common_sampler_sample_and_accept_n_greedy_fast(
                     slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
@@ -5622,6 +5642,8 @@ private:
             }
             slot.spec_tree_batch_round = false;
             any = true;
+            slot.spec_tree_rrs_tokens.clear(); // SPEC-DTREE-SAMPLED-V2: never carry a stale round's decision
+            slot.spec_tree_rrs_smpl.reset();
 
             auto inside = [&](const std::vector<int32_t> & rows) {
                 for (const int32_t i : rows) {
@@ -5655,14 +5677,20 @@ private:
                         prow.push_back(&slot.spec_tree_i_batch[a]);
                         ptok.push_back(&slot.spec_tree_alts[a]);
                     }
+                    // SPEC-DTREE-SAMPLED-V2: recursive rejection sampling over the tree. Main-chain nodes keep the
+                    // SERVED rejection step against the drafter's dists (spec_dists intact, same condition as the
+                    // served verify), sibling / off-chain nodes take the served sample-and-compare draw. The probe
+                    // decides AND accepts the whole round; the accept pass below adopts its tokens and sampler.
+                    const bool use_q = slot.spec_dists.size() == slot.spec_draft.size() &&
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                         (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && slot.spec_draft.size() <= llama_n_rs_seq(ctx_tgt)));
                     int32_t k = 0;
-                    best_n = common_dtree_sampled_walk(prow, ptok,
-                        [&](int32_t row) { return common_sampler_sample(probe.get(), ctx_tgt, row, false); },
-                        [&](llama_token tok) { common_sampler_accept(probe.get(), tok, true); }, &k);
-                    best = k - 1;
-                    // the rejection-sampling accept reads the MAIN chain's draft dists; the winner is accepted by
-                    // the plain sample-and-compare pass the probe replayed
-                    slot.spec_dists.clear();
+                    slot.spec_tree_rrs_tokens = common_sampler_tree_accept(probe.get(), ctx_tgt, prow, ptok,
+                                                                           use_q ? &slot.spec_dists : nullptr, &k, &slot.n_tree_rrs_alt);
+                    slot.n_tree_alts_drafted += (int64_t) slot.spec_tree_alts.size();
+                    best_n = (int32_t) slot.spec_tree_rrs_tokens.size() - 1;
+                    best   = k - 1;
+                    slot.spec_tree_rrs_smpl = std::move(probe);
                 } else {
                 best_n = common_dtree_greedy_accept_len(ctx_tgt, slot.spec_i_batch, slot.spec_draft, dev_ok);
                 for (size_t a = 0; a < slot.spec_tree_alts.size(); ++a) {
@@ -6420,6 +6448,11 @@ private:
                         accepted = common_sampler_sample_and_accept_n_greedy_fast(
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 &n_zos2_gf_fast, &n_zos2_gf_fallback);
+                    } else if (!slot.spec_tree_rrs_tokens.empty()) {
+                        // SPEC-DTREE-SAMPLED-V2: the tree resolve's RRS walk already decided and accepted this round
+                        accepted = std::move(slot.spec_tree_rrs_tokens);
+                        slot.spec_tree_rrs_tokens.clear();
+                        slot.smpl = std::move(slot.spec_tree_rrs_smpl);
                     } else {
                     accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
                                     slot.spec_dists.size() == slot.spec_draft.size()

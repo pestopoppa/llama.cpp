@@ -411,6 +411,126 @@ int32_t common_dtree_sampled_walk(
     return d;
 }
 
+int32_t common_dtree_rrs_walk(
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::function<llama_token(int32_t row)>        & sample,
+        const std::function<bool(int32_t row, int32_t d, llama_token * y)> & reject,
+        const std::function<void(llama_token tok)>           & accept,
+        llama_token * bonus,
+        int32_t * best,
+        int64_t * n_alt) {
+    std::vector<int32_t> live;
+    for (size_t k = 0; k < paths.size(); ++k) {
+        if (rows[k]->size() == paths[k]->size() + 1) {
+            live.push_back((int32_t) k);
+        }
+    }
+    if (best) {
+        *best = live.empty() ? 0 : live[0];
+    }
+    if (live.empty()) {
+        if (bonus) {
+            *bonus = LLAMA_TOKEN_NULL;
+        }
+        return 0;
+    }
+    int32_t d = 0;
+    std::vector<int32_t> next;
+    for (;;) {
+        const int32_t row = (*rows[live[0]])[d];
+        bool has_child = false;
+        for (const int32_t k : live) {
+            has_child = has_child || (size_t) d < paths[k]->size();
+        }
+        const bool main_node = live[0] == 0 && (size_t) d < paths[0]->size();
+        llama_token y;
+        bool main_rejected = false;
+        if (has_child && main_node && reject) {
+            main_rejected = !reject(row, d, &y);
+        } else {
+            y = sample(row);
+        }
+        next.clear();
+        const bool y_is_main = main_node && (*paths[0])[d] == y;
+        if (!(main_rejected && y_is_main)) { // served: a rejected main stops even if the residual re-draws it
+            for (const int32_t k : live) {
+                if ((size_t) d < paths[k]->size() && (*paths[k])[d] == y) {
+                    next.push_back(k);
+                }
+            }
+        }
+        if (next.empty()) {
+            if (bonus) {
+                *bonus = y;
+            }
+            break;
+        }
+        if (live[0] == 0 && next[0] != 0 && n_alt) {
+            (*n_alt)++;
+        }
+        accept(y);
+        live.swap(next);
+        ++d;
+        if (best) {
+            *best = live[0];
+        }
+    }
+    return d;
+}
+
+std::vector<std::vector<int32_t>> common_dtree_build_sampled(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, const std::vector<int32_t> & main,
+        const std::vector<std::vector<float>> & q, int32_t n_nodes, int32_t max_paths) {
+    std::vector<std::vector<int32_t>> out;
+    int32_t budget = n_nodes - (D + 1);
+    if (D <= 0 || K < 2 || max_paths <= 1 || budget <= 0 || (int32_t) main.size() < D || (int32_t) q.size() < D) {
+        return out;
+    }
+    std::vector<branch_cand> cands;
+    double cum = 0.0;
+    for (int32_t j = 0; j < D; ++j) {
+        const auto & qj = q[j];
+        for (int32_t k = 0; k < K && k < (int32_t) qj.size(); ++k) {
+            if (k != main[j] && qj[k] > 0.0f) {
+                cands.push_back({ j, k, cum + std::log((double) qj[k]) });
+            }
+        }
+        const float qm = main[j] < (int32_t) qj.size() ? qj[main[j]] : 0.0f;
+        if (qm <= 0.0f) {
+            break; // the main chain has no draft mass past here: no sibling below it is reachable by the walk
+        }
+        cum += std::log((double) qm);
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const branch_cand & a, const branch_cand & b) {
+        return a.score > b.score;
+    });
+    for (const auto & c : cands) {
+        if ((int32_t) out.size() + 1 >= max_paths) {
+            break;
+        }
+        const int32_t cost = D - c.j;
+        if (cost > budget) {
+            continue;
+        }
+        std::vector<int32_t> path(main.begin(), main.begin() + c.j);
+        path.push_back(c.c);
+        greedy_from(D, K, scores, c.j + 1, c.c, path);
+        out.push_back(std::move(path));
+        budget -= cost;
+    }
+    return out;
+}
+
+int32_t common_dtree_sampled_max_paths() {
+    static const int32_t w = [] {
+        const char * e = getenv("LLAMA_DTREE_SAMPLED_W");
+        const int32_t v = e ? atoi(e) : 0;
+        return v >= 1 ? v : COMMON_DTREE_MAX_PATHS;
+    }();
+    return w;
+}
+
 bool common_dtree_sampled_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_DTREE_SAMPLED");

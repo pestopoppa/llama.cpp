@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "speculative-tree.h"
 #include "rng-poskey.h"
 
 #include "common.h"
@@ -1017,6 +1018,79 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_greedy_fast(
     return result;
 }
 
+// SPEC-DTREE-SAMPLED-V2: one served rejection-sampling step (moved verbatim out of the loop below, which calls it;
+// draws and arithmetic unchanged). Does NOT accept the returned token.
+llama_token common_sampler_spec_reject_step(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        llama_token draft_tok,
+        const common_speculative_token_dist & dists_i,
+        bool * accepted) {
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    // Residual sampling needs the target distribution after every constraint.
+    const llama_token fallback = common_sampler_sample(gsmpl, ctx, idx, true);
+    const auto & q = dists_i;
+    GGML_ASSERT(q.ids.size() == q.probs.size());
+
+    std::unordered_map<llama_token, float> q_probs;
+    q_probs.reserve(q.ids.size());
+    for (size_t j = 0; j < q.ids.size(); ++j) {
+        q_probs[q.ids[j]] += q.probs[j];
+    }
+    const auto q_prob = [&](llama_token id) {
+        const auto it = q_probs.find(id);
+        return it == q_probs.end() ? 0.0f : it->second;
+    };
+
+    auto * p = common_sampler_get_candidates(gsmpl, false);
+    float p_draft = 0.0f;
+    const float q_draft = q_prob(draft_tok);
+    for (size_t j = 0; j < p->size; ++j) {
+        if (p->data[j].id == draft_tok) {
+            p_draft = p->data[j].p;
+            break;
+        }
+    }
+
+    const uint64_t spec_pos = gsmpl->n_accepted; // absolute position of the token being decided
+    const bool poskey = gsmpl->params.rng_poskey;
+    const float u_acc = poskey
+        ? (float) llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_ACC)
+        : 0.0f;
+    if (q_draft > 0.0f && (poskey ? u_acc : uniform(gsmpl->speculative_rng)) * q_draft <= p_draft) {
+        *accepted = true;
+        return draft_tok;
+    }
+    *accepted = false;
+
+    std::vector<float> residual(p->size);
+    float residual_sum = 0.0f;
+    for (size_t j = 0; j < p->size; ++j) {
+        residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
+        residual_sum += residual[j];
+    }
+
+    llama_token id = fallback;
+    if (residual_sum > 0.0f) {
+        if (poskey) {
+            // inverse-CDF on a position-keyed uniform
+            const double tgt = llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_RES) * (double) residual_sum;
+            double run = 0.0;
+            size_t pick = p->size - 1;
+            for (size_t j = 0; j < p->size; ++j) {
+                run += residual[j];
+                if (residual[j] > 0.0f && run > tgt) { pick = j; break; }
+            }
+            id = p->data[pick].id;
+        } else {
+            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
+            id = p->data[sample(gsmpl->speculative_rng)].id;
+        }
+    }
+    return id;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
@@ -1031,81 +1105,20 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     size_t i = 0;
     for (; i < draft.size(); ++i) {
-        // Residual sampling needs the target distribution after every constraint.
-        const llama_token fallback = common_sampler_sample(gsmpl, ctx, idxs[i], true);
-        const auto & q = dists[i];
-        GGML_ASSERT(q.ids.size() == q.probs.size());
-
-        std::unordered_map<llama_token, float> q_probs;
-        q_probs.reserve(q.ids.size());
-        for (size_t j = 0; j < q.ids.size(); ++j) {
-            q_probs[q.ids[j]] += q.probs[j];
-        }
-        const auto q_prob = [&](llama_token id) {
-            const auto it = q_probs.find(id);
-            return it == q_probs.end() ? 0.0f : it->second;
-        };
-
-        auto * p = common_sampler_get_candidates(gsmpl, false);
-        float p_draft = 0.0f;
-        const float q_draft = q_prob(draft[i]);
-        for (size_t j = 0; j < p->size; ++j) {
-            if (p->data[j].id == draft[i]) {
-                p_draft = p->data[j].p;
-                break;
-            }
-        }
-
-        const uint64_t spec_pos = gsmpl->n_accepted; // absolute position of the token being decided
-        const bool poskey = gsmpl->params.rng_poskey;
-        const float u_acc = poskey
-            ? (float) llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_ACC)
-            : 0.0f;
-        if (q_draft > 0.0f && (poskey ? u_acc : uniform(gsmpl->speculative_rng)) * q_draft <= p_draft) {
-            common_sampler_accept(gsmpl, draft[i], true);
-            result.push_back(draft[i]);
-
-            if (out_dists) {
-                const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
-                out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-            }
-
-            continue;
-        }
-
-        std::vector<float> residual(p->size);
-        float residual_sum = 0.0f;
-        for (size_t j = 0; j < p->size; ++j) {
-            residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
-            residual_sum += residual[j];
-        }
-
-        llama_token id = fallback;
-        if (residual_sum > 0.0f) {
-            if (poskey) {
-                // inverse-CDF on a position-keyed uniform
-                const double tgt = llama_rng_poskey_u01(gsmpl->speculative_seed, spec_pos, LLAMA_RNG_ROLE_SPEC_RES) * (double) residual_sum;
-                double run = 0.0;
-                size_t pick = p->size - 1;
-                for (size_t j = 0; j < p->size; ++j) {
-                    run += residual[j];
-                    if (residual[j] > 0.0f && run > tgt) { pick = j; break; }
-                }
-                id = p->data[pick].id;
-            } else {
-                std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
-                id = p->data[sample(gsmpl->speculative_rng)].id;
-            }
-        }
+        bool acc = false;
+        const llama_token id = common_sampler_spec_reject_step(gsmpl, ctx, idxs[i], draft[i], dists[i], &acc);
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
         if (out_dists) {
             const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
             out_dists->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+        }
+
+        if (acc) {
+            continue;
         }
 
         break;
@@ -1138,6 +1151,33 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         idxs[i] = i;
     }
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, dists, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_tree_accept(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<const std::vector<int32_t> *>     & rows,
+        const std::vector<const std::vector<llama_token> *> & paths,
+        const std::vector<common_speculative_token_dist> * dists,
+        int32_t * best,
+        int64_t * n_alt) {
+    std::vector<llama_token> result;
+    const bool use_q = dists != nullptr && !paths.empty() && dists->size() == paths[0]->size();
+    llama_token bonus = LLAMA_TOKEN_NULL;
+    common_dtree_rrs_walk(rows, paths,
+        [&](int32_t row) { return common_sampler_sample(gsmpl, ctx, row, false); },
+        use_q ? std::function<bool(int32_t, int32_t, llama_token *)>([&](int32_t row, int32_t d, llama_token * y) {
+            bool acc = false;
+            *y = common_sampler_spec_reject_step(gsmpl, ctx, row, (*paths[0])[d], (*dists)[d], &acc);
+            return acc;
+        }) : std::function<bool(int32_t, int32_t, llama_token *)>(),
+        [&](llama_token tok) { common_sampler_accept(gsmpl, tok, true); result.push_back(tok); },
+        &bonus, best, n_alt);
+    if (bonus != LLAMA_TOKEN_NULL) {
+        common_sampler_accept(gsmpl, bonus, true);
+        result.push_back(bonus);
+    }
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
