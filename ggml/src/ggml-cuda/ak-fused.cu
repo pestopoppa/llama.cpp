@@ -23,10 +23,12 @@ static bool ak_env_opt_in(const char * name) {
     return v != nullptr && atoi(v) != 0;
 }
 
+// WARN, not INFO: llama-server drops ggml INFO lines at its default verbosity, so an INFO fused/reject line is invisible in
+// a server log and a gate that greps for it reads "never fired" (ak-c19-h15-gate-20261123 was VACUOUS for exactly this).
 static void ak_log_once(std::atomic<bool> & flag, const char * what, const ggml_tensor * t) {
     static const bool do_log = getenv("GGML_CUDA_AK_FUSE_LOG") != nullptr && atoi(getenv("GGML_CUDA_AK_FUSE_LOG")) != 0;
     if (do_log && !flag.exchange(true)) {
-        GGML_LOG_INFO("ggml_cuda_ak: %s fused (first hit at node %s)\n", what, t->name);
+        GGML_LOG_WARN("ggml_cuda_ak: %s fused (first hit at node %s)\n", what, t->name);
     }
 }
 
@@ -436,7 +438,7 @@ static int ak_h15_reject(int id, const ggml_tensor * concat) {
     static const bool dbg = getenv("GGML_CUDA_AK_FUSE_DEBUG") != nullptr && atoi(getenv("GGML_CUDA_AK_FUSE_DEBUG")) != 0;
     static std::atomic<int> n{0};
     if (dbg && n.fetch_add(1) < 32) {
-        GGML_LOG_INFO("ggml_cuda_ak: H15 reject %d at %s\n", id, concat->name);
+        GGML_LOG_WARN("ggml_cuda_ak: H15 reject %d at %s\n", id, concat->name);
     }
     return 0;
 }
