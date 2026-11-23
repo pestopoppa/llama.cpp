@@ -431,6 +431,8 @@ llama_build_and_test(test-exl3.cpp)
 llama_build_and_test(test-gdn-state-guard.cpp)
 llama_build_and_test(test-gdn-replay-identity.cpp)
 llama_build_and_test(test-gdn-fused.cpp)
+# [AK-BW-GDN-GATE-FOLD] GGML_HIP_GDN_GATE_FOLD=1 beta/alpha projection + gate fold vs the unfused path (SKIP without ROCm0)
+llama_build_and_test(test-gdn-gate-fold.cpp)
 # [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
 llama_build(test-akx-numerics.cpp)
 

@@ -62,6 +62,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/topk-moe-asm-gfx90a.cuh"
 #include "ggml-cuda/hc-fuse.cuh"
+#include "ggml-cuda/gdn-gate-fold.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -4372,6 +4373,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_hc_fuse_plan(cgraph, hc_plan);
             }
 
+            // AK-BW-GDN-GATE-FOLD: GDN beta/alpha projections + gate ops -> one launch (GGML_HIP_GDN_GATE_FOLD=1, default
+            // off). Single-stream graphs only.
+            ggml_cuda_gdn_gate_plan gate_plan;
+            if (stream_ctx.concurrent_events.empty()) {
+                ggml_cuda_gdn_gate_fold_plan(cgraph, gate_plan);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4421,6 +4429,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const auto hc_it = hc_plan.anchors.find(node);
                     if (hc_it != hc_plan.anchors.end()) {
                         ggml_cuda_hc_fuse_run(*cuda_ctx, node, hc_it->second);
+                        continue;
+                    }
+                }
+
+                if (!gate_plan.anchors.empty()) {
+                    if (gate_plan.skip.count(node)) {
+                        continue;  // elided into a later gate-fold anchor
+                    }
+                    const auto gf_it = gate_plan.anchors.find(node);
+                    if (gf_it != gate_plan.anchors.end()) {
+                        ggml_cuda_gdn_gate_fold_run(*cuda_ctx, gf_it->second);
                         continue;
                     }
                 }
@@ -5842,6 +5861,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_gdn_fused_auto_cols") == 0) {
         return (void *)gdn_fused_auto_cols;
+    }
+    // AK-BW-GDN-GATE-FOLD test witness: gate-fold launches since process start
+    if (strcmp(name, "ggml_backend_cuda_gdn_gate_fold_n_calls") == 0) {
+        return (void *)ggml_cuda_gdn_gate_fold_n_calls;
     }
     // AK-ASM-H13b test witness: hc fused-kernel launches since process start
     if (strcmp(name, "ggml_backend_cuda_hc_fuse_n_calls") == 0) {
