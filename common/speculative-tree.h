@@ -160,6 +160,11 @@ std::vector<std::vector<int32_t>> common_dtree_build_sampled(
 // LLAMA_DTREE_SAMPLED_W (paths incl. main, default COMMON_DTREE_MAX_PATHS) for the T > 0 sibling builders
 int32_t common_dtree_sampled_max_paths();
 
+// Witness line printed once when LLAMA_DTREE_SAMPLED=1 is read: names the verifier actually compiled in (the V2
+// recursive rejection tree accept, common_dtree_rrs_walk), so a run log proves which sampled verifier served it.
+#define COMMON_DTREE_SAMPLED_ENABLED_MSG \
+    "llama_dtree_sampled: ENABLED (LLAMA_DTREE_SAMPLED=1; T>0 tree verify, V2 recursive rejection (RRS) tree accept, siblings at T>0)"
+
 // LLAMA_DTREE_SAMPLED=1 read once (lifts the T > 0 guard of the tree verify; the accept walk is the V2 walk above)
 bool common_dtree_sampled_enabled();
 

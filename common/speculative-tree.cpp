@@ -536,7 +536,7 @@ bool common_dtree_sampled_enabled() {
         const char * e = getenv("LLAMA_DTREE_SAMPLED");
         const bool v = e != nullptr && e[0] == '1';
         if (v) {
-            fprintf(stderr, "llama_dtree_sampled: ENABLED (LLAMA_DTREE_SAMPLED=1; T>0 tree verify, V2 target-sample walk)\n");
+            fprintf(stderr, "%s\n", COMMON_DTREE_SAMPLED_ENABLED_MSG);
         }
         return v;
     }();

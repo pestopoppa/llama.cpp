@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
@@ -184,6 +185,13 @@ static std::vector<int> served(const std::vector<int> & ctx, const tree_t & t, u
 }
 
 int main() {
+    // the ENABLED witness names the V2 recursive rejection verifier (not the V1 target-sample walk)
+    {
+        const std::string msg = COMMON_DTREE_SAMPLED_ENABLED_MSG;
+        CHECK(msg.rfind("llama_dtree_sampled: ENABLED", 0) == 0);
+        CHECK(msg.find("recursive rejection (RRS)") != std::string::npos);
+        CHECK(msg.find("target-sample walk") == std::string::npos);
+    }
     const std::vector<int> ctx0 = {3, 1};
     const int N = 200000;
     const double crit = 66.62; // chi-square df = 35, p = 0.001
