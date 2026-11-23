@@ -132,7 +132,7 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
 // [DTREE-GDN-BATCH] tree-walk cases (GGML_HIP_GDN_FUSED_TREE=1, F32 state, K = T). Two checks per tree:
 //  (a) knob on vs knob off (the recurrent tree kernel) on the same backend: same F32 bound as above;
 //  (b) path identity, n_seqs 1: for every column c whose root path has >= 2 columns, the tree op's attention row c and
-//      its snapshot slot (T-1-c) must be BIT-IDENTICAL to the fused chain op (K = path length) run on that path's rows
+//      its snapshot slot (T-1-c) must be BIT-IDENTICAL to the same fused tree kernel run as a chain (parent t-1) on that path's rows
 //      (last attention row, slot 0). The tree walk must do exactly the chain arithmetic along the path.
 static std::vector<int32_t> tree_parents(int kind, int64_t T, int64_t seq) {
     std::vector<int32_t> p(T);
@@ -242,7 +242,12 @@ static int run_tree_case(int64_t T, int64_t B, int kind, int64_t S = 128) {
                 pin.g.insert(pin.g.end(), in.g.begin() + x * H, in.g.begin() + (x + 1) * H);
                 pin.b.insert(pin.b.end(), in.b.begin() + x * H, in.b.begin() + (x + 1) * H);
             }
-            const std::vector<float> ch = run(S, H_k, H, L, 1, L, GGML_TYPE_F32, pin);
+            // the same tree kernel instantiation over the path's rows as a chain (parent t-1): the plain fused K=T kernel is a
+            // different template instance whose FMA contraction may differ (smoke: ~1e-7 diffs at S_v 128), so it is held
+            // only to check (a)'s bound
+            std::vector<int32_t> cpar(L);
+            for (int64_t t = 0; t < L; t++) { cpar[t] = (int32_t) t - 1; }
+            const std::vector<float> ch = run_tree(S, H_k, H, L, 1, pin, cpar);
             const size_t ch_attn = (size_t) S * H * L;
             size_t diff = 0;
             for (int64_t i = 0; i < S * H; i++) {   // attention row c vs chain row L-1
