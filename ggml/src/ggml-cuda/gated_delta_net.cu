@@ -1291,7 +1291,9 @@ static __device__ __forceinline__ void gdn_fu_st4(state_t * p, const float * o) 
     }
 }
 
-template <int S_v, bool keep_rs_t, typename state_t, int TPB, bool NT>
+// [GDN-COLWIDTH] C = state columns per 8-lane group (1, 2, 4): the group reads each k/q chunk from LDS once and reuses it
+// for its C columns; the C (kv, sq) pair reductions are independent DPP chains that interleave.
+template <int S_v, bool keep_rs_t, typename state_t, int TPB, bool NT, int C = 1>
 __global__ void __launch_bounds__(TPB, 2)
 gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
                const float * __restrict__ g, const float * __restrict__ beta,
@@ -1303,7 +1305,7 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
                const uint3 neqk1_magic, const uint3 rq3_magic, const float scale,
                const int64_t state_slot_stride, const int K) {
     constexpr int LPC  = GDN_FU_LPC;
-    constexpr int CPB  = TPB / GDN_FU_LPC;
+    constexpr int CPB  = (TPB / GDN_FU_LPC) * C;
     constexpr int RPL  = S_v / LPC;  // state rows per lane
     constexpr int NCH  = RPL / 4;    // 4-element chunks per lane: row i = c*4*LPC + 4*lane + e
     constexpr int WARP = ggml_cuda_get_physical_warp_size();
@@ -1325,7 +1327,7 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
     const int      lane     = tid % LPC;
     const int      cl       = tid / LPC;
     const int      col0     = blockIdx.z * CPB;
-    const int      col      = col0 + cl;
+    const int      col      = col0 + cl * C;   // first of this group's C columns
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
@@ -1337,10 +1339,13 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
 
     ggml_cuda_pdl_sync();
 
-    float s[RPL];
+    float s[C * RPL];   // column cc's rows at s[cc * RPL + r]
 #pragma unroll
-    for (int c = 0; c < NCH; c++) {
-        gdn_fu_ld4(curr_state + c * 4 * LPC + 4 * lane, s + 4 * c);
+    for (int cc = 0; cc < C; cc++) {
+#pragma unroll
+        for (int c = 0; c < NCH; c++) {
+            gdn_fu_ld4(curr_state + cc * S_v + c * 4 * LPC + 4 * lane, s + cc * RPL + 4 * c);
+        }
     }
 
     const float * qh = q + iq3 * sq3 + iq1 * sq1;
@@ -1393,42 +1398,54 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
             }
             const int t = t0 + tt;
             float kr[RPL];
-            float2 acc = make_float2(0.0f, 0.0f);   // (S^T k, S^T q) partials on the OLD state, one pass
+            float2 acc[C];   // per column: (S^T k, S^T q) partials on the OLD state, one pass
+#pragma unroll
+            for (int cc = 0; cc < C; cc++) {
+                acc[cc] = make_float2(0.0f, 0.0f);
+            }
 #pragma unroll
             for (int c = 0; c < NCH; c++) {
                 const float4 k4 = *(const float4 *) &k_s[tt][c * 4 * LPC + 4 * lane];
                 const float4 q4 = *(const float4 *) &q_s[tt][c * 4 * LPC + 4 * lane];
                 kr[4 * c + 0] = k4.x; kr[4 * c + 1] = k4.y; kr[4 * c + 2] = k4.z; kr[4 * c + 3] = k4.w;
-                acc.x += s[4 * c + 0] * k4.x; acc.y += s[4 * c + 0] * q4.x;
-                acc.x += s[4 * c + 1] * k4.y; acc.y += s[4 * c + 1] * q4.y;
-                acc.x += s[4 * c + 2] * k4.z; acc.y += s[4 * c + 2] * q4.z;
-                acc.x += s[4 * c + 3] * k4.w; acc.y += s[4 * c + 3] * q4.w;
+#pragma unroll
+                for (int cc = 0; cc < C; cc++) {
+                    const float * sc = s + cc * RPL + 4 * c;
+                    acc[cc].x += sc[0] * k4.x; acc[cc].y += sc[0] * q4.x;
+                    acc[cc].x += sc[1] * k4.y; acc[cc].y += sc[1] * q4.y;
+                    acc[cc].x += sc[2] * k4.z; acc[cc].y += sc[2] * q4.z;
+                    acc[cc].x += sc[3] * k4.w; acc[cc].y += sc[3] * q4.w;
+                }
             }
-            acc = gdn_fu_sum8x2(acc);
+#pragma unroll
+            for (int cc = 0; cc < C; cc++) {
+                acc[cc] = gdn_fu_sum8x2(acc[cc]);
+            }
 
             const float g_val = eg_s[t];
-            const float delta = (v_s[tt][cl] - g_val * acc.x) * b_s[t];
-            // [r3] attention row stored immediately (no 16-entry register array): frees ~16 VGPRs
-            if (lane == 0) {
-                dst[(int64_t) t * S_v * H] = gdn_store<state_t>((g_val * acc.y + delta * kq_s[tt]) * scale);
-            }
-
+            const int   slot  = n_tokens - 1 - t;
 #pragma unroll
-            for (int r = 0; r < RPL; r++) {
-                s[r] = g_val * s[r] + kr[r] * delta;
-            }
-
-            if constexpr (keep_rs_t) {
-                const int slot = n_tokens - 1 - t;
-                if (slot < K) {
-                    state_t * snap = state + (int64_t) slot * state_slot_stride;
+            for (int cc = 0; cc < C; cc++) {
+                const float delta = (v_s[tt][cl * C + cc] - g_val * acc[cc].x) * b_s[t];
+                // [r3] attention row stored immediately (no 16-entry register array): frees ~16 VGPRs
+                if (lane == 0) {
+                    dst[(int64_t) t * S_v * H + cc] = gdn_store<state_t>((g_val * acc[cc].y + delta * kq_s[tt]) * scale);
+                }
 #pragma unroll
-                    for (int c = 0; c < NCH; c++) {
-                        // slot 0 (the final state) is re-read by the next op: keep it cached
-                        if (slot == 0) {
-                            gdn_fu_st4<state_t, false>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
-                        } else {
-                            gdn_fu_st4<state_t, NT>(snap + c * 4 * LPC + 4 * lane, s + 4 * c);
+                for (int r = 0; r < RPL; r++) {
+                    s[cc * RPL + r] = g_val * s[cc * RPL + r] + kr[r] * delta;
+                }
+                if constexpr (keep_rs_t) {
+                    if (slot < K) {
+                        state_t * snap = state + (int64_t) slot * state_slot_stride + cc * S_v;
+#pragma unroll
+                        for (int c = 0; c < NCH; c++) {
+                            // slot 0 (the final state) is re-read by the next op: keep it cached
+                            if (slot == 0) {
+                                gdn_fu_st4<state_t, false>(snap + c * 4 * LPC + 4 * lane, s + cc * RPL + 4 * c);
+                            } else {
+                                gdn_fu_st4<state_t, NT>(snap + c * 4 * LPC + 4 * lane, s + cc * RPL + 4 * c);
+                            }
                         }
                     }
                 }
@@ -1438,8 +1455,11 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
-        for (int c = 0; c < NCH; c++) {
-            gdn_fu_st4<state_t, false>(state + c * 4 * LPC + 4 * lane, s + 4 * c);
+        for (int cc = 0; cc < C; cc++) {
+#pragma unroll
+            for (int c = 0; c < NCH; c++) {
+                gdn_fu_st4<state_t, false>(state + cc * S_v + c * 4 * LPC + 4 * lane, s + cc * RPL + 4 * c);
+            }
         }
     }
 }
@@ -1484,14 +1504,35 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         constexpr int TPB = GDN_FU_THREADS;   // [r3] back to r1's 256 threads; LDS cut instead (r2's 128 was LDS-bound)
         const char * nte = getenv("GGML_HIP_GDN_FUSED_NT");
         const bool   nt  = !(nte != nullptr && nte[0] == '0');
-        const dim3   grid(H, n_seqs, S_v / (TPB / GDN_FU_LPC));
+        // [GDN-COLWIDTH] GGML_HIP_GDN_FUSED_COLS = 1 (default, r3) | 2 | 4 state columns per 8-lane group
+        const char * cse = getenv("GGML_HIP_GDN_FUSED_COLS");
+        int          cw  = cse != nullptr && (cse[0] == '2' || cse[0] == '4') ? cse[0] - '0' : 1;
+        if (S_v == 64 && cw == 4) {
+            cw = 2;   // 32 groups x 4 columns = 128 > S_v 64: the widest width that tiles S_v 64 is 2
+        }
+        const dim3   grid(H, n_seqs, S_v / ((TPB / GDN_FU_LPC) * cw));
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, dim3(TPB, 1, 1), 0, stream);
+#define GDN_FU_KT(SV, NTV, CW) ggml_cuda_kernel_launch(gdn_fused_cuda<SV, true, state_t, TPB, NTV, CW>, GDN_FU_ARGS)
+#define GDN_FU_KT_C(SV, NTV) do { if (cw == 4) { GDN_FU_KT(SV, NTV, 4); } else if (cw == 2) { GDN_FU_KT(SV, NTV, 2); } else { GDN_FU_KT(SV, NTV, 1); } } while (0)
         if (S_v == 128) {
-            if (nt) { ggml_cuda_kernel_launch(gdn_fused_cuda<128, true, state_t, TPB, true>,  GDN_FU_ARGS); }
-            else    { ggml_cuda_kernel_launch(gdn_fused_cuda<128, true, state_t, TPB, false>, GDN_FU_ARGS); }
+            if (nt) { GDN_FU_KT_C(128, true); } else { GDN_FU_KT_C(128, false); }
         } else {
-            if (nt) { ggml_cuda_kernel_launch(gdn_fused_cuda<64, true, state_t, TPB, true>,  GDN_FU_ARGS); }
-            else    { ggml_cuda_kernel_launch(gdn_fused_cuda<64, true, state_t, TPB, false>, GDN_FU_ARGS); }
+            if (cw == 2) {
+                if (nt) { GDN_FU_KT(64, true, 2); } else { GDN_FU_KT(64, false, 2); }
+            } else {
+                if (nt) { GDN_FU_KT(64, true, 1); } else { GDN_FU_KT(64, false, 1); }
+            }
+        }
+#undef GDN_FU_KT_C
+#undef GDN_FU_KT
+        {
+            // [GDN-COLWIDTH] per-width route witness, once per width per process
+            static std::atomic<int> seen{0};
+            const int bit = 1 << cw;
+            if ((seen.fetch_or(bit) & bit) == 0) {
+                GGML_LOG_WARN("GDN_FUSED_COLS: ggml_cuda_gdn_fused column width %d ran (S_v %d, n_tokens %d, K %d)\n",
+                              cw, (int) S_v, (int) n_tokens, K);
+            }
         }
     } else {
         const dim3 grid(H, n_seqs, S_v / GDN_FU_CPB);

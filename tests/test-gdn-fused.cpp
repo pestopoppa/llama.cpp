@@ -63,9 +63,10 @@ static std::vector<float> run(int64_t S, int64_t H_k, int64_t H, int64_t T, int6
     return res;
 }
 
-static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st) {
-    const int64_t S = 128, H_k = 16, H = 48;
-    std::mt19937 rng(0x6d4e + 31 * (int) T + 7 * (int) B + (int) K + (st == GGML_TYPE_BF16 ? 500 : 0));
+// cols: GGML_HIP_GDN_FUSED_COLS for the knob-on run (1 = r3 default; 2/4 = [GDN-COLWIDTH], K=T only)
+static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1, int64_t S = 128) {
+    const int64_t H_k = 16, H = 48;
+    std::mt19937 rng(0x6d4e + 31 * (int) T + 7 * (int) B + (int) K + (st == GGML_TYPE_BF16 ? 500 : 0) + (int) S);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     inputs in;
     auto unit = [&](std::vector<float> & x) {
@@ -94,8 +95,11 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st) {
     const std::vector<float> ref = run(S, H_k, H, T, B, K, st, in);
     const uint64_t c0 = g_fused_calls ? g_fused_calls() : 0;
     setenv("GGML_HIP_GDN_FUSED", "1", 1);
+    char cbuf[8]; snprintf(cbuf, sizeof(cbuf), "%d", cols);
+    setenv("GGML_HIP_GDN_FUSED_COLS", cbuf, 1);
     const std::vector<float> cand = run(S, H_k, H, T, B, K, st, in);
     unsetenv("GGML_HIP_GDN_FUSED");
+    unsetenv("GGML_HIP_GDN_FUSED_COLS");
     const uint64_t c1 = g_fused_calls ? g_fused_calls() : 0;
 
     const bool bf = st == GGML_TYPE_BF16;
@@ -111,8 +115,8 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st) {
     const double nmse = den > 0 ? num / den : num;
     const bool routed = g_fused_calls == nullptr || c1 > c0;
     const bool ok = bad == 0 && nmse <= nmse_max && routed && ref.size() == cand.size();
-    printf("[%s] S=128 H_k=16 H=48 T=%lld n_seqs=%lld K=%lld state=%s: max|d| %.3g nmse %.3g out-of-tol %zu fused-route %s -> %s\n",
-           ggml_backend_name(g_backend), (long long) T, (long long) B, (long long) K, bf ? "bf16" : "f32", maxe, nmse, bad,
+    printf("[%s] S=%lld H_k=16 H=48 T=%lld n_seqs=%lld K=%lld state=%s cols=%d: max|d| %.3g nmse %.3g out-of-tol %zu fused-route %s -> %s\n",
+           ggml_backend_name(g_backend), (long long) S, (long long) T, (long long) B, (long long) K, bf ? "bf16" : "f32", cols, maxe, nmse, bad,
            routed ? "ran" : "DID NOT RUN", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -132,8 +136,16 @@ int main() {
         for (int64_t B : { 1, 4 }) {
             for (int64_t T : { 1, 4, 8, 12, 16 }) {
                 failures += run_case(T, B, 1, st); n++;
-                if (T > 1) { failures += run_case(T, B, T, st); n++; }
+                if (T > 1) {
+                    for (int cols : { 1, 2, 4 }) { failures += run_case(T, B, T, st, cols); n++; }
+                }
             }
+        }
+    }
+    // [GDN-COLWIDTH] S_v 64 K=T (width 4 clamps to 2 there)
+    for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int64_t T : { 8, 16 }) {
+            for (int cols : { 1, 2, 4 }) { failures += run_case(T, 1, T, st, cols, 64); n++; }
         }
     }
     printf("%d/%d fused-vs-existing cases OK\n", n - failures, n);
