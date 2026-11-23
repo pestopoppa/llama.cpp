@@ -1464,6 +1464,23 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
     }
 }
 
+// [GDN-COLWIDTH-DISPATCH] automatic column width for the fused K=T kernel, from ak-gdn-colwidth-gpu-20261123 (SHIP_WIDE):
+// width 4 won large F32 ops (np4 2.3-2.6x), width 2 helped np1 F32 S_v 128 (1.15-1.29x), and wide widths lost on small grids and
+// most BF16 cells (np1 BF16 width 4 0.44x). size = H * n_seqs * S_v.
+//   F32  state, S_v 128: 4 if size >= 12288, 2 if size >= 6144, else 1
+//   F32  state, S_v  64: 2 if size >= 12288, else 1
+//   BF16 state:          4 if S_v 128 and size >= 24576, else 1
+int gdn_fused_auto_cols(int S_v, int64_t h_seqs, size_t state_esz) {
+    const int64_t size = h_seqs * S_v;
+    if (state_esz == 4) {
+        if (S_v == 128) {
+            return size >= 12288 ? 4 : size >= 6144 ? 2 : 1;
+        }
+        return size >= 12288 ? 2 : 1;
+    }
+    return S_v == 128 && size >= 24576 ? 4 : 1;
+}
+
 // Returns true when the fused kernel handled the op (GGML_HIP_GDN_FUSED=1 and a covered shape).
 template <typename state_t>
 static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
@@ -1504,9 +1521,11 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         constexpr int TPB = GDN_FU_THREADS;   // [r3] back to r1's 256 threads; LDS cut instead (r2's 128 was LDS-bound)
         const char * nte = getenv("GGML_HIP_GDN_FUSED_NT");
         const bool   nt  = !(nte != nullptr && nte[0] == '0');
-        // [GDN-COLWIDTH] GGML_HIP_GDN_FUSED_COLS = 1 (default, r3) | 2 | 4 state columns per 8-lane group
+        // [GDN-COLWIDTH] state columns per 8-lane group. Default: size/dtype dispatch measured in ak-gdn-colwidth-gpu-20261123
+        // (gdn_fused_auto_cols); GGML_HIP_GDN_FUSED_COLS = 1 | 2 | 4 is an explicit override (1 = r3).
         const char * cse = getenv("GGML_HIP_GDN_FUSED_COLS");
-        int          cw  = cse != nullptr && (cse[0] == '2' || cse[0] == '4') ? cse[0] - '0' : 1;
+        int          cw  = cse != nullptr && (cse[0] == '1' || cse[0] == '2' || cse[0] == '4') ? cse[0] - '0'
+                         : gdn_fused_auto_cols((int) S_v, H * n_seqs, sizeof(state_t));
         if (S_v == 64 && cw == 4) {
             cw = 2;   // 32 groups x 4 columns = 128 > S_v 64: the widest width that tiles S_v 64 is 2
         }

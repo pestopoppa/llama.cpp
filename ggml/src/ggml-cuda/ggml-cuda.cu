@@ -5840,6 +5840,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_gdn_fused_n_calls") == 0) {
         return (void *)ggml_cuda_gdn_fused_n_calls;
     }
+    if (strcmp(name, "ggml_backend_cuda_gdn_fused_auto_cols") == 0) {
+        return (void *)gdn_fused_auto_cols;
+    }
     // AK-ASM-H13b test witness: hc fused-kernel launches since process start
     if (strcmp(name, "ggml_backend_cuda_hc_fuse_n_calls") == 0) {
         return (void *)ggml_cuda_hc_fuse_n_calls;
