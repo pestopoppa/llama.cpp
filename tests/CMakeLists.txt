@@ -505,6 +505,10 @@ if (NOT GGML_BACKEND_DL)
     # not registered with ctest; run it explicitly: test-fa-rowexact [n_kv ...]
     llama_build(test-fa-rowexact.cpp)
 
+    # [GGML-DET-POSINV-TEST] batch-position invariance per op (MUL_MAT/MUL_MAT_ID/FA/RMS_NORM/GDN), bitwise, M in
+    # {2,4,8,16}; POSINV_BACKEND=CPU|ROCm0. A measurement of the build under test: built, run explicitly.
+    llama_build(test-batch-posinv.cpp)
+
     # [AKX-ALL-LB4.6] the iqk FA work-buffer sizer vs the split-KV consumers it reserves for: pure
     # arithmetic over nth, n_kv and every -inf range trim, plus undersized-sizer mutants that must be
     # caught. It calls the real iqk_fa_work_buffer_size, which only the ON build's libggml-cpu exports.

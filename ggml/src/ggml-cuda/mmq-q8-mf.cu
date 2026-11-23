@@ -1543,6 +1543,15 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     const int     ncu    = ggml_cuda_info().devices[ctx.device].nsm;
     GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
     const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    {
+        // GGML-DET-POSINV-TEST: GGML_DET_TRACE=1 logs the stream-K split of every call so tests/test-batch-posinv can
+        // assert the split count depends only on (M, N, K), never on the batch row order. Read once, default off.
+        static const bool trace = [] { const char * e = getenv("GGML_DET_TRACE"); return e != nullptr && atoi(e) != 0; }();
+        if (trace) {
+            GGML_LOG_INFO("q8mf6_split M=%d N=%d K=%d U=%d G=%d det=%d\n", M, N, nblk * 32, U, G,
+                ggml_cuda_deterministic() ? 1 : 0);
+        }
+    }
     const size_t abytes = (size_t) S * Q8MF_A1;
     ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
     float * d = (float *) dst->data;
