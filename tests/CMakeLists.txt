@@ -429,6 +429,7 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-fused-decode-prev-logits.cpp) # FUSED-DECODE-ZERO-ROW-LOGITS guard
 llama_build_and_test(test-moe-fused-upgate.cpp) # CH-19 Q8_0 opt-in; external gate checks ACTIVE marker
 llama_build_and_test(test-mm-sibling-fuse.cpp) # AK-Q38FN-CPU-GDNPROJ-FUSE: fused sibling MUL_MAT bit-exact vs stock
+llama_build_and_test(test-mm-smalln.cpp) # GGML_Q0_RM4 (C20 default ON) bit-identical vs the two-row tails
 llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
