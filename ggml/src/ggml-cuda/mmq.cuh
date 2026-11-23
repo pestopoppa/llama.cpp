@@ -1344,6 +1344,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         nblocks_stream_k = (int) nwork;
     }
 
+    // AK-MMQ-SK2 (upstream #30022 force-tiling rule, predicate widened from GCN to GCN+CDNA, default OFF):
+    // GGML_HIP_MMQ_CDNA_FORCE_TILING=1. Stream-k grid = nsm*occupancy capped at nwork; plain tiling (grid = ntiles,
+    // which the stream-k kernel executes as one whole tile per block with no fixup) when the last tile wave is
+    // >= 90% full, or ntiles >= 2*grid, or k_chunks <= occupancy*tile_waves.
+    static const bool force_tiling_env = [] {
+        const char * e = getenv("GGML_HIP_MMQ_CDNA_FORCE_TILING");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (force_tiling_env && (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc))) {
+        const int occ        = std::max(config.occupancy, 1);
+        const int grid_sk    = (int) std::min<int64_t>((int64_t) nsm*occ, nwork);
+        const int waves      = (ntiles_dst + nsm*occ - 1) / (nsm*occ);
+        const int eff_pct    = 100 * ntiles_dst / (nsm*occ*waves);
+        const bool force_tiling = eff_pct >= 90 || ntiles_dst >= 2*grid_sk || k_chunks <= (int64_t) occ*waves;
+        nblocks_stream_k = force_tiling ? ntiles_dst : grid_sk;
+    }
+
     const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
