@@ -165,6 +165,14 @@ bool common_dtree_rrs_q_ok(size_t n_dists, size_t n_main, bool seq_rm_part, bool
 // SPEC-DTREE-SAMPLED-V2: verify columns a sibling path adds beyond the main chain (its length past the shared prefix)
 int32_t common_dtree_new_cols(const std::vector<int32_t> & main, const std::vector<int32_t> & alt);
 
+// DTREE-B at T > 0: emission of a NARROWER tree arm in an RRS round, by coupling. The narrower arm's tree is the main
+// path plus the leading (best-first) alternatives whose cumulative new columns fit extra_budget; the RRS walk on it
+// draws the same keyed samples as the full walk until the full walk takes a node outside it, where it emits that same y
+// as its bonus. Returns the arm's accepted length = the longest prefix of acc (the full round's accepted tokens, bonus
+// excluded) covered by one of its paths. Emission = return + 1.
+int32_t common_dtree_arm_cover(const std::vector<int32_t> & main, const std::vector<std::vector<int32_t>> & alts,
+                               const std::vector<int32_t> & acc, int32_t extra_budget);
+
 // LLAMA_DTREE_SAMPLED_W (paths incl. main, default COMMON_DTREE_MAX_PATHS) for the T > 0 sibling builders
 int32_t common_dtree_sampled_max_paths();
 

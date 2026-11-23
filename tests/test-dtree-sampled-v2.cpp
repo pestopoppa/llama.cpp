@@ -232,6 +232,21 @@ int main() {
                 n_alt += r.n_alt;
                 const auto sv = served(ctx0, t, seed, use_q);
                 mean_served += (double) sv.size() - 1;
+                if (W == 12 && s < 20000) {
+                    // DTREE-B coupling: the walk on the first m alternatives emits exactly 1 + arm_cover of the full round
+                    std::vector<int32_t> acc(r.emitted.begin(), r.emitted.end() - 1);
+                    std::vector<int32_t> mn(t.paths[0].begin(), t.paths[0].end());
+                    std::vector<std::vector<int32_t>> al;
+                    for (size_t k = 1; k < t.paths.size(); ++k) { al.emplace_back(t.paths[k].begin(), t.paths[k].end()); }
+                    int32_t bud = 0;
+                    for (size_t m = 0; m <= al.size(); ++m) {
+                        if (m > 0) { bud += common_dtree_new_cols(mn, al[m - 1]); }
+                        tree_t sub; sub.q = t.q; sub.paths.assign(t.paths.begin(), t.paths.begin() + 1 + m);
+                        const auto rs = run_round(ctx0, sub, seed, use_q);
+                        CHECK((int) rs.emitted.size() == 1 + common_dtree_arm_cover(mn, al, acc, bud));
+                        CHECK(std::equal(rs.emitted.begin(), rs.emitted.end(), r.emitted.begin()));
+                    }
+                }
                 if (W == 1) {
                     // W = 1: bit-identical to the served single-draft verify
                     CHECK(r.emitted == sv);
