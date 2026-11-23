@@ -11885,6 +11885,14 @@ struct test_mul_mat_served_shape : public test_mul_mat {
             std::array<int64_t, 4> per, int64_t k_v, uint32_t o, double max_nmse)
         : test_mul_mat(type_a, type_b, m, n, k, bs, nr, per, k_v, o), max_nmse(max_nmse) {}
     double max_nmse_err() override { return max_nmse; }
+    // [C19 fix-up] the tight IQ3_XXS bound (AKX-ALL-31.QDEC-CPU-IQ3Q6) is for the CPU iqk-vs-scalar comparison; a GPU backend
+    // quantizes activations to q8_1, so it is held to the standard MUL_MAT bound there (CPU keeps max_nmse).
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_IQ3_XXS && !ggml_backend_is_cpu(backend)) {
+            return std::max(max_nmse, test_mul_mat::max_nmse_err());
+        }
+        return max_nmse;
+    }
     void initialize_tensors(ggml_context * ctx) override {
         autokernel_seed_case(test_mul_mat::vars());
         test_mul_mat::initialize_tensors(ctx);
@@ -11900,6 +11908,14 @@ struct test_mul_mat_id_served_shape : public test_mul_mat_id {
             int n_used, bool b, int64_t m, int64_t n, int64_t k, double max_nmse)
         : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), max_nmse(max_nmse) {}
     double max_nmse_err() override { return max_nmse; }
+    // [C19 fix-up] the tight IQ3_XXS bound (AKX-ALL-31.QDEC-CPU-IQ3Q6) is for the CPU iqk-vs-scalar comparison; a GPU backend
+    // quantizes activations to q8_1, so it is held to the standard MUL_MAT_ID bound there (CPU keeps max_nmse).
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type_a == GGML_TYPE_IQ3_XXS && !ggml_backend_is_cpu(backend)) {
+            return std::max(max_nmse, test_mul_mat_id::max_nmse_err());
+        }
+        return max_nmse;
+    }
     std::string vars() override {
         return test_mul_mat_id::vars() + ",max_nmse=" + autokernel_served_shape_nmse_str(max_nmse);
     }
