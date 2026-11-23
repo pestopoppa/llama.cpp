@@ -1,4 +1,4 @@
-// test-mm-smalln: GGML_MM_SMALLN / GGML_MM_SMALLN_NTH (AK-CPU-A3B-SHEXP-VERIFY-GAP) must be bit-identical to the default
+// test-mm-smalln: GGML_MM_SMALLN / GGML_MM_SMALLN_NTH (AK-CPU-A3B-SHEXP-VERIFY-GAP) and GGML_Q0_RM4 (tinyBLAS_Q0 4-row tiles at N=2/3) must be bit-identical to the default
 // small-batch Q8_0 mul_mat path. The knobs are read once per process, so the parent re-executes itself as a child under
 // each env arm and compares the FNV-1a hash of every output tensor byte for byte.
 //   shapes: A3B shared expert gate/up [2048,512], down [512,2048], plus odd shapes [96,40] and [512,33] (generic fallback /
@@ -78,16 +78,18 @@ static std::map<std::string, std::string> run_arm(const char * self, const char 
 
 int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "--child") == 0) return child();
-    const char * arms[] = { "-u GGML_MM_SMALLN -u GGML_MM_SMALLN_NTH", "-u GGML_MM_SMALLN_NTH GGML_MM_SMALLN=8",
-                            "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=12", "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=5" };
+    const char * arms[] = { "-u GGML_MM_SMALLN -u GGML_MM_SMALLN_NTH -u GGML_Q0_RM4", "-u GGML_MM_SMALLN_NTH GGML_MM_SMALLN=8",
+                            "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=12", "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=5",
+                            "-u GGML_MM_SMALLN -u GGML_MM_SMALLN_NTH GGML_Q0_RM4=1", "GGML_MM_SMALLN=8 GGML_Q0_RM4=1" };
+    const int narms = (int) (sizeof(arms) / sizeof(arms[0]));
     auto ref = run_arm(argv[0], arms[0]);
     if (ref.size() != 5 * 8 * 4) { fprintf(stderr, "reference arm produced %zu cases\n", ref.size()); return 1; }
     int bad = 0;
-    for (int a = 1; a < 4; a++) {
+    for (int a = 1; a < narms; a++) {
         auto got = run_arm(argv[0], arms[a]);
         if (got.size() != ref.size()) { fprintf(stderr, "arm '%s' produced %zu cases\n", arms[a], got.size()); return 1; }
         for (auto & kv : ref) if (got[kv.first] != kv.second) { fprintf(stderr, "MISMATCH arm '%s' case %s\n", arms[a], kv.first.c_str()); bad++; }
     }
-    printf("%s: %zu cases x 3 knob arms vs default, %d mismatches\n", bad ? "FAIL" : "PASS", ref.size(), bad);
+    printf("%s: %zu cases x %d knob arms vs default, %d mismatches\n", bad ? "FAIL" : "PASS", ref.size(), narms - 1, bad);
     return bad ? 1 : 0;
 }

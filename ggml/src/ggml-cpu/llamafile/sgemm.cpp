@@ -48,6 +48,7 @@
 #pragma GCC diagnostic ignored "-Wignored-attributes"
 #endif
 
+#include <cstdlib>
 #include "sgemm.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
@@ -2078,7 +2079,12 @@ class tinyBLAS_Q0_AVX {
                     C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
         }
         };
-        if ((RN == 2 || RN == 3) && rows2 < rows4)
+        // AK-CPU-A3B-SHEXP-Q0RM4 (2026-11-23): GGML_Q0_RM4=1 keeps the 4-row tiles at RN = 2/3 instead of the
+        // c08cd5df7 two-row tail tiles (chosen whenever rows2 < rows4, i.e. for the A3B shared expert at N = 2/3
+        // on 24 threads). Every output element's accumulation is row-independent, so the result is bit-identical;
+        // only the A-row grouping per tile changes. Default off.
+        static const bool q0_rm4 = [] { const char * e = getenv("GGML_Q0_RM4"); return e && atoi(e) != 0; }();
+        if ((RN == 2 || RN == 3) && rows2 < rows4 && !q0_rm4)
             run(std::integral_constant<int, 2>{});
         else
             run(std::integral_constant<int, 4>{});
