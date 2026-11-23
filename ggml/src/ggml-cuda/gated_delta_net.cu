@@ -1218,6 +1218,13 @@ uint64_t ggml_cuda_gdn_fused_n_calls() {
     return g_gdn_fused_n_calls.load();
 }
 
+// [DTREE-GDN-BATCH] tree-walk ops on the fused K=T kernel. Default OFF (tree ops keep the C18/C19 route: rows when
+// GGML_HIP_GDN_ROWS=1, else the recurrent tree kernel). Read per call so a test can flip it between launches.
+static bool gdn_fused_tree_enabled() {
+    const char * s = getenv("GGML_HIP_GDN_FUSED_TREE");
+    return s != nullptr && s[0] == '1';
+}
+
 static bool gdn_fused_enabled() {
 #if defined(GGML_USE_HIP)
     const char * s = getenv("GGML_HIP_GDN_FUSED");
@@ -1293,7 +1300,11 @@ static __device__ __forceinline__ void gdn_fu_st4(state_t * p, const float * o) 
 
 // [GDN-COLWIDTH] C = state columns per 8-lane group (1, 2, 4): the group reads each k/q chunk from LDS once and reuses it
 // for its C columns; the C (kv, sq) pair reductions are independent DPP chains that interleave.
-template <int S_v, bool keep_rs_t, typename state_t, int TPB, bool NT, int C = 1>
+// [DTREE-GDN-BATCH] TREE = tree-walk (record mode) variant of the K=T kernel: column t continues from its parent's state
+// (parent[seq*n_tokens + t], -1 = s0). Every lane group reloads only the shard it stored itself into the parent's snapshot
+// slot (slot n_tokens-1-p), so no cross-thread synchronisation is needed and the per-column arithmetic is exactly the
+// chain arithmetic along the root-to-column path. One launch, one s0 read per layer for all tree columns.
+template <int S_v, bool keep_rs_t, typename state_t, int TPB, bool NT, int C = 1, bool TREE = false>
 __global__ void __launch_bounds__(TPB, 2)
 gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
                const float * __restrict__ g, const float * __restrict__ beta,
@@ -1303,7 +1314,8 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
                const int64_t sv1, const int64_t sv2, const int64_t sv3,
                const int64_t sb1, const int64_t sb2, const int64_t sb3,
                const uint3 neqk1_magic, const uint3 rq3_magic, const float scale,
-               const int64_t state_slot_stride, const int K) {
+               const int64_t state_slot_stride, const int K, const int32_t * __restrict__ parent) {
+    static_assert(!TREE || (keep_rs_t && !NT), "tree walk needs K = T snapshots written with cached stores");
     constexpr int LPC  = GDN_FU_LPC;
     constexpr int CPB  = (TPB / GDN_FU_LPC) * C;
     constexpr int RPL  = S_v / LPC;  // state rows per lane
@@ -1397,6 +1409,19 @@ gdn_fused_cuda(const float * __restrict__ q, const float * __restrict__ k, const
                 break;
             }
             const int t = t0 + tt;
+            if constexpr (TREE) {
+                const int p = parent[(int64_t) sequence * n_tokens + t];
+                if (p != t - 1) {
+                    const state_t * src = p < 0 ? curr_state : state + (int64_t) (n_tokens - 1 - p) * state_slot_stride;
+#pragma unroll
+                    for (int cc = 0; cc < C; cc++) {
+#pragma unroll
+                        for (int c = 0; c < NCH; c++) {
+                            gdn_fu_ld4(src + cc * S_v + c * 4 * LPC + 4 * lane, s + cc * RPL + 4 * c);
+                        }
+                    }
+                }
+            }
             float kr[RPL];
             float2 acc[C];   // per column: (S^T k, S^T q) partials on the OLD state, one pass
 #pragma unroll
@@ -1488,9 +1513,12 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, bool kda, int K,
         int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3, int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int32_t * parent = nullptr) {
     if (!gdn_fused_enabled()) {
         return false;
+    }
+    if (parent != nullptr && (K <= 1 || K != n_tokens || !std::is_same_v<state_t, float>)) {
+        return false;   // [DTREE-GDN-BATCH] tree walk: F32 state, K = T only
     }
     if (n_tokens < 1 || n_tokens > GDN_FU_WMAX || kda || (S_v != 64 && S_v != 128) || n_seqs > 65535) {
         return false;
@@ -1523,7 +1551,7 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 #define GDN_FU_ARGS lp, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, (int) n_tokens, sq1, sq2, sq3, \
-        sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K
+        sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, parent
     if (keep_rs) {
         // [r2/r3] K = T is store-bound (one full state per row): more waves in flight hide the snapshot store latency;
         // r3 gets them from the smaller LDS footprint (chunked staging) and fewer VGPRs at 256 threads. Snapshot slots > 0: nontemporal by default (r1);
@@ -1543,7 +1571,22 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
         const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, dim3(TPB, 1, 1), 0, stream);
 #define GDN_FU_KT(SV, NTV, CW) ggml_cuda_kernel_launch(gdn_fused_cuda<SV, true, state_t, TPB, NTV, CW>, GDN_FU_ARGS)
 #define GDN_FU_KT_C(SV, NTV) do { if (cw == 4) { GDN_FU_KT(SV, NTV, 4); } else if (cw == 2) { GDN_FU_KT(SV, NTV, 2); } else { GDN_FU_KT(SV, NTV, 1); } } while (0)
-        if (S_v == 128) {
+#define GDN_FU_KTT(SV, CW) ggml_cuda_kernel_launch(gdn_fused_cuda<SV, true, state_t, TPB, false, CW, true>, GDN_FU_ARGS)
+        if (parent != nullptr) {
+            // [DTREE-GDN-BATCH] tree walk: cached snapshot stores (a column re-reads its parent's slot)
+            if constexpr (std::is_same_v<state_t, float>) {
+                if (S_v == 128) {
+                    if (cw == 4) { GDN_FU_KTT(128, 4); } else if (cw == 2) { GDN_FU_KTT(128, 2); } else { GDN_FU_KTT(128, 1); }
+                } else {
+                    if (cw == 2) { GDN_FU_KTT(64, 2); } else { GDN_FU_KTT(64, 1); }
+                }
+            }
+            static std::atomic<bool> tree_seen{false};
+            if (!tree_seen.exchange(true)) {
+                GGML_LOG_WARN("GDN_FUSED_TREE: ggml_cuda_gdn_fused_tree DTREE-GDN-BATCH tree-walk fused gated delta-net ran"
+                              " (call 1, n_tokens %d, cols %d, GGML_HIP_GDN_FUSED_TREE=1)\n", (int) n_tokens, cw);
+            }
+        } else if (S_v == 128) {
             if (nt) { GDN_FU_KT_C(128, true); } else { GDN_FU_KT_C(128, false); }
         } else {
             if (cw == 2) {
@@ -1552,6 +1595,7 @@ static bool gdn_fused_try(const float * q_d, const float * k_d, const float * v_
                 if (nt) { GDN_FU_KT(64, true, 1); } else { GDN_FU_KT(64, false, 1); }
             }
         }
+#undef GDN_FU_KTT
 #undef GDN_FU_KT_C
 #undef GDN_FU_KT
         {
@@ -1847,6 +1891,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (!replay && dst->src[6] != nullptr) {
             GGML_ASSERT(keep_rs && K == n_tokens);
             GGML_ASSERT(dst->src[6]->type == GGML_TYPE_I32 && ggml_is_contiguous(dst->src[6]));
+            // [DTREE-GDN-BATCH] GGML_HIP_GDN_FUSED_TREE=1 (default off): the fused K=T kernel walks the tree
+            if (gdn_fused_tree_enabled() && gdn_fused_try<float>(q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data,
+                    dst_d, state_d, S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                    scale, state_slot_stride, stream, (const int32_t *) dst->src[6]->data)) {
+                return;
+            }
             if (gdn_rows_try<float>(q_d, k_d, v_d, g_d, b_d, (const float *) src_state->data, dst_d, state_d,
                     S_v, H, n_tokens, n_seqs, kda, K, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                     state_slot_stride, stream, (const int32_t *) dst->src[6]->data)) {
