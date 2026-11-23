@@ -22,6 +22,10 @@ uint64_t ggml_cuda_gdn_gate_fold_n_calls() {
     return g_gdn_gate_fold_n_calls.load();
 }
 
+uint64_t ggml_cuda_gdn_gate_fold_n_unsafe() {
+    return g_gdn_gate_fold_n_unsafe.load();
+}
+
 bool ggml_cuda_gdn_gate_fold_enabled() {
     // read per graph evaluation so a test can flip it between two computes in one process (with CUDA graphs off)
     const char * e = getenv("GGML_HIP_GDN_GATE_FOLD");
@@ -104,9 +108,16 @@ void ggml_cuda_gdn_gate_fold_plan(const ggml_cgraph * cgraph, ggml_cuda_gdn_gate
         return;
     }
     ggml_gdn_gate_plan_build(cgraph, plan);
-    if (plan.n_unsafe > 0 && g_gdn_gate_fold_n_unsafe.fetch_add(plan.n_unsafe) == 0) {
-        GGML_LOG_WARN("GDN_GATE_FOLD: %d of %d matched gate chains run unfused (an input's memory was reused before the "
-                      "anchor)\n", plan.n_unsafe, plan.n_matched);
+    if (plan.n_unsafe > 0) {
+        // every refusal counts (test witness); the first 16 are logged with the failing check and the tensors involved
+        const uint64_t prev = g_gdn_gate_fold_n_unsafe.fetch_add(plan.n_unsafe);
+        if (prev < 16) {
+            GGML_LOG_WARN("GDN_GATE_FOLD: %d of %d matched gate chains run unfused (C7R guard refused the anchor)\n",
+                          plan.n_unsafe, plan.n_matched);
+            for (const std::string & w : plan.unsafe_why) {
+                GGML_LOG_WARN("GDN_GATE_FOLD: refused: %s\n", w.c_str());
+            }
+        }
     }
 }
 

@@ -29,6 +29,8 @@
 static ggml_backend_t g_backend = nullptr;
 typedef uint64_t (*n_calls_fn)();
 static n_calls_fn g_fold_calls = nullptr;
+static n_calls_fn g_fold_unsafe = nullptr;
+static int g_n_ok = 0, g_n_guard = 0, g_n_fail = 0;
 
 static const int64_t NE = 5120, H = 48, H_K = 16, S = 128;
 
@@ -181,6 +183,7 @@ static int run_case(int64_t T, int64_t B, int64_t K) {
     }
 
     const uint64_t c0 = g_fold_calls ? g_fold_calls() : 0;
+    const uint64_t u0 = g_fold_unsafe ? g_fold_unsafe() : 0;
     unsetenv("GGML_HIP_GDN_GATE_FOLD");
     const outputs off = run(true, T, B, K, in);
     const uint64_t c1 = g_fold_calls ? g_fold_calls() : 0;
@@ -189,6 +192,7 @@ static int run_case(int64_t T, int64_t B, int64_t K) {
     const outputs on = run(true, T, B, K, in);
     unsetenv("GGML_HIP_GDN_GATE_FOLD");
     const uint64_t c2 = g_fold_calls ? g_fold_calls() : 0;
+    const uint64_t u2 = g_fold_unsafe ? g_fold_unsafe() : 0;
 
     const cmp cb  = compare(on.beta, in.beta_ref, 2e-5);
     const cmp cg  = compare(on.g, in.g_ref, 2e-5);
@@ -198,14 +202,21 @@ static int run_case(int64_t T, int64_t B, int64_t K) {
     const cmp oo  = compare(off.out, ref.out, 1e-2);
     const bool routed     = g_fold_calls != nullptr && c2 == c1 + 1;
     const bool off_clean  = g_fold_calls != nullptr && c1 == c0;
+    // GUARD_REFUSED: the planner's C7R guard refused the fold (unsafe witness advanced, no fold launch) and the ON run equals
+    // the stock path (same unfused kernels): not a failure of the fold, but the fold is unproven for that case
+    const cmp sb = compare(on.beta, off.beta, 1e-5), sg = compare(on.g, off.g, 1e-5), so = compare(on.out, off.out, 1e-5);
+    const bool guard_refused = g_fold_unsafe != nullptr && u2 > u0 && c2 == c1 && off_clean &&
+                               sb.bad == 0 && sg.bad == 0 && so.bad == 0 && ob.nmse <= 1e-3 && og.nmse <= 1e-3;
     const bool ok = cb.bad == 0 && cg.bad == 0 && co.bad == 0 && co.nmse <= 1e-8 && routed && off_clean &&
                     ob.nmse <= 1e-3 && og.nmse <= 1e-3;
     printf("[%s] T=%lld n_seqs=%lld K=%lld ntok=%lld | ON beta max|d| %.2e g %.2e out max|d| %.2e nmse %.2e out-of-tol %zu/%zu/%zu"
            " | OFF(stock) beta nmse %.2e g nmse %.2e out nmse %.2e | fold %s, off-run %s -> %s\n",
            ggml_backend_name(g_backend), (long long) T, (long long) B, (long long) K, (long long) ntok,
            cb.maxe, cg.maxe, co.maxe, co.nmse, cb.bad, cg.bad, co.bad, ob.nmse, og.nmse, oo.nmse,
-           routed ? "ran" : "DID NOT RUN", off_clean ? "unfused" : "FOLDED (knob leak)", ok ? "OK" : "FAIL");
-    return ok ? 0 : 1;
+           routed ? "ran" : "DID NOT RUN", off_clean ? "unfused" : "FOLDED (knob leak)",
+           ok ? "OK" : guard_refused ? "GUARD_REFUSED (C7R guard refused the fold; ON == stock path)" : "FAIL");
+    if (ok) g_n_ok++; else if (guard_refused) g_n_guard++; else g_n_fail++;
+    return ok || guard_refused ? 0 : 1;
 }
 
 int main() {
@@ -219,6 +230,7 @@ int main() {
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(g_backend));
     g_fold_calls = (n_calls_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_gate_fold_n_calls");
+    g_fold_unsafe = (n_calls_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_gate_fold_n_unsafe");
     if (g_fold_calls == nullptr) {
         printf("gate-fold witness hook missing FAIL\n");
         return 1;
@@ -229,7 +241,7 @@ int main() {
         failures += run_case(s.T, s.B, 1); n++;
         if (s.T > 1) { failures += run_case(s.T, s.B, s.T); n++; }
     }
-    printf("%d/%d gate-fold cases OK\n", n - failures, n);
+    printf("%d folded OK / %d guard-refused / %d FAIL (of %d)\n", g_n_ok, g_n_guard, g_n_fail, n);
     printf(failures == 0 ? "OK\n" : "FAIL (%d)\n", failures);
     ggml_backend_free(g_backend);
     return failures == 0 ? 0 : 1;

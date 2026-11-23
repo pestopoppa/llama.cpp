@@ -20,6 +20,9 @@
 
 #include "hc-fuse-plan.h"
 
+#include <cstdio>
+#include <string>
+
 struct ggml_cuda_gdn_gate_anchor {
     const ggml_tensor * x     = nullptr;  // shared activation [K, ntok] f32
     const ggml_tensor * wb    = nullptr;  // ssm_beta  Q8_0 [K, H]
@@ -38,6 +41,7 @@ struct ggml_cuda_gdn_gate_plan {
     std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> chains;
     int n_matched = 0;
     int n_unsafe  = 0;
+    std::vector<std::string> unsafe_why;   // one line per refused anchor: the failing check + the tensors involved
 };
 
 #define GDN_GATE_FOLD_MAXT 16
@@ -116,27 +120,42 @@ inline bool try_gdn(const hc_ctx & c, const ggml_tensor * gdn, ggml_cuda_gdn_gat
     return true;
 }
 
+inline std::string tdesc(const ggml_tensor * t, const hc_ctx & c) {
+    char b[256];
+    const auto ip = c.pos.find(t);
+    snprintf(b, sizeof(b), "'%s' %s pos %d [%p, +%zu)", t->name, ggml_op_desc(t), ip == c.pos.end() ? -1 : ip->second,
+             t->data, ggml_nbytes(t));
+    return b;
+}
+
+// why (optional): the failing check and the tensors involved, for the unsafe log
 inline bool anchor_safe(const hc_ctx & c, const ggml_cuda_gdn_gate_plan & plan, const ggml_tensor * dst,
-                        const ggml_cuda_gdn_gate_anchor & an) {
+                        const ggml_cuda_gdn_gate_anchor & an, std::string * why = nullptr) {
+    auto fail = [&](const char * check, const ggml_tensor * a, const ggml_tensor * b) {
+        if (why) {
+            *why = std::string(check) + ": anchor " + tdesc(dst, c) + (a ? "; " + tdesc(a, c) : "") + (b ? "; " + tdesc(b, c) : "");
+        }
+        return false;
+    };
     const auto ia = c.pos.find(dst);
     const auto ic = plan.chains.find(dst);
-    if (ia == c.pos.end() || ic == plan.chains.end()) return false;
+    if (ia == c.pos.end() || ic == plan.chains.end()) return fail("anchor-not-in-graph", nullptr, nullptr);
     int chain_start = ia->second;
     for (const ggml_tensor * t : ic->second) {
         const auto ip = c.pos.find(t);
-        if (ip == c.pos.end()) return false;
+        if (ip == c.pos.end()) return fail("chain-node-not-in-graph", t, nullptr);
         chain_start = std::min(chain_start, ip->second);
     }
     const ggml_tensor * outs[2] = { an.beta, an.g };
     const ggml_tensor * ins[5]  = { an.x, an.wb, an.wa, an.dt, an.a };
     for (const ggml_tensor * o : outs) {
-        if (!o->data) return false;
+        if (!o->data) return fail("sink-no-data", o, nullptr);
     }
-    if (overlaps(an.beta, an.g)) return false;
+    if (overlaps(an.beta, an.g)) return fail("sinks-overlap", an.beta, an.g);
     for (const ggml_tensor * x : ins) {
-        if (!x->data) return false;
+        if (!x->data) return fail("input-no-data", x, nullptr);
         for (const ggml_tensor * o : outs) {
-            if (overlaps(o, x)) return false;
+            if (overlaps(o, x)) return fail("sink-overlaps-input", o, x);
         }
         const ggml_tensor * r  = root_of(x);
         const auto          ip = c.pos.find(r);
@@ -144,7 +163,7 @@ inline bool anchor_safe(const hc_ctx & c, const ggml_cuda_gdn_gate_plan & plan, 
         for (int i = i0; i < ia->second; ++i) {
             const ggml_tensor * w = c.graph->nodes[i];
             if (w == r || is_noop(w) || plan.skip.count(w) || !w->data) continue;
-            if (overlaps(w, x)) return false;
+            if (overlaps(w, x)) return fail("input-overwritten-before-anchor", x, w);
         }
     }
     return true;
@@ -159,6 +178,7 @@ inline void ggml_gdn_gate_plan_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_g
     plan.chains.clear();
     plan.n_matched = 0;
     plan.n_unsafe  = 0;
+    plan.unsafe_why.clear();
     bool any = false;
     for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
         any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
@@ -193,7 +213,9 @@ inline void ggml_gdn_gate_plan_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_g
         for (const auto & kv : plan.anchors) order.push_back(kv.first);
         std::sort(order.begin(), order.end(), [&](const ggml_tensor * x, const ggml_tensor * y) { return c.pos[x] < c.pos[y]; });
         for (const ggml_tensor * dst : order) {
-            if (anchor_safe(c, plan, dst, plan.anchors.at(dst))) continue;
+            std::string why;
+            if (anchor_safe(c, plan, dst, plan.anchors.at(dst), &why)) continue;
+            plan.unsafe_why.push_back(why);
             for (const ggml_tensor * t : plan.chains[dst]) plan.skip.erase(t);
             plan.chains.erase(dst);
             plan.anchors.erase(dst);
