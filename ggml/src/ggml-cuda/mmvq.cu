@@ -1950,6 +1950,12 @@ static void mul_mat_vec_q_moe_launch(
 
     // AK-A3B-VERIFY lever 2: GGML_HIP_MMID_DEDUP=1 reads each unique expert once for 4..16 tokens.
     if (ncols_dst >= 4 && ncols_dst <= MMVQ_MOE_SPLIT16_MAX_BATCH && ggml_cuda_mmid_dedup_enabled()) {
+        // Engagement witness: one log line per distinct n (host-side only, graph-capture safe).
+        static uint32_t dd_logged_mask = 0;
+        if (!(dd_logged_mask & (1u << ncols_dst))) {
+            dd_logged_mask |= 1u << ncols_dst;
+            GGML_LOG_INFO("GGML_HIP_MMID_DEDUP engaged type=%s n=%u slots=%d rows=%u\n", ggml_type_name(type), ncols_dst, nchannels_dst, nrows_x);
+        }
         const dim3 dd_block_nums(nblocks_rows, ncols_dst*nchannels_dst);
         const dim3 dd_block_dims(warp_size, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dd_block_nums, dd_block_dims, 0, stream);
