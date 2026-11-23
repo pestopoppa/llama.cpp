@@ -179,6 +179,7 @@ endif ()
 
 llama_build(test-multiseq-ubatch.cpp)
 llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build(test-multiseq-ragged-rollback.cpp get-model.cpp)
 llama_build(test-recurrent-rollback-guards.cpp get-model.cpp)
 llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)
@@ -319,6 +320,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # SPEC-ID-RAGGED-1: multi-sequence ragged rollback, snapshot and replay arms (qwen35 + qwen4exp synthetic)
+    foreach(arch qwen35 qwen4exp)
+        llama_test(
+            test-multiseq-ragged-rollback
+            NAME test-multiseq-ragged-rollback-${arch}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${arch}-dense.gguf"
+        )
+        set_tests_properties(test-multiseq-ragged-rollback-${arch} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
 
     # chunk-KV reuse (P1): f32 K/V caches so the shift exactness gates are not confounded by re-quantisation
     llama_build(test-chunk-kv.cpp)
