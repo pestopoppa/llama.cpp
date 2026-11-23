@@ -24,3 +24,6 @@ uint64_t ggml_cuda_gdn_rows_n_calls();
 
 // [GDN-FUSED-VARIANT] fused float2-reduction verify kernel (GGML_HIP_GDN_FUSED=1): launches since process start. Test witness.
 uint64_t ggml_cuda_gdn_fused_n_calls();
+
+// [GDN-COLWIDTH-DISPATCH] automatic fused K=T column width (1/2/4) for S_v, H*n_seqs and the state element size. Test hook.
+int gdn_fused_auto_cols(int S_v, int64_t h_seqs, size_t state_esz);

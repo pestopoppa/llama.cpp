@@ -96,7 +96,11 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
     const uint64_t c0 = g_fused_calls ? g_fused_calls() : 0;
     setenv("GGML_HIP_GDN_FUSED", "1", 1);
     char cbuf[8]; snprintf(cbuf, sizeof(cbuf), "%d", cols);
-    setenv("GGML_HIP_GDN_FUSED_COLS", cbuf, 1);
+    if (cols > 0) {
+        setenv("GGML_HIP_GDN_FUSED_COLS", cbuf, 1);
+    } else {
+        unsetenv("GGML_HIP_GDN_FUSED_COLS");   // cols 0 = automatic size/dtype dispatch (the default)
+    }
     const std::vector<float> cand = run(S, H_k, H, T, B, K, st, in);
     unsetenv("GGML_HIP_GDN_FUSED");
     unsetenv("GGML_HIP_GDN_FUSED_COLS");
@@ -141,7 +145,7 @@ int main() {
             for (int64_t T : { 1, 4, 8, 12, 16 }) {
                 failures += run_case(T, B, 1, st); n++;
                 if (T > 1) {
-                    for (int cols : { 1, 2, 4 }) { failures += run_case(T, B, T, st, cols); n++; }
+                    for (int cols : { 0, 1, 2, 4 }) { failures += run_case(T, B, T, st, cols); n++; }
                 }
             }
         }
@@ -149,8 +153,27 @@ int main() {
     // [GDN-COLWIDTH] S_v 64 K=T (width 4 clamps to 2 there)
     for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
         for (int64_t T : { 8, 16 }) {
-            for (int cols : { 1, 2, 4 }) { failures += run_case(T, 1, T, st, cols, 64); n++; }
+            for (int cols : { 0, 1, 2, 4 }) { failures += run_case(T, 1, T, st, cols, 64); n++; }
         }
+    }
+    // [GDN-COLWIDTH-DISPATCH] the automatic width table at the measured shapes (H = 48 v-heads)
+    typedef int (*auto_cols_fn)(int, int64_t, size_t);
+    auto_cols_fn ac = (auto_cols_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_fused_auto_cols");
+    if (ac != nullptr) {
+        struct { int sv; int64_t hs; size_t esz; int want; } tab[] = {
+            {128, 48, 4, 2}, {128, 96, 4, 4}, {128, 192, 4, 4}, {64, 48, 4, 1}, {64, 96, 4, 1}, {64, 192, 4, 2},
+            {128, 48, 2, 1}, {128, 96, 2, 1}, {128, 192, 2, 4}, {64, 192, 2, 1},
+        };
+        for (auto & e : tab) {
+            const int got = ac(e.sv, e.hs, e.esz);
+            const bool ok = got == e.want;
+            printf("auto-cols S_v=%d H*n_seqs=%lld state=%s -> %d (want %d) %s\n", e.sv, (long long) e.hs, e.esz == 4 ? "f32" : "bf16",
+                   got, e.want, ok ? "OK" : "FAIL");
+            failures += !ok; n++;
+        }
+    } else {
+        printf("auto-cols hook missing FAIL\n");
+        failures++; n++;
     }
     printf("%d/%d fused-vs-existing cases OK\n", n - failures, n);
     printf(failures == 0 ? "OK\n" : "FAIL (%d)\n", failures);
