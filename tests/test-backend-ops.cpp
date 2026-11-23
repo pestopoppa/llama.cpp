@@ -15603,6 +15603,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // [GDN-COLWIDTH] column-width sweep set (opt-in): K=n_tokens (the fused route), S_v {64,128}, 48 v-heads x n_seqs {1,2,4}
+    // (H*n_seqs*S_v 3k..24k), n_tokens {8,12,16}, F32/BF16 state; run with GGML_HIP_GDN_FUSED=1 and GGML_HIP_GDN_FUSED_COLS=1|2|4.
+    if (test_backend_ops_extra_case_set("gdn_colwidth")) {
+        for (ggml_type st : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+            for (int64_t sv : { 64, 128 }) {
+                for (int64_t ns : { 1, 2, 4 }) {
+                    for (int64_t nt : { 8, 12, 16 }) {
+                        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, sv, nt, ns, 3, false, false, /*K=*/nt, st));
+                    }
+                }
+            }
+        }
+    }
     // [GDN-FUSED-VARIANT] fused-kernel screen set (opt-in): S_v 128, 48 v-heads, n_seqs {1,4}, n_tokens {1,4,8,12,16},
     // F32/BF16 state, K=1 and K=n_tokens; run with GGML_HIP_GDN_FUSED unset vs =1.
     if (test_backend_ops_extra_case_set("gdn_fused")) {
