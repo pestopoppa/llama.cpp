@@ -276,6 +276,10 @@ if (GGML_HIP_TOPK_ASM_GFX90A)
     message(STATUS "GGML_HIP_TOPK_ASM_GFX90A: gfx90a AITER topksoftmax asm fast path embedded")
 endif()
 
+if (GGML_HIP_MMQ_CDNA_SMALL_TILE)
+    add_compile_definitions(GGML_HIP_MMQ_CDNA_SMALL_TILE)
+endif()
+
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
 endif()
