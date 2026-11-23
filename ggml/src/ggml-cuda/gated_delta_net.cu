@@ -1203,7 +1203,7 @@ static bool gdn_rows_try(const float * q_d, const float * k_d, const float * v_d
 // recurrent/rows kernels move BF16 state one 2-byte element at a time). K = T snapshots (the bandwidth-bound
 // ~3.1 MB/row F32 write) are issued as nontemporal (streaming) stores straight off the chain: the walk reads
 // only LDS, so they never stall it, and they do not evict the q/k/v working set from L2.
-// GGML_HIP_GDN_FUSED=1 enables it (default off: dispatch byte-identical to C18). Read per call, so a test can
+// [C19] default ON (served-gated np1 + np2); GGML_HIP_GDN_FUSED=0 opts out (dispatch byte-identical to C18). Read per call, so a test can
 // flip it between two launches in one process. Takes precedence over GGML_HIP_GDN_ROWS for the shapes it covers.
 // =====================================================================================================
 #define GDN_FU_WMAX    16
@@ -1221,7 +1221,7 @@ uint64_t ggml_cuda_gdn_fused_n_calls() {
 static bool gdn_fused_enabled() {
 #if defined(GGML_USE_HIP)
     const char * s = getenv("GGML_HIP_GDN_FUSED");
-    return s != nullptr && s[0] == '1';
+    return s == nullptr || s[0] != '0';   // [C19] default ON; GGML_HIP_GDN_FUSED=0 restores the C18 dispatch
 #else
     return false;
 #endif

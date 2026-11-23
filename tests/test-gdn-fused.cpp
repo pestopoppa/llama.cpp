@@ -91,7 +91,7 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
         for (size_t i = 0; i < ns; i++) { h[i] = ggml_fp32_to_bf16(s0f[i]).bits; }
     }
 
-    unsetenv("GGML_HIP_GDN_FUSED");
+    setenv("GGML_HIP_GDN_FUSED", "0", 1);   // [C19] fused is default ON: pin the reference to the unfused route
     const std::vector<float> ref = run(S, H_k, H, T, B, K, st, in);
     const uint64_t c0 = g_fused_calls ? g_fused_calls() : 0;
     setenv("GGML_HIP_GDN_FUSED", "1", 1);
