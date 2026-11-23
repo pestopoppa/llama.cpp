@@ -122,6 +122,10 @@ static int run_case(int64_t T, int64_t B, int64_t K, ggml_type st, int cols = 1,
 }
 
 int main() {
+    // The knob is read on the host at dispatch. CUDA/HIP graph replay of an identical graph skips host dispatch, so a
+    // knob flip between two runs could replay the previous run's kernels (seen: knob-on bit-identical to knob-off and the
+    // launch witness not advancing). Graphs off makes every run dispatch.
+    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
     ggml_backend_load_all();
     const char * bname = getenv("GDN_FUSED_BACKEND");
     g_backend = ggml_backend_init_by_name(bname && bname[0] ? bname : "ROCm0", nullptr);
