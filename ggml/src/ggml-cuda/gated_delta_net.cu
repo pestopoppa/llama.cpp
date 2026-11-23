@@ -1260,7 +1260,9 @@ static __device__ __forceinline__ void gdn_fu_st4(state_t * p, const float * o) 
         const float4 x = make_float4(o[0], o[1], o[2], o[3]);
 #if defined(GGML_USE_HIP)
         if constexpr (nt) {
-            __builtin_nontemporal_store(x, (float4 *) p);
+            typedef float gdn_fu_v4f __attribute__((ext_vector_type(4)));
+            const gdn_fu_v4f xv = { o[0], o[1], o[2], o[3] };
+            __builtin_nontemporal_store(xv, (gdn_fu_v4f *) p);
             return;
         }
 #endif
@@ -1274,7 +1276,9 @@ static __device__ __forceinline__ void gdn_fu_st4(state_t * p, const float * o) 
         }
 #if defined(GGML_USE_HIP)
         if constexpr (nt) {
-            __builtin_nontemporal_store(x, (uint2 *) p);
+            typedef unsigned int gdn_fu_v2u __attribute__((ext_vector_type(2)));
+            const gdn_fu_v2u xv = { x.x, x.y };
+            __builtin_nontemporal_store(xv, (gdn_fu_v2u *) p);
             return;
         }
 #endif
