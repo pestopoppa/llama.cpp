@@ -322,12 +322,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 
     # SPEC-ID-RAGGED-1: multi-sequence ragged rollback, snapshot and replay arms (qwen35 + qwen4exp synthetic)
-    foreach(arch qwen35 qwen4exp)
+    # test-llama-archs generates qwen4exp as MoE only
+    foreach(arch qwen35-dense qwen4exp-moe)
         llama_test(
             test-multiseq-ragged-rollback
             NAME test-multiseq-ragged-rollback-${arch}
             LABEL main
-            ARGS -m "${MODEL_DIR}/${arch}-dense.gguf"
+            ARGS -m "${MODEL_DIR}/${arch}.gguf"
         )
         set_tests_properties(test-multiseq-ragged-rollback-${arch} PROPERTIES
             FIXTURES_REQUIRED generate-models
