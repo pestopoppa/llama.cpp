@@ -78,7 +78,7 @@ static std::map<std::string, std::string> run_arm(const char * self, const char 
 
 int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "--child") == 0) return child();
-    const char * arms[] = { "-u GGML_MM_SMALLN -u GGML_MM_SMALLN_NTH", "GGML_MM_SMALLN=8 -u GGML_MM_SMALLN_NTH",
+    const char * arms[] = { "-u GGML_MM_SMALLN -u GGML_MM_SMALLN_NTH", "-u GGML_MM_SMALLN_NTH GGML_MM_SMALLN=8",
                             "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=12", "GGML_MM_SMALLN=8 GGML_MM_SMALLN_NTH=5" };
     auto ref = run_arm(argv[0], arms[0]);
     if (ref.size() != 5 * 8 * 4) { fprintf(stderr, "reference arm produced %zu cases\n", ref.size()); return 1; }
