@@ -913,6 +913,90 @@ static __global__ void gv_merge_kernel(
     dst[(((int64_t) seq * n_q_tot + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// GGML_HIP_VATTN_MERGE=2 (C22 VATTN-ROOFLINE-3, default OFF, independent of GGML_HIP_VATTN_RF): parallel split merge.
+// Same grid as gv_merge_kernel (one block per row r, kv head, virtual seq; thread d). The (m, l) pairs of all splits are
+// loaded in parallel (thread s loads split s), M and L are fixed-order LDS tree reductions, and the O sum runs with 4
+// independent accumulators combined in fixed order, so the 2 x n_splits serialized loads of the old merge become one
+// parallel load round plus n_splits/4 independent ones. Deterministic run to run (not bitwise equal to merge 1).
+#define GV_MERGE2_MAX_SPLITS GV_D
+static int gv_vattn_merge() {
+    static const int v = gv_env_int("GGML_HIP_VATTN_MERGE", 0);
+    return v;
+}
+
+static __global__ void __launch_bounds__(GV_D) gv_merge2_kernel(
+        const float * __restrict__ Opart, const float2 * __restrict__ MLpart, float * __restrict__ dst,
+        const int n_splits, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G) {
+    __shared__ float s_m[GV_MERGE2_MAX_SPLITS];
+    __shared__ float s_f[GV_MERGE2_MAX_SPLITS];
+    __shared__ float s_l[GV_MERGE2_MAX_SPLITS];
+    const int r    = blockIdx.x;
+    const int hkv  = blockIdx.y;
+    const int vseq = blockIdx.z;
+    const int n_seq = gridDim.z;
+    const int d    = threadIdx.x;
+    const int R    = gqa * G;
+    const int q0   = (vseq % n_grp) * G;
+    const int n_q  = min(G, n_q_tot - q0);
+    if (r >= gqa * n_q) {
+        return; // block-uniform
+    }
+    const int64_t row0   = (int64_t) vseq * n_head_kv * R + (int64_t) hkv * R + r;  // split 0
+    const int64_t sstride = (int64_t) n_seq * n_head_kv * R;                          // per split
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    if (d < n_splits) {
+        const float2 ml = MLpart[row0 + d * sstride];
+        if (ml.y > 0.0f) {
+            m = ml.x;
+            l = ml.y;
+        }
+    }
+    s_m[d] = m;
+    __syncthreads();
+#pragma unroll
+    for (int st = GV_MERGE2_MAX_SPLITS / 2; st > 0; st >>= 1) {
+        if (d < st) {
+            s_m[d] = fmaxf(s_m[d], s_m[d + st]);
+        }
+        __syncthreads();
+    }
+    const float M = s_m[0];
+    const float f = l > 0.0f ? __expf(m - M) : 0.0f;
+    s_f[d] = f;
+    s_l[d] = f * l;
+    __syncthreads();
+#pragma unroll
+    for (int st = GV_MERGE2_MAX_SPLITS / 2; st > 0; st >>= 1) {
+        if (d < st) {
+            s_l[d] += s_l[d + st];
+        }
+        __syncthreads();
+    }
+    const float L = s_l[0];
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int s = 0; s < n_splits; s += 4) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int sk = s + k;
+            if (sk < n_splits) {
+                const float fk = s_f[sk];
+                if (fk != 0.0f) {
+                    acc[k] += fk * Opart[(row0 + sk * sstride) * GV_D + d];
+                }
+            }
+        }
+    }
+    const float A = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    const int h = r / n_q;
+    const int q = q0 + r % n_q;
+    const int seq = vseq / n_grp;
+    const int n_head = n_head_kv * gqa;
+    dst[(((int64_t) seq * n_q_tot + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? A / L : 0.0f;
+}
+
 // GGML_CUDA_FA_GQA_VERIFY_DEBUG=1: the first 32 rejections of hd256 FA nodes are logged with their reason (WARN level, so that
 // llama-server's default verbosity shows them; ggml INFO lines are filtered there).
 static bool gv_reject(const ggml_tensor * dst, const char * why) {
@@ -1120,9 +1204,19 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 #undef GV_LAUNCH_K
     CUDA_CHECK(cudaGetLastError());
 
-    gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
-        Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+    const bool merge2 = gv_vattn_merge() == 2 && n_splits <= GV_MERGE2_MAX_SPLITS;
+    if (merge2) {
+        gv_merge2_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
+            Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+    } else {
+        gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
+            Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv, n_grp, G);
+    }
     CUDA_CHECK(cudaGetLastError());
+    static int n_merge2_calls = 0;
+    if (merge2 && n_merge2_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_MERGE=2 parallel merge ran (splits=%d)\n", n_splits);
+    }
 
     // path witness for the gate: emitted once per process, on the first call
     static int n_calls = 0;
