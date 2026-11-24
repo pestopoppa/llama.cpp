@@ -118,7 +118,7 @@ static int q8mf_env_int(const char * name, int def) {
 }
 
 struct q8mf_cfg {
-    int variant; int mmin; int mmax; int wg; int slc; int repack; int64_t min_bytes;
+    int variant; int mmin; int mmax; int wg; int slc; int repack; int64_t min_bytes; int sol;
 };
 
 static const q8mf_cfg & q8mf_get_cfg() {
@@ -129,6 +129,10 @@ static const q8mf_cfg & q8mf_get_cfg() {
             c.variant = 0;
         }
         c.slc     = q8mf_env_int("GGML_HIP_Q8_MF_SLC", 0) != 0 ? 1 : 0;
+        // AK-ASM-I8GEMM-PERCHANNEL-GEMV step 2 (TIMING ONLY, numerically WRONG): GGML_HIP_Q8_MF6_SOL=1 makes q8mf6 skip
+        // the per-block weight scales -- it streams 8192 of each 8704 B half-tile unit (the bytes a dense per-row int8
+        // layout would read: 32 B per 32 weights instead of 34 B) and uses dw = 1. Default off.
+        c.sol     = q8mf_env_int("GGML_HIP_Q8_MF6_SOL", 0) != 0 ? 1 : 0;
         c.mmin    = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_MIN", c.variant == 5 ? 1 : 9));
         c.mmax    = std::min(Q8MF_MAXM, q8mf_env_int("GGML_HIP_Q8_MF_MAX", 16));
         c.wg      = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_WG", 0));
@@ -1340,7 +1344,7 @@ static const char q8mf6_build_marker[] __attribute__((used)) =
 #define Q8MF6_HB    (32 * Q8MF_ROWB)   // 8704 B: half a packed stage
 #define Q8MF6_RED   2048
 
-template <int P, int AUX>
+template <int P, int AUX, int SOL>
 static __global__ void __launch_bounds__(Q8MF_NT, 4)
 q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
               const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
@@ -1354,7 +1358,8 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
     const int u1   = (int) (((int64_t) (g + 1) * U) / G);
 
     constexpr uint32_t OOB = 0x80000000u;
-    const uint32_t vb2 = tid < 32 ? (uint32_t) ((tid + 512) * 16) : OOB;
+    // SOL: chunks 512..543 (512 B = the 32 rows x 8 blocks x 2 B of per-block scales) are not loaded (OOB -> 0, no traffic)
+    const uint32_t vb2 = (!SOL && tid < 32) ? (uint32_t) ((tid + 512) * 16) : OOB;
     uint32_t ab[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -1415,7 +1420,7 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
                 w0 = p[0];
                 w1 = p[1];
             }
-            const float  dw = __half2float(*(const __half *) (lw + 34 * i));
+            const float  dw = SOL ? 1.0f : __half2float(*(const __half *) (lw + 34 * i));
             const int2   a  = *(const int2 *) (la + i * 512 + lane * 8);
             const float4 da = *(const float4 *) (la + Q8MF_KS * 512 + i * 64 + gq * 16);
             const q8mf_v4i z = {0, 0, 0, 0};
@@ -1503,6 +1508,9 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
         if (n_calls.fetch_add(1) == 0) {
             GGML_LOG_INFO("ggml_cuda_q8_mf: V5 4-WG/CU half-tile packed path ran (call 1, GGML_HIP_Q8_MF=6, P=%d, slc=%d, %s)\n",
                 p, cfg.slc, q8mf6_build_marker);
+            if (cfg.sol) {
+                GGML_LOG_WARN("ggml_cuda_q8_mf: GGML_HIP_Q8_MF6_SOL=1 engaged: per-block weight scales SKIPPED (timing only, output WRONG)\n");
+            }
         }
     }
     cudaStream_t stream = ctx.stream();
@@ -1525,11 +1533,17 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
-    if (cfg.slc) {
-        Q8MF6_L(2, 2);
+#define Q8MF6_L(PP, AA, SS) q8mf6_mul_mat<PP, AA, SS><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+    if (cfg.sol) {
+        if (cfg.slc) {
+            Q8MF6_L(2, 2, 1);
+        } else {
+            Q8MF6_L(2, 0, 1);
+        }
+    } else if (cfg.slc) {
+        Q8MF6_L(2, 2, 0);
     } else {
-        Q8MF6_L(2, 0);
+        Q8MF6_L(2, 0, 0);
     }
 #undef Q8MF6_L
     CUDA_CHECK(cudaGetLastError());
