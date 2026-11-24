@@ -645,7 +645,9 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 // K (logical k = 16s + 4kq + t <-> d = 64kq + 4s + t): lane (key li, kq) loads q8_0 blocks 2kq and 2kq+1 of its key (68 B,
 // 17 dwords) straight into registers and dequantizes them into the B fragment of each of the 16 QK^T MFMAs. The K load of
 // chunk c+1 is issued right after chunk c's QK^T, so it overlaps softmax + PV. V stays in LDS, transposed, single-buffered:
-// LDS = 12,288 + 1,024 + 3,072 = 16,384 B -> 4 WG (16 waves) per CU, and splits are sized for one 4-WG/CU round. With a
+// LDS = 12,288 + 1,024 + 3,072 = 16,384 B would admit 4 WG/CU, but the kernel needs ~180 VGPRs (o 64 + Q 32 + K raw 17 +
+// V raw + addressing): launch_bounds(256,4) spilled 294 VGPRs (636 B/lane scratch, -Rpass-analysis), so it is compiled
+// for 2 waves/SIMD = 2 WG/CU, and splits are sized for one 2-WG/CU round. With a
 // single V buffer the chunk keeps two block barriers (latency is hidden by the 4 resident WGs instead); the V/mask raw
 // registers are still loaded one chunk ahead, before the publishing barrier. Every active wave reads the K chunk (L2/L1
 // reuse, 4x K requests per WG, unchanged HBM bytes). Requires 4-byte-aligned K rows (host-checked).
@@ -1147,7 +1149,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     // lever 4 (RF=4): K register-direct kernel, 4 WG/CU; needs 4-byte-aligned K rows for the dword loads
     const bool rf4      = rf && gv_vattn_rf_level() == 4 && K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 &&
                           (uintptr_t) K->data % 4 == 0;
-    const int  rf_wgcu  = rf4 ? 4 : rf2 ? 1 : 2;
+    const int  rf_wgcu  = rf2 ? 1 : 2; // RF4: LDS admits 4 WG/CU, registers 2 (see gv_rf_kernel)
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -1206,7 +1208,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
     } else if (rf4) {
-        gv_rf_kernel<true, false, 4><<<grid, block, smem, stream>>>(
+        gv_rf_kernel<true, false, 2><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
