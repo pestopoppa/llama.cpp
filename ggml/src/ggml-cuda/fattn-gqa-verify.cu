@@ -114,6 +114,20 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
     return g >= 1 ? g : 0;
 }
 
+// GGML_HIP_VATTN_RF=1 (C22 VATTN-ROOFLINE-1, default OFF): occupancy-first launch regime for the single-sequence q8_0
+// verify shapes (n_seq 1, no row grouping, R = gqa*n_q <= 64). C21 launches 4-wave workgroups with 43.5 KB LDS -> 1 WG/CU,
+// and sizes splits as min(ceil(2*nsm/n_head_kv), n_kv/256): 128 WGs at kv 8k (512 waves, one CU in four runs a second
+// WG after the first finishes, so the kernel takes two WG lifetimes) and 208 at kv 32k. RF instead (a) runs the 16-key
+// LDS-cut kernel (24.8 KB, __launch_bounds__(256, 2): 2 WG = 8 waves per CU resident), (b) sizes splits to fill exactly
+// one resident round, splits = floor(2*nsm/n_head_kv) (52 on MI210 at 4 KV heads -> 208 WGs = 832 waves = 8 per CU,
+// no tail), (c) caps splits so the f32 partial-O write stays <= 1/2 of the KV bytes read (the merge traffic is otherwise
+// what the nq 8 shapes pay for a wide split) and so every split streams >= 8 chunks (128 keys). The merge is unchanged
+// and sums splits in index order, so the result is deterministic run to run.
+static bool gv_vattn_rf() {
+    static const bool v = gv_env_int("GGML_HIP_VATTN_RF", 0) != 0;
+    return v;
+}
+
 static bool gv_debug() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_DEBUG", 0) != 0;
     return v;
@@ -781,7 +795,9 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const int nwaves    = std::max(ntiles, GV_MIN_WAVES);
     GGML_ASSERT(ntiles <= GV_MAX_TILES);
     const bool pipe     = gv_pipe() && ntiles <= GV_PIPE_MAX_WAVES;
-    const bool cut      = gv_lds_cut() && pipe && nwaves == GV_MIN_WAVES;
+    const bool rf       = gv_vattn_rf() && pipe && nwaves == GV_MIN_WAVES && n_vseq == 1 && rows == nullptr &&
+                          K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -796,6 +812,16 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         n_splits = (2 * nsm + base - 1) / base;
         n_splits = std::min(n_splits, std::max(1, n_kv / 256));
         n_splits = std::min(n_splits, 256);
+    }
+    if (rf && gv_splits_env() <= 0) {
+        // one resident round at 2 WG/CU (see gv_vattn_rf)
+        int s_rf = std::max(1, (2 * nsm) / n_head_kv);
+        // partial-O traffic cap: splits * R * (D*4 + 8) <= 0.5 * n_kv * 2 * (K row bytes per head)
+        const int64_t kv_bytes_head = (int64_t) n_kv * (int64_t) (ggml_row_size(K->type, GV_D) + ggml_row_size(V->type, GV_D));
+        const int64_t cap_traffic   = std::max<int64_t>(1, kv_bytes_head / (2 * (int64_t) R * (GV_D * 4 + 8)));
+        s_rf = (int) std::min<int64_t>(s_rf, cap_traffic);
+        s_rf = std::min(s_rf, std::max(1, n_chunks / 8));
+        n_splits = s_rf;
     }
     n_splits = std::max(1, std::min(n_splits, n_chunks));
     const int chunks_per_split = (n_chunks + n_splits - 1) / n_splits;
@@ -864,6 +890,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_rows_calls = 0;
     if (rows && n_rows_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_ROWS_INPLACE in-place row-list K/V read ran (call 1)\n");
+    }
+    static int n_rf_calls = 0;
+    if (rf && n_rf_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF roofline launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
     }
     static int n_cut_calls = 0;
     if (cut && n_cut_calls++ == 0) {

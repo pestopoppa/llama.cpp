@@ -14240,6 +14240,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 8, 2, type_KV, 9));
         test_cases.emplace_back(new test_fa_gqa_verify(256, 16, 2, 16384, 8, 1, type_KV, 41));
     }
+    // C22 VATTN-ROOFLINE-1 (GGML_HIP_VATTN_RF=1, default off): 27B 24/4 q8_0 KV verify shapes nq 1/2/4/8, kv 8k/32k/64k,
+    // plus mid-chunk tails; with the env unset these gate the C21 kernel, with it set the RF launch regime.
+    for (int64_t kv : {8192, 32768, 65536}) {
+        for (int64_t nb : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 0));
+        }
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, 8, 1, GGML_TYPE_Q8_0, 1001));
+    }
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));
@@ -15309,6 +15317,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_fa_gqa_verify(256, hh[0], hh[1], kv, nb, 1, type_KV, 0));
                 }
             }
+        }
+    }
+
+    // C22 VATTN-ROOFLINE-1 perf: 27B 24/4 q8_0 verify, A/B GGML_HIP_VATTN_RF=1 vs unset (kv 8k/32k covered above at nb 1/2/5/8)
+    for (int64_t kv : {8192, 32768, 65536}) {
+        for (int64_t nb : {1, 2, 4, 8}) {
+            if (kv != 65536 && nb != 4) {
+                continue;
+            }
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q8_0, 0));
         }
     }
 
