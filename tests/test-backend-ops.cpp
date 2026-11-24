@@ -12694,6 +12694,28 @@ static void dtree_add_q8v5_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     }
 }
 
+// AK-BW-27B-ATTN-KV-CONCAT: 27B full-attention K/V (1024 x 5120 Q8_0, 5.6 MB) and the row-concatenated Q|K|V (14336 x 5120)
+// at verify widths. Eval: run with GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_KV_ROWS=1024 (arm a: the 1024-row
+// weights take q8mf6 while MIN_BYTES stays 6 MiB; a 48-row weight stays on the default path). Perf: q-alone (12288) vs
+// K/V (1024) vs concat (14336) at n 1/5/8 for the op-level stop rule (QKV_concat_ms <= q_alone_ms + 0.15 ms / verify).
+static void akqkvc_add_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> sh[] = {{1024, 5120}, {14336, 5120}, {48, 5120}, {1024, 2048}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 2, 3, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+        }
+    }
+}
+
+static void akqkvc_add_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> sh[] = {{1024, 5120}, {12288, 5120}, {14336, 5120}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+        }
+    }
+}
+
 // DTREE-0-Q8MF-V2 roofline table: the 27B Q8_0 verify shapes {m = rows, k} at M (= n) 1/8/12/16. Run with
 // GGML_HIP_Q8_MF=1|2 GGML_HIP_Q8_MF_MIN=1 to time the MF kernels at every M (GB/s = m * k * 34/32 / (us/op)).
 static void dtree_add_q8mf_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -12812,6 +12834,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
+    akqkvc_add_eval_cases(test_cases);          // AK-BW-27B-ATTN-KV-CONCAT
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
@@ -15274,6 +15297,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
+    akqkvc_add_perf_cases(test_cases);          // AK-BW-27B-ATTN-KV-CONCAT
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
     // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
     if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {

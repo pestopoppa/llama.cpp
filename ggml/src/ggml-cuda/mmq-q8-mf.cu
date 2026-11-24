@@ -119,6 +119,7 @@ static int q8mf_env_int(const char * name, int def) {
 
 struct q8mf_cfg {
     int variant; int mmin; int mmax; int wg; int slc; int repack; int64_t min_bytes;
+    int64_t rows_exact; int64_t rows_exact_min_k;   // AK-BW-27B-ATTN-KV-CONCAT arm (a)
 };
 
 static const q8mf_cfg & q8mf_get_cfg() {
@@ -137,9 +138,37 @@ static const q8mf_cfg & q8mf_get_cfg() {
         c.repack  = std::max(0, std::min(2, q8mf_env_int("GGML_HIP_Q8_MF_REPACK", 0)));
         const char * mb = getenv("GGML_HIP_Q8_MF_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (c.variant == 5 ? 0ll : (6ll << 20));
+        // AK-BW-27B-ATTN-KV-CONCAT arm (a): GGML_HIP_Q8_MF_KV_ROWS=R (default 0 = off) lets Q8_0 weights with EXACTLY R rows
+        // and K >= GGML_HIP_Q8_MF_KV_MIN_K (default 4096) bypass the MIN_BYTES floor. Targets the 27B full-attention K/V
+        // projections (1024 x 5120 Q8_0, 5.6 MB < 6 MiB) without routing tiny tensors (ssm_alpha/beta) the way MIN_BYTES=0 does.
+        c.rows_exact       = std::max(0, q8mf_env_int("GGML_HIP_Q8_MF_KV_ROWS", 0));
+        c.rows_exact_min_k = std::max(1, q8mf_env_int("GGML_HIP_Q8_MF_KV_MIN_K", 4096));
         return c;
     }();
     return cfg;
+}
+
+static const char q8mf_kv_rows_marker[] __attribute__((used)) =
+    "ggml-cuda: Q8_0 MF exact-row-count MIN_BYTES bypass (GGML_HIP_Q8_MF_KV_ROWS)";
+
+// size gate shared by the MF route and the in-place repack (they must agree, or a packed weight takes the natural path)
+static bool q8mf_size_ok(const ggml_tensor * w, const int64_t nbytes) {
+    const q8mf_cfg & cfg = q8mf_get_cfg();
+    if (nbytes >= (int64_t) INT32_MAX - 4096) {
+        return false;
+    }
+    if (nbytes > cfg.min_bytes) {
+        return true;
+    }
+    if (cfg.rows_exact > 0 && w->ne[1] == cfg.rows_exact && w->ne[0] >= cfg.rows_exact_min_k) {
+        static std::atomic<int> n_hit{0};
+        if (n_hit.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: KV_ROWS bypass engaged (GGML_HIP_Q8_MF_KV_ROWS=%lld, %s %lldx%lld, %lld B <= MIN_BYTES)\n",
+                (long long) cfg.rows_exact, w->name, (long long) w->ne[0], (long long) w->ne[1], (long long) nbytes);
+        }
+        return true;
+    }
+    return false;
 }
 
 bool ggml_cuda_q8_mf_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
@@ -156,7 +185,7 @@ bool ggml_cuda_q8_mf_eligible(const ggml_tensor * src0, const ggml_tensor * src1
             ggml_is_contiguous(src0) && src0->ne[0] % (32 * Q8MF5_KC) == 0 &&
             src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
             dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0 &&
-            nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096;
+            q8mf_size_ok(src0, nbytes);
     }
     return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= cfg.mmin && src1->ne[1] <= cfg.mmax &&
@@ -166,7 +195,7 @@ bool ggml_cuda_q8_mf_eligible(const ggml_tensor * src0, const ggml_tensor * src1
         ((uintptr_t) src0->data) % 16 == 0 &&             // dwordx4 weight chunks
         src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
         dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0 &&
-        nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096;
+        q8mf_size_ok(src0, nbytes);
 #else
     GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(cc);
     return false;
@@ -1100,7 +1129,6 @@ static bool q8ip_nopack_getrows() {
 }
 
 static bool q8ip_shape_ok(const ggml_tensor * t) {
-    const q8mf_cfg & cfg = q8mf_get_cfg();
     const int64_t nbytes = (int64_t) ggml_nbytes(t);
     // both DFlash2 GET_ROWS selectors (llama-arch.cpp: SELECTOR_PREV/NEXT -> GGML_OP_GET_ROWS); selector_hidden is a
     // MUL_MAT weight and stays packed
@@ -1114,7 +1142,7 @@ static bool q8ip_shape_ok(const ggml_tensor * t) {
     }
     return t->type == GGML_TYPE_Q8_0 && t->view_src == nullptr && t->ne[2] == 1 && t->ne[3] == 1 &&
         ggml_is_contiguous(t) && t->ne[0] % 256 == 0 && t->ne[1] % Q8MF_RT == 0 && ((uintptr_t) t->data) % 16 == 0 &&
-        nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096 && strncmp(t->name, "token_embd", 10) != 0;
+        q8mf_size_ok(t, nbytes) && strncmp(t->name, "token_embd", 10) != 0;
 }
 
 bool ggml_cuda_q8ip_want(const ggml_tensor * t, bool weights_buffer) {
