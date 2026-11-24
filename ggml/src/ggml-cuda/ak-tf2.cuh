@@ -20,3 +20,9 @@ void     ggml_cuda_ak_tf2_note(int group, const char * what);
 // G3
 bool ggml_cuda_ak_tf2_g3_supported(const ggml_tensor * add, const ggml_tensor * sp, const ggml_tensor * mul);
 void ggml_cuda_ak_tf2_g3(ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * sp, ggml_tensor * mul);
+
+// G5 (norm.cu)
+bool ggml_cuda_ak_tf2_g5_supported(const ggml_tensor * norm, const ggml_tensor * nw, const ggml_tensor * sl,
+                                   const ggml_tensor * out);
+void ggml_cuda_ak_tf2_g5(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * nw,
+                         const ggml_tensor * sl, ggml_tensor * out);

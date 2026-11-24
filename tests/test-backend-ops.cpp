@@ -4630,6 +4630,42 @@ struct test_ak_tf2_g3 : public test_ak_tf2_base {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE-2 G5 (GGML_CUDA_AK_TF2_G5=1): qwen35 build_norm_gated = MUL(MUL(RMS_NORM(x), w), SILU(z)), x / z
+// [ncols, n_heads, n_tokens]; z_view = z is a row-strided view (the qkvz split). Must not fuse: ncols 1536, a 2-row w.
+struct test_ak_tf2_g5 : public test_ak_tf2_base {
+    const int64_t ncols, nh, nt, w_rows;
+    const bool    z_view;
+    const float   eps;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_TF2_G5"; }
+    std::string vars() override { return VARS_TO_STR6(ncols, nh, nt, w_rows, z_view, eps); }
+    int  tf2_group() const override { return 5; }
+    bool tf2_eligible() const override { return ncols != 1536 && w_rows == 1; }
+
+    test_ak_tf2_g5(int64_t ncols, int64_t nh, int64_t nt, int64_t w_rows = 1, bool z_view = false, float eps = 1e-6f)
+        : ncols(ncols), nh(nh), nt(nt), w_rows(w_rows), z_view(z_view), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nh, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, w_rows);
+        ggml_set_name(w, "w");
+        ggml_tensor * z;
+        if (z_view) {
+            ggml_tensor * zz = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * ncols, nh, nt);
+            ggml_set_name(zz, "zz");
+            z = ggml_view_3d(ctx, zz, ncols, nh, nt, zz->nb[1], zz->nb[2], ncols * sizeof(float));
+        } else {
+            z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nh, nt);
+            ggml_set_name(z, "z");
+        }
+        ggml_tensor * nw  = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        ggml_tensor * out = ggml_mul(ctx, nw, ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
 // reachable from one root while keeping the fused chain contiguous in graph order.
@@ -13764,6 +13800,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 2));
     }
     test_cases.emplace_back(new test_ak_tf2_g3(48, 4, 3));
+
+    // AK-RF-27B-TAIL-FUSE-2 G5 (GGML_CUDA_AK_TF2_G5=1): 27B head_v_dim 128 x 48 v-heads, 256, a 1024-thread width, a
+    // row-strided z; 1536 and a 2-row w must not fuse
+    for (int64_t nt : { 1, 8, 16 }) {
+        test_cases.emplace_back(new test_ak_tf2_g5(128, 48, nt));
+        test_cases.emplace_back(new test_ak_tf2_g5(128, 48, nt, 1, true));
+        test_cases.emplace_back(new test_ak_tf2_g5(256, 16, nt));
+        test_cases.emplace_back(new test_ak_tf2_g5(2048, 4, nt));
+        test_cases.emplace_back(new test_ak_tf2_g5(1536, 4, nt));
+        test_cases.emplace_back(new test_ak_tf2_g5(128, 48, nt, 2));
+    }
+    for (float eps : { 0.0f, 1e-5f, 1.0f }) {
+        test_cases.emplace_back(new test_ak_tf2_g5(128, 48, 8, 1, false, eps));
+    }
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,
     // a ragged width, multi-channel rows; 1536 (float4 variant) and a broadcast weight are the must-not-fuse witnesses

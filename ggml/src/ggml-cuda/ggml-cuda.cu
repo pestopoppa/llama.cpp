@@ -3596,6 +3596,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // AK-RF-27B-TAIL-FUSE-2 G5: GDN gated norm RMS_NORM -> MUL(w) -> SILU(z) -> MUL in one launch (GGML_CUDA_AK_TF2_G5=1)
+    // (the model emits RESHAPE(z) between the two: no-op view nodes there are skipped, they run nothing on this backend)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_ak_tf2_enabled(5) && i + 3 < cgraph->n_nodes) {
+        int j = i + 2;
+        while (j < cgraph->n_nodes && j < i + 6 && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+            ++j;
+        }
+        if (j + 1 < cgraph->n_nodes) {
+            const int          idxs[4] = { i, i + 1, j, j + 1 };
+            const enum ggml_op ops[4]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+            const int          outs[1] = { j + 1 };
+            if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outs, 1) &&
+                ggml_cuda_ak_tf2_g5_supported(node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+                ggml_cuda_ak_tf2_g5(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1]);
+                return j + 1 - i;
+            }
+        }
+    }
+
     // AK-ASM-H14: rms_norm + mul + rope [+ view + set_rows] (GGML_CUDA_AK_H14=0 disables)
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_skip = ggml_cuda_ak_h14_try(*cuda_ctx, cgraph, i);

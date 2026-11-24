@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "ak-tf2.cuh"
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -904,4 +905,116 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// AK-RF-27B-TAIL-FUSE-2 G5 (GGML_CUDA_AK_TF2_G5=1, default off): qwen35 build_norm_gated = MUL(MUL(RMS_NORM(x), w), SILU(z))
+// in one launch. Unfused it is rms_norm_f32<bs, true> (n = scale * x * w) then unary_gated_op_kernel<op_silu>
+// (out = silu(z) * n): two launches per GDN layer. Same block size (256 below 1024 columns, else 1024; 1536 refused),
+// same column loop, reduction and expression order, so the output is bit-identical. The two inner nodes are elided.
+
+template <int block_size>
+static __global__ void ak_tf2_g5_kernel(const float * __restrict__ x, const int64_t stride_row, const int64_t stride_channel,
+                                        const int64_t stride_sample, const float * __restrict__ w,
+                                        const float * __restrict__ z, const int64_t z_s1, float * __restrict__ dst,
+                                        const int ncols, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    const int64_t r = ((int64_t) sample * nchannels + channel) * nrows + row;
+    x   += sample * stride_sample + channel * stride_channel + row * stride_row;
+    z   += r * z_s1;
+    dst += r * ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float n  = scale * x[col] * w[col];
+        const float zc = z[col];
+        dst[col] = (zc / (1.0f + expf(-zc))) * n;   // = op_silu(z) * n (ggml_cuda_op_silu_single)
+    }
+}
+
+// norm = RMS_NORM(x), nw = MUL(norm, w) (either order), sl = SILU(z), out = MUL(nw, sl) (either order). x F32 with
+// contiguous rows (ne[0] stride 1); w one contiguous F32 row of ncols; z F32 of out's shape with contiguous rows and a
+// uniform row stride (rows flat over dims 1..3, as unary_gated indexes it); out contiguous. Uses checked by the caller.
+bool ggml_cuda_ak_tf2_g5_supported(const ggml_tensor * norm, const ggml_tensor * nw, const ggml_tensor * sl,
+                                   const ggml_tensor * out) {
+    if (norm->op != GGML_OP_RMS_NORM || nw->op != GGML_OP_MUL || sl->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(sl) != GGML_UNARY_OP_SILU || out->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * w = nw->src[0] == norm ? nw->src[1] : (nw->src[1] == norm ? nw->src[0] : nullptr);
+    if (w == nullptr || w == norm) {
+        return false;
+    }
+    if (!((out->src[0] == nw && out->src[1] == sl) || (out->src[0] == sl && out->src[1] == nw))) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * z = sl->src[0];
+    for (const ggml_tensor * t : { x, w, z, norm, nw, sl, out }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t ncols = x->ne[0];
+    if (!ggml_are_same_shape(x, out) || !ggml_are_same_shape(nw, out) || !ggml_are_same_shape(z, out) ||
+        !ggml_is_contiguous(out) || !ggml_is_contiguous(w) || w->ne[0] != ncols || ggml_nrows(w) != 1 ||
+        ncols == 1536 || ncols > INT32_MAX || x->nb[0] != sizeof(float) || z->nb[0] != sizeof(float) ||
+        z->nb[1] % sizeof(float) != 0 || z->nb[2] != z->nb[1] * z->ne[1] || z->nb[3] != z->nb[2] * z->ne[2] ||
+        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 || x->nb[3] % sizeof(float) != 0 ||
+        x->ne[1] > INT32_MAX || x->ne[2] > 65535 || x->ne[3] > 65535) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    if (!(eps >= 0.0f)) {
+        return false;
+    }
+    // out must not overlap any input (each block reads its whole x row twice and writes its out row last)
+    const int64_t olo = (int64_t) out->data, ohi = olo + (int64_t) ggml_nbytes(out);
+    for (const ggml_tensor * t : { x, w, z }) {
+        const int64_t lo = (int64_t) t->data, hi = lo + (int64_t) ggml_nbytes(t);
+        if (!(ohi <= lo || hi <= olo)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_ak_tf2_g5(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * nw,
+                         const ggml_tensor * sl, ggml_tensor * out) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = nw->src[0] == norm ? nw->src[1] : nw->src[0];
+    const ggml_tensor * z = sl->src[0];
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int     ncols = (int) x->ne[0];
+    const int64_t sr = x->nb[1] / sizeof(float), sc = x->nb[2] / sizeof(float), ss = x->nb[3] / sizeof(float);
+    const dim3    blocks((unsigned) x->ne[1], (unsigned) x->ne[2], (unsigned) x->ne[3]);
+    ggml_cuda_ak_tf2_note(5, "gated rms_norm+mul+silu*mul");
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        ak_tf2_g5_kernel<256><<<blocks, 256, 32 * sizeof(float), stream>>>((const float *) x->data, sr, sc, ss,
+            (const float *) w->data, (const float *) z->data, z->nb[1] / sizeof(float), (float *) out->data, ncols, eps);
+    } else {
+        ak_tf2_g5_kernel<1024><<<blocks, 1024, 32 * sizeof(float), stream>>>((const float *) x->data, sr, sc, ss,
+            (const float *) w->data, (const float *) z->data, z->nb[1] / sizeof(float), (float *) out->data, ncols, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
