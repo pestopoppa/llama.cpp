@@ -45,7 +45,7 @@ static int child() {
         for (int th : threads) {
             ggml_backend_t be = ggml_backend_cpu_init();
             ggml_backend_cpu_set_n_threads(be, th);
-            ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+            ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
             ggml_context * cw = ggml_init(ip);
             ggml_context * ca = ggml_init(ip);
             ggml_tensor * W = ggml_new_tensor_2d(cw, GGML_TYPE_F32, tc.K, tc.N);
