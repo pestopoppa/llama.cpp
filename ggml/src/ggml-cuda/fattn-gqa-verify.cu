@@ -140,6 +140,16 @@ static bool gv_vattn_rf5() {
     return gv_vattn_rf_level() == 5;
 }
 
+// GGML_HIP_VATTN_RF=6 (C22 VATTN-ROOFLINE-4, default OFF): RF5 with 3 chunks of K/V in flight per WG instead of 1
+// (vattn-rf6-design-20261124). RF5 loads only from threads 0-127 with 2 register sets, so the WG blocks on chunk c while
+// only chunk c+1 is outstanding: 17.4 KB per CU, a 74 % Little's-law cap. RF6 splits the loads across both wave pairs:
+// group 0 (threads 0-127) owns chunks j = 0,2 mod 4 of the split, group 1 (threads 128-255) owns j = 1,3 mod 4, each
+// thread keeping RF5's two register sets (same VGPRs, same 2 WG/CU). The loop is unrolled by 4, so at chunk j the
+// chunks j+1..j+3 are outstanding: 52 KB per CU. Same per-chunk arithmetic and chunk order as RF5 (bit-identical).
+static bool gv_vattn_rf6() {
+    return gv_vattn_rf_level() == 6;
+}
+
 static bool gv_debug() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_DEBUG", 0) != 0;
     return v;
@@ -385,8 +395,9 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
     constexpr int VTSTR = KC + 8;
     constexpr int PSTR  = KC + 8;
-    constexpr bool RF5  = RF == 5;
-    static_assert(!RF5 || (KV_Q8 && PIPE && LATE && !ROWS && KC == GV_KC_CUT), "RF5 = q8_0 LATE pipelined 16-key cut, no ROWS");
+    constexpr bool RF6  = RF == 6;
+    constexpr bool RF5  = RF == 5 || RF6; // RF6 = RF5 chunk step and prologue, deeper load pipeline
+    static_assert(!RF5 || (KV_Q8 && PIPE && LATE && !ROWS && KC == GV_KC_CUT), "RF5/RF6 = q8_0 LATE pipelined 16-key cut, no ROWS");
     extern __shared__ char gv_smem[];
     _Float16 * sK   = (_Float16 *) gv_smem;
     _Float16 * sVt  = sK + KC * GV_KSTR;
@@ -663,17 +674,20 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
         struct __attribute__((packed, aligned(2))) gv_q8_w1 { uint32_t w; };
         gv_rf5_set sa;
         gv_rf5_set sb;
+        // RF6: a set is loaded/stored by one 128-thread group; lt = thread index in the group, ln = group size
+        const int lt = RF6 ? tid % 128 : tid;
+        const int ln = RF6 ? 128 : nthreads;
         auto load_set = [&](gv_rf5_set & r, const int c) __attribute__((always_inline)) {
             const int kbase = c * KC;
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
-                const int i = tid + s * nthreads;
+                const int i = lt + s * ln;
                 if (i < n_q * KC) {
                     r.rm[s] = *(const uint16_t *) (Mb + (i / KC) * nb31 + (int64_t) (kbase + i % KC) * sizeof(half));
                 }
             }
-            if (tid < KC * (GV_D / QK8_0)) {
-                const int b = tid / KC, key = tid % KC;
+            if (lt < KC * (GV_D / QK8_0)) {
+                const int b = lt / KC, key = lt % KC;
                 const char * pk = Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0);
                 const char * pv = Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0);
                 const gv_q8_w8 * qk = (const gv_q8_w8 *) pk;
@@ -694,15 +708,15 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
             int any = 0;
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
-                const int i = tid + s * nthreads;
+                const int i = lt + s * ln;
                 if (i < n_q * KC) {
                     const float mv = __half2float(__ushort_as_half(r.rm[s]));
                     smask[i] = mv;
                     any |= mv != -INFINITY;
                 }
             }
-            if (tid < KC * (GV_D / QK8_0)) {
-                const int b = tid / KC, key = tid % KC;
+            if (lt < KC * (GV_D / QK8_0)) {
+                const int b = lt / KC, key = lt % KC;
                 auto hk = [&](const int k) -> uint16_t { return k == QK8_0 / 2 ? (uint16_t) (r.kt >> 16) : (uint16_t) (r.kw[k / 2] >> (16 * (k % 2))); };
                 auto hv = [&](const int k) -> uint16_t { return k == QK8_0 / 2 ? (uint16_t) (r.vt >> 16) : (uint16_t) (r.vw[k / 2] >> (16 * (k % 2))); };
                 const float dk = __half2float(__ushort_as_half(hk(0)));
@@ -727,6 +741,39 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
             }
             return any;
         };
+        if constexpr (RF6) {
+        // chunk j = c - c_begin: owner group j % 2 (wave-uniform: waves 0-1 / 2-3), set sa for j % 4 < 2, sb otherwise
+        const int grp = tid / 128;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            if ((u & 1) == grp && c_begin + u < c_end) {
+                load_set(u < 2 ? sa : sb, c_begin + u);
+            }
+        }
+        for (int c = c_begin; c < c_end; c += 4) {
+            bool done = false;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                if (c + u >= c_end) {
+                    done = true;
+                    break;
+                }
+                gv_rf5_set & r = u < 2 ? sa : sb;
+                const bool mine = (u & 1) == grp;
+                const int live = __syncthreads_or(mine ? store_set(r) : 0);
+                if (mine && c + u + 4 < c_end) {
+                    load_set(r, c + u + 4);
+                }
+                if (live) {
+                    gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                }
+                __syncthreads();
+            }
+            if (done) {
+                break;
+            }
+        }
+        } else {
         if (c_begin < c_end) {
             load_set(sa, c_begin);
         }
@@ -753,6 +800,7 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                 gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
             }
             __syncthreads();
+        }
         }
         } else {
         if (c_begin < c_end) {
@@ -1128,6 +1176,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
     const bool q_al16   = (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0;
     const bool rf5      = rf && cut && gv_vattn_rf5() && gv_prefetch_late() && q_al16;
+    const bool rf6      = rf && cut && gv_vattn_rf6() && gv_prefetch_late() && q_al16;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -1180,7 +1229,9 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         mask->nb[1], mask->nb[3], ne33, rows, rows_s1)
 #define GV_LAUNCH(Q8, PIPE_, LATE_, ROWS_) do { if (cut) { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC_CUT); } else { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC); } } while (0)
 #define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)
-    if (rf5) {
+    if (rf6) {
+        GV_LAUNCH_K(true, true, true, false, GV_KC_CUT, 6);
+    } else if (rf5) {
         GV_LAUNCH_K(true, true, true, false, GV_KC_CUT, 5);
     } else if (late) {
         GV_LAUNCH_R(true, true, true);
@@ -1240,6 +1291,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_rf5_calls = 0;
     if (rf5 && n_rf5_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=5 chain-cut launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
+    }
+    static int n_rf6_calls = 0;
+    if (rf6 && n_rf6_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=6 deep-prefetch launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
     }
     static int n_cut_calls = 0;
     if (cut && n_cut_calls++ == 0) {
