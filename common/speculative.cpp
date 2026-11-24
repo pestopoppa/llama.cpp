@@ -1824,6 +1824,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             p /= sum;
                         }
                         if (common_speculative_q_match_enabled()) {
+                            static std::atomic<bool> logged{false};
+                            if (!logged.exchange(true)) {
+                                LOG_INF("llama_dflash_q_match: ENABLED (LLAMA_DFLASH_Q_MATCH=1; top_k %d top_p %.3f min_p %.3f)\n",
+                                        dp.top_k, dp.top_p, dp.min_p);
+                            }
                             common_speculative_q_match(dist.probs, dp.top_k, dp.top_p, dp.min_p);
                         }
                         std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
