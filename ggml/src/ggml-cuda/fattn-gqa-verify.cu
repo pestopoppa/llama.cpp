@@ -427,12 +427,29 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
         const int h = valid ? r / n_q : 0;
         const int q = valid ? r % n_q : 0;
         const float * Qr = (const float *) (Q + seq * nb03 + (int64_t) (hkv * gqa + h) * nb02 + (int64_t) (q0 + q) * nb01);
+        if constexpr (RF5) {
+            // piece 5: unconditional 16 B loads (Qr is row 0 of the head when !valid, always in bounds; the host
+            // requires 16 B aligned Q data and strides), then a select: one wait instead of 64 branch+load+wait.
+            float4 qv[GV_D / 16];
+#pragma unroll
+            for (int s = 0; s < GV_D / 16; ++s) {
+                qv[s] = *(const float4 *) (Qr + 16 * s + 4 * kq);
+            }
+#pragma unroll
+            for (int s = 0; s < GV_D / 16; ++s) {
+                qa[s][0] = valid ? (_Float16) qv[s].x : (_Float16) 0.0f;
+                qa[s][1] = valid ? (_Float16) qv[s].y : (_Float16) 0.0f;
+                qa[s][2] = valid ? (_Float16) qv[s].z : (_Float16) 0.0f;
+                qa[s][3] = valid ? (_Float16) qv[s].w : (_Float16) 0.0f;
+            }
+        } else {
 #pragma unroll
         for (int s = 0; s < GV_D / 16; ++s) {
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 qa[s][t] = valid ? (_Float16) Qr[16 * s + 4 * kq + t] : (_Float16) 0.0f;
             }
+        }
         }
     }
 
@@ -1027,7 +1044,8 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool rf       = gv_vattn_rf() && pipe && nwaves == GV_MIN_WAVES && n_vseq == 1 && rows == nullptr &&
                           K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
     const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
-    const bool rf5      = rf && cut && gv_vattn_rf5() && gv_prefetch_late();
+    const bool q_al16   = (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0;
+    const bool rf5      = rf && cut && gv_vattn_rf5() && gv_prefetch_late() && q_al16;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
