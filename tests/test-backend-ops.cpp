@@ -4519,6 +4519,31 @@ struct test_ak_add_rms_norm : public test_case {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE G4 (= AK-BW-27B-ACTQUANT-FUSE GGML_HIP_ACTQ_FUSE bit 0): Q8_0 x F32 MUL_MAT on the gfx90a skinny
+// split-K path with the dst zero-fill folded into the activation-quantize launch. dst is pre-filled with uniform noise by
+// initialize_tensors, so a missing or short zero-fill (rows past the grid-stride, ragged N, a skipped column) is an error.
+// Run with GGML_HIP_ACTQ_FUSE=1; the fold's path witness is the backend log line "ggml_cuda_actq: q8sk zero-fold ran".
+// Own op name so a gate can select exactly these cases (-o AK_Q8SK_ZERO_FOLD). Off by default: ordinary MUL_MAT cases.
+struct test_ak_q8sk_zero_fold : public test_case {
+    const int64_t m, n, k;   // dst [m, n] = W [k, m]^T x [k, n]
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_Q8SK_ZERO_FOLD"; }
+    std::string vars() override { return VARS_TO_STR3(m, n, k); }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_ak_q8sk_zero_fold(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // AK-ASM-H15: gated-DeltaNet decode conv chain as emitted by llm_build_delta_net_base::build_conv_state +
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
@@ -13630,6 +13655,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    // AK-RF-27B-TAIL-FUSE G4 (GGML_HIP_ACTQ_FUSE=1): the <= 6 MiB 27B / A3B skinny shapes, a ragged N, and a K = 256 x
+    // N = 20000 shape whose N*M zero-fill (up to 320k floats) far exceeds the quantize grid (16 blocks x 256 threads), so the
+    // grid-stride loop is exercised; n 4 / 17 are the edges that must fall back off the skinny path
+    {
+        static const std::array<int64_t, 2> g4_shapes[] = {{1024, 5120}, {512, 2048}, {2048, 512}, {32, 2048}, {1000, 2304}, {20000, 256}};
+        for (const auto & sh : g4_shapes) {
+            for (int64_t nt : { 4, 5, 8, 12, 16, 17 }) {
+                test_cases.emplace_back(new test_ak_q8sk_zero_fold(sh[0], nt, sh[1]));
+            }
         }
     }
 
