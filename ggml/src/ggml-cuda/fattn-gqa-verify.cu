@@ -123,8 +123,8 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
 // no tail), (c) caps splits so the f32 partial-O write stays <= 1/2 of the KV bytes read (the merge traffic is otherwise
 // what the nq 8 shapes pay for a wide split) and so every split streams >= 8 chunks (128 keys). The merge is unchanged
 // and sums splits in index order, so the result is deterministic run to run.
-// GGML_HIP_VATTN_RF=2 adds lever 2 (double-buffered LDS, one barrier per chunk, see gv_rf_kernel). Any other nonzero value
-// is lever 1 only.
+// GGML_HIP_VATTN_RF=2 adds lever 2 (double-buffered LDS, one barrier per chunk, see gv_rf_kernel); =4 adds lever 4 (K
+// register-direct, 4 WG/CU). Any other nonzero value is lever 1 only.
 static int gv_vattn_rf_level() {
     static const int v = gv_env_int("GGML_HIP_VATTN_RF", 0);
     return v;
@@ -640,6 +640,15 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 // barrier. Thread roles: tid < 128 own one K block (key, b), tid >= 128 one V block (RF1: tid < 128 own both, 128 idle).
 // LDS = 2 x (8,448 + 12,288 + 1,024) + 3,072 = 46,592 B -> 1 WG (4 waves) per CU; splits are sized for that round.
 // Per-key arithmetic, dequant rounding and the merge are unchanged (deterministic split order).
+//
+// GGML_HIP_VATTN_RF=4 (lever 4, KDIRECT): no K in LDS. The MFMA k order is free, so d is permuted consistently in Q and
+// K (logical k = 16s + 4kq + t <-> d = 64kq + 4s + t): lane (key li, kq) loads q8_0 blocks 2kq and 2kq+1 of its key (68 B,
+// 17 dwords) straight into registers and dequantizes them into the B fragment of each of the 16 QK^T MFMAs. The K load of
+// chunk c+1 is issued right after chunk c's QK^T, so it overlaps softmax + PV. V stays in LDS, transposed, single-buffered:
+// LDS = 12,288 + 1,024 + 3,072 = 16,384 B -> 4 WG (16 waves) per CU, and splits are sized for one 4-WG/CU round. With a
+// single V buffer the chunk keeps two block barriers (latency is hidden by the 4 resident WGs instead); the V/mask raw
+// registers are still loaded one chunk ahead, before the publishing barrier. Every active wave reads the K chunk (L2/L1
+// reuse, 4x K requests per WG, unchanged HBM bytes). Requires 4-byte-aligned K rows (host-checked).
 #define GV_RF_KC    16
 #define GV_RF_VTSTR (GV_RF_KC + 8)
 #define GV_RF_PSTR  (GV_RF_KC + 8)
@@ -761,6 +770,19 @@ static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
             qt = qb->tail;
         }
     };
+    // KDIRECT: this lane's 2 q8_0 blocks of key li (blocks 2kq, 2kq+1), raw
+    uint32_t kr[KDIRECT ? 17 : 1];
+    auto kload = [&](const int c) __attribute__((always_inline)) {
+        if constexpr (KDIRECT) {
+            const uint32_t * pk = (const uint32_t *) (Kb + (int64_t) (c * KC + li) * nb11 + kq * 2 * (int64_t) sizeof(block_q8_0));
+#pragma unroll
+            for (int t = 0; t < 17; ++t) {
+                kr[t] = pk[t];
+            }
+        } else {
+            GGML_UNUSED(c);
+        }
+    };
     auto raw_h = [&](const int k) __attribute__((always_inline)) -> uint16_t {
         return k == QK8_0 / 2 ? qt : (uint16_t) (qw[k / 2] >> (16 * (k % 2)));
     };
@@ -804,12 +826,30 @@ static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
 
     // S = Q K^T, online softmax, P -> sP (wave-local), O = O*alpha + P V, for one 16-key chunk from buffer b
     auto compute = [&](const int b, const int c) __attribute__((always_inline)) {
-        GGML_UNUSED(c);
         float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         const float * smask = smk_of(b);
         if (tile_active) {
             gv_floatx4 S = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
-            {
+            if constexpr (KDIRECT) {
+                // block 0: d at bytes 0-1, qs at 2..33; block 1: d at 34-35, qs at 36..67
+                const float d0 = __half2float(__ushort_as_half((uint16_t) kr[0]));
+                const float d1 = __half2float(__ushort_as_half((uint16_t) (kr[8] >> 16)));
+#pragma unroll
+                for (int s = 0; s < GV_D / 16; ++s) {
+                    gv_halfx4 kb;
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const int e   = 4 * s + t;
+                        const int off = e < QK8_0 ? 2 + e : 36 + (e - QK8_0);
+                        const int8_t q = (int8_t) (kr[off >> 2] >> (8 * (off & 3)));
+                        kb[t] = (_Float16) ((e < QK8_0 ? d0 : d1) * (float) q);
+                    }
+                    S = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S, 0, 0, 0);
+                }
+                if (c + 1 < c_end) {
+                    kload(c + 1); // in flight during softmax + PV of this chunk
+                }
+            } else {
                 const _Float16 * sK = sK_of(b);
 #pragma unroll
                 for (int s = 0; s < GV_D / 16; ++s) {
@@ -866,6 +906,9 @@ static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
         if (c_begin + 1 < c_end) {
             load_raw(c_begin + 1);
         }
+        if (KDIRECT && tile_active && c_begin < c_end) {
+            kload(c_begin);
+        }
         for (int c = c_begin; c < c_end; ++c) {
             const int live = __syncthreads_or(any); // the one barrier of the chunk: publishes buffer c&1
             if (c + 1 < c_end) {
@@ -876,11 +919,16 @@ static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
             }
             if (live) {
                 compute((c - c_begin) & 1, c);
+            } else if (KDIRECT && tile_active && c + 1 < c_end) {
+                kload(c + 1);
             }
         }
     } else {
         if (c_begin < c_end) {
             load_raw(c_begin);
+            if (KDIRECT && tile_active) {
+                kload(c_begin);
+            }
         }
         for (int c = c_begin; c < c_end; ++c) {
             const int any = store_raw(0);
@@ -890,6 +938,8 @@ static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
             const int live = __syncthreads_or(any);
             if (live) {
                 compute(0, c);
+            } else if (KDIRECT && tile_active && c + 1 < c_end) {
+                kload(c + 1);
             }
             __syncthreads();
         }
@@ -1094,7 +1144,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
     // lever 2 (RF=2): dedicated double-buffered kernel, 1 WG/CU; lever 1 (RF=1): LDS-cut kernel, 2 WG/CU
     const bool rf2      = rf && gv_vattn_rf_level() == 2;
-    const int  rf_wgcu  = rf2 ? 1 : 2;
+    // lever 4 (RF=4): K register-direct kernel, 4 WG/CU; needs 4-byte-aligned K rows for the dword loads
+    const bool rf4      = rf && gv_vattn_rf_level() == 4 && K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 &&
+                          (uintptr_t) K->data % 4 == 0;
+    const int  rf_wgcu  = rf4 ? 4 : rf2 ? 1 : 2;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -1131,7 +1184,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     cudaStream_t stream = ctx.stream();
     const dim3 grid(n_splits, n_head_kv, n_vseq);
     const dim3 block(64 * nwaves);
-    const size_t smem = rf2 ? gv_rf_smem_bytes(false, true) : gv_smem_bytes(nwaves, kc);
+    const size_t smem = rf4 ? gv_rf_smem_bytes(true, false) : rf2 ? gv_rf_smem_bytes(false, true) : gv_smem_bytes(nwaves, kc);
 
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
@@ -1149,6 +1202,11 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 #define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)
     if (rf2) {
         gv_rf_kernel<false, true, 1><<<grid, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+    } else if (rf4) {
+        gv_rf_kernel<true, false, 4><<<grid, block, smem, stream>>>(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
             Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
@@ -1196,6 +1254,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_rf_calls = 0;
     if (rf && n_rf_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF roofline launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
+    }
+    static int n_rf4_calls = 0;
+    if (rf4 && n_rf4_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=4 K-register-direct launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
     }
     static int n_rf2_calls = 0;
     if (rf2 && n_rf2_calls++ == 0) {
