@@ -4738,6 +4738,14 @@ private:
                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
+                        {
+                            // DF2-QMATCH-1: hand the request truncation to the drafter (used only with LLAMA_DFLASH_Q_MATCH=1)
+                            auto & dpq = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dpq.top_k = slot.task->params.sampling.top_k;
+                            dpq.top_p = slot.task->params.sampling.top_p;
+                            dpq.min_p = slot.task->params.sampling.min_p;
+                        }
+
                         // AK-DTREE-1: tree width of this round (0 = chain)
                         slot.spec_tree_alts.clear();
                         slot.spec_tree_arm     = -1;

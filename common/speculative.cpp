@@ -1823,6 +1823,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (float & p : dist.probs) {
                             p /= sum;
                         }
+                        if (common_speculative_q_match_enabled()) {
+                            common_speculative_q_match(dist.probs, dp.top_k, dp.top_p, dp.min_p);
+                        }
                         std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
                         predecessor = sample(selector_rng[seq_id]);
                         main_idx.push_back(predecessor);
@@ -3150,6 +3153,52 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     }
 
     return n_max;
+}
+
+bool common_speculative_q_match_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DFLASH_Q_MATCH");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+void common_speculative_q_match(std::vector<float> & probs, int32_t top_k, float top_p, float min_p) {
+    const size_t n = probs.size();
+    if (n == 0) {
+        return;
+    }
+    std::vector<size_t> ord(n);
+    for (size_t i = 0; i < n; ++i) { ord[i] = i; }
+    std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return probs[a] > probs[b]; });
+    size_t keep = n;
+    if (top_k > 0 && (size_t) top_k < keep) {
+        keep = (size_t) top_k;
+    }
+    if (top_p < 1.0f) {
+        double tot = 0.0, cum = 0.0;
+        for (size_t i = 0; i < keep; ++i) { tot += probs[ord[i]]; }
+        size_t k = 0;
+        while (k < keep) {
+            cum += probs[ord[k]];
+            ++k;
+            if (cum >= top_p * tot) { break; }
+        }
+        keep = std::max<size_t>(k, 1);
+    }
+    if (min_p > 0.0f) {
+        const float thr = min_p * probs[ord[0]];
+        size_t k = 1;
+        while (k < keep && probs[ord[k]] >= thr) { ++k; }
+        keep = k;
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i < keep) { sum += probs[ord[i]]; } else { probs[ord[i]] = 0.0f; }
+    }
+    if (sum > 0.0) {
+        for (size_t i = 0; i < keep; ++i) { probs[ord[i]] = (float) (probs[ord[i]] / sum); }
+    }
 }
 
 void common_speculative_cap_draft(llama_tokens & draft, std::vector<common_speculative_token_dist> * dists, int32_t cap) {

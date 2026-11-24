@@ -27,6 +27,12 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // SPEC-DISTS-TRUNC: truncate a draft to `cap` tokens and its per-token draft distributions with it (when aligned),
 // so a capped draft keeps the rejection-sampling verify path
+// DF2-QMATCH-1: truncate a normalised proposal in place by top_k, then top_p, then min_p (the target chain's order),
+// zeroing dropped entries (index alignment with the selector candidates is kept) and renormalising. Exact under
+// rejection sampling as long as the same q is drawn from and passed as the verify dist.
+void common_speculative_q_match(std::vector<float> & probs, int32_t top_k, float top_p, float min_p);
+bool common_speculative_q_match_enabled();
+
 void common_speculative_cap_draft(llama_tokens & draft, std::vector<common_speculative_token_dist> * dists, int32_t cap);
 
 // return the max number of draft tokens based on the speculative parameters
@@ -72,6 +78,11 @@ struct common_speculative_draft_params {
     // (DFlash2, greedy) also writes up to 2 alternative root-to-leaf paths, each the same length as *result
     int32_t tree_nodes = 0;
     std::vector<llama_tokens> * tree_alts = nullptr;
+
+    // DF2-QMATCH-1: the request's truncation, applied to the DFlash2 proposal q when LLAMA_DFLASH_Q_MATCH=1 (T > 0)
+    int32_t top_k = 0;     // <= 0: off
+    float   top_p = 1.0f;  // >= 1: off
+    float   min_p = 0.0f;  // <= 0: off
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
