@@ -770,6 +770,11 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // SPEC-BSAMP: per-row mode (llama_spec_backend_sampling_enabled): the sequence of every output row the graph
+    // sampled, in output order; the graph is only reusable for a ubatch with the same row -> sequence layout
+    bool by_row = false;
+    std::vector<llama_seq_id> row_seqs;
 };
 
 //
@@ -987,6 +992,9 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+
+    // SPEC-BSAMP: true when the four maps above are keyed by the ubatch-local output row instead of the seq id
+    bool sampled_by_row = false;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;

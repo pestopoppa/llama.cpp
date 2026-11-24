@@ -692,6 +692,22 @@ static void llama_sampler_chain_free(struct llama_sampler * smpl) {
     delete chain;
 }
 
+bool llama_spec_backend_sampling_enabled(void) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SPEC_BACKEND_SAMPLING");
+        const bool v = e != nullptr && e[0] == '1';
+        if (v) {
+            fprintf(stderr, "llama_spec_backend_sampling: ENABLED (LLAMA_SPEC_BACKEND_SAMPLING=1; per-row backend "
+                            "sampling, stateless chain prefix on device, final draw on host)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+// SPEC-BSAMP: defined after the sampler ifaces below
+static bool llama_sampler_spec_prefix_kind(const struct llama_sampler * smpl, bool * transparent);
+
 static bool llama_sampler_chain_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft) {
@@ -703,8 +719,28 @@ static bool llama_sampler_chain_backend_init(
 
     bool res = true;
 
+    // SPEC-BSAMP: strict prefix; the first sampler that is not stateless-offloadable ends it
+    const bool spec_prefix = llama_spec_backend_sampling_enabled();
+    bool prefix_open = true;
+
     for (auto & smpl : chain->samplers) {
         bool res_cur = true;
+
+        if (spec_prefix) {
+            bool transparent = false;
+            const bool ok = prefix_open && llama_sampler_spec_prefix_kind(smpl.ptr, &transparent);
+            if (!ok) {
+                prefix_open = false;
+                smpl.is_backend = false;
+                res = false;
+                continue;
+            }
+            if (transparent) {
+                // identity on this chain's params (neutral penalties): skipped on both sides, accept() still runs
+                smpl.is_backend = true;
+                continue;
+            }
+        }
 
         // to be able to run a sampler on the backend, it has to:
         // - have the .backend_init() API implemented
@@ -718,6 +754,10 @@ static bool llama_sampler_chain_backend_init(
         }
 
         smpl.is_backend = res_cur;
+
+        if (spec_prefix && !res_cur) {
+            prefix_open = false;
+        }
 
         res = res && res_cur;
     }
@@ -3591,6 +3631,30 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
     /* .backend_apply     = */ llama_sampler_logit_bias_backend_apply,
     /* .backend_set_input = */ llama_sampler_logit_bias_backend_set_input,
 };
+
+// SPEC-BSAMP: may this sampler sit in the device prefix of a per-row (speculative) chain? Only samplers whose
+// backend graph has no per-call input tensor qualify, since one sampler object is applied once per output row and
+// an input set once per sequence would be shared (dist's uniform) or left unset (logit bias inputs) on all but
+// the last row. *transparent = the sampler is the identity for its params (no device op, nothing to skip wrongly).
+static bool llama_sampler_spec_prefix_kind(const struct llama_sampler * smpl, bool * transparent) {
+    *transparent = false;
+    if (smpl->iface == &llama_sampler_penalties_i) {
+        const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
+        *transparent = ctx->penalty_last_n == 0 ||
+            (ctx->penalty_repeat == 1.0f && ctx->penalty_freq == 0.0f && ctx->penalty_present == 0.0f);
+        return *transparent;
+    }
+    if (smpl->iface == &llama_sampler_logit_bias_i) {
+        const auto * ctx = (const llama_sampler_logit_bias *) smpl->ctx;
+        *transparent = ctx->logit_bias.empty();
+        return *transparent;
+    }
+    if (smpl->iface == &llama_sampler_dist_i) {
+        return false; // the draw stays on the host (stateful rng / position-keyed rng)
+    }
+    return smpl->iface->backend_init != nullptr && smpl->iface->backend_apply != nullptr &&
+           smpl->iface->backend_set_input == nullptr;
+}
 
 struct llama_sampler * llama_sampler_init_logit_bias(
                          int32_t   n_vocab,

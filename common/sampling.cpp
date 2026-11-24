@@ -422,7 +422,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
-    if (params.rng_poskey && params.backend_sampling) {
+    // SPEC-BSAMP: with LLAMA_SPEC_BACKEND_SAMPLING=1 the dist sampler never leaves the host (only the stateless chain
+    // prefix is offloaded), so the position-keyed draw is unchanged and backend sampling may stay on
+    if (params.rng_poskey && params.backend_sampling && !llama_spec_backend_sampling_enabled()) {
         LOG_WRN("%s: backend sampling does not implement the position-keyed RNG (rng_poskey), disabling backend sampling\n", __func__);
 
         params.backend_sampling = false;

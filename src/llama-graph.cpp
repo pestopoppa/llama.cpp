@@ -1668,6 +1668,18 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
+    if (by_row) {
+        std::vector<llama_seq_id> cur;
+        for (uint32_t i = 0; i < params.ubatch.n_tokens; i++) {
+            if (params.ubatch.output[i]) {
+                cur.push_back(params.ubatch.seq_id[i][0]);
+            }
+        }
+        if (cur != row_seqs) {
+            return false;
+        }
+    }
+
     for (const auto & [seq_id, sampler] : params.samplers) {
         if (samplers[seq_id] != sampler) {
             return false;
@@ -1706,6 +1718,7 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_sampled_probs.clear();
+    sampled_by_row = false;
     t_sampled_logits.clear();
     t_candidates.clear();
 
@@ -4498,6 +4511,70 @@ void llm_graph_context::build_sampling() const {
 
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
+
+    if (llama_spec_backend_sampling_enabled()) {
+        // SPEC-BSAMP: one sampler application per OUTPUT ROW (a speculative verify batch has several rows per
+        // sequence). Maps are keyed by the ubatch-local output row. Only the stateless chain prefix is on the
+        // device here (llama_sampler_spec_prefix_kind), so applying one sampler object to several rows is exact.
+        auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+        inp_sampling->by_row = true;
+
+        int32_t row = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+            inp_sampling->row_seqs.push_back(seq_id);
+
+            const auto it = samplers.find(seq_id);
+            if (it != samplers.end()) {
+                llama_sampler * sampler = it->second;
+
+                ggml_tensor * logits_row = ggml_view_1d(ctx0, res->t_logits, res->t_logits->ne[0], row * res->t_logits->nb[1]);
+                ggml_format_name(logits_row, "logits_row_%d", row);
+
+                struct llama_sampler_data data = {
+                    /*.logits      =*/ logits_row,
+                    /*.probs       =*/ nullptr,
+                    /*.sampled     =*/ nullptr,
+                    /*.candidates  =*/ nullptr,
+                };
+
+                assert(sampler->iface->backend_apply);
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+                // logits are always emitted (also when the device prefix was all-transparent and left the view
+                // untouched): raw logits are not downloaded for rows that have a backend sampler (needs_raw_logits)
+                if (data.sampled != nullptr) {
+                    ggml_set_output(data.sampled);
+                    ggml_build_forward_expand(gf, data.sampled);
+                    res->t_sampled[row] = data.sampled;
+                }
+                if (data.probs != nullptr) {
+                    ggml_set_output(data.probs);
+                    ggml_build_forward_expand(gf, data.probs);
+                    res->t_sampled_probs[row] = data.probs;
+                }
+                if (data.logits != nullptr) {
+                    data.logits = ggml_cont(ctx0, data.logits);
+                    ggml_set_output(data.logits);
+                    ggml_build_forward_expand(gf, data.logits);
+                    res->t_sampled_logits[row] = data.logits;
+                }
+                if (data.candidates != nullptr) {
+                    ggml_set_output(data.candidates);
+                    ggml_build_forward_expand(gf, data.candidates);
+                    res->t_candidates[row] = data.candidates;
+                }
+            }
+            row++;
+        }
+
+        res->sampled_by_row = true;
+        res->add_input(std::move(inp_sampling));
+        return;
+    }
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));

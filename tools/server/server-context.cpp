@@ -2856,8 +2856,13 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            // speculative decoding requires multiple samples per batch: supported only by the SPEC-BSAMP per-row mode
+            // (LLAMA_SPEC_BACKEND_SAMPLING=1), and only at T > 0, where every verify row goes through
+            // common_sampler_sample (the T <= 0 greedy/tree accept paths read raw logits, which are not downloaded
+            // for rows that have a backend sampler)
+            if (slot.can_speculate()) {
+                backend_sampling &= llama_spec_backend_sampling_enabled() && task.params.sampling.temp > 0.0f;
+            }
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;

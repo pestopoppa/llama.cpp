@@ -2080,6 +2080,14 @@ static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubat
     return seq_to_row;
 }
 
+static std::map<llama_seq_id, uint32_t> build_row_to_output_row(int64_t n_outputs, uint32_t row_offset) {
+    std::map<llama_seq_id, uint32_t> row_to_row;
+    for (int64_t r = 0; r < n_outputs; ++r) {
+        row_to_row[(llama_seq_id) r] = row_offset + (uint32_t) r;
+    }
+    return row_to_row;
+}
+
 static void copy_tensor_async_ints(
     const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
     const buffer_view<llama_token> & sampled,
@@ -2532,7 +2540,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+            // SPEC-BSAMP: per-row graphs key the tensor maps by the ubatch-local output row
+            const auto seq_to_output_row = res->sampled_by_row ? build_row_to_output_row(n_outputs, n_outputs_prev)
+                                                               : build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host

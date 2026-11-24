@@ -1423,6 +1423,12 @@ extern "C" {
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
 
+    // SPEC-BSAMP: LLAMA_SPEC_BACKEND_SAMPLING=1 (read once, default off). Backend samplers then run on EVERY output
+    // row of a sequence (multi-row speculative verify batches), and a sampler chain offloads only its stateless
+    // leading prefix (top-k/top-p/min-p/temp, empty logit bias, neutral penalties). The final draw (dist, incl. the
+    // position-keyed dist) stays on the host, so the verifier sees the post-chain p per row and keeps its RNG keys.
+    LLAMA_API bool llama_spec_backend_sampling_enabled(void);
+
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
