@@ -15335,6 +15335,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // AK-GVFATTN-Q4KV perf cells (the 18 decision cells of ak-gvfattn-q4kv-gpu-20261124-r3): 27B 24/4 hd256, kv 8192/16384/32768,
+    // nb 1/4/8, q8_0 and q4_0, tail 23 -- the same shapes as the eval block, so perf mode times what correctness gated.
+    // A/B: GGML_CUDA_FA_GQA_Q4KV=1 (q4_0 native gv_fattn) vs unset (q4_0 -> C6 convert path; q8_0 unchanged = A/A).
+    for (int64_t kv : {8192, 16384, 32768}) {
+        for (int64_t nb : {1, 4, 8}) {
+            for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, type_KV, 23));
+            }
+        }
+    }
+
     // C8-1-LCATTN: 27B np4 DFlash2 verify (4 seqs x 9 rows, unified KV, q8_0), A/B GGML_HIP_GV_MULTISEQ=1 vs =0
     for (int64_t kv : {32768, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext_unified(256, 256, 4, 6, kv, 36, 4, kv/4, 0, 0.0f, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 4));
