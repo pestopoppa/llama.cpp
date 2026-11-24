@@ -15,6 +15,26 @@ static constexpr bool ggml_cuda_mmq_h3_iglp0_allowed(ggml_type type, int J, bool
              (type == GGML_TYPE_Q4_K   && J == 32 && !fallback) ||
              (type == GGML_TYPE_IQ2_XS && J == 16 &&  fallback));
 }
+
+// AK-MMQ-H3-NAN-DIAGNOSE: iglp_opt must be fenced by sched_barrier(0) on both sides. On ROCm 6.2 (LLVM 18) the IGLP
+// DAG mutation resets the edges of the iglp_opt pseudo, which sits on the side-effect barrier chain between the caller's
+// __syncthreads() and this function's LDS reads. With those edges gone the scheduler hoisted s_barrier above the
+// load_tiles ds_writes, so vec_dot ds_reads ran against LDS other waves had not written yet (inf/NaN, 1038/1202).
+// sched_barrier(0) is a scheduling-region boundary, so the mutation is confined to the vec_dot body and can no longer
+// move anything across the caller's barriers.
+template <bool enabled> struct ggml_cuda_mmq_h3_iglp0_region {
+    __device__ __forceinline__ ggml_cuda_mmq_h3_iglp0_region() {
+        if constexpr (enabled) {
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_iglp_opt(0);
+        }
+    }
+    __device__ __forceinline__ ~ggml_cuda_mmq_h3_iglp0_region() {
+        if constexpr (enabled) {
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    }
+};
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
@@ -154,9 +174,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #if defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0) // AK-MMQ-H3: default-off compile-time arm
-    if constexpr (ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)) {
-        __builtin_amdgcn_iglp_opt(0); // AK-MMQ-H3 arm gfx90a.iglp_opt0
-    }
+    const ggml_cuda_mmq_h3_iglp0_region<ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)> h3_region; // AK-MMQ-H3 arm gfx90a.iglp_opt0
+    GGML_UNUSED(h3_region);
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
@@ -331,9 +350,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #if defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0) // AK-MMQ-H3: default-off compile-time arm
-    if constexpr (ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)) {
-        __builtin_amdgcn_iglp_opt(0); // AK-MMQ-H3 arm gfx90a.iglp_opt0
-    }
+    const ggml_cuda_mmq_h3_iglp0_region<ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)> h3_region; // AK-MMQ-H3 arm gfx90a.iglp_opt0
+    GGML_UNUSED(h3_region);
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
@@ -504,9 +522,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #if defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0) // AK-MMQ-H3: default-off compile-time arm
-    if constexpr (ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)) {
-        __builtin_amdgcn_iglp_opt(0); // AK-MMQ-H3 arm gfx90a.iglp_opt0
-    }
+    const ggml_cuda_mmq_h3_iglp0_region<ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)> h3_region; // AK-MMQ-H3 arm gfx90a.iglp_opt0
+    GGML_UNUSED(h3_region);
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -709,9 +726,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #if defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0) // AK-MMQ-H3: default-off compile-time arm
-    if constexpr (ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)) {
-        __builtin_amdgcn_iglp_opt(0); // AK-MMQ-H3 arm gfx90a.iglp_opt0
-    }
+    const ggml_cuda_mmq_h3_iglp0_region<ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)> h3_region; // AK-MMQ-H3 arm gfx90a.iglp_opt0
+    GGML_UNUSED(h3_region);
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -1051,9 +1067,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #if defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0) // AK-MMQ-H3: default-off compile-time arm
-    if constexpr (ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)) {
-        __builtin_amdgcn_iglp_opt(0); // AK-MMQ-H3 arm gfx90a.iglp_opt0
-    }
+    const ggml_cuda_mmq_h3_iglp0_region<ggml_cuda_mmq_h3_iglp0_allowed(type, J, fallback)> h3_region; // AK-MMQ-H3 arm gfx90a.iglp_opt0
+    GGML_UNUSED(h3_region);
 #endif // defined(__gfx90a__) && defined(GGML_HIP_MMQ_H3_IGLP0)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
