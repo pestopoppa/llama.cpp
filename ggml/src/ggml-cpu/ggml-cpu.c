@@ -1476,8 +1476,8 @@ static uint64_t ggml_cpu_router_bf16_fp(const struct ggml_tensor * t) {
     const uint32_t * w = (const uint32_t *) t->data;
     const int64_t ne = ggml_nelements(t);
     uint64_t h = 1469598103934665603ull;
-    for (int64_t k = 0; k < 257; k++) {
-        const int64_t i = (ne - 1) * k / 256;
+    for (int64_t k = 0; k < 4097; k++) {
+        const int64_t i = (ne - 1) * k / 4096;
         h ^= w[i]; h *= 1099511628211ull;
     }
     return h;

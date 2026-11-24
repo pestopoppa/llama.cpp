@@ -58,7 +58,9 @@ static int child() {
             ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             ggml_backend_buffer_t ba = ggml_backend_alloc_ctx_tensors(ca, be);
 
-            uint64_t sx = 0x9E3779B97F4A7C15ull ^ (uint64_t) tc.K * 31 ^ (uint64_t) tc.N;
+            uint64_t sx = 0x9E3779B97F4A7C15ull ^ (uint64_t) tc.K * 31 ^ (uint64_t) tc.N ^ ((uint64_t) (&tc - CASES) << 40);
+            // distinct contents per case: a freed-and-reused weight address is caught by the sampled fingerprint,
+            // which cannot see a single-element change (weights are immutable for a model's lifetime)
             auto rnd = [&]() { sx ^= sx << 13; sx ^= sx >> 7; sx ^= sx << 17; return (float) ((int64_t) (sx % 200001) - 100000) / 77777.0f; };
             std::vector<float> w((size_t) ggml_nelements(W));
             for (auto & v : w) {
