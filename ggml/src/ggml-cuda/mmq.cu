@@ -7,6 +7,13 @@
 #include <atomic>
 #include <cstdint>
 
+#if defined(GGML_HIP_MMQ_H3_IGLP0)
+// AK-MMQ-H3 build-marker witness: present in libggml-hip.so iff the iglp_opt(0) arm was compiled in
+// (`strings libggml-hip.so | grep AK-MMQ-H3-IGLP0-BUILD-MARKER`).
+extern "C" __attribute__((used)) const char ggml_hip_mmq_h3_iglp0_build_marker[] =
+    "AK-MMQ-H3-IGLP0-BUILD-MARKER: gfx90a iglp_opt(0) in MMQ vec_dot_*_mma, ISA-gate narrowed";
+#endif // defined(GGML_HIP_MMQ_H3_IGLP0)
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:

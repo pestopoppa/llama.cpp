@@ -119,6 +119,11 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
+if (GGML_HIP_MMQ_H3_IGLP0)
+    add_compile_definitions(GGML_HIP_MMQ_H3_IGLP0)
+    message(STATUS "GGML_HIP_MMQ_H3_IGLP0: AK-MMQ-H3 iglp_opt(0) arm compiled into MMQ")
+endif()
+
 if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
 endif()
