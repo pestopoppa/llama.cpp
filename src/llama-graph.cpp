@@ -4571,6 +4571,28 @@ void llm_graph_context::build_sampling() const {
             row++;
         }
 
+        // SPEC-BSAMP witness (once per process): one sequence got per-row device sampling on >= 2 output rows (a
+        // speculative verify batch) and the device prefix emitted candidates for them (top-k ran on the device)
+        {
+            static bool witnessed = false;
+            if (!witnessed) {
+                std::map<llama_seq_id, int32_t> rows_per_seq;
+                for (size_t r = 0; r < inp_sampling->row_seqs.size(); ++r) {
+                    if (samplers.count(inp_sampling->row_seqs[r]) && res->t_candidates.count((llama_seq_id) r)) {
+                        rows_per_seq[inp_sampling->row_seqs[r]]++;
+                    }
+                }
+                for (const auto & kv : rows_per_seq) {
+                    if (kv.second >= 2) {
+                        witnessed = true;
+                        fprintf(stderr, "llama_spec_backend_sampling: per-row device prefix engaged (seq %d: %d rows with "
+                                        "device candidates)\n", (int) kv.first, kv.second);
+                        break;
+                    }
+                }
+            }
+        }
+
         res->sampled_by_row = true;
         res->add_input(std::move(inp_sampling));
         return;
