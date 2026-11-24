@@ -123,9 +123,14 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
 // no tail), (c) caps splits so the f32 partial-O write stays <= 1/2 of the KV bytes read (the merge traffic is otherwise
 // what the nq 8 shapes pay for a wide split) and so every split streams >= 8 chunks (128 keys). The merge is unchanged
 // and sums splits in index order, so the result is deterministic run to run.
-static bool gv_vattn_rf() {
-    static const bool v = gv_env_int("GGML_HIP_VATTN_RF", 0) != 0;
+// GGML_HIP_VATTN_RF=2 adds lever 2 (double-buffered LDS, one barrier per chunk, see gv_rf_kernel). Any other nonzero value
+// is lever 1 only.
+static int gv_vattn_rf_level() {
+    static const int v = gv_env_int("GGML_HIP_VATTN_RF", 0);
     return v;
+}
+static bool gv_vattn_rf() {
+    return gv_vattn_rf_level() != 0;
 }
 
 static bool gv_debug() {
@@ -626,6 +631,295 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 }
 
+// GGML_HIP_VATTN_RF=2 (C22 VATTN-ROOFLINE-2, lever 2): double-buffered LDS q8_0 verify kernel for the RF shapes (n_vseq 1,
+// no row list, R <= 64 -> 4 waves, q8_0 K/V). KC = 16. sK / sVt / smask are ping-pong buffers; the raw q8_0 blocks are
+// register-prefetched two chunks ahead of the compute: in iteration c the block-wide barrier publishes buffer c&1, then
+// the raw registers (chunk c+1) are dequantized into buffer (c+1)&1, the global loads of chunk c+2 are issued, and chunk
+// c is computed from buffer c&1. Buffer (c+1)&1 was last read by chunk c-1, which every wave finished before the barrier,
+// so ONE barrier per chunk suffices (C21 / RF1: two). sP is per wave, so the P store -> P load hazard needs only a wave
+// barrier. Thread roles: tid < 128 own one K block (key, b), tid >= 128 one V block (RF1: tid < 128 own both, 128 idle).
+// LDS = 2 x (8,448 + 12,288 + 1,024) + 3,072 = 46,592 B -> 1 WG (4 waves) per CU; splits are sized for that round.
+// Per-key arithmetic, dequant rounding and the merge are unchanged (deterministic split order).
+#define GV_RF_KC    16
+#define GV_RF_VTSTR (GV_RF_KC + 8)
+#define GV_RF_PSTR  (GV_RF_KC + 8)
+#define GV_RF_NT    (64 * GV_MIN_WAVES)
+
+static size_t gv_rf_smem_bytes(const bool kdirect, const bool db) {
+    const size_t buf = sizeof(_Float16) * (size_t) ((kdirect ? 0 : GV_RF_KC * GV_KSTR) + GV_D * GV_RF_VTSTR) +
+                       sizeof(float) * (size_t) (GV_MAX_NQ * GV_RF_KC);
+    return (db ? 2 : 1) * buf + sizeof(_Float16) * (size_t) (GV_MIN_WAVES * 16 * GV_RF_PSTR);
+}
+
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+// LDS written and read back by the same wave: in-order per wave, only the compiler must not reorder across this point
+static __device__ __forceinline__ void gv_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#endif
+
+template <bool KDIRECT, bool DB, int MINB>
+static __global__ void __launch_bounds__(GV_RF_NT, MINB) gv_rf_kernel(
+        const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
+        const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
+        const float scale, const int n_q, const int gqa, const int n_head_kv,
+        const int chunks_per_split, const int n_chunks,
+        const int64_t nb01, const int64_t nb02, const int64_t nb11, const int64_t nb12,
+        const int64_t nb21, const int64_t nb22, const int64_t nb31) {
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+    constexpr int KC    = GV_RF_KC;
+    constexpr int VTSTR = GV_RF_VTSTR;
+    constexpr int PSTR  = GV_RF_PSTR;
+    constexpr int SK_H  = KDIRECT ? 0 : KC * GV_KSTR;            // halves
+    constexpr int BUF_B = 2 * (SK_H + GV_D * VTSTR) + 4 * GV_MAX_NQ * KC; // bytes per buffer
+    extern __shared__ char gv_smem[];
+    auto sK_of   = [&](const int b) __attribute__((always_inline)) { return (_Float16 *) (gv_smem + b * BUF_B); };
+    auto sVt_of  = [&](const int b) __attribute__((always_inline)) { return (_Float16 *) (gv_smem + b * BUF_B) + SK_H; };
+    auto smk_of  = [&](const int b) __attribute__((always_inline)) { return (float *) ((_Float16 *) (gv_smem + b * BUF_B) + SK_H + GV_D * VTSTR); };
+
+    const int split = blockIdx.x;
+    const int hkv   = blockIdx.y;
+    const int tid   = threadIdx.x;
+    const int w     = tid / 64;
+    const int l     = tid % 64;
+    const int li    = l % 16;
+    const int kq    = l / 16;
+
+    const int R      = gqa * n_q;
+    const int ntiles = (R + 15) / 16;
+    const bool tile_active = w < ntiles;
+    _Float16 * sP = (_Float16 *) (gv_smem + (DB ? 2 : 1) * BUF_B) + w * 16 * PSTR;
+
+    const char * Kb = K + hkv * nb12;
+    const char * Vb = V + hkv * nb22;
+    const char * Mb = mask;
+
+    gv_halfx4 qa[GV_D / 16];
+    {
+        const int r = 16 * w + li;
+        const bool valid = tile_active && r < R;
+        const int h = valid ? r / n_q : 0;
+        const int q = valid ? r % n_q : 0;
+        const float * Qr = (const float *) (Q + (int64_t) (hkv * gqa + h) * nb02 + (int64_t) q * nb01);
+#pragma unroll
+        for (int s = 0; s < GV_D / 16; ++s) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                // KDIRECT: MFMA k index permuted consistently in Q and K: logical k = 16s+4kq+t <-> d = 64kq+4s+t
+                const int d = KDIRECT ? 64 * kq + 4 * s + t : 16 * s + 4 * kq + t;
+                qa[s][t] = valid ? (_Float16) Qr[d] : (_Float16) 0.0f;
+            }
+        }
+    }
+
+    gv_floatx4 o[GV_D / 16];
+#pragma unroll
+    for (int nb = 0; nb < GV_D / 16; ++nb) {
+        o[nb] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    float m_run[4];
+    float l_run[4];
+    int   row_q[4];
+    bool  row_ok[4];
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        m_run[v] = -FLT_MAX / 2.0f;
+        l_run[v] = 0.0f;
+        const int r = 16 * w + 4 * kq + v;
+        row_ok[v] = tile_active && r < R;
+        row_q[v]  = row_ok[v] ? r % n_q : 0;
+    }
+
+    const int c_begin = split * chunks_per_split;
+    const int c_end   = min(c_begin + chunks_per_split, n_chunks);
+
+    // raw q8_0 block of this thread's role (34 B as 8 dwords + tail), mask halfword
+    struct __attribute__((packed, aligned(2))) gv_q8_raw { uint32_t w[8]; uint16_t tail; };
+    const bool is_v    = KDIRECT ? true : tid >= 128;
+    const bool has_blk = KDIRECT ? tid < 128 : true;
+    const int  bi      = tid & 127;
+    const int  bb      = bi / KC;  // q8_0 block index along d
+    const int  bkey    = bi % KC;
+    uint32_t qw[8];
+    uint16_t qt = 0;
+    uint16_t rm = 0;
+
+    auto load_raw = [&](const int c) __attribute__((always_inline)) {
+        const int kbase = c * KC;
+        if (tid < n_q * KC) {
+            rm = *(const uint16_t *) (Mb + (tid / KC) * nb31 + (int64_t) (kbase + tid % KC) * sizeof(half));
+        }
+        if (has_blk) {
+            const char * p = is_v ? Vb + (int64_t) (kbase + bkey) * nb21 : Kb + (int64_t) (kbase + bkey) * nb11;
+            const gv_q8_raw * qb = (const gv_q8_raw *) (p + bb * (int64_t) sizeof(block_q8_0));
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                qw[t] = qb->w[t];
+            }
+            qt = qb->tail;
+        }
+    };
+    auto raw_h = [&](const int k) __attribute__((always_inline)) -> uint16_t {
+        return k == QK8_0 / 2 ? qt : (uint16_t) (qw[k / 2] >> (16 * (k % 2)));
+    };
+    auto store_raw = [&](const int b) __attribute__((always_inline)) -> int {
+        int any = 0;
+        uint32_t x0 = qt, x1 = rm;
+        asm volatile("" : "+v"(x0), "+v"(x1));
+        qt = (uint16_t) x0; rm = (uint16_t) x1;
+        if (tid < n_q * KC) {
+            const float mv = __half2float(__ushort_as_half(rm));
+            smk_of(b)[tid] = mv;
+            any = mv != -INFINITY;
+        }
+        if (has_blk) {
+            const float dq = __half2float(__ushort_as_half(raw_h(0)));
+            if (!is_v) {
+                _Float16 * sK = sK_of(b);
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    _Float16 tmp[8];
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const uint16_t u = raw_h(1 + 4 * g + t);
+                        tmp[2 * t + 0] = (_Float16) (dq * (float) (int8_t) (u & 0xFF));
+                        tmp[2 * t + 1] = (_Float16) (dq * (float) (int8_t) (u >> 8));
+                    }
+                    *(uint4 *) (sK + bkey * GV_KSTR + bb * QK8_0 + 8 * g) = *(const uint4 *) tmp;
+                }
+            } else {
+                _Float16 * sVt = sVt_of(b);
+#pragma unroll
+                for (int t = 0; t < QK8_0 / 2; ++t) {
+                    const uint16_t u = raw_h(1 + t);
+                    sVt[(bb * QK8_0 + 2 * t + 0) * VTSTR + bkey] = (_Float16) (dq * (float) (int8_t) (u & 0xFF));
+                    sVt[(bb * QK8_0 + 2 * t + 1) * VTSTR + bkey] = (_Float16) (dq * (float) (int8_t) (u >> 8));
+                }
+            }
+        }
+        return any;
+    };
+
+    // S = Q K^T, online softmax, P -> sP (wave-local), O = O*alpha + P V, for one 16-key chunk from buffer b
+    auto compute = [&](const int b, const int c) __attribute__((always_inline)) {
+        GGML_UNUSED(c);
+        float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        const float * smask = smk_of(b);
+        if (tile_active) {
+            gv_floatx4 S = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+            {
+                const _Float16 * sK = sK_of(b);
+#pragma unroll
+                for (int s = 0; s < GV_D / 16; ++s) {
+                    const gv_halfx4 kb = *(const gv_halfx4 *) (sK + li * GV_KSTR + 16 * s + 4 * kq);
+                    S = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S, 0, 0, 0);
+                }
+            }
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const float mv = row_ok[v] ? smask[row_q[v] * KC + li] : -INFINITY;
+                S[v] = S[v] * scale + mv;
+                float rmax = S[v];
+#pragma unroll
+                for (int off = 1; off < 16; off <<= 1) {
+                    rmax = fmaxf(rmax, __shfl_xor(rmax, off, 64));
+                }
+                rmax = fmaxf(rmax, -FLT_MAX / 2.0f);
+                const float m_new = fmaxf(m_run[v], rmax);
+                alpha[v] = __expf(m_run[v] - m_new);
+                const float p = __expf(S[v] - m_new);
+                sP[(4 * kq + v) * PSTR + li] = (_Float16) p;
+                float rsum = p;
+#pragma unroll
+                for (int off = 1; off < 16; off <<= 1) {
+                    rsum += __shfl_xor(rsum, off, 64);
+                }
+                l_run[v] = l_run[v] * alpha[v] + rsum;
+                m_run[v] = m_new;
+            }
+        }
+        gv_wave_sync();
+        if (tile_active) {
+            const _Float16 * sVt = sVt_of(b);
+            const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * PSTR + 4 * kq);
+#pragma unroll
+            for (int nb = 0; nb < GV_D / 16; ++nb) {
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    o[nb][v] *= alpha[v];
+                }
+                const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * VTSTR + 4 * kq);
+                o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
+            }
+        }
+        gv_wave_sync(); // sP is rewritten by the next chunk of this wave
+    };
+
+    if constexpr (DB) {
+        int any = 0;
+        if (c_begin < c_end) {
+            load_raw(c_begin);
+            any = store_raw(0);
+        }
+        if (c_begin + 1 < c_end) {
+            load_raw(c_begin + 1);
+        }
+        for (int c = c_begin; c < c_end; ++c) {
+            const int live = __syncthreads_or(any); // the one barrier of the chunk: publishes buffer c&1
+            if (c + 1 < c_end) {
+                any = store_raw((c + 1 - c_begin) & 1);
+            }
+            if (c + 2 < c_end) {
+                load_raw(c + 2);
+            }
+            if (live) {
+                compute((c - c_begin) & 1, c);
+            }
+        }
+    } else {
+        if (c_begin < c_end) {
+            load_raw(c_begin);
+        }
+        for (int c = c_begin; c < c_end; ++c) {
+            const int any = store_raw(0);
+            if (c + 1 < c_end) {
+                load_raw(c + 1);
+            }
+            const int live = __syncthreads_or(any);
+            if (live) {
+                compute(0, c);
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tile_active) {
+        const int64_t base_row = ((int64_t) split * n_head_kv + hkv) * R;
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            if (!row_ok[v]) {
+                continue;
+            }
+            const int r = 16 * w + 4 * kq + v;
+            float * Or = Opart + (base_row + r) * GV_D;
+#pragma unroll
+            for (int nb = 0; nb < GV_D / 16; ++nb) {
+                Or[nb * 16 + li] = o[nb][v];
+            }
+            if (li == 0) {
+                MLpart[base_row + r] = make_float2(m_run[v], l_run[v]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
+        nb01, nb02, nb11, nb12, nb21, nb22, nb31);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+}
+
 // one block per (row r, kv head, seq), one thread per d
 static __global__ void gv_merge_kernel(
         const float * __restrict__ Opart, const float2 * __restrict__ MLpart, float * __restrict__ dst,
@@ -798,6 +1092,9 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool rf       = gv_vattn_rf() && pipe && nwaves == GV_MIN_WAVES && n_vseq == 1 && rows == nullptr &&
                           K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
     const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
+    // lever 2 (RF=2): dedicated double-buffered kernel, 1 WG/CU; lever 1 (RF=1): LDS-cut kernel, 2 WG/CU
+    const bool rf2      = rf && gv_vattn_rf_level() == 2;
+    const int  rf_wgcu  = rf2 ? 1 : 2;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -815,7 +1112,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     }
     if (rf && gv_splits_env() <= 0) {
         // one resident round at 2 WG/CU (see gv_vattn_rf)
-        int s_rf = std::max(1, (2 * nsm) / n_head_kv);
+        int s_rf = std::max(1, (rf_wgcu * nsm) / n_head_kv);
         // partial-O traffic cap: splits * R * (D*4 + 8) <= 0.5 * n_kv * 2 * (K row bytes per head)
         const int64_t kv_bytes_head = (int64_t) n_kv * (int64_t) (ggml_row_size(K->type, GV_D) + ggml_row_size(V->type, GV_D));
         const int64_t cap_traffic   = std::max<int64_t>(1, kv_bytes_head / (2 * (int64_t) R * (GV_D * 4 + 8)));
@@ -834,7 +1131,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     cudaStream_t stream = ctx.stream();
     const dim3 grid(n_splits, n_head_kv, n_vseq);
     const dim3 block(64 * nwaves);
-    const size_t smem = gv_smem_bytes(nwaves, kc);
+    const size_t smem = rf2 ? gv_rf_smem_bytes(false, true) : gv_smem_bytes(nwaves, kc);
 
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
@@ -850,7 +1147,12 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         mask->nb[1], mask->nb[3], ne33, rows, rows_s1)
 #define GV_LAUNCH(Q8, PIPE_, LATE_, ROWS_) do { if (cut) { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC_CUT); } else { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC); } } while (0)
 #define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)
-    if (late) {
+    if (rf2) {
+        gv_rf_kernel<false, true, 1><<<grid, block, smem, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+    } else if (late) {
         GV_LAUNCH_R(true, true, true);
     } else if (pipe) {
         if (q8) {
@@ -894,6 +1196,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_rf_calls = 0;
     if (rf && n_rf_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF roofline launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
+    }
+    static int n_rf2_calls = 0;
+    if (rf2 && n_rf2_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=2 double-buffered LDS launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
     }
     static int n_cut_calls = 0;
     if (cut && n_cut_calls++ == 0) {
