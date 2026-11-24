@@ -4,6 +4,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 // AK-RF-A3B-ROUTER-FUSE (see router-fuse.cuh). The top-k phase is the topk-moe kernel's softmax gating path
 // (topk-moe.cu: softmax, NaN -> -FLT_MAX, k rounds of (value desc, expert asc) argmax with a per-thread taken mask,
@@ -12,6 +14,27 @@
 #define ROUTER_FUSE_WARPS 2  // experts per block (one 32-lane warp each); 256 experts -> 128 blocks on 104 CUs
 
 static std::atomic<uint64_t> g_router_fuse_n_calls{0};
+
+// per-context GGML_CUDA_MAX_STREAMS self-resetting completion counters (device memory), kept here rather than in the
+// context struct so the feature does not touch common.cuh (which every ggml-cuda TU includes)
+static std::mutex                                                          g_router_fuse_mutex;
+static std::unordered_map<const ggml_backend_cuda_context *, unsigned int *> g_router_fuse_counters;
+
+void ggml_cuda_router_fuse_release(ggml_backend_cuda_context * ctx) {
+    unsigned int * p = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_router_fuse_mutex);
+        auto it = g_router_fuse_counters.find(ctx);
+        if (it == g_router_fuse_counters.end()) {
+            return;
+        }
+        p = it->second;
+        g_router_fuse_counters.erase(it);
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(p));
+}
 
 uint64_t ggml_cuda_router_fuse_n_calls() {
     return g_router_fuse_n_calls.load(std::memory_order_relaxed);
@@ -271,7 +294,15 @@ bool ggml_cuda_op_router_fuse(ggml_backend_cuda_context & ctx,
 
     cudaStream_t stream = ctx.stream();
 
-    if (ctx.router_fuse_counters == nullptr) {
+    unsigned int * counters = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_router_fuse_mutex);
+        auto it = g_router_fuse_counters.find(&ctx);
+        if (it != g_router_fuse_counters.end()) {
+            counters = it->second;
+        }
+    }
+    if (counters == nullptr) {
         // first use: allocate the per-stream completion counters outside stream capture (graph warmup runs the
         // first evaluations eagerly; a captured first call declines and the unfused nodes are captured instead)
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
@@ -285,9 +316,11 @@ bool ggml_cuda_op_router_fuse(ggml_backend_cuda_context & ctx,
             return false;
         }
         CUDA_CHECK(cudaMemsetAsync(p, 0, GGML_CUDA_MAX_STREAMS * sizeof(unsigned int), stream));
-        ctx.router_fuse_counters = (unsigned int *) p;
+        counters = (unsigned int *) p;
+        std::lock_guard<std::mutex> lock(g_router_fuse_mutex);
+        g_router_fuse_counters[&ctx] = counters;
     }
-    unsigned int * counter = ctx.router_fuse_counters + ctx.curr_stream_no;
+    unsigned int * counter = counters + ctx.curr_stream_no;
 
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_rows * n_experts);
 

@@ -784,12 +784,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(h20_src1_buf));
         h20_src1_buf = nullptr;
     }
-    if (router_fuse_counters != nullptr) {
-        ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaFree(router_fuse_counters));
-        router_fuse_counters = nullptr;
-    }
+    ggml_cuda_router_fuse_release(this);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {

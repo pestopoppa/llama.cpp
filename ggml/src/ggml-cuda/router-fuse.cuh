@@ -33,3 +33,6 @@ bool ggml_cuda_op_router_fuse(ggml_backend_cuda_context & ctx,
 
 // engagement witness: fused launches enqueued since process start (host side; a captured graph counts once)
 uint64_t ggml_cuda_router_fuse_n_calls();
+
+// frees the context's completion counters (no-op when the fused kernel never ran on it); called by the context dtor
+void ggml_cuda_router_fuse_release(ggml_backend_cuda_context * ctx);
