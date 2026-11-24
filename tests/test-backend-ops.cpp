@@ -4666,6 +4666,38 @@ struct test_ak_tf2_g5 : public test_ak_tf2_base {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE-2 G2 (GGML_CUDA_AK_TF2_G2=1): FFN down-proj MUL_MAT(W Q8_0 [k, m], SWIGLU(gate, up) [k, n]) with the
+// SwiGLU folded into the V5 (MF=6) activation pre-pass. Fuses only on the packed-weight V5 route, so run it with
+// GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_MIN_BYTES=0 (the witness expects the fusion
+// only then, and only for k % 256 == 0, m % 64 == 0, n <= 16). Must not fuse: k = 4992 / m = 1000 (never packed), n 17.
+struct test_ak_tf2_g2 : public test_ak_tf2_base {
+    const int64_t m, n, k;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_TF2_G2"; }
+    std::string vars() override { return VARS_TO_STR3(m, n, k); }
+    double max_nmse_err() override { return 5e-4; }
+    int  tf2_group() const override { return 2; }
+    bool tf2_eligible() const override {
+        auto env_is = [](const char * name, int v) { const char * e = getenv(name); return e != nullptr && atoi(e) == v; };
+        return env_is("GGML_HIP_Q8_MF", 6) && env_is("GGML_HIP_Q8_MF_INPLACE", 2) && k % 256 == 0 && m % 64 == 0 &&
+               n >= 1 && n <= 16;
+    }
+
+    test_ak_tf2_g2(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(up, "up");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_swiglu_split(ctx, gate, up));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
 // reachable from one root while keeping the fused chain contiguous in graph order.
@@ -13813,6 +13845,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (float eps : { 0.0f, 1e-5f, 1.0f }) {
         test_cases.emplace_back(new test_ak_tf2_g5(128, 48, 8, 1, false, eps));
+    }
+
+    // AK-RF-27B-TAIL-FUSE-2 G2 (GGML_CUDA_AK_TF2_G2=1 + the V5 packed env): the 27B down-proj 5120 x 17408, a small
+    // 1024 x 2048, odd M; k = 4992 / m = 1000 (never packed) and n = 17 (above MAXM) must not fuse
+    {
+        static const std::array<int64_t, 2> g2_shapes[] = {{5120, 17408}, {1024, 2048}, {1000, 2048}, {1024, 4992}};
+        for (const auto & sh : g2_shapes) {
+            for (int64_t nt : { 1, 5, 8, 16, 17 }) {
+                test_cases.emplace_back(new test_ak_tf2_g2(sh[0], nt, sh[1]));
+            }
+        }
     }
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,

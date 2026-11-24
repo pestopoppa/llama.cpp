@@ -3615,6 +3615,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // AK-RF-27B-TAIL-FUSE-2 G2: FFN SwiGLU folded into the down-proj q8mf6 pre-pass (GGML_CUDA_AK_TF2_G2=1, default off)
+    if (node->op == GGML_OP_GLU && ggml_cuda_ak_tf2_enabled(2) && i + 1 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 }) &&
+        ggml_cuda_q8_mf6_glu_supported(node, cgraph->nodes[i + 1])) {
+        ggml_cuda_q8_mf6_glu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     // AK-ASM-H14: rms_norm + mul + rope [+ view + set_rows] (GGML_CUDA_AK_H14=0 disables)
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_skip = ggml_cuda_ak_h14_try(*cuda_ctx, cgraph, i);

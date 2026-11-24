@@ -29,3 +29,7 @@ bool ggml_cuda_q8ip_blas_handles(const ggml_tensor * src0, const ggml_tensor * s
 bool ggml_cuda_q8ip_mf_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_q8ip_substitute(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_q8ip_subst & s);
 void ggml_cuda_q8ip_restore(ggml_tensor * dst, ggml_cuda_q8ip_subst & s);
+
+// AK-RF-27B-TAIL-FUSE-2 G2 (GGML_CUDA_AK_TF2_G2=1): GLU(SWIGLU, a, b) -> MUL_MAT(packed Q8_0) with the SwiGLU in the pre-pass
+bool ggml_cuda_q8_mf6_glu_supported(const ggml_tensor * glu, const ggml_tensor * mm);
+void ggml_cuda_q8_mf6_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * mm);

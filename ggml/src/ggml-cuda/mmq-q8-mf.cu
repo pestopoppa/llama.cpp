@@ -87,6 +87,7 @@
 //  MFMA load per CU per 2 stages (one per WG): 2 x 4 waves x 16 MFMA x 32 clk on 4 SIMDs = 1024 clk per 34.8 KB -> cap
 //  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
+#include "ak-tf2.cuh"
 
 #include "quantize.cuh"
 #include "mmq.cuh"
@@ -184,9 +185,12 @@ static __device__ __forceinline__ void q8mf_zero_counters(int * __restrict__ cnt
 // MF=1 pre-pass. y: [M][K] f32 (row stride s1 floats) -> stage-major act: stage s at s * Q8MF_A1:
 //   [8 blk][4 g][16 col][8 B] int8 (qs bytes 8g..8g+7 of the block) then [8 blk][16 col] f32 scale. Columns >= M are zero.
 // One 32-thread group per (block, column).
+// AK-RF-27B-TAIL-FUSE-2 G2: with yg != nullptr the activation is the SwiGLU silu(y) * yg (row stride gs1), computed with
+// unary_gated_op_kernel<op_silu>'s expression, so the quantized act is bit-identical to quantizing the GLU node's output.
 static __global__ void q8mf_pre_i8(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
                                    char * __restrict__ act, int * __restrict__ cnt, const int ncnt,
-                                   float * __restrict__ z = nullptr, const int64_t zs1 = 0, const int zN = 0) {
+                                   float * __restrict__ z = nullptr, const int64_t zs1 = 0, const int zN = 0,
+                                   const float * __restrict__ yg = nullptr, const int64_t gs1 = 0) {
     q8mf_zero_counters(cnt, ncnt);
     if (z != nullptr) {   // V5: zero dst [M][zN] (row stride zs1) for the atomic partial-tile adds
         const int nthr = gridDim.x * gridDim.y * blockDim.x;
@@ -200,7 +204,11 @@ static __global__ void q8mf_pre_i8(const float * __restrict__ y, const int64_t s
     if (blk >= nblk) {
         return;
     }
-    const float x = c < M ? y[c * s1 + (int64_t) blk * 32 + i] : 0.0f;
+    float x = 0.0f;
+    if (c < M) {
+        const float yv = y[c * s1 + (int64_t) blk * 32 + i];
+        x = yg == nullptr ? yv : (yv / (1.0f + expf(-yv))) * yg[c * gs1 + (int64_t) blk * 32 + i];
+    }
     float amax = fabsf(x);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -1495,7 +1503,8 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
-static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                                     const ggml_tensor * src1_gate = nullptr) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     constexpr int p = 2;
     {
@@ -1521,7 +1530,12 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     float * d = (float *) dst->data;
     {
         const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
-        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+        if (src1_gate == nullptr) {
+            q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+        } else {
+            q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N,
+                (const float *) src1_gate->data, src1_gate->nb[1] / sizeof(float));
+        }
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
@@ -1826,4 +1840,38 @@ void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor 
         default: GGML_ABORT("q8_mf: bad variant %d", cfg.variant);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// AK-RF-27B-TAIL-FUSE-2 G2 (GGML_CUDA_AK_TF2_G2=1, default off): FFN SwiGLU folded into the down-proj's V5 (MF=6) pre-pass.
+// glu = GLU(SWIGLU, a, b) (split form, not swapped), mm = MUL_MAT(W packed Q8_0, glu): the pre-pass quantizes silu(a) * b
+// directly, the GLU launch and its [ff, M] f32 round trip are gone. Same path as ggml_cuda_mul_mat_q8_mf would take
+// for (W, glu) (variant 6, packed weight, n above the packed-MMVQ cap), so dst is the knob-off result bit-for-bit up to
+// the V5 kernel's own atomic order.
+bool ggml_cuda_q8_mf6_glu_supported(const ggml_tensor * glu, const ggml_tensor * mm) {
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || mm->op != GGML_OP_MUL_MAT ||
+        mm->src[1] != glu || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const ggml_tensor * a  = glu->src[0];
+    const ggml_tensor * b  = glu->src[1];
+    const ggml_tensor * w  = mm->src[0];
+    if (q8mf_get_cfg().variant != 6 || !ggml_cuda_q8ip_is_packed(w) || !ggml_cuda_q8ip_mf_handles(w, glu, mm) ||
+        glu->ne[1] <= q8ip_mmvq_max()) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(a, glu) || !ggml_are_same_shape(b, glu) || a->ne[2] != 1 || a->ne[3] != 1 ||
+        a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || a->nb[1] % sizeof(float) != 0 ||
+        b->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    const int nblk = (int) (w->ne[0] / 32);
+    return glu->ne[0] == w->ne[0] && nblk % Q8MF_KS == 0 && w->ne[1] % Q8MF_RT == 0 && glu->ne[1] >= 1 &&
+           glu->ne[1] <= Q8MF_MAXM;
+}
+
+void ggml_cuda_q8_mf6_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * mm) {
+    ggml_cuda_ak_tf2_note(2, "swiglu into the q8mf6 down-proj pre-pass");
+    ggml_cuda_mul_mat_q8_mf6(ctx, mm->src[0], glu->src[0], mm, glu->src[1]);
 }
