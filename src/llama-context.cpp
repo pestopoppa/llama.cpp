@@ -2228,7 +2228,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
-    if (has_samplers && batch_inp.logits) {
+    // SPEC-BSAMP: with LLAMA_SPEC_BACKEND_SAMPLING=1 build_sampling samples every output row (maps keyed by output
+    // row), so a speculative verify batch may carry several output rows per sequence
+    if (has_samplers && batch_inp.logits && !llama_spec_backend_sampling_enabled()) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
         for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
