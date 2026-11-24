@@ -5877,13 +5877,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_gdn_chunked_usable") == 0) {
         return (void *)ggml_cuda_gdn_chunked_usable;
     }
-    // AK-RF-27B-TAIL-FUSE G4 test witnesses: q8 skinny calls, and those that folded the dst zero-fill into the quantize
-    if (strcmp(name, "ggml_backend_cuda_q8_skinny_n_calls") == 0) {
-        return (void *)ggml_cuda_q8_skinny_n_calls;
-    }
-    if (strcmp(name, "ggml_backend_cuda_q8_skinny_zero_fold_n_calls") == 0) {
-        return (void *)ggml_cuda_q8_skinny_zero_fold_n_calls;
-    }
     // AK-RF-27B-TAIL-FUSE G1 test witness: fused add+rms_norm+mul launches since process start
     if (strcmp(name, "ggml_backend_cuda_ak_add_rms_norm_n_calls") == 0) {
         return (void *)ggml_cuda_ak_add_rms_norm_n_calls;

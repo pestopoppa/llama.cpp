@@ -6,7 +6,3 @@
 
 bool ggml_cuda_q8_skinny_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
-
-// test witnesses: skinny-path calls, and calls that took the G4 folded zero-fill (GGML_HIP_Q8_SKINNY_ZERO_FOLD=1)
-uint64_t ggml_cuda_q8_skinny_n_calls();
-uint64_t ggml_cuda_q8_skinny_zero_fold_n_calls();
