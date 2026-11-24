@@ -3578,6 +3578,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // AK-RF-27B-TAIL-FUSE G1: residual add + rms_norm + mul(weight) in one launch (GGML_CUDA_AK_ADD_RMS_NORM=1, default off).
+    // The add result stays an output (it is the next residual), the rms_norm node is elided.
+    if (node->op == GGML_OP_ADD && ggml_cuda_ak_add_rms_norm_enabled() && i + 2 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
+        ggml_cuda_ak_add_rms_norm_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_ak_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     // AK-ASM-H14: rms_norm + mul + rope [+ view + set_rows] (GGML_CUDA_AK_H14=0 disables)
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_skip = ggml_cuda_ak_h14_try(*cuda_ctx, cgraph, i);
@@ -5867,6 +5876,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_gdn_chunked_usable") == 0) {
         return (void *)ggml_cuda_gdn_chunked_usable;
+    }
+    // AK-RF-27B-TAIL-FUSE G1 test witness: fused add+rms_norm+mul launches since process start
+    if (strcmp(name, "ggml_backend_cuda_ak_add_rms_norm_n_calls") == 0) {
+        return (void *)ggml_cuda_ak_add_rms_norm_n_calls;
     }
     if (strcmp(name, "ggml_backend_cuda_gdn_rows_n_calls") == 0) {
         return (void *)ggml_cuda_gdn_rows_n_calls;
