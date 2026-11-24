@@ -1171,6 +1171,190 @@ static void q8ip_permute_inplace(char * data, const int64_t N, const int64_t K, 
     CUDA_CHECK(cudaFree(scratch));
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// AK-ASM-I8GEMM-PERCHANNEL-GEMV (GGML_HIP_I8PC=1; needs GGML_HIP_Q8_MF=6 and GGML_HIP_Q8_MF_INPLACE=1|2; default OFF).
+// "Per-channel" = one scale per OUTPUT ROW (output channel) instead of Q8_0's one f16 scale per 32-weight block. At the
+// load-time in-place repack an eligible Q8_0 weight is REQUANTIZED (lossy, measured on 27B by AK-ASM-I8GEMM-PERCHANNEL-KLD:
+// KLD 0.001015, dPPL +0.082 %) into a dense int8 layout:
+//   s_row = f16_round_up(max_b(|d_b| * max|q_b|) / 127)     (f16-representable, so the unpack back to Q8_0 is exact)
+//   q'    = clamp(rint(q * d_b / s_row), -127, 127)
+//   bytes [tile = 64 rows][k-stage = 256 k][64 rows][256 B] int8, then N f32 row scales at byte N * K.
+// N * (K + 4) <= N * K * 34 / 32 for K >= 64, so it fits in the Q8_0 allocation; the tail bytes are unused.
+// The half-tile unit (32 rows x 1 k-stage) is 8192 contiguous B instead of 8704 (1/17 fewer weight bytes, no per-block
+// scale load or multiply): q8pc_mul_mat (below q8mf6) reads it at n 1..16 and applies s_row once at the flush.
+// Every other consumer (prefill MMQ/cuBLAS, get_rows, cpy, fusions, host get) gets a Q8_0 natural copy with d = s_row in
+// every block (ggml_cuda_q8ip_substitute / ggml_cuda_q8ip_get), i.e. the model is consistently the requantized one.
+// Shape gate: the 27B verify K dims {5120, 6144, 17408} (GGML_HIP_I8PC_ANYSHAPE=1 lifts it for tests), on top of the
+// q8ip gate (N % 64 == 0, K % 256 == 0, contiguous 2-D, < 2 GiB, not token_embd).
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8pc_build_marker[] __attribute__((used)) =
+    "ggml-cuda: I8PC per-output-channel int8 requant layout + q8pc_mul_mat (GGML_HIP_I8PC)";
+
+#define Q8PC_HB    (32 * 256)          // 8192 B: half-tile unit (32 rows x 256 int8)
+#define Q8PC_STAGE (Q8MF_RT * 256)     // 16384 B: one k-stage of a 64-row tile
+#define Q8PC_LROW  272                 // LDS row pitch (256 + 16 B pad: rows shift 4 banks, as Q8_0's 272 B rows)
+
+static bool q8pc_on() {
+    static const bool on = [] {
+        if (q8mf_env_int("GGML_HIP_I8PC", 0) == 0) {
+            return false;
+        }
+        if (q8mf_get_cfg().variant != 6) {
+            GGML_LOG_WARN("ggml_cuda_q8pc: GGML_HIP_I8PC=1 ignored: needs GGML_HIP_Q8_MF=6 (and GGML_HIP_Q8_MF_INPLACE)\n");
+            return false;
+        }
+        GGML_LOG_INFO("ggml_cuda_q8pc: I8PC per-channel int8 requant enabled (%s)\n", q8pc_build_marker);
+        return true;
+    }();
+    return on;
+}
+
+static std::map<const void *, int> q8pc_set;   // data -> 1, guarded by q8ip_mu; subset of q8ip_packed
+
+static bool q8pc_shape_ok(const ggml_tensor * t) {
+    static const bool any = q8mf_env_int("GGML_HIP_I8PC_ANYSHAPE", 0) != 0;
+    const int64_t K = t->ne[0];
+    return any || K == 5120 || K == 6144 || K == 17408;
+}
+
+// base tensor (not a view) packed as I8PC?
+static bool q8pc_is_base(const ggml_tensor * b) {
+    if (b == nullptr || !ggml_cuda_q8ip_any()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(q8ip_mu);
+    return q8pc_set.count(b->data) != 0;
+}
+
+// same lookup-by-data semantics as ggml_cuda_q8ip_is_packed (a slice view has other data and gets a natural copy)
+static bool ggml_cuda_q8pc_is_packed(const ggml_tensor * t) {
+    return t != nullptr && q8pc_is_base(t);
+}
+
+static __host__ __device__ __forceinline__ int64_t q8pc_off(const int64_t r, const int64_t k, const int S) {
+    return (((r / Q8MF_RT) * S + k / 256) * Q8MF_RT + r % Q8MF_RT) * 256 + k % 256;
+}
+
+// natural Q8_0 rows (src, row pitch nb01) -> I8PC int8 (dst, local rows from 0) + f32 row scales (sc). One WG per row.
+static __global__ void q8pc_pack(const char * __restrict__ src, char * __restrict__ dst, float * __restrict__ sc,
+                                 const int64_t nb01, const int nb, const int S) {
+    __shared__ float red[256];
+    const int64_t r   = blockIdx.x;
+    const int     tid = threadIdx.x;
+    const char *  row = src + r * nb01;
+    float v = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const char * blk = row + (int64_t) b * 34;
+        const float  d   = fabsf(__half2float(*(const __half *) blk));
+        int m = 0;
+        for (int e = 0; e < 32; ++e) {
+            m = max(m, abs((int) (int8_t) blk[2 + e]));
+        }
+        v = fmaxf(v, d * (float) m);
+    }
+    red[tid] = v;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (tid < o) {
+            red[tid] = fmaxf(red[tid], red[tid + o]);
+        }
+        __syncthreads();
+    }
+    const float s0 = red[0] / 127.0f;
+    __half h = __float2half(s0);
+    if (__half2float(h) < s0) {   // round up: |q'| <= 127 without clamping in exact arithmetic
+        h = __ushort_as_half((unsigned short) (__half_as_ushort(h) + 1));
+    }
+    const float s   = __half2float(h);
+    const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const char * blk = row + (int64_t) b * 34;
+        const float  d   = __half2float(*(const __half *) blk);
+        char *       o   = dst + q8pc_off(r, (int64_t) b * 32, S);
+        for (int e = 0; e < 32; ++e) {
+            const float x = (float) (int8_t) blk[2 + e] * d * inv;
+            o[e] = (char) (int) fminf(127.0f, fmaxf(-127.0f, rintf(x)));
+        }
+    }
+    if (tid == 0) {
+        sc[r] = s;
+    }
+}
+
+// I8PC (src, local rows from 0, scales sc) -> natural Q8_0 rows (dst, pitch nb01), d = s_row in every block (exact)
+static __global__ void q8pc_unpack(const char * __restrict__ src, const float * __restrict__ sc, char * __restrict__ dst,
+                                   const int64_t nb01, const int nb, const int S, const int64_t nrows) {
+    const int64_t total = nrows * nb;
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = q / nb;
+        const int     b = (int) (q % nb);
+        char *        o = dst + r * nb01 + (int64_t) b * 34;
+        const char *  i = src + q8pc_off(r, (int64_t) b * 32, S);
+        *(__half *) o = __float2half(sc[r]);
+        for (int e = 0; e < 32; ++e) {
+            o[2 + e] = i[e];
+        }
+    }
+}
+
+// in place natural -> I8PC: ascending tile batches (the I8PC output of batch t ends at (t0+nt)*64*K <= the natural start
+// of batch t+1), scales collected in a transient buffer and written at N*K after the last batch (that range still holds
+// natural bytes until then). Synchronous on `stream`, transient cudaMalloc freed before return.
+static void q8pc_pack_inplace(char * data, const int64_t N, const int64_t K, cudaStream_t stream) {
+    const int64_t nb01  = K / 32 * 34;
+    const int     S     = (int) (K / 256);
+    const int64_t tileb = Q8MF_RT * nb01;
+    const int64_t ntile = N / Q8MF_RT;
+    const int64_t bt    = std::max<int64_t>(1, std::min<int64_t>(ntile, (16ll << 20) / tileb));
+    char *  scratch = nullptr;
+    float * sc      = nullptr;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMalloc((void **) &scratch, (size_t) (bt * tileb)));
+    CUDA_CHECK(cudaMalloc((void **) &sc, (size_t) N * sizeof(float)));
+    for (int64_t t0 = 0; t0 < ntile; t0 += bt) {
+        const int64_t nt = std::min(bt, ntile - t0);
+        CUDA_CHECK(cudaMemcpyAsync(scratch, data + t0 * tileb, (size_t) (nt * tileb), cudaMemcpyDeviceToDevice, stream));
+        q8pc_pack<<<(unsigned) (nt * Q8MF_RT), 256, 0, stream>>>(scratch, data + t0 * Q8MF_RT * K, sc + t0 * Q8MF_RT, nb01,
+                                                                (int) (K / 32), S);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaMemcpyAsync(data + N * K, sc, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(scratch));
+    CUDA_CHECK(cudaFree(sc));
+}
+
+// in place I8PC -> natural Q8_0 (d = s_row): scales saved first, then DESCENDING tile batches (the natural output of batch
+// t starts at t0*64*nb01 >= the I8PC end of every lower batch).
+static void q8pc_unpack_inplace(char * data, const int64_t N, const int64_t K, cudaStream_t stream) {
+    const int64_t nb01  = K / 32 * 34;
+    const int     S     = (int) (K / 256);
+    const int64_t tileb = Q8MF_RT * nb01;
+    const int64_t pcb   = Q8MF_RT * K;
+    const int64_t ntile = N / Q8MF_RT;
+    const int64_t bt    = std::max<int64_t>(1, std::min<int64_t>(ntile, (16ll << 20) / tileb));
+    char *  scratch = nullptr;
+    float * sc      = nullptr;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMalloc((void **) &scratch, (size_t) (bt * pcb)));
+    CUDA_CHECK(cudaMalloc((void **) &sc, (size_t) N * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(sc, data + N * K, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    const int64_t nbatch = (ntile + bt - 1) / bt;
+    for (int64_t bi = nbatch - 1; bi >= 0; --bi) {
+        const int64_t t0 = bi * bt;
+        const int64_t nt = std::min(bt, ntile - t0);
+        CUDA_CHECK(cudaMemcpyAsync(scratch, data + t0 * pcb, (size_t) (nt * pcb), cudaMemcpyDeviceToDevice, stream));
+        const int64_t total = nt * Q8MF_RT * (K / 32);
+        const int     grid  = (int) std::min<int64_t>((total + 255) / 256, 65535);
+        q8pc_unpack<<<grid, 256, 0, stream>>>(scratch, sc + t0 * Q8MF_RT, data + t0 * tileb, nb01, (int) (K / 32), S,
+                                              nt * Q8MF_RT);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(scratch));
+    CUDA_CHECK(cudaFree(sc));
+}
+
 void ggml_cuda_q8ip_before_write(ggml_tensor * t, size_t offset, size_t size, cudaStream_t stream) {
     if (!ggml_cuda_q8ip_any()) {
         return;
@@ -1181,10 +1365,16 @@ void ggml_cuda_q8ip_before_write(ggml_tensor * t, size_t offset, size_t size, cu
     }
     const size_t boff = (size_t) ((const char *) t->data - (const char *) b->data) + offset;
     const bool whole = boff == 0 && size >= ggml_nbytes(b);
+    const bool pc = q8pc_is_base(b);
     if (!whole) {   // keep the bytes outside the write: back to natural first
-        q8ip_permute_inplace((char *) b->data, b->ne[1], b->ne[0], false, stream);
+        if (pc) {   // I8PC: the kept bytes come back as the requantized Q8_0 (d = s_row), not the original blocks
+            q8pc_unpack_inplace((char *) b->data, b->ne[1], b->ne[0], stream);
+        } else {
+            q8ip_permute_inplace((char *) b->data, b->ne[1], b->ne[0], false, stream);
+        }
     }
     std::lock_guard<std::mutex> lk(q8ip_mu);
+    q8pc_set.erase(b->data);
     q8ip_packed.erase(b->data);
     q8ip_count.fetch_sub(1);
 }
@@ -1210,8 +1400,22 @@ void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, boo
         }
         q8ip_progress.erase(t->data);
     }
-    q8ip_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
+    const bool pc = q8pc_on() && q8pc_shape_ok(t);
+    if (pc) {   // AK-ASM-I8GEMM-PERCHANNEL-GEMV: requantize to the per-row int8 layout instead of the Q8_0 permutation
+        q8pc_pack_inplace((char *) t->data, t->ne[1], t->ne[0], stream);
+    } else {
+        q8ip_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
+    }
     std::lock_guard<std::mutex> lk(q8ip_mu);
+    if (pc) {
+        q8pc_set[t->data] = 1;
+        static std::atomic<int64_t> n_pc{0};
+        const int64_t n = n_pc.fetch_add(1) + 1;
+        if (n == 1 || (n & (n - 1)) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8pc: requantized %lld Q8_0 tensors to I8PC per-channel int8 (last %s %lldx%lld)\n",
+                (long long) n, t->name, (long long) t->ne[0], (long long) t->ne[1]);
+        }
+    }
     if (q8ip_packed.emplace(t->data, nbytes).second) {
         q8ip_count.fetch_add(1);
     }
@@ -1234,6 +1438,9 @@ void ggml_cuda_q8ip_forget_range(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(q8ip_mu);
     const char * lo = (const char *) base;
     const char * hi = lo + size;
+    for (auto it = q8pc_set.lower_bound(lo); it != q8pc_set.end() && (const char *) it->first < hi; ) {
+        it = q8pc_set.erase(it);
+    }
     for (auto it = q8ip_packed.lower_bound(lo); it != q8ip_packed.end() && (const char *) it->first < hi; ) {
         it = q8ip_packed.erase(it);
         q8ip_count.fetch_sub(1);
@@ -1254,7 +1461,19 @@ bool ggml_cuda_q8ip_get(const ggml_tensor * t, void * data, size_t offset, size_
     const int     S      = (int) (b->ne[0] / 256);
     std::vector<char> pk(nbytes), nat(nbytes);
     CUDA_CHECK(cudaMemcpy(pk.data(), b->data, nbytes, cudaMemcpyDeviceToHost));
-    const int64_t nchunk = (int64_t) nbytes / 16;
+    const int64_t nchunk = q8pc_is_base(b) ? 0 : (int64_t) nbytes / 16;
+    if (nchunk == 0) {   // I8PC: natural Q8_0 with d = s_row in every block
+        const int64_t N = b->ne[1], K = b->ne[0];
+        const float * sc = (const float *) (pk.data() + N * K);
+        for (int64_t r = 0; r < N; ++r) {
+            const ggml_fp16_t d = ggml_fp32_to_fp16(sc[r]);
+            for (int64_t bb = 0; bb < K / 32; ++bb) {
+                char * o = nat.data() + r * nb01 + bb * 34;
+                memcpy(o, &d, 2);
+                memcpy(o + 2, pk.data() + q8pc_off(r, bb * 32, S), 32);
+            }
+        }
+    }
     for (int64_t q = 0; q < nchunk; ++q) {
         const int64_t st = q / Q8MF_NCHUNK;
         const int     c  = (int) (q % Q8MF_NCHUNK);
@@ -1301,7 +1520,15 @@ void ggml_cuda_q8ip_substitute(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         char * nat = s.buf[i].alloc(ctx.pool(), nbytes);
         const int64_t nchunk = (int64_t) nbytes / 16;
         const int     grid   = (int) std::min<int64_t>((nchunk + 255) / 256, 65535);
-        q8ip_permute<false><<<grid, 256, 0, ctx.stream()>>>((const char *) b->data, nat, (int64_t) b->nb[1], (int) (b->ne[0] / 256), nchunk);
+        if (q8pc_is_base(b)) {   // I8PC -> requantized natural Q8_0 copy
+            const int64_t N = b->ne[1], K = b->ne[0];
+            const int64_t total = N * (K / 32);
+            const int     g2    = (int) std::min<int64_t>((total + 255) / 256, 65535);
+            q8pc_unpack<<<g2, 256, 0, ctx.stream()>>>((const char *) b->data, (const float *) ((const char *) b->data + N * K),
+                                                      nat, (int64_t) b->nb[1], (int) (K / 32), (int) (K / 256), N);
+        } else {
+            q8ip_permute<false><<<grid, 256, 0, ctx.stream()>>>((const char *) b->data, nat, (int64_t) b->nb[1], (int) (b->ne[0] / 256), nchunk);
+        }
         CUDA_CHECK(cudaGetLastError());
         s.copy[i]          = *src;
         s.copy[i].data     = nat + ((const char *) src->data - (const char *) b->data);
@@ -1536,6 +1763,198 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// AK-ASM-I8GEMM-PERCHANNEL-GEMV: q8pc_mul_mat = q8mf6 (V5 4-WG/CU persistent half-tile grid, P = 2 register stages,
+// 2 x mfma_i32_16x16x16i8 per 32-k block, kh-pair LDS reduction, atomic tail on split half-tiles) over the I8PC layout.
+// Differences from q8mf6: a unit is 8192 B = 512 dwordx4 (thread t loads chunks t, t + 256; no third chunk), the weight
+// image is written to LDS at a 272 B row pitch (chunk q -> row q >> 4, byte 16 (q & 15)) so the 16 rows a wave reads stay
+// 4 banks apart, the inner loop has no per-block f16 scale load or multiply (acc += s * da), and the row scale is applied
+// once at the flush (s_row from the f32 table at W + N*K). Same activation pre-pass (q8mf_pre_i8) and dst zeroing.
+// ---------------------------------------------------------------------------------------------------------------------
+template <int P, int AUX>
+static __global__ void __launch_bounds__(Q8MF_NT, 4)
+q8pc_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const float * __restrict__ wsc,
+             const char * __restrict__ act, const uint32_t abytes,
+             const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    __shared__ __attribute__((aligned(16))) char lds[32 * Q8PC_LROW + Q8MF_A1 + Q8MF6_RED];
+    constexpr int LW = 32 * Q8PC_LROW;   // 8704 B
+    const int tid  = threadIdx.x;
+    const int lane = tid & 63;
+    const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
+    const int g    = blockIdx.x;
+    const int u0   = (int) (((int64_t) g * U) / G);
+    const int u1   = (int) (((int64_t) (g + 1) * U) / G);
+
+    constexpr uint32_t OOB = 0x80000000u;
+    uint32_t ab[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int q = tid + i * Q8MF_NT;
+        const bool ok = q < 256 ? 2 * (q % 8) < M : (q < 288 && 4 * ((q - 256) % 4) < M);
+        ab[i] = ok ? (uint32_t) (q * 16) : OOB;
+    }
+    const q8mf_v4i wrsrc = q8mf_make_rsrc(W, wbytes);
+    const q8mf_v4i arsrc = q8mf_make_rsrc(act, abytes);
+
+    struct regs { q8mf_v4i w[2]; q8mf_v4i a[2]; };
+    int ui = u0, iht = u0 / S, iks = u0 - (u0 / S) * S;
+    auto issue_next = [&](regs & R) {
+        const bool live = ui < u1;
+        // unit (ht, ks) at ((ht >> 1) * S + ks) * 16384 + (ht & 1) * 8192
+        const uint32_t sw = live ? ((uint32_t) ((iht >> 1) * S + iks) * Q8PC_STAGE + (uint32_t) (iht & 1) * Q8PC_HB) : wbytes;
+        const uint32_t sa = live ? (uint32_t) (iks * Q8MF_A1) : abytes;
+        R.w[0] = q8mf_buf_x4(wrsrc, (int) (sw + tid * 16), 0, AUX);
+        R.w[1] = q8mf_buf_x4(wrsrc, (int) (sw + (tid + 256) * 16), 0, AUX);
+        R.a[0] = q8mf_buf_x4(arsrc, (int) (sa + ab[0]), 0, 0);
+        R.a[1] = q8mf_buf_x4(arsrc, (int) (sa + ab[1]), 0, 0);
+        ++ui;
+        if (++iks == S) {
+            iks = 0;
+            ++iht;
+        }
+    };
+    char * red = lds + LW + Q8MF_A1;   // dummy commit slot / kh reduction, never live together
+    // chunk q = row (q >> 4), 16 B column (q & 15); tid and tid + 256 are rows tid >> 4 and 16 + (tid >> 4), same column
+    const int wl0 = (tid >> 4) * Q8PC_LROW + (tid & 15) * 16;
+    auto commit = [&](const regs & R) {
+        *(q8mf_v4i *) (lds + wl0)                  = R.w[0];
+        *(q8mf_v4i *) (lds + wl0 + 16 * Q8PC_LROW) = R.w[1];
+        *(q8mf_v4i *) (lds + LW + tid * 16) = R.a[0];
+        *(q8mf_v4i *) (tid < 32 ? lds + LW + (tid + 256) * 16 : red + lane * 16) = R.a[1];
+    };
+
+    const int rg = w & 1;
+    const int kh = w >> 1;
+    const int j  = lane & 15;
+    const int gq = lane >> 4;
+    const int c0 = 4 * gq;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto compute = [&]() {
+        const char * lw = lds + (16 * rg + j) * Q8PC_LROW + 8 * gq;
+        const char * la = lds + LW;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+            const int    i  = 4 * kh + ii;
+            const int2   wv = *(const int2 *) (lw + 32 * i);
+            const int2   a  = *(const int2 *) (la + i * 512 + lane * 8);
+            const float4 da = *(const float4 *) (la + Q8MF_KS * 512 + i * 64 + gq * 16);
+            const q8mf_v4i z = {0, 0, 0, 0};
+            q8mf_v4i s = __builtin_amdgcn_mfma_i32_16x16x16i8(a.x, wv.x, z, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(a.y, wv.y, s, 0, 0, 0);
+            acc[0] += (float) s[0] * da.x;
+            acc[1] += (float) s[1] * da.y;
+            acc[2] += (float) s[2] * da.z;
+            acc[3] += (float) s[3] * da.w;
+        }
+    };
+
+    int cht = u0 / S, cks = u0 - (u0 / S) * S;
+    auto end_of_unit = [&](const int uc) {
+        if (cks == S - 1 || uc == u1 - 1) {   // uniform
+            float * rf = (float *) red;
+            if (kh == 1) {
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    rf[(rg * 4 + r) * 64 + lane] = acc[r];
+                }
+            }
+            Q8MF_LDS_BARRIER();
+            if (kh == 0) {
+                const int   ts   = cht * S;
+                const bool  full = ts >= u0 && ts + S <= u1;
+                const int   row  = (cht >> 1) * Q8MF_RT + (cht & 1) * 32 + 16 * rg + j;
+                const float srow = wsc[row];
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const float v = (acc[r] + rf[(rg * 4 + r) * 64 + lane]) * srow;
+                    if (c0 + r < M) {
+                        float * o = out + (int64_t) (c0 + r) * out_s1 + row;
+                        if (full) {
+                            *o = v;
+                        } else {
+                            unsafeAtomicAdd(o, v);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                acc[r] = 0.0f;
+            }
+        }
+        if (++cks == S) {
+            cks = 0;
+            ++cht;
+        }
+    };
+
+    regs R[P];
+#pragma unroll
+    for (int jj = 0; jj < P; ++jj) {
+        issue_next(R[jj]);
+        asm volatile("" ::: "memory");
+    }
+    int u = u0;
+    do {
+#pragma unroll
+        for (int jj = 0; jj < P; ++jj) {
+            commit(R[jj]);
+            issue_next(R[jj]);
+            Q8MF_LDS_BARRIER();
+            if (u + jj < u1) {
+                compute();
+                end_of_unit(u + jj);
+            }
+            Q8MF_LDS_BARRIER();
+        }
+        u += P;
+    } while (u < u1);
+#else
+    GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(wsc); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S);
+    GGML_UNUSED(U); GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
+static void ggml_cuda_mul_mat_q8_pc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const q8mf_cfg & cfg = q8mf_get_cfg();
+    {
+        static std::atomic<int64_t> n_calls{0};
+        if (n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8pc: I8PC per-channel int8 packed path ran (call 1, P=2, slc=%d, %s)\n", cfg.slc,
+                q8pc_build_marker);
+        }
+    }
+    cudaStream_t stream = ctx.stream();
+    const int     N      = (int) src0->ne[1];
+    const int     M      = (int) src1->ne[1];
+    const int     nblk   = (int) (src0->ne[0] / 32);
+    const int64_t s1     = src1->nb[1] / sizeof(float);
+    const int64_t dst_s1 = dst->nb[1]  / sizeof(float);
+    const int     S      = nblk / Q8MF_KS;
+    const int     U      = (N / Q8MF_RT) * 2 * S;
+    const int     ncu    = ggml_cuda_info().devices[ctx.device].nsm;
+    GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
+    const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    const size_t abytes = (size_t) S * Q8MF_A1;
+    ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
+    float * d = (float *) dst->data;
+    {
+        const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
+        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+    }
+    const char *   W      = (const char *) src0->data;
+    const uint32_t wbytes = (uint32_t) ((int64_t) N * src0->ne[0]);   // int8 region only; the scale table follows it
+    const float *  wsc    = (const float *) (W + (int64_t) N * src0->ne[0]);
+    if (cfg.slc) {
+        q8pc_mul_mat<2, 2><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, wsc, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1);
+    } else {
+        q8pc_mul_mat<2, 0><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, wsc, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // DTREE-0-Q8MF-PACKED-CONSUMERS: consumers that read the in-place packed layout directly (no natural copy).
 // (a) q8ip_mmvq: n1 (GGML_HIP_Q8IP_MMVQ_MAX=0 -> V3) Q8_0 x q8_1 matvec. A WG (256 threads) owns Q8IPV_R = 8
 //     consecutive rows of one 64-row tile; in the packed layout those rows' segment of a k-stage is ONE contiguous,
@@ -1705,21 +2124,26 @@ static void q8ip_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor 
 bool ggml_cuda_q8ip_blas_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
     static const bool on = q8mf_env_int("GGML_HIP_Q8IP_BLAS", 1) != 0;
     return on && ggml_cuda_h20_enabled() && getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") == nullptr &&
-        ggml_cuda_q8ip_is_packed(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        dst->op_params[0] != GGML_PREC_F32 && fast_fp16_hardware_available(cc) && ggml_is_contiguous(dst) &&
+        ggml_cuda_q8ip_is_packed(src0) && !ggml_cuda_q8pc_is_packed(src0) && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && dst->op_params[0] != GGML_PREC_F32 && fast_fp16_hardware_available(cc) && ggml_is_contiguous(dst) &&
         src1->ne[1] > Q8MF_MAXM && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         !ggml_cuda_q8ip_mmq_handles(src0, src1, dst, cc);
 }
 
 bool ggml_cuda_q8ip_mmq_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
     static const bool on = q8mf_env_int("GGML_HIP_Q8IP_MMQ", 1) != 0;
-    return on && ggml_cuda_q8ip_is_packed(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        src1->ne[1] > Q8MF_MAXM && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+    // I8PC tensors are not Q8_0-packed: prefill gets the requantized natural copy (ggml_cuda_q8ip_substitute)
+    return on && ggml_cuda_q8ip_is_packed(src0) && !ggml_cuda_q8pc_is_packed(src0) && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && src1->ne[1] > Q8MF_MAXM && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         ggml_cuda_should_use_mmq(GGML_TYPE_Q8_0, cc, src1->ne[1], /*n_experts =*/ 0);
 }
 
 void ggml_cuda_mul_mat_q8_mf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg0 = q8mf_get_cfg();
+    if (ggml_cuda_q8pc_is_packed(src0)) {   // AK-ASM-I8GEMM-PERCHANNEL-GEMV: I8PC layout, n 1..16 (mf_handles)
+        ggml_cuda_mul_mat_q8_pc(ctx, src0, src1, dst);
+        return;
+    }
     if (src1->ne[1] <= q8ip_mmvq_max() && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
         q8ip_mul_mat_vec(ctx, src0, src1, dst);
         return;

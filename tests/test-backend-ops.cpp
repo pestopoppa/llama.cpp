@@ -12694,6 +12694,70 @@ static void dtree_add_q8v5_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     }
 }
 
+// AK-ASM-I8GEMM-PERCHANNEL-GEMV (GGML_HIP_I8PC=1): Q8_0 x F32 at the 27B verify shapes, n 1/4/8/16, against the CPU Q8_0
+// reference. Run with GGML_HIP_I8PC=1 GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_MIN_BYTES=0
+// (I8PC ON) and without GGML_HIP_I8PC (OFF: the same cases on the stock q8mf6 path). The GPU computes with the per-row
+// REQUANTIZED weights while the CPU reference keeps the original Q8_0 blocks, so the error under test is the per-channel
+// requantization error. PRE-STATED BOUND (2026-11-24, before any run): NMSE <= 2e-4 for every case, both init modes.
+//   uniform init (block maxima ~= row maximum):   expected NMSE ~ (1/127)^2/12 / (1/3)  ~ 1.6e-5
+//   spread init (block magnitude 8^-h, h ~ U[0,1), the per-channel worst case of a 1/8..1 within-row scale spread):
+//     expected NMSE ~ (1/127)^2/12 / (E[m^2]/3 = 0.0789) ~ 6.6e-5
+// The stock bound for MUL_MAT is 5e-4; 2e-4 is tighter so a layout / scale-indexing bug cannot hide under it.
+struct test_mul_mat_i8pc : public test_mul_mat {
+    const bool spread;
+    test_mul_mat_i8pc(int64_t m, int64_t n, int64_t k, bool spread)
+        : test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), spread(spread) {}
+    std::string vars() override {
+        return test_mul_mat::vars() + ",i8pc_init=" + (spread ? "spread" : "uniform");
+    }
+    double max_nmse_err() override {
+        return 2e-4;
+    }
+    double max_nmse_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 2e-4;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (!spread || t->type != GGML_TYPE_Q8_0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t nels = ggml_nelements(t);
+            std::vector<float> data(nels);
+            for (int64_t i = 0; i < nels; ++i) {
+                const double u = (double) (suite_seed_mix(0x18bc5eedull ^ (uint64_t) i) >> 11) * 0x1.0p-53;
+                const double h = (double) (suite_seed_mix(0x5ca1e000ull ^ (uint64_t) (i / 32)) >> 11) * 0x1.0p-53;
+                data[i] = (float) ((2.0 * u - 1.0) * std::pow(8.0, -h));
+            }
+            std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q8_0, nels));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, data.data(), q.data(), 0, nels / t->ne[0], t->ne[0], nullptr);
+            ggml_backend_tensor_set(t, q.data(), 0, q.size());
+        }
+    }
+};
+
+static void ak_add_i8pc_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // {rows m = GGUF ne1, k = ne0}: gate/up, down, qkv, attn_gate, ssm_out/attn_output, attn_q, lm_head
+    static const std::array<int64_t, 2> sh[] = {{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144},
+                                                {12288, 5120}, {248320, 5120}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 4, 8, 16}) {
+            for (bool spread : {false, true}) {
+                if (s[0] == 248320 && spread) {
+                    continue;   // the 1.3 GB lm_head runs once per n (uniform) to keep the CPU reference affordable
+                }
+                test_cases.emplace_back(new test_mul_mat_i8pc(s[0], n, s[1], spread));
+            }
+        }
+    }
+    // prefill consumer of an I8PC weight (n > 16 -> requantized natural copy into MMQ / cuBLAS) and the shape gate
+    // (K = 2048 is not a 27B K: stays Q8_0-packed unless GGML_HIP_I8PC_ANYSHAPE=1)
+    test_cases.emplace_back(new test_mul_mat_i8pc(17408, 64, 5120, true));
+    test_cases.emplace_back(new test_mul_mat_i8pc(1024, 8, 2048, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 5120, 128, 3));
+}
+
 // DTREE-0-Q8MF-V2 roofline table: the 27B Q8_0 verify shapes {m = rows, k} at M (= n) 1/8/12/16. Run with
 // GGML_HIP_Q8_MF=1|2 GGML_HIP_Q8_MF_MIN=1 to time the MF kernels at every M (GB/s = m * k * 34/32 / (us/op)).
 static void dtree_add_q8mf_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -12812,6 +12876,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
+    ak_add_i8pc_eval_cases(test_cases);         // AK-ASM-I8GEMM-PERCHANNEL-GEMV
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
