@@ -76,6 +76,33 @@ static inline bool iqk_dequant_enabled() {
     return f != 0;
 }
 
+// CPU-NT-WEIGHT-STREAM (autokernel-akx-program.md, triage 2026-11-24): GGML_IQK_PREFETCH_NTA=<bytes>
+// issues prefetchnta over the decode-path weight stream <bytes> ahead of the rows about to be
+// consumed, so single-use weight lines are not allocated into L3 and stop evicting the reused
+// KV / GDN-state / activation working set. Unset or 0 = off (bit-identical upstream path).
+// Loads only: the kernels and their per-row instruction sequence are unchanged, so numerics are
+// unchanged; the decode GEMV is just called in k_nta_rows-row chunks instead of one call.
+static inline long iqk_prefetch_nta_distance() {
+    static long d = -1;
+    if (d < 0) {
+        const char * s = getenv("GGML_IQK_PREFETCH_NTA");
+        long v = s ? atol(s) : 0;
+        d = v > 0 ? v : 0;
+    }
+    return d;
+}
+static inline void iqk_prefetch_nta_range(const char * base, size_t total, size_t beg, size_t end) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (beg >= total) return;
+    if (end > total) end = total;
+    for (size_t off = beg & ~size_t(63); off < end; off += 64) {
+        _mm_prefetch(base + off, _MM_HINT_NTA);
+    }
+#else
+    (void)base; (void)total; (void)beg; (void)end;
+#endif
+}
+
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
@@ -154,9 +181,23 @@ struct MulMat {
         }
         n_left = nrc_y - info.cur_y;
         if (n_left > 0) {
-            funcs[n_left-1](n, vx, bx, info, nrc_x);
+            if (const long nta = iqk_prefetch_nta_distance(); nta > 0 && nrc_x > k_nta_rows) {
+                const char * cx = (const char *)vx;
+                const size_t total = (size_t)nrc_x*bx;
+                for (int ix = 0; ix < nrc_x; ix += k_nta_rows) {
+                    const int this_nrc_x = ix + k_nta_rows <= nrc_x ? k_nta_rows : nrc_x - ix;
+                    const size_t beg = (size_t)ix*bx, end = beg + (size_t)this_nrc_x*bx;
+                    iqk_prefetch_nta_range(cx, total, beg + (size_t)nta, end + (size_t)nta);
+                    auto this_info = info;
+                    this_info.s += ix;
+                    funcs[n_left-1](n, (const void *)(cx + beg), bx, this_info, this_nrc_x);
+                }
+            } else {
+                funcs[n_left-1](n, vx, bx, info, nrc_x);
+            }
         }
     }
+    static constexpr int k_nta_rows = 16;
     inline static void gelu(int n, const float * src, float * dst);
     inline static void relu(int n, const float * src, float * dst);
     inline static void silu(int n, const float * src, float * dst);
