@@ -4698,6 +4698,64 @@ struct test_ak_tf2_g2 : public test_ak_tf2_base {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE-2 G6 (GGML_CUDA_AK_TF2_G6=1): the qwen35 K prologue tail, multi-section RoPE (IMROPE / MROPE,
+// partial n_dims < head dim as the 27B's 64 of 256) -> VIEW -> SET_ROWS into an F16 / F32 cache at I64 row ids. NORMAL
+// mode is the must-not-fuse witness (upstream's own rope+set_rows fusion takes it, not G6).
+struct test_ak_tf2_g6 : public test_ak_tf2_base {
+    const ggml_type type;
+    const int64_t   hd, nh, nt;
+    const int       n_dims, mode;
+    const int       n_ctx = 512;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_TF2_G6"; }
+    std::string vars() override { return VARS_TO_STR6(type, hd, nh, nt, n_dims, mode); }
+    int  tf2_group() const override { return 6; }
+    bool tf2_eligible() const override { return (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION; }
+
+    test_ak_tf2_g6(ggml_type type, int64_t hd, int64_t nh, int64_t nt, int n_dims, int mode)
+        : type(type), hd(hd), nh(nh), nt(nt), n_dims(n_dims), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, nh, nt);
+        ggml_set_name(a, "a");
+        const bool    mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, mrope ? nt * 4 : nt);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * rope;
+        if (mrope) {
+            int sections[4] = { 11, 11, 10, 0 };   // qwen35 rope.dimension_sections
+            rope = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            rope = ggml_rope_ext(ctx, a, pos, nullptr, n_dims, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
+        ggml_tensor * view = ggml_view_2d(ctx, rope, hd * nh, nt, rope->nb[2], 0);
+        ggml_tensor * dst  = ggml_new_tensor_2d(ctx, type, hd * nh, n_ctx);
+        ggml_set_name(dst, "dst");
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nt);
+        ggml_set_name(row_idxs, "row_idxs");
+        ggml_tensor * out = ggml_set_rows(ctx, dst, view, row_idxs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "row_idxs") == 0) {
+                init_set_rows_row_ids(t, n_ctx);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::mt19937     rng = suite_seed_rng();
+                std::vector<int> data(ggml_nelements(t));
+                for (auto & v : data) {
+                    v = rng() % n_ctx;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
 // reachable from one root while keeping the fused chain contiguous in graph order.
@@ -13855,6 +13913,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int64_t nt : { 1, 5, 8, 16, 17 }) {
                 test_cases.emplace_back(new test_ak_tf2_g2(sh[0], nt, sh[1]));
             }
+        }
+    }
+
+    // AK-RF-27B-TAIL-FUSE-2 G6 (GGML_CUDA_AK_TF2_G6=1): 27B K 256 x 4 kv-heads with n_rot 64, a full-width rope, F16 and
+    // F32 caches; NORMAL mode must not fuse (upstream's fusion owns it)
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t nt : { 1, 8, 16 }) {
+            test_cases.emplace_back(new test_ak_tf2_g6(type, 256, 4, nt, 64, GGML_ROPE_TYPE_IMROPE));
+            test_cases.emplace_back(new test_ak_tf2_g6(type, 256, 4, nt, 64, GGML_ROPE_TYPE_MROPE));
+            test_cases.emplace_back(new test_ak_tf2_g6(type, 128, 8, nt, 128, GGML_ROPE_TYPE_IMROPE));
+            test_cases.emplace_back(new test_ak_tf2_g6(type, 256, 4, nt, 64, GGML_ROPE_TYPE_NORMAL));
         }
     }
 

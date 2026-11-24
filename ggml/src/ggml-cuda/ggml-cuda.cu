@@ -3721,6 +3721,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // AK-RF-27B-TAIL-FUSE-2 G6: multi-section (M/IM)RoPE + view + set_rows into the KV cache in one launch
+    // (GGML_CUDA_AK_TF2_G6=1, default off; upstream fuses only the norm / neox modes)
+    if (node->op == GGML_OP_ROPE && ggml_cuda_ak_tf2_enabled(6) && i + 2 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 })) {
+        ggml_tensor * rope     = node;
+        ggml_tensor * view     = cgraph->nodes[i + 1];
+        ggml_tensor * set_rows = cgraph->nodes[i + 2];
+        const int     mode     = ((const int32_t *) rope->op_params)[2];
+        const bool    mrope    = (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION;
+        if (mrope && view->src[0] == rope && set_rows->src[0] == view && rope->src[0]->ne[3] == 1 &&
+            rope->type == GGML_TYPE_F32 && rope->src[0]->type == GGML_TYPE_F32 &&
+            (set_rows->type == GGML_TYPE_F32 || set_rows->type == GGML_TYPE_F16) &&
+            set_rows->src[1]->type == GGML_TYPE_I64 && ggml_is_contiguous(view) &&
+            view->ne[0] == rope->ne[0] * rope->ne[1] && set_rows->ne[0] == view->ne[0] &&
+            set_rows->nb[0] == ggml_type_size(set_rows->type) && set_rows->nb[1] % ggml_type_size(set_rows->type) == 0 &&
+            ggml_nrows(view) == rope->ne[2]) {
+            ggml_cuda_ak_tf2_note(6, "mrope+view+set_rows");
+            ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
+            return 2;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
