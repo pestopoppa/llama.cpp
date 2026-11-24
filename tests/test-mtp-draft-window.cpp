@@ -46,6 +46,27 @@ static void test_sink(testing & t) {
     t.assert_equal("kept = sink + window", (int) (S + W), kept);
 }
 
+static void test_adaptive_min_pos(testing & t) {
+    // [TAG_MTP_DRAFT_WINDOW_ADAPT] W4096A40K: dense below query position 40000, windowed at/above it
+    const uint32_t W = 4096, S = 64, MP = 40000;
+    bool dense_below = true, same_above = true, same_when_zero = true;
+    for (int p1 = 0; p1 < 70000; p1 += 499) {
+        for (int p0 = 0; p0 <= p1; p0 += 97) {
+            const bool a = llama_hparams::is_masked_draft_window_adaptive(W, S, MP, p0, p1);
+            const bool b = llama_hparams::is_masked_draft_window(W, S, p0, p1);
+            if (p1 < (int) MP && a) { dense_below = false; }
+            if (p1 >= (int) MP && a != b) { same_above = false; }
+            if (llama_hparams::is_masked_draft_window_adaptive(W, S, 0, p0, p1) != b) { same_when_zero = false; }
+        }
+    }
+    t.assert_true("below min_pos: dense",               dense_below);
+    t.assert_true("at/above min_pos: plain window",     same_above);
+    t.assert_true("min_pos 0: identical to plain",      same_when_zero);
+    t.assert_true("p1 = MP-1 far past kept",           !llama_hparams::is_masked_draft_window_adaptive(W, S, MP, 100, MP - 1));
+    t.assert_true("p1 = MP far past dropped",           llama_hparams::is_masked_draft_window_adaptive(W, S, MP, 100, MP));
+    t.assert_true("window 0 never masks",              !llama_hparams::is_masked_draft_window_adaptive(0, S, MP, 100, 65000));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -61,6 +82,7 @@ int main(int argc, char ** argv) {
     t.test("off-is-dense", test_off_is_dense);
     t.test("window-edges", test_window_edges);
     t.test("sink",         test_sink);
+    t.test("adaptive-min-pos", test_adaptive_min_pos);
 
     return t.summary();
 }

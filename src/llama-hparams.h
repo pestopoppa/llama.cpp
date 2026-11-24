@@ -442,6 +442,12 @@ struct llama_hparams {
         return window > 0 && p0 >= (llama_pos) sink && p1 - p0 >= (llama_pos) window;
     }
 
+    // [TAG_MTP_DRAFT_WINDOW_ADAPT] context-adaptive form: the window applies only to query positions
+    // p1 >= min_pos (min_pos == 0 = always, identical to is_masked_draft_window)
+    static bool is_masked_draft_window_adaptive(uint32_t window, uint32_t sink, uint32_t min_pos, llama_pos p0, llama_pos p1) {
+        return p1 >= (llama_pos) min_pos && is_masked_draft_window(window, sink, p0, p1);
+    }
+
     static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1) {
         assert(p0 >= 0 && p1 >= 0);
 
