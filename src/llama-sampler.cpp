@@ -3638,6 +3638,13 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
 // the last row. *transparent = the sampler is the identity for its params (no device op, nothing to skip wrongly).
 static bool llama_sampler_spec_prefix_kind(const struct llama_sampler * smpl, bool * transparent) {
     *transparent = false;
+    if (smpl->iface == &llama_sampler_empty_i) {
+        // llama_sampler_init_penalties() / _logit_bias() return the empty sampler for neutral params; it is the
+        // identity, but its iface carries a no-op backend_set_input, so the generic rule below would wrongly close
+        // the prefix at the chain's first sampler and leave top-k/top-p/temp on the host
+        *transparent = true;
+        return true;
+    }
     if (smpl->iface == &llama_sampler_penalties_i) {
         const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
         *transparent = ctx->penalty_last_n == 0 ||
