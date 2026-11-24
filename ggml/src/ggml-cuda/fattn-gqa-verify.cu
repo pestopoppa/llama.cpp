@@ -114,6 +114,18 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
     return g >= 1 ? g : 0;
 }
 
+// RKA-GV-PSCALE-1: P is stored to LDS as f16 before the PV MFMA. On sink-heavy rows (one key holds most of the mass) the
+// remaining p values fall into the f16 subnormal range (< 2^-14) and lose precision. GGML_HIP_GV_PSCALE_LOG2=N (0..14,
+// default 0 = off, bit-identical to the unscaled kernel) stores p * 2^N and multiplies the partial O by 2^-N before it is
+// written (both exact power-of-two scalings; l stays unscaled in f32, so the merge is unchanged).
+static float gv_pscale() {
+    static const float v = [] {
+        const int n = gv_env_int("GGML_HIP_GV_PSCALE_LOG2", 0);
+        return (n > 0 && n <= 14) ? (float) (1 << n) : 1.0f;
+    }();
+    return v;
+}
+
 static bool gv_debug() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_VERIFY_DEBUG", 0) != 0;
     return v;
@@ -132,7 +144,7 @@ typedef float    gv_floatx4 __attribute__((ext_vector_type(4)));
 static __device__ __forceinline__ void gv_compute_chunk(
         const bool tile_active, const _Float16 * sK, const _Float16 * sVt, _Float16 * sP, const float * smask,
         const gv_halfx4 (&qa)[GV_D / 16], gv_floatx4 (&o)[GV_D / 16], float (&m_run)[4], float (&l_run)[4],
-        const bool (&row_ok)[4], const int (&row_q)[4], const float scale, const int li, const int kq) {
+        const bool (&row_ok)[4], const int (&row_q)[4], const float scale, const float pscale, const int li, const int kq) {
     // 3. S = Q K^T, online softmax, P -> sP
     float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     if (tile_active) {
@@ -172,7 +184,7 @@ static __device__ __forceinline__ void gv_compute_chunk(
             for (int nb = 0; nb < GV_KC / 16; ++nb) {
                 const float p = __expf(S[nb][v] - m_new);
                 rsum += p;
-                sP[(4 * kq + v) * GV_PSTR + nb * 16 + li] = (_Float16) p;
+                sP[(4 * kq + v) * GV_PSTR + nb * 16 + li] = (_Float16) (p * pscale);
             }
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1) {
@@ -225,7 +237,7 @@ template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false>
 static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES, 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
-        const float scale, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G,
+        const float scale, const float pscale, const int n_q_tot, const int gqa, const int n_head_kv, const int n_grp, const int G,
         const int chunks_per_split, const int n_chunks,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
@@ -493,7 +505,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
                 load_raw(c + 1); // in flight during the MFMA work below
             }
             if (live) {
-                gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, pscale, li, kq);
             }
             __syncthreads();
         }
@@ -563,11 +575,12 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         }
         __syncthreads();
 
-        gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+        gv_compute_chunk(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, pscale, li, kq);
         __syncthreads();
     }
 
     // partials: Opart[(((split*n_seq + seq)*n_head_kv + hkv)*R + r)*D + d], MLpart[... r]
+    const float pinv = 1.0f / pscale;   // exact: pscale is a power of two
     if (tile_active) {
         const int64_t base_row = ((int64_t) (split * n_vseq + vseq) * n_head_kv + hkv) * Rs;
 #pragma unroll
@@ -579,7 +592,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
             float * Or = Opart + (base_row + r) * GV_D;
 #pragma unroll
             for (int nb = 0; nb < GV_D / 16; ++nb) {
-                Or[nb * 16 + li] = o[nb][v];
+                Or[nb * 16 + li] = o[nb][v] * pinv;
             }
             if (li == 0) {
                 MLpart[base_row + r] = make_float2(m_run[v], l_run[v]);
@@ -587,7 +600,7 @@ static __global__ void __launch_bounds__(PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q_tot, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
+    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, pscale, n_q_tot, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks,
         nb01, nb02, nb03, nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, ne33, rows, rows_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
@@ -790,6 +803,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const size_t smem = gv_smem_bytes(nwaves);
 
     const int ne33 = (int) mask->ne[3];
+    const float pscale = gv_pscale();
     const bool q8 = K->type == GGML_TYPE_Q8_0;
     const bool late = pipe && q8 && gv_prefetch_late();
     // ROWS (KPF-41 in-place): K/V are the unified cache itself, one slice per ne[3] -> no per-slice K/V offset
@@ -798,7 +812,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 #define GV_LAUNCH(Q8, PIPE_, LATE_, ROWS_) \
     gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_><<<grid, block, smem, stream>>>( \
         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
-        Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
+        Opart.get(), MLpart.get(), scale, pscale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
         Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], nb13, V->nb[1], V->nb[2], nb23, \
         mask->nb[1], mask->nb[3], ne33, rows, rows_s1)
 #define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)

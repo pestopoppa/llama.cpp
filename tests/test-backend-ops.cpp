@@ -10016,6 +10016,63 @@ struct test_fa_gqa_verify : public test_case {
     }
 };
 
+// RKA-GV-PSCALE-1: attention-sink numerics of the GQA-packed verify kernel. Same graph as test_fa_gqa_verify, but the first
+// key of every visible row gets a +sink logit bias through the mask, so P mass concentrates on key 0 and every other p is
+// tiny. The GQA kernel stores P as f16 before the PV MFMA; tiny p land in the f16 subnormal range. err() is the max abs
+// error vs the CPU reference and is printed per comparison ("GV_SINK max_abs_err=..."), so one run of each arm
+// (GGML_CUDA_FA_GQA_VERIFY=1 gv path, =0 vector/C6 path, GGML_HIP_GV_PSCALE_LOG2=10 scaled gv) gives the error ratio.
+// Select with -p 'gqav_sink='. The tolerance is loose on purpose: this case measures, it does not gate.
+struct test_fa_gqa_verify_sink : public test_fa_gqa_verify {
+    const float sink;
+
+    test_fa_gqa_verify_sink(int64_t hs, int64_t nh, int64_t nh_kv, int64_t kv, int64_t nb, ggml_type type_KV, float sink = 20.0f)
+        : test_fa_gqa_verify(hs, nh, nh_kv, kv, nb, 1, type_KV, 0), sink(sink) {}
+
+    std::string vars() override {
+        return "gqav_sink=" + std::to_string((int) sink) + "," + test_fa_gqa_verify::vars();
+    }
+
+    double max_err() override {
+        return 1.0;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 1.0;
+    }
+
+    const char * err_metric_id() override {
+        return "max_abs_err/v1";
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        printf("GV_SINK max_abs_err=%.9g ", result);
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nb; ++i) {
+                    const int64_t pos = kv - nb + i;
+                    for (int64_t j = 0; j < kv; ++j) {
+                        const float mv = j > pos ? -INFINITY : (j == 0 ? sink : 0.0f);
+                        data[i*kv + j] = ggml_fp32_to_fp16(mv);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // G10 (INF-48): a test_flash_attn_ext that carries a stable id in its case name (",g10=NN" appended to vars()), so the imported
 // upstream cases can be selected in isolation with `-p 'g10='` (or one at a time with `-p 'g10=07$'`) and parsed per case.
 // Behaviour is otherwise identical to test_flash_attn_ext (prec is always GGML_PREC_F32, as in every imported upstream case).
@@ -14228,6 +14285,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
+    }
+    // RKA-GV-PSCALE-1: sink-heavy rows (key 0 +20 logit) on the 27B GQA-verify layout 24/4, hd256, n_q 4 and 8
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {4096, 16384}) {
+            for (int64_t nb : {4, 8}) {
+                test_cases.emplace_back(new test_fa_gqa_verify_sink(256, 24, 4, kv, nb, type_KV, 20.0f));
+            }
+        }
     }
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
