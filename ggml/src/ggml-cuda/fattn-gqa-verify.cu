@@ -289,7 +289,9 @@ static __device__ __forceinline__ void gv_row_sum4(float (&x)[4]) {
 //   - row max: gv_row_max4 (4 rows interleaved, DPP) instead of 4 x 4 dependent ds_bpermute + lgkmcnt(0)
 //   - row sum: not reduced per chunk. l_run holds this lane's partial sum (alpha is uniform across the row, so the
 //     per-lane recurrence l = l*alpha + p sums to the row recurrence); the kernel reduces it once at the split end.
-template <int KC>
+// VPAD (RF6): halves of padding after each 32-row d block of sVt, so the 4 q8_0 blocks a wave stores (b step) land in
+// different LDS banks (VPAD 0: b step 384 dwords = 0 mod 32, 4-way conflicted; VPAD 16: 392 dwords = 8 mod 32, free).
+template <int KC, int VPAD = 0>
 static __device__ __forceinline__ void gv_compute_chunk_rf5(
         const bool tile_active, const _Float16 * sK, const _Float16 * sVt, _Float16 * sP, const float * smask,
         const gv_halfx4 (&qa)[GV_D / 16], gv_floatx4 (&o)[GV_D / 16], float (&m_run)[4], float (&l_run)[4],
@@ -349,7 +351,8 @@ static __device__ __forceinline__ void gv_compute_chunk_rf5(
             gv_halfx4 vb[GV_D / 32];
 #pragma unroll
             for (int j = 0; j < GV_D / 32; ++j) {
-                vb[j] = *(const gv_halfx4 *) (sVt + ((8 * h + j) * 16 + li) * VTSTR + 4 * kq);
+                const int d = (8 * h + j) * 16 + li;
+                vb[j] = *(const gv_halfx4 *) (sVt + d * VTSTR + (d / 32) * VPAD + 4 * kq);
             }
 #pragma unroll
             for (int j = 0; j < GV_D / 32; ++j) {
@@ -397,11 +400,12 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
     constexpr int PSTR  = KC + 8;
     constexpr bool RF6  = RF == 6;
     constexpr bool RF5  = RF == 5 || RF6; // RF6 = RF5 chunk step and prologue, deeper load pipeline
+    constexpr int VPAD  = RF6 ? 16 : 0;    // RF6: bank-conflict-free transposed V store (see gv_compute_chunk_rf5)
     static_assert(!RF5 || (KV_Q8 && PIPE && LATE && !ROWS && KC == GV_KC_CUT), "RF5/RF6 = q8_0 LATE pipelined 16-key cut, no ROWS");
     extern __shared__ char gv_smem[];
     _Float16 * sK   = (_Float16 *) gv_smem;
     _Float16 * sVt  = sK + KC * GV_KSTR;
-    _Float16 * sP0  = sVt + GV_D * VTSTR;
+    _Float16 * sP0  = sVt + GV_D * VTSTR + (GV_D / 32) * VPAD;
     const int nthreads = blockDim.x;
     const int nwaves   = nthreads / 64;
     float    * smask = (float *) (sP0 + nwaves * 16 * PSTR);
@@ -735,8 +739,8 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 #pragma unroll
                 for (int t = 0; t < QK8_0 / 2; ++t) {
                     const uint16_t u = hv(1 + t);
-                    sVt[(b * QK8_0 + 2 * t + 0) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
-                    sVt[(b * QK8_0 + 2 * t + 1) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
+                    sVt[(b * QK8_0 + 2 * t + 0) * VTSTR + b * VPAD + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
+                    sVt[(b * QK8_0 + 2 * t + 1) * VTSTR + b * VPAD + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
                 }
             }
             return any;
@@ -765,7 +769,7 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                     load_set(r, c + u + 4);
                 }
                 if (live) {
-                    gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                    gv_compute_chunk_rf5<KC, VPAD>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
                 }
                 __syncthreads();
             }
@@ -786,7 +790,7 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                 load_set(sa, c + 2);
             }
             if (live) {
-                gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                gv_compute_chunk_rf5<KC, VPAD>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
             }
             __syncthreads();
             if (c + 1 >= c_end) {
@@ -797,7 +801,7 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                 load_set(sb, c + 3);
             }
             if (live) {
-                gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                gv_compute_chunk_rf5<KC, VPAD>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
             }
             __syncthreads();
         }
@@ -1213,7 +1217,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     cudaStream_t stream = ctx.stream();
     const dim3 grid(n_splits, n_head_kv, n_vseq);
     const dim3 block(64 * nwaves);
-    const size_t smem = gv_smem_bytes(nwaves, kc);
+    const size_t smem = gv_smem_bytes(nwaves, kc) + (rf6 ? sizeof(_Float16) * (GV_D / 32) * 16 : 0); // RF6 sVt pad
 
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
