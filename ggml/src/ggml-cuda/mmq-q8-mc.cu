@@ -24,6 +24,9 @@
 
 #define Q8MC_MAXM    8
 #define Q8MC_YT      4
+// rows per wave: M=7 at YT=4 spilled (ScratchSize 16 @128 VGPRs); the doc fallback YT=2 applies to it only
+// (M=8 at YT=4 fits 128 VGPRs with no spill and keeps the wider pipeline).
+template <int M> struct q8mc_yt { static constexpr int v = M == 7 ? 2 : Q8MC_YT; };
 #define Q8MC_LDS_B   65536
 #define Q8MC_MAXWAVE 16
 #define Q8MC_STEP    32
@@ -117,20 +120,22 @@ __device__ short     q8mc_buf_s16(q8mc_int4 rsrc, int voffset, int soffset, int 
 #define Q8MC_LDS_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
 #define Q8MC_DPP_ADD(x, ctrl) asm("s_nop 0\n\tv_add_f32 %0, %2, %3 " ctrl " bound_ctrl:0" : "=v"(x) : "0"(x), "v"(x), "v"(x))
 
+template <int YT>
 struct q8mc_win {
-    q8mc_int4 a[Q8MC_YT];
-    int       b[Q8MC_YT];
-    short     s[Q8MC_YT];
+    q8mc_int4 a[YT];
+    int       b[YT];
+    short     s[YT];
 };
 
 // lane l covers half h = l&1 (16 qs bytes) of block k1 + l/2: one wave instruction per row = 32 blocks = 1088 B.
-static __device__ __forceinline__ void q8mc_issue(q8mc_win & w, const q8mc_int4 rsrc, const int k1, const int hb,
+template <int YT>
+static __device__ __forceinline__ void q8mc_issue(q8mc_win<YT> & w, const q8mc_int4 rsrc, const int k1, const int hb,
                                                   const int h, const int row0, const bool active, const int N,
                                                   const int nb01, const int nblk) {
     const int bb = k1 + hb;
     const int tb = bb * 34 + 2 + 16 * h;
 #pragma unroll
-    for (int y = 0; y < Q8MC_YT; ++y) {
+    for (int y = 0; y < YT; ++y) {
         const int  row = row0 + y;
         const bool ok  = active && row < N && bb < nblk;
         const int  rb  = row * nb01;
@@ -149,6 +154,7 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
              const int8_t * __restrict__ yq, const float * __restrict__ yd, const int P, const int n_tiles, const int n_rnd,
              float * __restrict__ dst, const int64_t dst_s1) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    constexpr int YT = q8mc_yt<M>::v;
     __shared__ q8mc_int4 lds[Q8MC_LDS_B / 16];
     float * lds_d = (float *) &lds[M * P * 2];
 
@@ -166,23 +172,23 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
     for (int rnd = 0; rnd < n_rnd; ++rnd) {
         const int  t      = (rnd * gridDim.x + blockIdx.x) * wv + threadIdx.y;
         const bool active = t < n_tiles;
-        const int  row0   = t * Q8MC_YT;
+        const int  row0   = t * YT;
 
-        float acc[Q8MC_YT][M];
+        float acc[YT][M];
 #pragma unroll
-        for (int y = 0; y < Q8MC_YT; ++y) {
+        for (int y = 0; y < YT; ++y) {
 #pragma unroll
             for (int n = 0; n < M; ++n) {
                 acc[y][n] = 0.0f;
             }
         }
 
-        q8mc_win cur;
+        q8mc_win<YT> cur;
         q8mc_issue(cur, rsrc, 0, hb, h, row0, active, N, nb01, nblk);
 
         for (int k1 = 0; k1 < nblk; k1 += Q8MC_STEP) {
             // 1) next step's windows leave before this step's wait (past-the-end steps read 0 and are discarded)
-            q8mc_win nxt;
+            q8mc_win<YT> nxt;
             q8mc_issue(nxt, rsrc, k1 + Q8MC_STEP, hb, h, row0, active && k1 + Q8MC_STEP < nblk, N, nb01, nblk);
 
             // 2) activation page restage, uniform across the WG
@@ -210,10 +216,10 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
             // 3) math on the current step
             const int sh = (((k1 + hb) * 34 + 2 + 16 * h) & 3);
             const int bl = k1 - page + hb;
-            int   qw[Q8MC_YT][4];
-            float dw[Q8MC_YT];
+            int   qw[YT][4];
+            float dw[YT];
 #pragma unroll
-            for (int y = 0; y < Q8MC_YT; ++y) {
+            for (int y = 0; y < YT; ++y) {
                 const int d5[5] = {cur.a[y][0], cur.a[y][1], cur.a[y][2], cur.a[y][3], cur.b[y]};
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -226,7 +232,7 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
                 const q8mc_int4 a  = lds[(n * P + bl) * 2 + h];
                 const float     da = lds_d[n * P + bl];
 #pragma unroll
-                for (int y = 0; y < Q8MC_YT; ++y) {
+                for (int y = 0; y < YT; ++y) {
                     int s = ggml_cuda_dp4a(qw[y][0], a[0], 0);
                     s     = ggml_cuda_dp4a(qw[y][1], a[1], s);
                     s     = ggml_cuda_dp4a(qw[y][2], a[2], s);
@@ -238,7 +244,7 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
         }
 
 #pragma unroll
-        for (int y = 0; y < Q8MC_YT; ++y) {
+        for (int y = 0; y < YT; ++y) {
 #pragma unroll
             for (int n = 0; n < M; ++n) {
                 Q8MC_DPP_ADD(acc[y][n], "row_shr:8");
@@ -251,7 +257,7 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
         }
         if (active && lane == 63) {
 #pragma unroll
-            for (int y = 0; y < Q8MC_YT; ++y) {
+            for (int y = 0; y < YT; ++y) {
                 if (row0 + y < N) {
 #pragma unroll
                     for (int n = 0; n < M; ++n) {
@@ -275,7 +281,8 @@ static void q8mc_launch(const char * W, int nb01, int nblk, int N, uint32_t wbyt
     P = std::min(P, (nblk + Q8MC_STEP - 1) / Q8MC_STEP * Q8MC_STEP);
     GGML_ASSERT(P >= Q8MC_STEP && M * P * 36 <= Q8MC_LDS_B);
 
-    const int n_tiles = (N + Q8MC_YT - 1) / Q8MC_YT;
+    constexpr int YT = q8mc_yt<M>::v;
+    const int n_tiles = (N + YT - 1) / YT;
     const int n_rnd   = (n_tiles + ncu * max_waves - 1) / (ncu * max_waves);
     const int wv      = (n_tiles + ncu * n_rnd - 1) / (ncu * n_rnd);
     const dim3 block(64, wv, 1);
