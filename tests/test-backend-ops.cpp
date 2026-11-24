@@ -15082,6 +15082,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 4, false, 256, n, 512));
         }
     }
+    // MMID-HELPER-N10 correctness (opt-in): n_expert_used = 10 (Q38FN top-10 of 512) now takes the fast
+    // mm_ids_helper path (upstream f1793c1c4), padded to 16 lanes per token. Token counts straddle the
+    // lane-group stride (warp 64 / 16 = 4, warp 32 / 16 = 2) and reach prefill sizes so MMQ uses the helper.
+    if (test_backend_ops_extra_case_set("mmid_n10")) {
+        for (int n_mats : {16, 512}) {
+            for (int64_t n : {16, 33, 64, 129, 512, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, n_mats, 10, false, 256, n, 512));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, n_mats, 10, false, 256, n, 512));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, n_mats, 10, true, 256, 129, 512));
+        }
+    }
     if (test_backend_ops_extra_case_set("gdn_bf16_state")) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, false, /*K=*/1, GGML_TYPE_BF16));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  /*K=*/4, GGML_TYPE_BF16));
