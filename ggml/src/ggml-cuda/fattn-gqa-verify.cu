@@ -140,6 +140,17 @@ static int gv_splits_mode() {
     return v;
 }
 
+// GGML_CUDA_FA_GQA_AUTO_TUNE=1 (default OFF): per-call-shape pick from the AK-GVFATTN-LONGCTX measured table
+// (row ak-gvfattn-lds-gpu-20261124, MI210): n_kv <= 16384 -> split target 26 (as SPLITS_MODE=26; 1.32-1.62x q8_0),
+// n_kv > 16384 -> 16-key LDS cut (as LDS_CUT=1; 1.21x q8_0 kv32768 nb8). Explicit LDS_CUT / SPLITS_MODE /
+// VERIFY_SPLITS settings still win; CUT+S26 together is never picked (0.92x measured).
+#define GV_AUTO_KV_SPLIT_MAX 16384
+#define GV_AUTO_SPLITS 26
+static bool gv_auto_tune() {
+    static const bool v = gv_env_int("GGML_CUDA_FA_GQA_AUTO_TUNE", 0) != 0;
+    return v;
+}
+
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 typedef _Float16 gv_halfx4 __attribute__((ext_vector_type(4)));
 typedef float    gv_floatx4 __attribute__((ext_vector_type(4)));
@@ -789,7 +800,9 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const int nwaves    = std::max(ntiles, GV_MIN_WAVES);
     GGML_ASSERT(ntiles <= GV_MAX_TILES);
     const bool pipe     = gv_pipe() && ntiles <= GV_PIPE_MAX_WAVES;
-    const bool cut      = gv_lds_cut() && pipe && nwaves == GV_MIN_WAVES;
+    const bool autot    = gv_auto_tune() && !gv_lds_cut() && gv_splits_mode() == 0;
+    const bool auto_cut = autot && n_kv > GV_AUTO_KV_SPLIT_MAX;
+    const bool cut      = (gv_lds_cut() || auto_cut) && pipe && nwaves == GV_MIN_WAVES;
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -801,7 +814,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     if (n_splits <= 0) {
         // grouped: each group streams ~1/n_grp of the KV (live-range trim), so size the splits per real sequence
         const int base = n_head_kv * n_seq;
-        const int mode = gv_splits_mode();
+        const int mode = autot ? (auto_cut ? 0 : GV_AUTO_SPLITS) : gv_splits_mode();
         n_splits = mode == 1 ? (nsm + base - 1) / base : mode >= 2 ? mode : (2 * nsm + base - 1) / base;
         n_splits = std::min(n_splits, std::max(1, n_kv / 256));
         n_splits = std::min(n_splits, 256);
@@ -877,6 +890,14 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_cut_calls = 0;
     if (cut && n_cut_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_GQA_LDS_CUT 16-key chunk variant ran (smem=%zu)\n", smem);
+    }
+    static int n_auto_split_calls = 0;
+    static int n_auto_cut_calls = 0;
+    if (autot && !auto_cut && n_auto_split_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_GQA_AUTO_TUNE split-26 regime ran (n_kv=%d splits=%d)\n", n_kv, n_splits);
+    }
+    if (autot && auto_cut && n_auto_cut_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_GQA_AUTO_TUNE lds-cut regime ran (n_kv=%d cut=%d splits=%d)\n", n_kv, (int) cut, n_splits);
     }
     static int n_late_calls = 0;
     if (late && n_late_calls++ == 0) {

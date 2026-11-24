@@ -14240,6 +14240,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 8, 2, type_KV, 9));
         test_cases.emplace_back(new test_fa_gqa_verify(256, 16, 2, 16384, 8, 1, type_KV, 41));
     }
+    // GGML_CUDA_FA_GQA_AUTO_TUNE=1 regimes: split-26 side (n_kv <= 16384: 8192 exact, 16384 boundary) and the LDS-cut side
+    // (n_kv > 16384: 16640 just past the boundary, 32768 with a mid-chunk tail, 2-stream 24576). Default-off knob: without
+    // the env these run the C20 kernel, so the same cases gate both.
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8192, nb, 1, type_KV, 5));
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 32768, nb, 1, type_KV, 23));
+        }
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16384, 8, 1, type_KV, 0));
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16640, 8, 1, type_KV, 7));
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 24576, 5, 2, type_KV, 13));
+    }
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));
