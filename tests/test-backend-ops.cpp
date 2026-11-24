@@ -14229,6 +14229,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // the DFlash2 verify step the e2e smoke served: 27B 24/4, n_q 8 (1 + 7 drafted), 8154 cells filled of a 256-padded 8448 window
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8448, 8, 1, type_KV, 8448 - 8162));
     }
+    // AK-GVFATTN-LONGCTX step 2 (GGML_CUDA_FA_GQA_LDS_CUT=1 16-key chunks, GGML_CUDA_FA_GQA_SPLITS_MODE): 27B 24/4 at 16k with
+    // nb 4/8 (the census point), tails that end mid 16-key chunk, and a 2-stream case. Default-off knobs: these run the
+    // C20 kernel unless the env selects the variant, so the same cases gate both.
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {2, 4, 8, 10}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16384, nb, 1, type_KV, 23));
+        }
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 768, 3, 1, type_KV, 17));
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 8, 2, type_KV, 9));
+        test_cases.emplace_back(new test_fa_gqa_verify(256, 16, 2, 16384, 8, 1, type_KV, 41));
+    }
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));
@@ -15285,6 +15296,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // AK-ASM-H10: DFlash verify attention at long context, hd256, layouts 27B 24/4, A3B 16/2, Q38FN 24/2.
     // A/B: GGML_CUDA_FA_GQA_VERIFY=1 (GQA-packed kernel, n_q 2..16) vs =0 (C6 selection). n_q=1 is a null control.
+    // AK-GVFATTN-LONGCTX step 2: the 16k census point at nb 4/8 (27B 24/4), A/B GGML_CUDA_FA_GQA_LDS_CUT / SPLITS_MODE
+    for (int64_t nb : {4, 8}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16384, nb, 1, type_KV, 0));
+        }
+    }
     for (int64_t kv : {8192, 32768, 81920}) {
         for (auto hh : std::vector<std::array<int64_t, 2>>{{24, 4}, {16, 2}, {24, 2}}) {
             for (int64_t nb : {1, 2, 5, 8, 16}) {
