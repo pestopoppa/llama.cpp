@@ -4948,6 +4948,131 @@ static void ggml_compute_forward_mul_mat_siblings(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// AK-CPU-MOE-WSUM-FOLD (GGML_MOE_WSUM_FOLD, default OFF). The MoE tail is
+//   X = MUL_MAT_ID(down)  [n_embd, n_used, n_tok]
+//   M = MUL(X, w)         w = [1, n_used, n_tok]   ("ffn_moe_weighted")
+//   V_k = VIEW(M, expert k), A_1 = ADD(V_0, V_1), A_k = ADD(A_{k-1}, V_k)  ("ffn_moe_out" = A_{n_used-1})
+// i.e. 1 + (n_used - 1) nodes and as many full passes. With the knob on, the MUL node computes the
+// final sum directly into A_{n_used-1} and the views/ADDs are consumed by the fusion (one pass, one
+// barrier). Per element the arithmetic is the stock one in the stock order -- p_k = x_k * w_k rounded
+// to F32, then ((p_0 + p_1) + p_2) + ... -- with FP contraction disabled so no FMA can merge a product
+// into the running sum -> bit-identical. The MUL_MAT_ID itself is not touched (iqk owns it).
+// Any extra consumer of M, a view or an intermediate sum, an OUTPUT flag, or a non-adjacent node
+// sequence keeps the stock nodes.
+// ---------------------------------------------------------------------------------------------
+static bool ggml_cpu_moe_wsum_fold = false;          // set once in ggml_cpu_init()
+static atomic_llong ggml_cpu_moe_wsum_fold_hits = 0; // fused MoE tails executed
+
+long long ggml_cpu_moe_wsum_fold_count(void) {
+    return atomic_load_explicit(&ggml_cpu_moe_wsum_fold_hits, memory_order_relaxed);
+}
+
+// returns the index of the final ADD when nodes[node_n] heads a foldable MoE tail, else -1
+static int ggml_cpu_moe_wsum_match(const struct ggml_cgraph * cgraph, int node_n) {
+    const struct ggml_tensor * M = cgraph->nodes[node_n];
+    if (M->op != GGML_OP_MUL || M->type != GGML_TYPE_F32 || (M->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const struct ggml_tensor * X = M->src[0];
+    const struct ggml_tensor * w = M->src[1];
+    if (X == NULL || w == NULL || X->op != GGML_OP_MUL_MAT_ID || X->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(X) || !ggml_is_contiguous(M) || !ggml_are_same_shape(X, M) || X->ne[3] != 1) {
+        return -1;
+    }
+    const int64_t n_embd = X->ne[0], n_used = X->ne[1], n_tok = X->ne[2];
+    if (n_used < 2 || w->ne[0] != 1 || w->ne[1] != n_used || w->ne[2] != n_tok || w->ne[3] != 1) {
+        return -1;
+    }
+    if (!ggml_node_has_n_uses(cgraph, node_n, (int32_t) n_used)) {
+        return -1;
+    }
+    const struct ggml_tensor * views[512];
+    if (n_used > (int64_t) (sizeof(views) / sizeof(views[0]))) {
+        return -1;
+    }
+    int j = node_n + 1;
+    int nv = 0;
+    // the n_used views of M, in expert order
+    for (; j < cgraph->n_nodes && nv < n_used; j++, nv++) {
+        const struct ggml_tensor * v = cgraph->nodes[j];
+        if (v->op != GGML_OP_VIEW || v->view_src != M || v->src[0] != M || v->type != GGML_TYPE_F32 ||
+            v->view_offs != (size_t) nv * M->nb[1] || v->ne[0] != n_embd || v->ne[1] != n_tok ||
+            v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float) || v->nb[1] != M->nb[2] ||
+            (v->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) != 1) {
+            return -1;
+        }
+        views[nv] = v;
+    }
+    if (nv != n_used) {
+        return -1;
+    }
+    // the ADD chain
+    const struct ggml_tensor * prev = views[0];
+    for (int64_t k = 1; k < n_used; k++, j++) {
+        if (j >= cgraph->n_nodes) {
+            return -1;
+        }
+        const struct ggml_tensor * a = cgraph->nodes[j];
+        if (a->op != GGML_OP_ADD || a->type != GGML_TYPE_F32 || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !((a->src[0] == prev && a->src[1] == views[k]) || (a->src[0] == views[k] && a->src[1] == prev)) ||
+            a->ne[0] != n_embd || a->ne[1] != n_tok || a->ne[2] != 1 || a->ne[3] != 1 || !ggml_is_contiguous(a) ||
+            a->data == NULL || a->view_src != NULL) {
+            return -1;
+        }
+        if (k < n_used - 1 && ((a->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(cgraph, j, 1))) {
+            return -1;
+        }
+        prev = a;
+    }
+    return j - 1;
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+static void ggml_cpu_moe_wsum_compute(const struct ggml_compute_params * params, const struct ggml_tensor * M,
+                                      struct ggml_tensor * out) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const struct ggml_tensor * X = M->src[0];
+    const struct ggml_tensor * w = M->src[1];
+    const int64_t n_embd = X->ne[0], n_used = X->ne[1], n_tok = X->ne[2];
+
+    // partition (token, 64-element block) work items across the team; order within an element is fixed
+    const int64_t nblk  = (n_embd + 63) / 64;
+    const int64_t items = nblk * n_tok;
+    const int64_t per   = (items + params->nth - 1) / params->nth;
+    const int64_t it0   = per * params->ith;
+    const int64_t it1   = MIN(it0 + per, items);
+
+    for (int64_t it = it0; it < it1; it++) {
+        const int64_t t  = it / nblk;
+        const int64_t i0 = (it % nblk) * 64;
+        const int64_t i1 = MIN(i0 + 64, n_embd);
+        const float * wt = (const float *) ((const char *) w->data + t * w->nb[2]);
+        float * o = (float *) ((char *) out->data + t * out->nb[1]);
+        const float * x0 = (const float *) ((const char *) X->data + t * X->nb[2]);
+        const float w0 = *wt;
+        for (int64_t i = i0; i < i1; i++) {
+            o[i] = x0[i] * w0;
+        }
+        for (int64_t k = 1; k < n_used; k++) {
+            const float * xk = (const float *) ((const char *) X->data + k * X->nb[1] + t * X->nb[2]);
+            const float wk = *(const float *) ((const char *) wt + k * w->nb[1]);
+            for (int64_t i = i0; i < i1; i++) {
+                const float p = xk[i] * wk;
+                o[i] = o[i] + p;
+            }
+        }
+    }
+    if (params->ith == 0) {
+        const long long n = atomic_fetch_add_explicit(&ggml_cpu_moe_wsum_fold_hits, 1, memory_order_relaxed) + 1;
+        ggml_cpu_lever_witness("moe-wsum-fold", "GGML_MOE_WSUM_FOLD_QUIET", n);
+    }
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4959,6 +5084,15 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    // AK-CPU-MOE-WSUM-FOLD: MUL(experts, weights) + the expert-sum ADD chain -> one pass, one barrier
+    if (ggml_cpu_moe_wsum_fold && node->op == GGML_OP_MUL) {
+        const int last = ggml_cpu_moe_wsum_match(cgraph, node_n);
+        if (last > node_n) {
+            ggml_cpu_moe_wsum_compute(params, node, cgraph->nodes[last]);
+            return last - node_n;
+        }
+    }
 
 #if defined(GGML_USE_IQK_MULMAT) && defined(IQK_IMPLEMENT)
     if (node->op == GGML_OP_MUL_MAT_ID && node_n + 2 < cgraph->n_nodes) {
@@ -6224,6 +6358,15 @@ void ggml_cpu_init(void) {
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
 
+            // AK-CPU-MOE-WSUM-FOLD: default OFF; =1 folds the MoE weighting MUL + expert-sum ADDs into one pass
+            const char * env = getenv("GGML_MOE_WSUM_FOLD");
+            ggml_cpu_moe_wsum_fold = (env != NULL && atoi(env) != 0);
+            if (ggml_cpu_moe_wsum_fold && getenv("GGML_MOE_WSUM_FOLD_QUIET") == NULL) {
+                fprintf(stderr, "[moe-wsum-fold] MOE_WSUM_FOLD enabled\n");
+            }
+        }
+
+        {
             // AK-CPU-ROUTER-BF16: default OFF; =1 serves exact-BF16 F32 weight GEMVs from a BF16 shadow
             const char * env = getenv("GGML_ROUTER_BF16");
             ggml_cpu_router_bf16 = (env != NULL && atoi(env) != 0);
