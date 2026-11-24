@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-q8-skinny.cuh"
 #include "ggml-cuda/mmq-q8-wvsk.cuh"
+#include "ggml-cuda/mmq-q8-mc.cuh"
 #include "ggml-cuda/mmq-q8-mf.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2122,6 +2123,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_log_mul_mat_route("MMF", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // Q8-MULTICOL-GEMV-1: opt-in GGML_HIP_Q8MC=1 multi-column Q8_0 GEMV for ne11 2..8 (CDNA2, > 1 MiB), ahead of
+    // MMVQ (2..4) and q8wv (5..8). Default OFF: unset or != 1 leaves the C21 routes byte-identical.
+    if (ggml_cuda_q8_mc_eligible(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("Q8_MC", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_mc(ctx, src0, src1, dst);
         return;
     }
     // DTREE-0-Q8MF-V2: stream-K MFMA small-M Q8_0 path (M 9..16, > 6 MiB, K % 256 == 0, CDNA2); OPT-IN
