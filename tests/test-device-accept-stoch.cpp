@@ -20,6 +20,7 @@
 #include "common.h"
 #include "llama.h"
 #include "sampling.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cmath>
@@ -175,6 +176,51 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "FAIL law: chi-square p = %.3g on row %d\n", worst_p, chi_row);
         ok = false;
     }
+
+    // 4: composition with SPEC-RNG.1 (rng_poskey, used by the V2 RRS tree walk). The poskey dist and the served
+    // rejection step draw from (seed, absolute position), so the candidate path must give the same tokens, the same
+    // accept decisions and the same residual resamples as the full-row path while the position advances.
+    long n_pk_mismatch = 0;
+    long n_pk_steps    = 0;
+    {
+        common_params_sampling spk = sp;           spk.rng_poskey = true;
+        common_params_sampling spk_full = sp_full; spk_full.rng_poskey = true;
+        for (size_t r = 0; r < rows.size(); ++r) {
+            common_sampler * A = common_sampler_init(model, spk);
+            common_sampler * B = common_sampler_init(model, spk_full);
+            // a fixed draft distribution: uniform over the row's first 4 device candidates
+            const int32_t * ids = nullptr;
+            const float *   vals = nullptr;
+            const int32_t   n = llama_get_topk_ith(ctx, rows[r], &ids, &vals);
+            common_speculative_token_dist q;
+            for (int i = 0; i < std::min<int32_t>(n, 4); ++i) {
+                q.ids.push_back(ids[i]);
+                q.probs.push_back(1.0f / std::min<int32_t>(n, 4));
+            }
+            for (int d = 0; d < 2000 && n > 0; ++d) {
+                const llama_token ta = common_sampler_sample(A, ctx, rows[r], false);
+                const llama_token tb = common_sampler_sample(B, ctx, rows[r], false);
+                bool acc_a = false, acc_b = false;
+                const llama_token draft_tok = q.ids[d % q.ids.size()];
+                const llama_token ya = common_sampler_spec_reject_step(A, ctx, rows[r], draft_tok, q, &acc_a);
+                const llama_token yb = common_sampler_spec_reject_step(B, ctx, rows[r], draft_tok, q, &acc_b);
+                if (ta != tb || ya != yb || acc_a != acc_b) {
+                    n_pk_mismatch++;
+                }
+                n_pk_steps++;
+                common_sampler_accept(A, ya, true);   // advance the absolute position on both
+                common_sampler_accept(B, yb, true);
+            }
+            common_sampler_free(A);
+            common_sampler_free(B);
+        }
+    }
+    if (n_pk_mismatch != 0) {
+        fprintf(stderr, "FAIL poskey: %ld of %ld steps differ between device-candidate and full-row paths\n",
+                n_pk_mismatch, n_pk_steps);
+        ok = false;
+    }
+    printf("poskey+reject_step steps=%ld mismatches=%ld\n", n_pk_steps, n_pk_mismatch);
 
     // 1: candidates vs the downloaded logits (forces the deferred download)
     int n_cand_rows = 0;
