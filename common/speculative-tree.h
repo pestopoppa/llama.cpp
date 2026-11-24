@@ -184,6 +184,19 @@ int32_t common_dtree_sampled_max_paths();
 // LLAMA_DTREE_SAMPLED=1 read once (lifts the T > 0 guard of the tree verify; the accept walk is the V2 walk above)
 bool common_dtree_sampled_enabled();
 
+// DF2-PM: LLAMA_DF2_POINT_MASS=1 read once (default off). At T > 0 the DFlash2 selector walk proposes the argmax
+// candidate with a point-mass proposal q = one-hot instead of sampling softmax(scores/T). The rejection verifier then
+// accepts with p_target(draft) and resamples from the residual, which stays lossless. The sampled tree siblings
+// (LLAMA_DTREE_SAMPLED) need a non-degenerate q, so they are skipped on point-mass rounds.
+#define COMMON_DF2_POINT_MASS_ENABLED_MSG \
+    "llama_df2_point_mass: ENABLED (LLAMA_DF2_POINT_MASS=1; DFlash2 T>0 proposals are argmax with one-hot q)"
+bool common_df2_point_mass_enabled();
+
+// One DFlash2 selector step at T > 0. Fills probs (size top_k) with the proposal distribution and returns the chosen
+// candidate index: point_mass -> argmax with probs one-hot; otherwise softmax(scores/T) sampled with u01 in [0,1).
+int32_t common_df2_propose(const float * scores, int32_t top_k, float temperature, bool point_mass, double u01,
+                           std::vector<float> & probs);
+
 // LLAMA_DTREE_DEVICE_ACCEPT=1 read once; witness counters (rows decided by the device pick / by the host scan)
 bool    common_dtree_device_accept_enabled();
 void    common_dtree_device_accept_counts(int64_t * n_dev_rows, int64_t * n_host_rows);

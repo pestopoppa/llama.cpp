@@ -576,6 +576,45 @@ bool common_dtree_sampled_enabled() {
     return on;
 }
 
+bool common_df2_point_mass_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DF2_POINT_MASS");
+        const bool v = e != nullptr && e[0] == '1';
+        if (v) {
+            fprintf(stderr, "%s\n", COMMON_DF2_POINT_MASS_ENABLED_MSG);
+        }
+        return v;
+    }();
+    return on;
+}
+
+int32_t common_df2_propose(const float * scores, int32_t top_k, float temperature, bool point_mass, double u01,
+                           std::vector<float> & probs) {
+    probs.assign(top_k, 0.0f);
+    const int32_t amax = (int32_t) (std::max_element(scores, scores + top_k) - scores);
+    if (point_mass) {
+        probs[amax] = 1.0f;
+        return amax;
+    }
+    const float max_score = scores[amax];
+    double sum = 0.0;
+    for (int32_t k = 0; k < top_k; ++k) {
+        probs[k] = std::exp((scores[k] - max_score) / temperature);
+        sum += probs[k];
+    }
+    for (float & p : probs) {
+        p = (float) (p / sum);
+    }
+    double acc = 0.0;
+    for (int32_t k = 0; k < top_k; ++k) {
+        acc += probs[k];
+        if (u01 < acc) {
+            return k;
+        }
+    }
+    return top_k - 1;
+}
+
 void common_dtree_fork(llama_context * ctx, llama_seq_id src, llama_seq_id dst) {
     llama_memory_t mem = llama_get_memory(ctx);
     llama_memory_seq_rm(mem, dst, -1, -1);

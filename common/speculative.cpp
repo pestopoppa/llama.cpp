@@ -1809,7 +1809,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
-                    if (dp.temperature > 0.0f) {
+                    if (dp.temperature > 0.0f && common_df2_point_mass_enabled()) {
+                        // DF2-PM: argmax proposal with one-hot q; the rejection verify stays lossless
+                        common_speculative_token_dist dist;
+                        dist.ids.resize(selector_top_k);
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            dist.ids[k] = (llama_token) row[k];
+                        }
+                        predecessor = common_df2_propose(scores, selector_top_k, dp.temperature, true, 0.0, dist.probs);
+                        main_idx.push_back(predecessor);
+                        result.push_back(dist.ids[predecessor]);
+                        dp.dists->push_back(std::move(dist));
+                    } else if (dp.temperature > 0.0f) {
                         common_speculative_token_dist dist;
                         dist.ids.resize(selector_top_k);
                         dist.probs.resize(selector_top_k);
@@ -1839,7 +1850,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     dp.tree_alts->clear();
                 }
                 if (dp.tree_alts && dp.tree_nodes > 0 && dp.temperature > 0.0f && n_block_tokens > 1 &&
-                        common_dtree_sampled_enabled() && dp.dists && (int32_t) main_idx.size() == n_block_tokens - 1 &&
+                        common_dtree_sampled_enabled() && !common_df2_point_mass_enabled() && dp.dists && (int32_t) main_idx.size() == n_block_tokens - 1 &&
                         dp.dists->size() >= main_idx.size()) {
                     // SPEC-DTREE-SAMPLED-V2: siblings of the SAMPLED main chain from the drafter's own distribution
                     // (top-q per depth, greedy continuation over the lattice); the tree verify decides them by
