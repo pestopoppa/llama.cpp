@@ -436,6 +436,7 @@ llama_build_and_test(test-exl3.cpp)
 # [CH-LB1] CPU must refuse GATED_DELTA_NET with a BF16 recurrent state (supports_op contract)
 llama_build_and_test(test-gdn-state-guard.cpp)
 llama_build_and_test(test-gdn-replay-identity.cpp)
+llama_build_and_test(test-router-bf16.cpp) # AK-CPU-ROUTER-BF16: GGML_ROUTER_BF16=1 bit-identical vs =0
 llama_build_and_test(test-gdn-fused.cpp)
 # [AKX-ALL-31.NATIVE] native producer of AK_NUMERICS_V1 receipts (run by the AKX row, not by ctest)
 llama_build(test-akx-numerics.cpp)

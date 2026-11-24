@@ -136,6 +136,62 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
     *s = sumf;
 }
 
+// AK-CPU-ROUTER-BF16: mirror of the non-SVE / non-RISC-V ggml_vec_dot_f32 above. Each GGML_F32_STEP chunk of
+// x is widened into an F32 staging block (exact: bf16 -> f32 is a 16-bit shift) and then fed through the
+// identical load / FMA / reduce / leftover sequence, so every rounding step matches ggml_vec_dot_f32.
+bool ggml_vec_dot_bf16_f32_exact_supported(void) {
+#if defined(GGML_SIMD) && (defined(__ARM_FEATURE_SVE) || defined(__riscv_v_intrinsic))
+    return false;
+#else
+    return true;
+#endif
+}
+
+void ggml_vec_dot_bf16_f32_exact(int n, float * GGML_RESTRICT s, const ggml_bf16_t * GGML_RESTRICT x, const float * GGML_RESTRICT y) {
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+    float sumf = 0.0f;
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO };
+
+    GGML_F32_VEC ax[GGML_F32_ARR];
+    GGML_F32_VEC ay[GGML_F32_ARR];
+
+    float xs[GGML_F32_STEP];
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int k = 0; k < GGML_F32_STEP; k++) {
+            xs[k] = GGML_BF16_TO_FP32(x[i + k]);
+        }
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            ax[j] = GGML_F32_VEC_LOAD(xs + j*GGML_F32_EPR);
+            ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
+
+            sum[j] = GGML_F32_VEC_FMA(sum[j], ax[j], ay[j]);
+        }
+    }
+
+    // reduce sum0..sum3 to sum0
+    GGML_F32_VEC_REDUCE(sumf, sum);
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        sumf += GGML_BF16_TO_FP32(x[i])*y[i];
+    }
+    *s = sumf;
+#elif defined(GGML_SIMD)
+    GGML_UNUSED(n); GGML_UNUSED(x); GGML_UNUSED(y);
+    *s = 0.0f;
+    GGML_ABORT("ggml_vec_dot_bf16_f32_exact: unsupported SIMD target");
+#else
+    ggml_float sumf = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sumf += (ggml_float)(GGML_BF16_TO_FP32(x[i])*y[i]);
+    }
+    *s = sumf;
+#endif
+}
+
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
     assert(nrc == 1);
     GGML_UNUSED(nrc);

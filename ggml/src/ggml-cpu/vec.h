@@ -70,6 +70,12 @@ extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
 void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
+// AK-CPU-ROUTER-BF16 (GGML_ROUTER_BF16): x is BF16 storage of an F32 tensor whose every value is exactly
+// representable in BF16. Widens x to F32 and runs the SAME accumulation as ggml_vec_dot_f32, so the result
+// is bit-identical to ggml_vec_dot_f32 on the original F32 data. Returns false where that cannot be promised
+// (SVE / RISC-V vector builds: the knob is then inert).
+bool ggml_vec_dot_bf16_f32_exact_supported(void);
+void ggml_vec_dot_bf16_f32_exact(int n, float * GGML_RESTRICT s, const ggml_bf16_t * GGML_RESTRICT x, const float * GGML_RESTRICT y);
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x);

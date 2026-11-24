@@ -1436,6 +1436,169 @@ static inline bool ggml_cpu_rowexact_batch(const struct ggml_compute_params * pa
     return !params->disable_rowexact && ne11 > 1 && ne11 <= ggml_cpu_rowexact_n();
 }
 
+// AK-CPU-C22 levers: one stderr witness line when an engagement counter reaches 1, 1e3, 1e6, ...
+// (non-PROF builds; the row harness greps it). <tag>_QUIET silences it.
+static void ggml_cpu_lever_witness(const char * tag, const char * quiet_env, long long n) {
+    if (n == 1 || n == 1000 || n == 1000000 || n == 1000000000) {
+        if (getenv(quiet_env) == NULL) {
+            fprintf(stderr, "[%s] engaged: %lld\n", tag, n);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// AK-CPU-ROUTER-BF16 (GGML_ROUTER_BF16, default OFF). The MoE router ffn_gate_inp is stored F32 but
+// every value is exactly a BF16 (RPF:1713). With the knob on, each F32 *weight* matrix that a
+// single-token MUL_MAT reads is checked once: if all its values are exact BF16 a BF16 shadow is kept
+// and the decode GEMV reads the shadow (half the bytes), widening to F32 in-register and running the
+// identical ggml_vec_dot_f32 accumulation -> bit-identical. Non-exact matrices keep the F32 path.
+// The shadow table is keyed by (tensor, data, nbytes) and built single-threaded before the team
+// starts; it is append-only and published with a release store, so readers need no lock.
+// ---------------------------------------------------------------------------------------------
+#define GGML_ROUTER_BF16_MAX 1024
+static bool ggml_cpu_router_bf16 = false;            // set once in ggml_cpu_init()
+static atomic_llong ggml_cpu_router_bf16_hits = 0;   // MUL_MATs served from a BF16 shadow
+static atomic_int   ggml_cpu_router_bf16_n    = 0;   // published shadow-table entries
+static struct {
+    const struct ggml_tensor * t;
+    const void * data;
+    size_t       nbytes;
+    uint64_t     fp;      // sampled content fingerprint: a recycled address with new data is a new entry
+    ggml_bf16_t * shadow; // NULL: matrix is not exactly BF16, keep F32
+} ggml_cpu_router_bf16_tab[GGML_ROUTER_BF16_MAX];
+
+static uint64_t ggml_cpu_router_bf16_fp(const struct ggml_tensor * t) {
+    const uint32_t * w = (const uint32_t *) t->data;
+    const int64_t ne = ggml_nelements(t);
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t k = 0; k < 257; k++) {
+        const int64_t i = (ne - 1) * k / 256;
+        h ^= w[i]; h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool ggml_cpu_router_bf16_eligible(const struct ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    return src0 && src1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+           node->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src0->data != NULL && src0->buffer != NULL &&
+           ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           src1->ne[1] * src1->ne[2] * src1->ne[3] == 1;
+}
+
+static int ggml_cpu_router_bf16_slot(const struct ggml_tensor * src0, bool * found) {
+    const int n = atomic_load_explicit(&ggml_cpu_router_bf16_n, memory_order_acquire);
+    const size_t nb = ggml_nbytes(src0);
+    for (int i = n - 1; i >= 0; i--) {
+        if (ggml_cpu_router_bf16_tab[i].t == src0 && ggml_cpu_router_bf16_tab[i].data == src0->data &&
+            ggml_cpu_router_bf16_tab[i].nbytes == nb) {
+            *found = true;
+            return i;
+        }
+    }
+    *found = false;
+    return -1;
+}
+
+static const ggml_bf16_t * ggml_cpu_router_bf16_find(const struct ggml_tensor * src0, bool * found) {
+    const int i = ggml_cpu_router_bf16_slot(src0, found);
+    return *found ? ggml_cpu_router_bf16_tab[i].shadow : NULL;
+}
+
+// single-threaded, before the compute team starts
+static void ggml_cpu_router_bf16_setup(const struct ggml_cgraph * g) {
+    if (!ggml_cpu_router_bf16 || !ggml_vec_dot_bf16_f32_exact_supported()) {
+        return;
+    }
+    for (int i = 0; i < g->n_nodes; i++) {
+        const struct ggml_tensor * node = g->nodes[i];
+        if (!ggml_cpu_router_bf16_eligible(node)) {
+            continue;
+        }
+        const struct ggml_tensor * src0 = node->src[0];
+        const uint64_t fp = ggml_cpu_router_bf16_fp(src0);
+        bool found = false;
+        int  slot  = ggml_cpu_router_bf16_slot(src0, &found);
+        if (found && ggml_cpu_router_bf16_tab[slot].fp == fp) {
+            continue;
+        }
+        ggml_critical_section_start();
+        slot = ggml_cpu_router_bf16_slot(src0, &found);
+        if (found && ggml_cpu_router_bf16_tab[slot].fp != fp) {
+            // same address, different contents (freed and reused): retire the entry (its shadow leaks)
+            ggml_cpu_router_bf16_tab[slot].t = NULL;
+            found = false;
+        }
+        const int n = atomic_load_explicit(&ggml_cpu_router_bf16_n, memory_order_relaxed);
+        if (!found && n < GGML_ROUTER_BF16_MAX) {
+            const int64_t ne = ggml_nelements(src0);
+            const uint32_t * w = (const uint32_t *) src0->data;
+            bool exact = true;
+            for (int64_t k = 0; k < ne; k++) {
+                if ((w[k] & 0xFFFFu) != 0) { exact = false; break; }
+            }
+            ggml_bf16_t * sh = NULL;
+            if (exact) {
+                sh = (ggml_bf16_t *) ggml_aligned_malloc((size_t) ne * sizeof(ggml_bf16_t));
+                if (sh != NULL) {
+                    for (int64_t k = 0; k < ne; k++) {
+                        sh[k].bits = (uint16_t) (w[k] >> 16);
+                    }
+                }
+            }
+            ggml_cpu_router_bf16_tab[n].t      = src0;
+            ggml_cpu_router_bf16_tab[n].data   = src0->data;
+            ggml_cpu_router_bf16_tab[n].nbytes = ggml_nbytes(src0);
+            ggml_cpu_router_bf16_tab[n].fp     = fp;
+            ggml_cpu_router_bf16_tab[n].shadow = sh;
+            atomic_store_explicit(&ggml_cpu_router_bf16_n, n + 1, memory_order_release);
+            if (getenv("GGML_ROUTER_BF16_QUIET") == NULL) {
+                fprintf(stderr, "[router-bf16] %s %s [%" PRId64 " x %" PRId64 "]\n", src0->name,
+                        sh ? "-> bf16 shadow" : "not exact bf16, keeps f32", src0->ne[0], src0->ne[1]);
+            }
+        }
+        ggml_critical_section_end();
+    }
+}
+
+// returns true when the decode GEMV was served from the BF16 shadow
+static bool ggml_cpu_router_bf16_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    if (!ggml_cpu_router_bf16 || params->use_ref || !ggml_cpu_router_bf16_eligible(dst)) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    bool found = false;
+    const ggml_bf16_t * sh = ggml_cpu_router_bf16_find(src0, &found);
+    if (sh == NULL) {
+        return false;
+    }
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t dr   = (ne01 + params->nth - 1) / params->nth;
+    const int64_t ir0  = dr * params->ith;
+    const int64_t ir1  = MIN(ir0 + dr, ne01);
+    const float * y    = (const float *) src1->data;
+    float * d          = (float *) dst->data;
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        ggml_vec_dot_bf16_f32_exact((int) ne00, d + ir, sh + ir * ne00, y);
+    }
+    if (params->ith == 0) {
+        const long long n = atomic_fetch_add_explicit(&ggml_cpu_router_bf16_hits, 1, memory_order_relaxed) + 1;
+        ggml_cpu_lever_witness("router-bf16", "GGML_ROUTER_BF16_QUIET", n);
+    }
+    return true;
+}
+
+long long ggml_cpu_router_bf16_count(void) {
+    return atomic_load_explicit(&ggml_cpu_router_bf16_hits, memory_order_relaxed);
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1539,6 +1702,11 @@ void ggml_compute_forward_mul_mat(
     }
 UseGgmlGemm1:;
 #endif
+
+    // AK-CPU-ROUTER-BF16: single-token F32-weight GEMV from an exact BF16 shadow (bit-identical)
+    if (ggml_cpu_router_bf16_mul_mat(params, dst)) {
+        return;
+    }
 
     // INF-70 D1: batch-1 fast path — drop the internal barrier.
     //
@@ -5525,6 +5693,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
+
+    // AK-CPU-ROUTER-BF16: build BF16 shadows of exact-BF16 F32 weights (no-op with the knob off)
+    ggml_cpu_router_bf16_setup(cgraph);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads                               = cplan->n_threads;
@@ -6051,6 +6222,14 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+            // AK-CPU-ROUTER-BF16: default OFF; =1 serves exact-BF16 F32 weight GEMVs from a BF16 shadow
+            const char * env = getenv("GGML_ROUTER_BF16");
+            ggml_cpu_router_bf16 = (env != NULL && atoi(env) != 0);
+            if (ggml_cpu_router_bf16 && getenv("GGML_ROUTER_BF16_QUIET") == NULL) {
+                fprintf(stderr, "[router-bf16] ROUTER_BF16 enabled\n");
+            }
         }
 
         {
