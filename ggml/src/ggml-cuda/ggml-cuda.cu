@@ -61,6 +61,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/topk-moe-asm-gfx90a.cuh"
+#include "ggml-cuda/router-fuse.cuh"
 #include "ggml-cuda/hc-fuse.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
@@ -782,6 +783,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(h20_src1_buf));
         h20_src1_buf = nullptr;
+    }
+    if (router_fuse_counters != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(router_fuse_counters));
+        router_fuse_counters = nullptr;
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -3559,6 +3566,58 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// AK-RF-A3B-ROUTER-FUSE: match MUL_MAT -> SOFT_MAX -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+// [-> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE] [-> SCALE] at node i (the MUL_MAT) and run it as one kernel.
+// Returns the number of nodes to skip (0 = not fused, nothing enqueued).
+static int ggml_cuda_router_fuse_try(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_SOFT_MAX || cgraph->nodes[i + 1]->src[0] != mm) {
+        return 0;
+    }
+    if (mm->src[0] == nullptr || mm->src[1] == nullptr || mm->src[0]->buffer == nullptr || mm->src[1]->buffer == nullptr ||
+            !ggml_backend_buffer_is_cuda(mm->src[0]->buffer) || !ggml_backend_buffer_is_cuda(mm->src[1]->buffer) ||
+            !ggml_cuda_router_fuse_rows_ok(mm->src[1]->ne[1])) {
+        return 0;
+    }
+
+    ggml_cuda_topk_moe_args args;
+    if (!ggml_cuda_topk_moe_fusion(cgraph, i + 1, args)) {
+        return 0;
+    }
+    if (!args.softmax || args.sigmoid || args.sqrt_softplus || args.prob_bias || args.delayed_softmax) {
+        return 0;
+    }
+
+    std::vector<ggml_op> ops = { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW,
+                                 GGML_OP_GET_ROWS };
+    int out_nodes[2];
+    out_nodes[0]              = i + 4;  // top-k VIEW of the argsort
+    ggml_tensor *       ids   = cgraph->nodes[out_nodes[0]];
+    const ggml_tensor * clamp = nullptr;
+    const ggml_tensor * scale = nullptr;
+    if (args.norm) {
+        ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+        clamp = cgraph->nodes[i + ops.size() - 3];
+    }
+    if (args.scale) {
+        ops.insert(ops.end(), { GGML_OP_SCALE });
+        scale = cgraph->nodes[i + ops.size() - 1];
+    }
+    out_nodes[1]          = i + (int) ops.size() - 1;
+    ggml_tensor * weights = cgraph->nodes[out_nodes[1]];
+    const ggml_tensor * softmax = cgraph->nodes[i + 1];
+
+    if (!ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) ||
+            !ggml_cuda_should_use_topk_moe(softmax, weights, mm, ids) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2)) {
+        return 0;
+    }
+    if (!ggml_cuda_op_router_fuse(*cuda_ctx, mm, weights, ids, clamp, scale)) {
+        return 0;
+    }
+    return (int) ops.size() - 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3568,6 +3627,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // AK-RF-A3B-ROUTER-FUSE: MUL_MAT (F32 router) + the softmax topk-moe chain in one kernel (default off;
+    // GGML_HIP_ROUTER_FUSE=1 enables, router-fuse.cuh). Off: this block is skipped before any graph inspection.
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_router_fuse_enabled()) {
+        const int n_skip = ggml_cuda_router_fuse_try(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
 
     // AK-ASM-H15: concat + conv-state cpy + ssm_conv + silu + q/k l2_norm (default off since C19; GGML_CUDA_AK_H15=1 enables)
     // (at SSM_CONV it only skips a tail the fused kernel already computed at the CONCAT position)
@@ -5880,6 +5948,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // AK-ASM-H13b test witness: hc fused-kernel launches since process start
     if (strcmp(name, "ggml_backend_cuda_hc_fuse_n_calls") == 0) {
         return (void *)ggml_cuda_hc_fuse_n_calls;
+    }
+    // AK-RF-A3B-ROUTER-FUSE test witness: fused router launches enqueued since process start
+    if (strcmp(name, "ggml_backend_cuda_router_fuse_n_calls") == 0) {
+        return (void *)ggml_cuda_router_fuse_n_calls;
     }
 #ifdef GGML_CUDA_TOPK_ASM_GFX90A_AVAILABLE
     // AK-ASM-H11 test witness (NULL = the build has no gfx90a topksoftmax asm fast path)

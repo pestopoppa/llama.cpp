@@ -38,6 +38,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -8837,6 +8838,111 @@ struct test_topk_moe_hold : public test_topk_moe {
     // instead of graph time / thousands of appended no-op view repeats (r3: 0.02 us/run, two significant digits)
     size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
 };
+
+// AK-RF-A3B-ROUTER-FUSE: the whole MoE router graph, MUL_MAT (F32 gate_inp [n_embd, n_expert] x F32 cur
+// [n_embd, n_tok]) -> softmax -> top-k -> get_rows [-> renorm] [-> scale], under its own label ROUTER_FUSE (always
+// registered; no existing op corpus changes). GGML_HIP_ROUTER_FUSE=1 in the environment runs it as one fused kernel
+// for 1 <= n_tok <= 8 (router-fuse.cu); unset runs the existing MUL_MAT + topk-moe route, so the same cases give the
+// knob-on / knob-off correctness and perf arms. n_tok 9 stays unfused under the knob (row cap) and must still pass.
+// The router is built so the logits are well separated (a permuted 0.05-spaced per-expert offset carried by input
+// column 0, plus 1e-4-scale noise): GEMV summation-order differences (~1e-6) cannot reorder experts across the top-k
+// boundary, so ids are compared exactly and weights to the usual float tolerance.
+struct test_router_fuse : public test_case {
+    const int64_t n_embd;
+    const int64_t n_expert;
+    const int64_t n_tok;
+    const int     n_expert_used;
+    const bool    with_norm;
+    const float   scale_w;
+    ggml_tensor * gate_inp {};
+    ggml_tensor * cur {};
+    ggml_tensor * weights {};
+    ggml_tensor * selected_experts {};
+
+    test_router_fuse(int64_t n_embd = 2048, int64_t n_expert = 256, int64_t n_tok = 4, int n_expert_used = 8,
+                     bool with_norm = true, float scale_w = 0.0f) :
+        n_embd(n_embd), n_expert(n_expert), n_tok(n_tok), n_expert_used(n_expert_used), with_norm(with_norm),
+        scale_w(scale_w) {}
+
+    std::string vars() override { return VARS_TO_STR6(n_embd, n_expert, n_tok, n_expert_used, with_norm, scale_w); }
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "ROUTER_FUSE"; }
+
+    bool run_whole_graph() override { return true; }
+
+    // perf: one graph per timed run, so us/run is the whole router graph time (as TOPK_MOE_ASM)
+    size_t op_size(ggml_tensor * t) override { GGML_UNUSED(t); return (size_t) 1 << 40; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        gate_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        ggml_set_name(gate_inp, "gate_inp");
+        cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * logits = ggml_mul_mat(ctx, gate_inp, cur); // [n_expert, n_tok]
+        ggml_set_name(logits, "logits");
+        ggml_tensor * probs = ggml_soft_max(ctx, logits);
+        ggml_set_name(probs, "probs");
+
+        selected_experts = ggml_argsort_top_k(ctx, probs, n_expert_used); // [n_expert_used, n_tok]
+        ggml_set_name(selected_experts, "selected_experts");
+
+        weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tok), selected_experts);
+        if (with_norm) {
+            weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tok);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights);
+            weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
+            weights = ggml_div(ctx, weights, weights_sum);
+            weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tok);
+        }
+        if (scale_w) {
+            weights = ggml_scale(ctx, weights, scale_w);
+        }
+        ggml_set_name(weights, "weights");
+        return weights;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == gate_inp) {
+                std::vector<int> perm(n_expert);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::uniform_real_distribution<float> noise(-1e-4f, 1e-4f);
+                std::vector<float> data(n_embd * n_expert);
+                for (int64_t e = 0; e < n_expert; ++e) {
+                    for (int64_t k = 0; k < n_embd; ++k) {
+                        data[e * n_embd + k] = k == 0 ? 0.05f * (float) perm[e] - 6.0f : noise(rng);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t == cur) {
+                std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+                std::vector<float> data(n_embd * n_tok);
+                for (int64_t r = 0; r < n_tok; ++r) {
+                    for (int64_t k = 0; k < n_embd; ++k) {
+                        // column 0 carries the expert offsets, scaled per token so the weights differ by row
+                        data[r * n_embd + k] = k == 0 ? 1.0f + 0.25f * (float) r : u(rng);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+
+    // verify both outputs
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+
+    // top-k order within a row is not part of the contract (as test_topk_moe): compare sorted
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> a2(a, a + n);
+        std::vector<float> b2(b, b + n);
+        std::sort(a2.begin(), a2.end());
+        std::sort(b2.begin(), b2.end());
+        return nmse(a2.data(), b2.data(), n);
+    }
+};
 // AK-ASM-H11-UNIQ: degenerate router rows (exact ties, -inf, NaN). The C14 MUL_MAT_ID helper silently drops duplicate
 // expert slots, so the router (topksoftmax asm or topk-moe fusion) must emit k DISTINCT ids in [0, n_expert) on every
 // row whatever the logits. Tie-break order may legitimately differ from CPU, so err() is order- and value-free and the
@@ -14906,6 +15012,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // AK-RF-A3B-ROUTER-FUSE: router MUL_MAT + top-k chain (label ROUTER_FUSE, always registered). A3B shape
+    // (2048 x 256, top-8, renorm) at every fused width 1..8 and the unfused 9, plus no-norm, scale, 128- and
+    // 512-expert and a non-multiple-of-128 n_embd variant. GGML_HIP_ROUTER_FUSE=1 selects the fused kernel.
+    {
+        for (int64_t n_tok : { 1, 2, 3, 4, 5, 8, 9 }) {
+            test_cases.emplace_back(new test_router_fuse(2048, 256, n_tok, 8, true, 0.0f));
+        }
+        for (int64_t n_tok : { 1, 4 }) {
+            test_cases.emplace_back(new test_router_fuse(2048, 256, n_tok, 8, false, 0.0f));
+            test_cases.emplace_back(new test_router_fuse(2048, 256, n_tok, 8, true, 2.5f));
+            test_cases.emplace_back(new test_router_fuse(2048, 128, n_tok, 8, true, 0.0f));
+            test_cases.emplace_back(new test_router_fuse(4096, 512, n_tok, 10, true, 0.0f));
+            test_cases.emplace_back(new test_router_fuse(1028, 256, n_tok, 8, true, 0.0f));
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     for (bool keep : { true, false }) {
         test_cases.emplace_back(new test_gated_delta_net_replay(4, 32,  4, 1, 1, false, 4, keep));
@@ -15749,6 +15871,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n_tok : { 1, 4, 16, 512, 2048 }) {
             test_cases.emplace_back(new test_topk_moe_asm({256, n_tok, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
             test_cases.emplace_back(new test_topk_moe_asm({512, n_tok, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+        }
+    }
+    // AK-RF-A3B-ROUTER-FUSE perf (label ROUTER_FUSE): the A3B router graph at decode, MTP verify and tree widths;
+    // run once with GGML_HIP_ROUTER_FUSE unset and once with =1 for the op on/off timing
+    {
+        for (int64_t n_tok : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_router_fuse(2048, 256, n_tok, 8, true, 0.0f));
         }
     }
     // AK-ASM-H13b: one Q38FN hc seam (n_embd 2560, hc 4, low rank 320); own label HC_SEAM, always registered

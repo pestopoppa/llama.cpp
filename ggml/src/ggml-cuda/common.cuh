@@ -1439,6 +1439,9 @@ struct ggml_backend_cuda_context {
     size_t              h20_src1_nb[4] = {0, 0, 0, 0};
     cudaStream_t        h20_src1_strm  = nullptr;
     uint64_t            h20_src1_epoch = UINT64_MAX;
+    // AK-RF-A3B-ROUTER-FUSE: GGML_CUDA_MAX_STREAMS self-resetting completion counters of the fused router kernel
+    // (router-fuse.cu); allocated on first use (GGML_HIP_ROUTER_FUSE=1 only), nullptr otherwise
+    unsigned int *      router_fuse_counters = nullptr;
     // a few entries: a graph may carry more than one KQ mask (e.g. SWA + full), and in graph mode every mask is
     // classified in the pre-capture pass and must still be cached when its node is captured
     static constexpr int FATTN_ASM_MASK_CACHE_N = 4;
