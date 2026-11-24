@@ -13833,6 +13833,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // C22 MMID-TILE: mm_ids_helper staged n_tokens*4 bytes in shared memory and aborted at
+    // GGML_ASSERT(nbytes_shared <= smpbo) above n_tokens = smpbo/4 (16384 on MI210). Above that limit it now takes a
+    // two-pass global-memory path. Shapes are the ak-mmid-ub-ceil-gpu-20261124 row's: 4 experts, 2 used, m = k = 256.
+    // Q4_0 routes through MMQ (and the helper) on CDNA2 at any n; Q8_0 routes to hipBLAS above n = 128 there.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int n : {16384, 16385, 32768, 65536}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 256, n, 256));
+        }
+    }
+
     for (auto bs2 : {1,3}) {
         for (auto bs : {1,2,4,8}) {
             for (auto nr : {1,4}) {
