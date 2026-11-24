@@ -312,8 +312,12 @@ static __device__ __forceinline__ void gv_compute_chunk_rf5(
             l_run[v] = l_run[v] * alpha[v] + p;
             m_run[v] = m_new;
         }
+        // sP is private to this wave (sP0 + w*16*PSTR): the P write -> P read hand-off needs only this wave's LDS writes
+        // to land, not a workgroup barrier. 2 s_barrier per 16 keys instead of 3 (KC = 32 per barrier would need
+        // >= 35 KB of f16 K+V LDS per WG and lose 2 WG/CU, so the per-key barrier cut is taken here instead).
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        __builtin_amdgcn_wave_barrier();
     }
-    __syncthreads();
 
     if (tile_active) {
 #pragma unroll
