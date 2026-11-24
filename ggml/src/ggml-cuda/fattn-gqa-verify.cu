@@ -132,6 +132,14 @@ static bool gv_lds_cut() {
     return v;
 }
 
+// GGML_CUDA_FA_GQA_SPLITS_MODE (default 0 = C20 auto sizing min(ceil(2*nsm/base), n_kv/256)): changes only the AUTO split
+// count (GGML_CUDA_FA_GQA_VERIFY_SPLITS, when set, still wins). 1 = one dispatch wave, ceil(nsm/base) (26 on MI210 at 4 KV
+// heads, 1 seq); N >= 2 = target N splits. Both are capped by n_kv/256 like the default rule.
+static int gv_splits_mode() {
+    static const int v = gv_env_int("GGML_CUDA_FA_GQA_SPLITS_MODE", 0);
+    return v;
+}
+
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 typedef _Float16 gv_halfx4 __attribute__((ext_vector_type(4)));
 typedef float    gv_floatx4 __attribute__((ext_vector_type(4)));
@@ -793,7 +801,8 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     if (n_splits <= 0) {
         // grouped: each group streams ~1/n_grp of the KV (live-range trim), so size the splits per real sequence
         const int base = n_head_kv * n_seq;
-        n_splits = (2 * nsm + base - 1) / base;
+        const int mode = gv_splits_mode();
+        n_splits = mode == 1 ? (nsm + base - 1) / base : mode >= 2 ? mode : (2 * nsm + base - 1) / base;
         n_splits = std::min(n_splits, std::max(1, n_kv / 256));
         n_splits = std::min(n_splits, 256);
     }
