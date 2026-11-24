@@ -289,11 +289,16 @@ static __device__ __forceinline__ void gv_compute_chunk_rf5(
     constexpr int PSTR  = KC + 8;
     float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     if (tile_active) {
+        // piece 4: all 16 K fragments are read from LDS before the first MFMA (one lgkmcnt wait, not one per MFMA)
+        gv_halfx4 kb[GV_D / 16];
+#pragma unroll
+        for (int s = 0; s < GV_D / 16; ++s) {
+            kb[s] = *(const gv_halfx4 *) (sK + li * GV_KSTR + 16 * s + 4 * kq);
+        }
         gv_floatx4 S = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
         for (int s = 0; s < GV_D / 16; ++s) {
-            const gv_halfx4 kb = *(const gv_halfx4 *) (sK + li * GV_KSTR + 16 * s + 4 * kq);
-            S = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S, 0, 0, 0);
+            S = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb[s], S, 0, 0, 0);
         }
         float rmax[4];
 #pragma unroll
@@ -328,10 +333,18 @@ static __device__ __forceinline__ void gv_compute_chunk_rf5(
             }
         }
         const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * PSTR + 4 * kq);
+        // piece 4: V fragments in two batches of 8 LDS reads, each batch issued before its 8 MFMAs (VGPR budget: 2 WG/CU)
 #pragma unroll
-        for (int nb = 0; nb < GV_D / 16; ++nb) {
-            const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * VTSTR + 4 * kq);
-            o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
+        for (int h = 0; h < 2; ++h) {
+            gv_halfx4 vb[GV_D / 32];
+#pragma unroll
+            for (int j = 0; j < GV_D / 32; ++j) {
+                vb[j] = *(const gv_halfx4 *) (sVt + ((8 * h + j) * 16 + li) * VTSTR + 4 * kq);
+            }
+#pragma unroll
+            for (int j = 0; j < GV_D / 32; ++j) {
+                o[8 * h + j] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb[j], o[8 * h + j], 0, 0, 0);
+            }
         }
     }
 }
