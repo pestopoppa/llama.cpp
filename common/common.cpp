@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1663,6 +1664,54 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+
+// SPEC-ID-NOISE-2 arm C (experimental, autokernel 2026-11-24): LLAMA_NODE_HASH_LOG=<path> installs a cb_eval that writes
+// one line per computed graph node: "<seq> <name> <op> <type> <ne0>x<ne1>x<ne2>x<ne3> <fnv1a64 of the node bytes>".
+// Two launches' logs are diffed line by line; the first differing line names the first divergent node. Off when unset.
+static FILE * g_node_hash_fp = nullptr;
+static uint64_t g_node_hash_seq = 0;
+static std::vector<uint8_t> g_node_hash_buf;
+
+static bool common_node_hash_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (ask) {
+        return true;  // observe every node
+    }
+    const size_t n = ggml_nbytes(t);
+    const uint8_t * data = nullptr;
+    if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+        g_node_hash_buf.resize(n);
+        ggml_backend_tensor_get(t, g_node_hash_buf.data(), 0, n);
+        data = g_node_hash_buf.data();
+    } else {
+        data = (const uint8_t *) t->data;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; data && i < n; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    fprintf(g_node_hash_fp, "%" PRIu64 " %s %s %s %" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " %016" PRIx64 "\n",
+            g_node_hash_seq++, t->name, ggml_op_desc(t), ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3], h);
+    return true;
+}
+
+static void common_node_hash_install(llama_context_params & cparams) {
+    const char * path = getenv("LLAMA_NODE_HASH_LOG");
+    if (!path || !*path || cparams.cb_eval) {
+        return;
+    }
+    if (!g_node_hash_fp) {
+        g_node_hash_fp = fopen(path, "w");
+        if (!g_node_hash_fp) {
+            return;
+        }
+        setvbuf(g_node_hash_fp, nullptr, _IOLBF, 1 << 16);  // line-buffered: a SIGTERM-killed server keeps its log
+        fprintf(stderr, "node-hash log (LLAMA_NODE_HASH_LOG) = %s\n", path);
+    }
+    cparams.cb_eval           = common_node_hash_cb;
+    cparams.cb_eval_user_data = nullptr;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1694,6 +1743,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    common_node_hash_install(cparams);
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
