@@ -6565,6 +6565,44 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// [GDN-SLOTS-STRONGER] (kernel-champion-and-promotion.md:GDN-SLOTS-STRONGER) in-house snapshot guarantee witness.
+// ggml.h guarantees only slot 0 when n_tokens > K, but this fork's backends (the CDNA chunked kernel,
+// gated_delta_net.cu) write EVERY tail slot, and spec-decode rollback (MTP K=4, DFlash2 K=9) reads them.
+// This case runs n_tokens > K on the chunked path and compares each of the K snapshot slots as its own graph
+// node (one ggml_cont per slot, every node is compared), so a rebase that adopts upstream's slot-0-only view
+// (#32820) fails here instead of passing on a diluted whole-tensor NMSE. Do NOT relax it to slot 0.
+// It reports op GATED_DELTA_NET so `-o GATED_DELTA_NET` (the fold-gate tbo scope) selects it. grep: GDN_SLOTS_STRONGER
+struct test_gated_delta_net_slots_witness : public test_gated_delta_net {
+    test_gated_delta_net_slots_witness(int64_t head_count, int64_t head_size, int64_t n_tokens, int v_repeat, int64_t K)
+        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_tokens, 1, v_repeat, false, false, K,
+                               GGML_TYPE_F32, -0.05f) {}
+
+    std::string vars() override { return "GDN_SLOTS_STRONGER," + test_gated_delta_net::vars(); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(n_seq_tokens > K && K > 1);
+        ggml_tensor * out = test_gated_delta_net::build_graph(ctx);
+        const int64_t S_v = head_size, H = head_count * v_repeat;
+        // the packed output must hold all K slots: [S_v*H, n_tokens*n_seqs + K*S_v*n_seqs]
+        GGML_ASSERT(out->ne[0] == S_v * H && out->ne[1] == n_seq_tokens * n_seqs + K * S_v * n_seqs);
+        ggml_tensor * all = nullptr;
+        for (int64_t s = 0; s < K; ++s) {
+            ggml_tensor * slot = ggml_view_2d(ctx, out, S_v * H, S_v * n_seqs, out->nb[1],
+                                              (n_seq_tokens * n_seqs + s * S_v * n_seqs) * out->nb[1]);
+            slot = ggml_cont(ctx, slot);
+            ggml_set_name(slot, ("gdn_slot_" + std::to_string(s)).c_str());
+            all = all ? ggml_concat(ctx, all, slot, 1) : slot;
+        }
+        ggml_set_name(all, "gdn_all_slots");
+        return all;
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET with a replay of pending tokens (ggml_gated_delta_net_ext, RS-REPLAY)
 struct test_gated_delta_net_replay : public test_case {
     const int64_t head_count; // k heads
@@ -14968,6 +15006,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, vr, false, false, 4));
+        // [GDN-SLOTS-STRONGER] every snapshot slot compared at n_tokens > K on the chunked path (MTP K=4, DFlash2 K=9)
+        test_cases.emplace_back(new test_gated_delta_net_slots_witness(16, 128, 300, vr, 9));
+        test_cases.emplace_back(new test_gated_delta_net_slots_witness(16, 128, 300, vr, 4));
     }
     // [AK-DTREE-2] chunked-WY GDN prefill with the wide rollback tails a tree batch needs (K = 8 / 15 / 16 / 17)
     for (int64_t kk : { 8, 15, 16, 17 }) {
