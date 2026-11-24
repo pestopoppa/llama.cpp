@@ -12,10 +12,12 @@ static std::atomic<uint64_t> g_ak_tf2_n_calls[AK_TF2_NG];
 bool ggml_cuda_ak_tf2_enabled(int group) {
     static const int mask = [] {
         int m = 0;
+        // literal names (not snprintf'd) so each knob is a findable string in the library (content proof / preflight)
+        static const char * const names[AK_TF2_NG] = {
+            nullptr, nullptr, "GGML_CUDA_AK_TF2_G2", "GGML_CUDA_AK_TF2_G3", nullptr, "GGML_CUDA_AK_TF2_G5",
+            "GGML_CUDA_AK_TF2_G6", nullptr, nullptr };
         for (int g = 0; g < AK_TF2_NG; ++g) {
-            char name[32];
-            snprintf(name, sizeof(name), "GGML_CUDA_AK_TF2_G%d", g);
-            const char * e = getenv(name);
+            const char * e = names[g] ? getenv(names[g]) : nullptr;
             if (e != nullptr && atoi(e) == 1) {
                 m |= 1 << g;
             }
