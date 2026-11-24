@@ -28,7 +28,7 @@ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
-template <int n_expert_used_template>
+template <int n_expert_used_template, bool readlane = false>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -97,7 +97,16 @@ static __global__ void mm_ids_helper(
             }
 
             // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            // MMID-HELPER-READLANE (HIP, opt-in): the source lane is wave-uniform, so s_readlane broadcasts it
+            // through an SGPR instead of a ds_bpermute round trip.
+#if defined(GGML_USE_HIP)
+            if constexpr (readlane) {
+                it_compact += __builtin_amdgcn_readlane(it_compact_add_lower + it_compact_add_self, warp_size - 1);
+            } else
+#endif // defined(GGML_USE_HIP)
+            {
+                it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            }
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
@@ -138,14 +147,22 @@ static void launch_mm_ids_helper(
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper<n_expert_used_template, false>), smpbo);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper<n_expert_used_template, true>), smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
-    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+    // GGML_HIP_MMID_READLANE=1 selects the readlane arm (default off; identical on CUDA builds).
+    static const bool use_readlane = [] { const char * e = getenv("GGML_HIP_MMID_READLANE"); return e && atoi(e) != 0; }();
+    if (use_readlane) {
+        mm_ids_helper<n_expert_used_template, true><<<num_blocks, block_size, nbytes_shared, stream>>>
+            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+    } else {
+        mm_ids_helper<n_expert_used_template, false><<<num_blocks, block_size, nbytes_shared, stream>>>
+            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+    }
 }
 
 void ggml_cuda_launch_mm_ids_helper(
