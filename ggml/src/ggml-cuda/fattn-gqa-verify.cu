@@ -430,17 +430,15 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
         if constexpr (RF5) {
             // piece 5: unconditional 16 B loads (Qr is row 0 of the head when !valid, always in bounds; the host
             // requires 16 B aligned Q data and strides), then a select: one wait instead of 64 branch+load+wait.
-            float4 qv[GV_D / 16];
+            // (clang ext-vector locals, not an array of HIP float4: those are not promoted to registers)
+            typedef float gv_f32x4 __attribute__((ext_vector_type(4)));
 #pragma unroll
             for (int s = 0; s < GV_D / 16; ++s) {
-                qv[s] = *(const float4 *) (Qr + 16 * s + 4 * kq);
-            }
-#pragma unroll
-            for (int s = 0; s < GV_D / 16; ++s) {
-                qa[s][0] = valid ? (_Float16) qv[s].x : (_Float16) 0.0f;
-                qa[s][1] = valid ? (_Float16) qv[s].y : (_Float16) 0.0f;
-                qa[s][2] = valid ? (_Float16) qv[s].z : (_Float16) 0.0f;
-                qa[s][3] = valid ? (_Float16) qv[s].w : (_Float16) 0.0f;
+                const gv_f32x4 x = *(const gv_f32x4 *) (Qr + 16 * s + 4 * kq);
+                qa[s][0] = valid ? (_Float16) x.x : (_Float16) 0.0f;
+                qa[s][1] = valid ? (_Float16) x.y : (_Float16) 0.0f;
+                qa[s][2] = valid ? (_Float16) x.z : (_Float16) 0.0f;
+                qa[s][3] = valid ? (_Float16) x.w : (_Float16) 0.0f;
             }
         } else {
 #pragma unroll
