@@ -4519,6 +4519,89 @@ struct test_ak_add_rms_norm : public test_case {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE G4: Q8_0 x F32 MUL_MAT on the gfx90a skinny split-K path with the dst zero-fill folded into the
+// activation-quantize launch (GGML_HIP_Q8_SKINNY_ZERO_FOLD=1). dst is pre-filled with uniform noise by
+// initialize_tensors, so a missing or short zero-fill (rows past the grid-stride, ragged N, a skipped column) shows up as
+// an error. Witness: on ROCm, an eligible shape must take the skinny path, and the folded zero-fill must run on every
+// skinny call iff the knob is set (never otherwise). Off by default these are ordinary MUL_MAT cases.
+struct test_ak_q8sk_zero_fold : public test_case {
+    const int64_t m, n, k;   // dst [m, n] = W [k, m]^T x [k, n]
+
+    using n_calls_t = uint64_t (*)();
+    n_calls_t sk_calls   = nullptr;
+    n_calls_t fold_calls = nullptr;
+    bool      armed      = false;
+    bool      fold_on    = false;
+    bool      expect_sk  = false;
+    uint64_t  sk_before  = 0;
+    uint64_t  fold_before = 0;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_Q8SK_ZERO_FOLD"; }
+    std::string vars() override { return VARS_TO_STR3(m, n, k); }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_ak_q8sk_zero_fold(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    static int env_int(const char * name, int def) {
+        const char * s = getenv(name);
+        return s != nullptr && s[0] != '\0' ? atoi(s) : def;
+    }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        sk_calls   = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_q8_skinny_n_calls");
+        fold_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_q8_skinny_zero_fold_n_calls");
+        if (sk_calls == nullptr || fold_calls == nullptr) {
+            return;
+        }
+        const bool rocm = strncmp(ggml_backend_name(backend), "ROCm", 4) == 0;
+        const int64_t wbytes = m * (k / 32) * 34;
+        const char * mb = getenv("GGML_HIP_Q8_SKINNY_MAX_BYTES");
+        const int64_t max_bytes = (mb && *mb) ? atoll(mb) : (6ll << 20);
+        expect_sk = rocm && env_int("GGML_HIP_Q8_SKINNY", 1) != 0 && k % 256 == 0 &&
+                    n >= std::max(2, env_int("GGML_HIP_Q8_SKINNY_MIN", 5)) && n <= std::min(16, env_int("GGML_HIP_Q8_SKINNY_MAX", 16)) &&
+                    (max_bytes == 0 || wbytes <= max_bytes) && env_int("GGML_HIP_Q8_MF", 0) == 0;
+        fold_on     = env_int("GGML_HIP_Q8_SKINNY_ZERO_FOLD", 0) == 1;
+        sk_before   = sk_calls();
+        fold_before = fold_calls();
+        armed       = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t sk   = sk_calls() - sk_before;
+        const uint64_t fold = fold_calls() - fold_before;
+        std::string reason;
+        if (expect_sk && sk == 0) {
+            reason = "AK_Q8SK_ZERO_FOLD_WITNESS: eligible shape did not take the q8 skinny path";
+        } else if (fold_on && fold != sk) {
+            reason = "AK_Q8SK_ZERO_FOLD_WITNESS: folded zero-fill did not run on every skinny call";
+        } else if (!fold_on && fold != 0) {
+            reason = "AK_Q8SK_ZERO_FOLD_WITNESS: folded zero-fill ran with the knob off";
+        }
+        fprintf(stderr, "AK_Q8SK_ZERO_FOLD_WITNESS m=%" PRId64 " n=%" PRId64 " k=%" PRId64 " expect_skinny=%d fold_on=%d skinny_calls=%" PRIu64 " fold_calls=%" PRIu64 " verdict=%s\n",
+                m, n, k, (int) expect_sk, (int) fold_on, sk, fold, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 // AK-ASM-H15: gated-DeltaNet decode conv chain as emitted by llm_build_delta_net_base::build_conv_state +
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
@@ -13630,6 +13713,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    // AK-RF-27B-TAIL-FUSE G4 (GGML_HIP_Q8_SKINNY_ZERO_FOLD=1): the <= 6 MiB 27B / A3B skinny shapes, a ragged N, and a
+    // K = 256 x N = 20000 shape whose N*M zero-fill (up to 320k floats) far exceeds the quantize grid (4096 threads), so the
+    // grid-stride loop is exercised; n 4 / 17 are the must-fall-back edges
+    {
+        static const std::array<int64_t, 2> g4_shapes[] = {{1024, 5120}, {512, 2048}, {2048, 512}, {32, 2048}, {1000, 2304}, {20000, 256}};
+        for (const auto & sh : g4_shapes) {
+            for (int64_t nt : { 4, 5, 8, 12, 16, 17 }) {
+                test_cases.emplace_back(new test_ak_q8sk_zero_fold(sh[0], nt, sh[1]));
+            }
         }
     }
 

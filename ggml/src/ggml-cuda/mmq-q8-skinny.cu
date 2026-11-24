@@ -22,7 +22,8 @@
 //    srcB fragments from global/L2, issued before the next item's DMA so the in-order vmcnt wait leaves that DMA in flight.
 //  Env: GGML_HIP_Q8_SKINNY=0 disables (falls back to MMVQ/MMQ exactly as C6), GGML_HIP_Q8_SKINNY_MIN (default 5),
 //       GGML_HIP_Q8_SKINNY_MAX (default 16, cap 16), GGML_HIP_Q8_SKINNY_WAVES (persistent wave count, default
-//       CUs x occupancy), GGML_HIP_Q8_SKINNY_MAX_BYTES (shape gate, default 6 MiB of Q8_0 weight; 0 = no limit).
+//       CUs x occupancy), GGML_HIP_Q8_SKINNY_MAX_BYTES (shape gate, default 6 MiB of Q8_0 weight; 0 = no limit),
+//       GGML_HIP_Q8_SKINNY_ZERO_FOLD=1 (AK-RF-27B-TAIL-FUSE G4, default off: dst zero-fill inside the quantize launch).
 #include "mmq-q8-skinny.cuh"
 
 #include <atomic>
@@ -42,6 +43,7 @@ static int q8sk_env_int(const char * name, int def) {
 
 struct q8sk_cfg {
     bool enabled; int mmin; int mmax; int waves; int64_t max_bytes;
+    bool zero_fold;   // AK-RF-27B-TAIL-FUSE G4: GGML_HIP_Q8_SKINNY_ZERO_FOLD=1 (default off)
 };
 
 // Shape gate (derived post hoc from gate r5, 2026-11-05, MI210, 39 cells x M 5/8/16): the fast path beat C6 on every
@@ -50,6 +52,17 @@ struct q8sk_cfg {
 // plain-load ceiling). Default: take the fast path only when the Q8_0 weight is <= 6 MiB. Override with
 // GGML_HIP_Q8_SKINNY_MAX_BYTES (bytes; 0 = no limit).
 #define Q8SK_DEFAULT_MAX_BYTES (6ll << 20)
+
+static std::atomic<uint64_t> g_q8sk_n_calls{0};
+static std::atomic<uint64_t> g_q8sk_zero_fold_n_calls{0};
+
+uint64_t ggml_cuda_q8_skinny_n_calls() {
+    return g_q8sk_n_calls.load();
+}
+
+uint64_t ggml_cuda_q8_skinny_zero_fold_n_calls() {
+    return g_q8sk_zero_fold_n_calls.load();
+}
 
 static const q8sk_cfg & q8sk_get_cfg() {
     static const q8sk_cfg cfg = [] {
@@ -60,6 +73,7 @@ static const q8sk_cfg & q8sk_get_cfg() {
         c.waves   = std::max(0, q8sk_env_int("GGML_HIP_Q8_SKINNY_WAVES", 0));
         const char * mb = getenv("GGML_HIP_Q8_SKINNY_MAX_BYTES");
         c.max_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : Q8SK_DEFAULT_MAX_BYTES;
+        c.zero_fold = q8sk_env_int("GGML_HIP_Q8_SKINNY_ZERO_FOLD", 0) == 1;
         return c;
     }();
     return cfg;
@@ -87,8 +101,27 @@ bool ggml_cuda_q8_skinny_eligible(const ggml_tensor * src0, const ggml_tensor * 
 }
 
 // y: [M][K] f32 (row stride s1 floats) -> yq: [16][nblk*32] int8, yd: [16][nblk] f32; columns >= M are zero.
+// AK-RF-27B-TAIL-FUSE G4 (zero_dst, GGML_HIP_Q8_SKINNY_ZERO_FOLD=1): the same launch also zero-fills the split-K output
+// dst [M][N] (row stride dst_s1) with a grid-stride loop, replacing the separate q8sk_zero launch. The quantize kernel is
+// the GEMV's same-stream predecessor, so every zero is ordered before the first atomicAdd flush; the accumulation then
+// starts from the same +0.0f as with q8sk_zero (same values, same atomic summation order freedom). The zero cannot live
+// inside q8sk_mul_mat itself: the stream-K split gives each output element atomic flushes from several waves in no fixed
+// order, so no wave can store the initial value without a grid-wide barrier.
+template <bool zero_dst>
 static __global__ void q8sk_quantize(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
-                                     int8_t * __restrict__ yq, float * __restrict__ yd) {
+                                     int8_t * __restrict__ yq, float * __restrict__ yd,
+                                     float * __restrict__ dst, const int N, const int64_t dst_s1) {
+    if constexpr (zero_dst) {
+        const int nthr = gridDim.x * gridDim.y * blockDim.x;
+        const int nel  = N * M;   // N <= INT32_MAX / 16 and M <= 16 (eligibility), so this fits int
+        for (int e = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x; e < nel; e += nthr) {
+            const int c   = e / N;
+            const int row = e - c * N;
+            dst[(int64_t) c * dst_s1 + row] = 0.0f;
+        }
+    } else {
+        GGML_UNUSED(dst); GGML_UNUSED(N); GGML_UNUSED(dst_s1);
+    }
     const int c   = blockIdx.y;
     const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int i   = threadIdx.x % 32;
@@ -265,6 +298,7 @@ void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_ten
             GGML_LOG_INFO("ggml_cuda_q8_skinny: gfx90a skinny-M Q8_0 split-K path ran (call 1, reduce=atomic, stream-k lds-dma)\n");
         }
     }
+    g_q8sk_n_calls.fetch_add(1);
     cudaStream_t stream = ctx.stream();
 
     const int     N      = (int) src0->ne[1];
@@ -289,14 +323,25 @@ void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_ten
 
     ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) Q8SK_MAXM * nblk * 32);
     ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) Q8SK_MAXM * nblk);
-    {
-        const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
-        q8sk_quantize<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get());
-    }
     float * dstd = (float *) dst->data;
-    {
-        const dim3 grid((N + 255) / 256, M, 1);
-        q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+    if (cfg.zero_fold) {
+        // AK-RF-27B-TAIL-FUSE G4: dst zero-fill folded into the quantize launch (one launch fewer per call)
+        if (g_q8sk_zero_fold_n_calls.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_skinny: AK-RF-27B-TAIL-FUSE G4 zero-fill folded into q8sk_quantize (call 1)\n");
+        }
+        const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
+        q8sk_quantize<true><<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get(),
+                                                      dstd, N, dst_s1);
+    } else {
+        {
+            const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
+            q8sk_quantize<false><<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get(),
+                                                           nullptr, 0, 0);
+        }
+        {
+            const dim3 grid((N + 255) / 256, M, 1);
+            q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+        }
     }
     q8sk_mul_mat<<<nwaves, 64, 0, stream>>>((const char *) src0->data, src0->nb[1], nblk, N, M, yq.get(), yd.get(),
                                             (int) n_items, nwaves, dstd, dst_s1);
