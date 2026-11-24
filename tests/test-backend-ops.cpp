@@ -14252,6 +14252,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16640, 8, 1, type_KV, 7));
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 24576, 5, 2, type_KV, 13));
     }
+    // AK-GVFATTN-Q4KV (GGML_CUDA_FA_GQA_Q4KV=1 routes q4_0 K/V through gv_fattn, default OFF): 27B 24/4 at kv 8192/16384/32768,
+    // nb 1/4/8 (the decision cells), plus a mid-chunk tail at 16640 and a 2-stream case. Without the knob these run the C6
+    // selection (f16 convert + flash_attn_ext_f16), so the same cases gate both.
+    for (int64_t kv : {8192, 16384, 32768}) {
+        for (int64_t nb : {1, 4, 8}) {
+            test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, nb, 1, GGML_TYPE_Q4_0, 23));
+        }
+    }
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 16640, 8, 1, GGML_TYPE_Q4_0, 7));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 5, 2, GGML_TYPE_Q4_0, 9));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 16, 2, 4096, 8, 1, GGML_TYPE_Q4_0, 300));
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));

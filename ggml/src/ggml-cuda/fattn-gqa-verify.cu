@@ -127,6 +127,14 @@ static size_t gv_smem_bytes(const int nwaves, const int kc = GV_KC) {
 #define GV_KC_CUT 16
 
 // GGML_CUDA_FA_GQA_LDS_CUT=1: 16-key chunk variant (24,832 B LDS at 4 waves -> 2 WG/CU), default OFF.
+// GGML_CUDA_FA_GQA_Q4KV=1 (default OFF): route type_K == type_V == q4_0 through gv_fattn. The q4_0 blocks (18 B) are loaded
+// raw and dequantized to f16 in registers before the LDS store, with the same sK/sVt layout (so the 16-key LDS cut applies
+// unchanged). Without the knob q4_0 KV is rejected here and keeps the C6 selection (f16 convert + flash_attn_ext_f16).
+static bool gv_q4kv() {
+    static const bool v = gv_env_int("GGML_CUDA_FA_GQA_Q4KV", 0) != 0;
+    return v;
+}
+
 static bool gv_lds_cut() {
     static const bool v = gv_env_int("GGML_CUDA_FA_GQA_LDS_CUT", 0) != 0;
     return v;
@@ -256,7 +264,7 @@ static __device__ __forceinline__ int64_t gv_kv_row(const int32_t * __restrict__
 // launched with exactly GV_MIN_WAVES waves (R <= 64) and compiled with __launch_bounds__(256, 2) so that the register
 // budget also admits two workgroups per CU. Per-key arithmetic is unchanged (online softmax is chunk-size invariant up
 // to f32 rounding of the running max/sum).
-template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false, int KC = GV_KC>
+template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false, int KC = GV_KC, bool KV_Q4 = false>
 static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES),
                                          KC != GV_KC ? 2 : 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -382,9 +390,11 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
         // Software pipeline: the raw global data of chunk c+1 (mask halves, q8_0 blocks or f16 16-byte rows) is loaded into
         // registers while chunk c is computed, then dequantized/stored to LDS after the end-of-chunk barrier.
         // nthreads in [256, 512]: q8_0 = 1 block of K + 1 of V per thread, f16 = up to 4 x 16 B of K and of V, mask = up to 2.
-        constexpr int NK = KV_Q8 ? 1 : (KC * (GV_D / 8) + 255) / 256;
-        uint16_t rk[KV_Q8 ? 1 + QK8_0 / 2 : 1];
-        uint16_t rv[KV_Q8 ? 1 + QK8_0 / 2 : 1];
+        constexpr int NK = (KV_Q8 || KV_Q4) ? 1 : (KC * (GV_D / 8) + 255) / 256;
+        // q4_0: 1 + QK4_0/4 = 9 halfwords per block (d, then 16 nibble-pair bytes)
+        constexpr int NRAW = KV_Q8 ? 1 + QK8_0 / 2 : KV_Q4 ? 1 + QK4_0 / 4 : 1;
+        uint16_t rk[NRAW];
+        uint16_t rv[NRAW];
         uint32_t fk[4 * NK]; // plain words: an array of HIP_vector_type uint4 is not promoted to registers (scratch)
         uint32_t fv[4 * NK];
         uint16_t rm[2];
@@ -431,6 +441,17 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                         rk[t] = pk[t];
                         rv[t] = pv[t];
                     }
+                    }
+                }
+            } else if constexpr (KV_Q4) {
+                if (tid < KC * (GV_D / QK4_0)) {
+                    const int b = tid / KC, key = tid % KC;
+                    const uint16_t * pk = (const uint16_t *) (Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + b * (int64_t) sizeof(block_q4_0));
+                    const uint16_t * pv = (const uint16_t *) (Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + b * (int64_t) sizeof(block_q4_0));
+#pragma unroll
+                    for (int t = 0; t < NRAW; ++t) {
+                        rk[t] = pk[t];
+                        rv[t] = pv[t];
                     }
                 }
             } else {
@@ -502,6 +523,31 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                         const uint16_t u = raw_v(1 + t);
                         sVt[(b * QK8_0 + 2 * t + 0) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
                         sVt[(b * QK8_0 + 2 * t + 1) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
+                    }
+                }
+            } else if constexpr (KV_Q4) {
+                if (tid < KC * (GV_D / QK4_0)) {
+                    const int b = tid / KC, key = tid % KC;
+                    const float dk = __half2float(__ushort_as_half(rk[0]));
+                    const float dv = __half2float(__ushort_as_half(rv[0]));
+                    // block_q4_0: element j < 16 = low nibble of qs[j], element j + 16 = high nibble of qs[j]; value (n - 8) * d
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        _Float16 tmp[8];
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            const int k = 8 * (g % 2) + t;
+                            const int byte = (rk[1 + k / 2] >> (8 * (k % 2))) & 0xFF;
+                            const int n = g < 2 ? (byte & 0xF) : (byte >> 4);
+                            tmp[t] = (_Float16) (dk * (float) (n - 8));
+                        }
+                        *(uint4 *) (sK + key * GV_KSTR + b * QK4_0 + 8 * g) = *(const uint4 *) tmp;
+                    }
+#pragma unroll
+                    for (int k = 0; k < QK4_0 / 2; ++k) {
+                        const int byte = (rv[1 + k / 2] >> (8 * (k % 2))) & 0xFF;
+                        sVt[(b * QK4_0 + k)              * VTSTR + key] = (_Float16) (dv * (float) ((byte & 0xF) - 8));
+                        sVt[(b * QK4_0 + k + QK4_0 / 2) * VTSTR + key] = (_Float16) (dv * (float) ((byte >> 4) - 8));
                     }
                 }
             } else {
@@ -582,6 +628,38 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                         const uint16_t u = qs[t];
                         sVt[(b * QK8_0 + 2 * t + 0) * VTSTR + key] = (_Float16) (d * (float) (int8_t) (u & 0xFF));
                         sVt[(b * QK8_0 + 2 * t + 1) * VTSTR + key] = (_Float16) (d * (float) (int8_t) (u >> 8));
+                    }
+                }
+            }
+        } else if constexpr (KV_Q4) {
+            for (int i = tid; i < KC * (GV_D / QK4_0); i += nthreads) {
+                const int b   = i / KC;
+                const int key = i % KC;
+                {
+                    const char * blk = Kb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb11 + b * (int64_t) sizeof(block_q4_0);
+                    const float d = __half2float(*(const half *) blk);
+                    const uint8_t * qs = (const uint8_t *) (blk + sizeof(half));
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        _Float16 tmp[8];
+#pragma unroll
+                        for (int t = 0; t < 8; ++t) {
+                            const int byte = qs[8 * (g % 2) + t];
+                            const int n = g < 2 ? (byte & 0xF) : (byte >> 4);
+                            tmp[t] = (_Float16) (d * (float) (n - 8));
+                        }
+                        *(uint4 *) (sK + key * GV_KSTR + b * QK4_0 + 8 * g) = *(const uint4 *) tmp;
+                    }
+                }
+                {
+                    const char * blk = Vb + gv_kv_row<ROWS>(rows_s, kbase + key) * nb21 + b * (int64_t) sizeof(block_q4_0);
+                    const float d = __half2float(*(const half *) blk);
+                    const uint8_t * qs = (const uint8_t *) (blk + sizeof(half));
+#pragma unroll
+                    for (int k = 0; k < QK4_0 / 2; ++k) {
+                        const int byte = qs[k];
+                        sVt[(b * QK4_0 + k)              * VTSTR + key] = (_Float16) (d * (float) ((byte & 0xF) - 8));
+                        sVt[(b * QK4_0 + k + QK4_0 / 2) * VTSTR + key] = (_Float16) (d * (float) ((byte >> 4) - 8));
                     }
                 }
             }
@@ -714,8 +792,12 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
     if (Q->ne[0] != GV_D || K->ne[0] != GV_D || V->ne[0] != GV_D) {
         return gv_reject(dst, "head dim != 256");
     }
-    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) {
-        return gv_reject(dst, "K/V type not equal f16/q8_0");
+    const bool kv_q4 = K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+    if (kv_q4 && !gv_q4kv()) {
+        return gv_reject(dst, "q4_0 K/V without GGML_CUDA_FA_GQA_Q4KV=1");
+    }
+    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && !kv_q4)) {
+        return gv_reject(dst, "K/V type not equal f16/q8_0/q4_0");
     }
     if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || sinks != nullptr) {
         return gv_reject(dst, "mask missing/not f16/ne2!=1 or sinks");
@@ -735,7 +817,8 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
     // C8-1-LCATTN: multi-sequence verify batches (n_q > 16 or gqa*n_q > 192) run as row groups
     const int n_grp_rows = n_q <= gv_multiseq_max_nq() ?
         gv_group_rows((int) n_q, (int) gqa, ggml_flash_attn_ext_get_n_seq(dst)) : 0;
-    if (n_q < gv_min_nq(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) || n_q < 1 || (n_q > GV_MAX_NQ && n_grp_rows == 0)) {
+    // q4_0 (knob on) shares the q8_0 decode default: both are block-dequantized in registers
+    if (n_q < gv_min_nq((K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) || kv_q4) || n_q < 1 || (n_q > GV_MAX_NQ && n_grp_rows == 0)) {
         return gv_reject(dst, "n_q outside [MIN_NQ,16] (multiseq off or > MAX_NQ)");
     }
     if (n_grp_rows == 0 && gqa * n_q > GV_MAX_ROWS) {
@@ -759,7 +842,7 @@ bool ggml_cuda_fattn_gqa_verify_applicable(const int device, const ggml_tensor *
         }
     } else {
         if (K->nb[1] % 2 != 0 || V->nb[1] % 2 != 0 || (uintptr_t) K->data % 2 != 0 || (uintptr_t) V->data % 2 != 0) {
-            return gv_reject(dst, "q8_0 K/V stride/alignment");
+            return gv_reject(dst, "q8_0/q4_0 K/V stride/alignment");
         }
     }
     // batched decode of several sequences on a unified KV stays on the per-sequence vec layout
@@ -834,12 +917,15 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 
     const int ne33 = (int) mask->ne[3];
     const bool q8 = K->type == GGML_TYPE_Q8_0;
+    const bool q4 = K->type == GGML_TYPE_Q4_0;
     const bool late = pipe && q8 && gv_prefetch_late();
     // ROWS (KPF-41 in-place): K/V are the unified cache itself, one slice per ne[3] -> no per-slice K/V offset
     const int64_t nb13 = rows ? 0 : K->nb[3];
     const int64_t nb23 = rows ? 0 : V->nb[3];
-#define GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, KC_) \
-    gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_, KC_><<<grid, block, smem, stream>>>( \
+#define GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, KC_) do { if (q4) { GV_LAUNCH_K4(PIPE_, ROWS_, KC_); } else { GV_LAUNCH_K1(Q8, PIPE_, LATE_, ROWS_, KC_, false); } } while (0)
+#define GV_LAUNCH_K4(PIPE_, ROWS_, KC_) GV_LAUNCH_K1(false, PIPE_, false, ROWS_, KC_, true)
+#define GV_LAUNCH_K1(Q8, PIPE_, LATE_, ROWS_, KC_, Q4_) \
+    gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_, KC_, Q4_><<<grid, block, smem, stream>>>( \
         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
         Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
         Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], nb13, V->nb[1], V->nb[2], nb23, \
@@ -864,6 +950,8 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 #undef GV_LAUNCH_R
 #undef GV_LAUNCH
 #undef GV_LAUNCH_K
+#undef GV_LAUNCH_K4
+#undef GV_LAUNCH_K1
     CUDA_CHECK(cudaGetLastError());
 
     gv_merge_kernel<<<dim3(R, n_head_kv, n_vseq), dim3(GV_D), 0, stream>>>(
@@ -898,6 +986,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     }
     if (autot && auto_cut && n_auto_cut_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_GQA_AUTO_TUNE lds-cut regime ran (n_kv=%d cut=%d splits=%d)\n", n_kv, (int) cut, n_splits);
+    }
+    static int n_q4_calls = 0;
+    if (q4 && n_q4_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_CUDA_FA_GQA_Q4KV q4_0 K/V path ran (pipe=%d cut=%d)\n", (int) pipe, (int) cut);
     }
     static int n_late_calls = 0;
     if (late && n_late_calls++ == 0) {
