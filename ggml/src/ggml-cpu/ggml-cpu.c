@@ -1493,7 +1493,10 @@ static bool ggml_cpu_router_bf16_eligible(const struct ggml_tensor * node) {
            node->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
            src0->data != NULL && src0->buffer != NULL &&
            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-           src1->ne[1] * src1->ne[2] * src1->ne[3] == 1;
+           src1->ne[1] * src1->ne[2] * src1->ne[3] == 1 &&
+           // no scalar leftovers: a K = 100 case differed from ggml_vec_dot_f32 in its leftover loop (FP
+           // contraction is decided per loop by the compiler), so only whole GGML_F32_STEP rows are served
+           src0->ne[0] % 64 == 0;
 }
 
 static int ggml_cpu_router_bf16_slot(const struct ggml_tensor * src0, bool * found) {

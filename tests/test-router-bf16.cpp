@@ -3,7 +3,7 @@
 // the MoE router ffn_gate_inp at decode. Exact-BF16 W must be served from the BF16 shadow; a W with any
 // non-BF16 value and a 3-column x must keep the stock F32 path. The knob is read once per process, so
 // the parent re-executes itself as a child under each env arm and compares FNV-1a hashes of the output.
-// Cases: K 2048 (no leftovers), 2050 and 100 (scalar leftovers), N 256 / 7, threads 1, 4, 24.
+// Cases: K 2048 (served), 2050 and 100 (scalar leftovers: must NOT be served), N 256 / 7, threads 1, 4, 24.
 // Usage: test-router-bf16          (parent; rc 0 iff all hashes equal and the shadow engaged as expected)
 //        test-router-bf16 --child  (prints "hash <case> <hash> served <n>")
 #include <cinttypes>
@@ -33,8 +33,8 @@ struct tcase {
 
 static const tcase CASES[] = {
     { "k2048_n256",        2048, 256, 1, true,  true  },
-    { "k2050_n7",          2050,   7, 1, true,  true  },
-    { "k100_n256",          100, 256, 1, true,  true  },
+    { "k2050_n7",          2050,   7, 1, true,  false },
+    { "k100_n256",          100, 256, 1, true,  false },
     { "k2048_n256_inexact",2048, 256, 1, false, false },
     { "k2048_n256_3col",   2048, 256, 3, true,  false },
 };
