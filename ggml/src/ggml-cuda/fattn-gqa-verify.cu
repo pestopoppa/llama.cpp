@@ -625,6 +625,108 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
             return any;
         };
 
+        if constexpr (RF5) {
+        // RF5 piece 3: two raw register sets (A = even chunks, B = odd), loop unrolled by 2. A set is reloaded right after
+        // its LDS store, so the store of a chunk waits only for loads issued two chunk steps earlier while the other set's
+        // loads stay outstanding: no vmcnt wait is ever on a just-issued load. The q8_0 tail halfword comes from a dword
+        // at block offset 30 (bytes 30..33, inside the block) instead of a separate global_load_ushort.
+        struct gv_rf5_set { uint32_t kw[8]; uint32_t vw[8]; uint32_t kt; uint32_t vt; uint16_t rm[2]; };
+        struct __attribute__((packed, aligned(2))) gv_q8_w8 { uint32_t w[8]; };
+        struct __attribute__((packed, aligned(2))) gv_q8_w1 { uint32_t w; };
+        gv_rf5_set sa;
+        gv_rf5_set sb;
+        auto load_set = [&](gv_rf5_set & r, const int c) __attribute__((always_inline)) {
+            const int kbase = c * KC;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int i = tid + s * nthreads;
+                if (i < n_q * KC) {
+                    r.rm[s] = *(const uint16_t *) (Mb + (i / KC) * nb31 + (int64_t) (kbase + i % KC) * sizeof(half));
+                }
+            }
+            if (tid < KC * (GV_D / QK8_0)) {
+                const int b = tid / KC, key = tid % KC;
+                const char * pk = Kb + (int64_t) (kbase + key) * nb11 + b * (int64_t) sizeof(block_q8_0);
+                const char * pv = Vb + (int64_t) (kbase + key) * nb21 + b * (int64_t) sizeof(block_q8_0);
+                const gv_q8_w8 * qk = (const gv_q8_w8 *) pk;
+                const gv_q8_w8 * qv = (const gv_q8_w8 *) pv;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    r.kw[t] = qk->w[t];
+                    r.vw[t] = qv->w[t];
+                }
+                r.kt = ((const gv_q8_w1 *) (pk + 30))->w; // tail halfword = high 16 bits
+                r.vt = ((const gv_q8_w1 *) (pv + 30))->w;
+            }
+        };
+        auto store_set = [&](gv_rf5_set & r) __attribute__((always_inline)) -> int {
+            uint32_t x0 = r.kt, x1 = r.vt, x2 = r.rm[0], x3 = r.rm[1];
+            asm volatile("" : "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3));
+            r.kt = x0; r.vt = x1; r.rm[0] = (uint16_t) x2; r.rm[1] = (uint16_t) x3;
+            int any = 0;
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int i = tid + s * nthreads;
+                if (i < n_q * KC) {
+                    const float mv = __half2float(__ushort_as_half(r.rm[s]));
+                    smask[i] = mv;
+                    any |= mv != -INFINITY;
+                }
+            }
+            if (tid < KC * (GV_D / QK8_0)) {
+                const int b = tid / KC, key = tid % KC;
+                auto hk = [&](const int k) -> uint16_t { return k == QK8_0 / 2 ? (uint16_t) (r.kt >> 16) : (uint16_t) (r.kw[k / 2] >> (16 * (k % 2))); };
+                auto hv = [&](const int k) -> uint16_t { return k == QK8_0 / 2 ? (uint16_t) (r.vt >> 16) : (uint16_t) (r.vw[k / 2] >> (16 * (k % 2))); };
+                const float dk = __half2float(__ushort_as_half(hk(0)));
+                const float dv = __half2float(__ushort_as_half(hv(0)));
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    _Float16 tmp[8];
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const uint16_t u = hk(1 + 4 * g + t);
+                        tmp[2 * t + 0] = (_Float16) (dk * (float) (int8_t) (u & 0xFF));
+                        tmp[2 * t + 1] = (_Float16) (dk * (float) (int8_t) (u >> 8));
+                    }
+                    *(uint4 *) (sK + key * GV_KSTR + b * QK8_0 + 8 * g) = *(const uint4 *) tmp;
+                }
+#pragma unroll
+                for (int t = 0; t < QK8_0 / 2; ++t) {
+                    const uint16_t u = hv(1 + t);
+                    sVt[(b * QK8_0 + 2 * t + 0) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u & 0xFF));
+                    sVt[(b * QK8_0 + 2 * t + 1) * VTSTR + key] = (_Float16) (dv * (float) (int8_t) (u >> 8));
+                }
+            }
+            return any;
+        };
+        if (c_begin < c_end) {
+            load_set(sa, c_begin);
+        }
+        if (c_begin + 1 < c_end) {
+            load_set(sb, c_begin + 1);
+        }
+        for (int c = c_begin; c < c_end; c += 2) {
+            int live = __syncthreads_or(store_set(sa));
+            if (c + 2 < c_end) {
+                load_set(sa, c + 2);
+            }
+            if (live) {
+                gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+            }
+            __syncthreads();
+            if (c + 1 >= c_end) {
+                break;
+            }
+            live = __syncthreads_or(store_set(sb));
+            if (c + 3 < c_end) {
+                load_set(sb, c + 3);
+            }
+            if (live) {
+                gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+            }
+            __syncthreads();
+        }
+        } else {
         if (c_begin < c_end) {
             load_raw(c_begin);
         }
@@ -634,13 +736,10 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                 load_raw(c + 1); // in flight during the MFMA work below
             }
             if (live) {
-                if constexpr (RF5) {
-                    gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
-                } else {
-                    gv_compute_chunk<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
-                }
+                gv_compute_chunk<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
             }
             __syncthreads();
+        }
         }
     } else
     for (int c = c_begin; c < c_end; ++c) {
