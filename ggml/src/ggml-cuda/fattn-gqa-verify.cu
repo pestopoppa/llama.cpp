@@ -123,9 +123,21 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
 // no tail), (c) caps splits so the f32 partial-O write stays <= 1/2 of the KV bytes read (the merge traffic is otherwise
 // what the nq 8 shapes pay for a wide split) and so every split streams >= 8 chunks (128 keys). The merge is unchanged
 // and sums splits in index order, so the result is deterministic run to run.
-static bool gv_vattn_rf() {
-    static const bool v = gv_env_int("GGML_HIP_VATTN_RF", 0) != 0;
+static int gv_vattn_rf_level() {
+    static const int v = gv_env_int("GGML_HIP_VATTN_RF", 0);
     return v;
+}
+
+static bool gv_vattn_rf() {
+    return gv_vattn_rf_level() != 0;
+}
+
+// GGML_HIP_VATTN_RF=5 (C22 VATTN-ROOFLINE-3 "chain-cut", default OFF): RF1 geometry (16-key LDS-cut gv_fattn, 2 WG/CU,
+// floor(2*nsm/n_head_kv) splits) with the in-wave serial chain of each chunk shortened (vattn-limiter-analysis-20261124):
+// the softmax row max is reduced with 4 interleaved DPP chains (no ds_bpermute) and the row sum is kept per lane and
+// reduced once per split. Later RF5 pieces are listed at gv_compute_chunk_rf5 / the RF5 loop.
+static bool gv_vattn_rf5() {
+    return gv_vattn_rf_level() == 5;
 }
 
 static bool gv_debug() {
@@ -231,6 +243,96 @@ static __device__ __forceinline__ void gv_compute_chunk(
 }
 #endif
 
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+// DPP lane move inside a 16-lane row (dpp_ctrl CTRL, all rows/banks enabled)
+template <int CTRL>
+static __device__ __forceinline__ float gv_dpp(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), CTRL, 0xF, 0xF, false));
+}
+
+// RF5: max over the 16 lanes of each DPP row, 4 independent values interleaved (chain depth 4 DPP+VALU steps, no LDS).
+// quad_perm[1,0,3,2], quad_perm[2,3,0,1], row_ror:4, row_ror:8 -> every lane of the row holds the row max (exact).
+static __device__ __forceinline__ void gv_row_max4(float (&x)[4]) {
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] = fmaxf(x[v], gv_dpp<0xB1>(x[v])); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] = fmaxf(x[v], gv_dpp<0x4E>(x[v])); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] = fmaxf(x[v], gv_dpp<0x124>(x[v])); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] = fmaxf(x[v], gv_dpp<0x128>(x[v])); }
+}
+
+// RF5: sum over the 16 lanes of each DPP row; lane li == 0 of the row holds a fixed-order sum (deterministic)
+static __device__ __forceinline__ void gv_row_sum4(float (&x)[4]) {
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] += gv_dpp<0xB1>(x[v]); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] += gv_dpp<0x4E>(x[v]); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] += gv_dpp<0x124>(x[v]); }
+#pragma unroll
+    for (int v = 0; v < 4; ++v) { x[v] += gv_dpp<0x128>(x[v]); }
+}
+
+// RF5 chunk step (KC = 16). Differences from gv_compute_chunk, same arithmetic per key:
+//   - row max: gv_row_max4 (4 rows interleaved, DPP) instead of 4 x 4 dependent ds_bpermute + lgkmcnt(0)
+//   - row sum: not reduced per chunk. l_run holds this lane's partial sum (alpha is uniform across the row, so the
+//     per-lane recurrence l = l*alpha + p sums to the row recurrence); the kernel reduces it once at the split end.
+template <int KC>
+static __device__ __forceinline__ void gv_compute_chunk_rf5(
+        const bool tile_active, const _Float16 * sK, const _Float16 * sVt, _Float16 * sP, const float * smask,
+        const gv_halfx4 (&qa)[GV_D / 16], gv_floatx4 (&o)[GV_D / 16], float (&m_run)[4], float (&l_run)[4],
+        const bool (&row_ok)[4], const int (&row_q)[4], const float scale, const int li, const int kq) {
+    static_assert(KC == 16, "RF5 chunk step is the 16-key LDS-cut variant");
+    constexpr int VTSTR = KC + 8;
+    constexpr int PSTR  = KC + 8;
+    float alpha[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (tile_active) {
+        gv_floatx4 S = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int s = 0; s < GV_D / 16; ++s) {
+            const gv_halfx4 kb = *(const gv_halfx4 *) (sK + li * GV_KSTR + 16 * s + 4 * kq);
+            S = __builtin_amdgcn_mfma_f32_16x16x16f16(qa[s], kb, S, 0, 0, 0);
+        }
+        float rmax[4];
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const float mv = row_ok[v] ? smask[row_q[v] * KC + li] : -INFINITY;
+            S[v] = S[v] * scale + mv;
+            rmax[v] = fmaxf(-FLT_MAX / 2.0f, S[v]);
+        }
+        gv_row_max4(rmax);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const float m_new = fmaxf(m_run[v], rmax[v]);
+            alpha[v] = __expf(m_run[v] - m_new);
+            const float p = __expf(S[v] - m_new);
+            sP[(4 * kq + v) * PSTR + li] = (_Float16) p;
+            l_run[v] = l_run[v] * alpha[v] + p;
+            m_run[v] = m_new;
+        }
+    }
+    __syncthreads();
+
+    if (tile_active) {
+#pragma unroll
+        for (int nb = 0; nb < GV_D / 16; ++nb) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                o[nb][v] *= alpha[v];
+            }
+        }
+        const gv_halfx4 pa = *(const gv_halfx4 *) (sP + li * PSTR + 4 * kq);
+#pragma unroll
+        for (int nb = 0; nb < GV_D / 16; ++nb) {
+            const gv_halfx4 vb = *(const gv_halfx4 *) (sVt + (nb * 16 + li) * VTSTR + 4 * kq);
+            o[nb] = __builtin_amdgcn_mfma_f32_16x16x16f16(pa, vb, o[nb], 0, 0, 0);
+        }
+    }
+}
+#endif
+
 // KPF-41 FAROWS-INPLACE: with ROWS the kernel reads the K/V rows of slice `seq` in place from the unified KV cache through
 // the per-slice row list (rows_s = rows + seq*rows_s1, entry i = KV cell of gathered row i; < 0 = padding, read as cell 0
 // and hidden by the gathered -inf mask column, exactly like the zero row of the gather path). Without ROWS it is the
@@ -251,7 +353,7 @@ static __device__ __forceinline__ int64_t gv_kv_row(const int32_t * __restrict__
 // launched with exactly GV_MIN_WAVES waves (R <= 64) and compiled with __launch_bounds__(256, 2) so that the register
 // budget also admits two workgroups per CU. Per-key arithmetic is unchanged (online softmax is chunk-size invariant up
 // to f32 rounding of the running max/sum).
-template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false, int KC = GV_KC>
+template <bool KV_Q8, bool PIPE, bool LATE = false, bool ROWS = false, int KC = GV_KC, int RF = 0>
 static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE ? 64 * GV_PIPE_MAX_WAVES : 64 * GV_MAX_WAVES),
                                          KC != GV_KC ? 2 : 1) gv_fattn_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -266,6 +368,8 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
     constexpr int VTSTR = KC + 8;
     constexpr int PSTR  = KC + 8;
+    constexpr bool RF5  = RF == 5;
+    static_assert(!RF5 || (KV_Q8 && PIPE && LATE && !ROWS && KC == GV_KC_CUT), "RF5 = q8_0 LATE pipelined 16-key cut, no ROWS");
     extern __shared__ char gv_smem[];
     _Float16 * sK   = (_Float16 *) gv_smem;
     _Float16 * sVt  = sK + KC * GV_KSTR;
@@ -526,7 +630,11 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
                 load_raw(c + 1); // in flight during the MFMA work below
             }
             if (live) {
-                gv_compute_chunk<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                if constexpr (RF5) {
+                    gv_compute_chunk_rf5<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                } else {
+                    gv_compute_chunk<KC>(tile_active, sK, sVt, sP, smask, qa, o, m_run, l_run, row_ok, row_q, scale, li, kq);
+                }
             }
             __syncthreads();
         }
@@ -601,6 +709,11 @@ static __global__ void __launch_bounds__(KC != GV_KC ? 64 * GV_MIN_WAVES : (PIPE
     }
 
     // partials: Opart[(((split*n_seq + seq)*n_head_kv + hkv)*R + r)*D + d], MLpart[... r]
+    if constexpr (RF5) {
+        if (tile_active) {
+            gv_row_sum4(l_run); // per-lane partial sums -> row sum in lane li == 0 (the lane that writes MLpart)
+        }
+    }
     if (tile_active) {
         const int64_t base_row = ((int64_t) (split * n_vseq + vseq) * n_head_kv + hkv) * Rs;
 #pragma unroll
@@ -798,6 +911,7 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool rf       = gv_vattn_rf() && pipe && nwaves == GV_MIN_WAVES && n_vseq == 1 && rows == nullptr &&
                           K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
     const bool cut      = (gv_lds_cut() || rf) && pipe && nwaves == GV_MIN_WAVES;
+    const bool rf5      = rf && cut && gv_vattn_rf5() && gv_prefetch_late();
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -842,15 +956,17 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     // ROWS (KPF-41 in-place): K/V are the unified cache itself, one slice per ne[3] -> no per-slice K/V offset
     const int64_t nb13 = rows ? 0 : K->nb[3];
     const int64_t nb23 = rows ? 0 : V->nb[3];
-#define GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, KC_) \
-    gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_, KC_><<<grid, block, smem, stream>>>( \
+#define GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, KC_, ...) \
+    gv_fattn_kernel<Q8, PIPE_, LATE_, ROWS_, KC_ __VA_OPT__(,) __VA_ARGS__><<<grid, block, smem, stream>>>( \
         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
         Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, n_grp, G, chunks_per_split, n_chunks, \
         Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], nb13, V->nb[1], V->nb[2], nb23, \
         mask->nb[1], mask->nb[3], ne33, rows, rows_s1)
 #define GV_LAUNCH(Q8, PIPE_, LATE_, ROWS_) do { if (cut) { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC_CUT); } else { GV_LAUNCH_K(Q8, PIPE_, LATE_, ROWS_, GV_KC); } } while (0)
 #define GV_LAUNCH_R(Q8, PIPE_, LATE_) do { if (rows) { GV_LAUNCH(Q8, PIPE_, LATE_, true); } else { GV_LAUNCH(Q8, PIPE_, LATE_, false); } } while (0)
-    if (late) {
+    if (rf5) {
+        GV_LAUNCH_K(true, true, true, false, GV_KC_CUT, 5);
+    } else if (late) {
         GV_LAUNCH_R(true, true, true);
     } else if (pipe) {
         if (q8) {
@@ -894,6 +1010,10 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     static int n_rf_calls = 0;
     if (rf && n_rf_calls++ == 0) {
         GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF roofline launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
+    }
+    static int n_rf5_calls = 0;
+    if (rf5 && n_rf5_calls++ == 0) {
+        GGML_LOG_WARN("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=5 chain-cut launch ran (splits=%d R=%d smem=%zu)\n", n_splits, R, smem);
     }
     static int n_cut_calls = 0;
     if (cut && n_cut_calls++ == 0) {
