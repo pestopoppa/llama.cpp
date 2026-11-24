@@ -501,6 +501,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    llama_build_and_test(test-qkv-concat.cpp)    # AK-BW-27B-ATTN-KV-CONCAT arm (b): zero-copy Q|K|V alias == separate
     llama_build_and_test(test-col2im-1d.cpp)
     llama_build_and_test(test-gather-rows-e4m3-e8m0.cpp)
     # [AK-DTREE-2] tree-verification ops: chain-tree == chain and every tree path == chain, bitwise (CPU)

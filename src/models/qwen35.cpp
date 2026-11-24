@@ -263,37 +263,59 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-    cb(Qcur_full, "Qcur_full", il);
+    const auto & L = model.layers[il];
+    // AK-BW-27B-ATTN-KV-CONCAT arm (b): one MUL_MAT over the zero-copy [wq|wk|wv] view, Q|gate / K / V split as views
+    // (bound only under LLAMA_QKV_CONCAT=1; LoRA adapters see wq/wk/wv by identity, so they keep the separate path)
+    const bool use_cat = L.wqkv_cat != nullptr && (loras == nullptr || loras->empty());
 
+    ggml_tensor * Qcur_full;
+    ggml_tensor * Kcur;
+    ggml_tensor * Vcur;
+    if (use_cat) {
+        ggml_tensor * qkv = ggml_mul_mat(ctx0, L.wqkv_cat, cur); // [nq + nk + nv, n_tokens]
+        cb(qkv, "wqkv_cat", il);
+        const int64_t nq = L.wq->ne[1];
+        const int64_t nk = L.wk->ne[1];
+        const size_t  es = ggml_element_size(qkv);
+        Qcur_full = ggml_view_2d(ctx0, qkv, nq, n_tokens, qkv->nb[1], 0);
+        Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens, es * n_embd_head, qkv->nb[1], es * nq);
+        Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens, es * n_embd_head, qkv->nb[1], es * (nq + nk));
+    } else {
+        Qcur_full = build_lora_mm(L.wq, cur, L.wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+        Kcur = build_lora_mm(L.wk, cur, L.wk_s);
+        Vcur = build_lora_mm(L.wv, cur, L.wv_s);
+    }
+    cb(Qcur_full, "Qcur_full", il);
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+
+    // row stride of Qcur_full: n_embd_head * 2 * n_head elements when separate, the concat row when fused
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        Qcur_full->nb[1], 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
-    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    Qcur = build_norm(Qcur, L.attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
-
     // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    if (!use_cat) {
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    }
+    Kcur = build_norm(Kcur, L.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        Qcur_full->nb[1],
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    if (!use_cat) {
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    }
 
     // the unroped q/k for Dual Chunk Attention (it ropes them itself)
     ggml_tensor * Qraw = Qcur;

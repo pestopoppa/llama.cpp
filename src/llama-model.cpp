@@ -1070,6 +1070,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // AK-BW-27B-ATTN-KV-CONCAT: metadata-only context of the wqkv_cat tensors (they alias wq's buffer bytes, own none)
+    ggml_context_ptr ctx_qkv_cat;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1762,6 +1765,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    bind_qkv_concat();
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1769,6 +1774,70 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     return true;
+}
+
+static const char llama_qkv_concat_marker[] __attribute__((used)) =
+    "llama: zero-copy row-concatenated Q|K|V weight view (LLAMA_QKV_CONCAT)";
+
+// AK-BW-27B-ATTN-KV-CONCAT arm (b), default off. LLAMA_QKV_CONCAT=1 binds, per full-attention layer whose wq, wk, wv were
+// allocated back to back in ONE buffer (the weight allocator places a ctx's tensors in creation order; create_tensor_qkv
+// creates wq, wk, wv consecutively, and with ne0 % 512 == 0 there is no row padding), a metadata-only tensor
+// wqkv_cat [ne0, nq + nk + nv] whose data IS wq's: the bytes are already the row concatenation, no copy, no extra VRAM.
+// The gfx90a in-place Q8_0 repack (GGML_HIP_Q8_MF_INPLACE) permutes inside 64-row tiles only, so with nq, nk, nv % 64 == 0
+// the three packed tensors are also exactly the packed concatenation (and q8ip looks packed-ness up by data pointer).
+// The graph (qwen35 build_layer_attn) then runs ONE MUL_MAT and splits Q|gate, K, V as views. Any layer that does not
+// meet the preconditions keeps the separate path (counted in the witness line).
+void llama_model_base::bind_qkv_concat() {
+    const char * env = getenv("LLAMA_QKV_CONCAT");
+    if (env == nullptr || atoi(env) == 0) {
+        return;
+    }
+    if (arch != LLM_ARCH_QWEN35) {
+        LLAMA_LOG_WARN("%s: LLAMA_QKV_CONCAT=1 ignored: arch %s has no concat graph path\n", __func__, llm_arch_name(arch));
+        return;
+    }
+    int n_bound = 0, n_skip = 0;
+    std::vector<llama_layer *> cand;
+    for (auto & layer : layers) {
+        if (layer.wq && layer.wk && layer.wv) {
+            cand.push_back(&layer);
+        }
+    }
+    if (cand.empty()) {
+        return;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * (cand.size() + 1), nullptr, true };
+    pimpl->ctx_qkv_cat.reset(ggml_init(ip));
+    ggml_context * ctx = pimpl->ctx_qkv_cat.get();
+    for (size_t i = 0; i < cand.size(); ++i) {
+        llama_layer & L = *cand[i];
+        const ggml_tensor * q = L.wq, * k = L.wk, * v = L.wv;
+        const bool ok =
+            q->type == k->type && q->type == v->type &&
+            q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0] &&
+            q->ne[2] == 1 && q->ne[3] == 1 && k->ne[2] == 1 && k->ne[3] == 1 && v->ne[2] == 1 && v->ne[3] == 1 &&
+            ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v) &&
+            q->view_src == nullptr && k->view_src == nullptr && v->view_src == nullptr &&
+            q->buffer != nullptr && q->buffer == k->buffer && q->buffer == v->buffer &&
+            q->ne[1] % 64 == 0 && k->ne[1] % 64 == 0 && v->ne[1] % 64 == 0 &&
+            (const char *) k->data == (const char *) q->data + ggml_nbytes(q) &&
+            (const char *) v->data == (const char *) k->data + ggml_nbytes(k) &&
+            L.wq_b == nullptr && L.wk_b == nullptr && L.wv_b == nullptr &&
+            L.wq_s == nullptr && L.wk_s == nullptr && L.wv_s == nullptr &&
+            !ggml_type_is_exl3(q->type);
+        if (!ok) {
+            ++n_skip;
+            continue;
+        }
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, q->type, q->ne[0], q->ne[1] + k->ne[1] + v->ne[1]);
+        ggml_format_name(t, "%s.qkv_cat", q->name);
+        t->buffer = q->buffer;
+        t->data   = q->data;
+        L.wqkv_cat = t;
+        ++n_bound;
+    }
+    LLAMA_LOG_INFO("%s: LLAMA_QKV_CONCAT engaged: %d layers bound to a zero-copy Q|K|V view, %d kept separate\n",
+        __func__, n_bound, n_skip);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

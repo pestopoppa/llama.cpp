@@ -261,6 +261,7 @@ struct llama_layer {
     struct ggml_tensor * wv        = nullptr;
     struct ggml_tensor * wo        = nullptr;
     struct ggml_tensor * wqkv      = nullptr;
+    struct ggml_tensor * wqkv_cat  = nullptr; // AK-BW-27B-ATTN-KV-CONCAT: zero-copy [wq|wk|wv] row view (LLAMA_QKV_CONCAT=1)
     struct ggml_tensor * wq_a      = nullptr;
     struct ggml_tensor * wq_b      = nullptr;
     struct ggml_tensor * wkv_a_mqa = nullptr;
@@ -842,6 +843,9 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // AK-BW-27B-ATTN-KV-CONCAT: bind layer.wqkv_cat after load (LLAMA_QKV_CONCAT=1, default off)
+    void bind_qkv_concat();
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,
