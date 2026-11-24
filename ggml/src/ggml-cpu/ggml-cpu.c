@@ -606,6 +606,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
+#define GGML_CONV_FWD_MAX 256
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -630,6 +631,10 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    // AK-CPU-CONV-STATE-FWD: forwarded (CONCAT, GET_ROWS) pairs for the graph being computed
+    int n_conv_fwd;
+    struct { const struct ggml_tensor * concat, * R; } conv_fwd[GGML_CONV_FWD_MAX];
 };
 
 // Per-thread state
@@ -3070,6 +3075,131 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// AK-CPU-CONV-STATE-FWD (GGML_CONV_STATE_FWD, default OFF). The recurrent conv path is
+//   R = GET_ROWS(conv_states_all, s_copy) -> T = RESHAPE(R) [d_conv-1, ch, n_seqs] ->
+//   C = CONCAT(T, transpose(x), dim 0) -> SSM_CONV ... ; CPY(view(C, last d_conv-1), cache row)
+// R is a pure copy of whole cache rows that only C reads. With the knob on, R is skipped (no compute,
+// no barrier) and C reads each sequence's rows straight from the cache row named by the index.
+// The values C copies are the same bytes -> bit-identical. Guards: R and T are sole-consumer, the
+// index is in range, and no compute node between R and C writes into any indexed cache row (the
+// conv-state CPY write-back depends on C, so it always runs after C has read the rows).
+// ---------------------------------------------------------------------------------------------
+static bool ggml_cpu_conv_state_fwd = false;       // set once in ggml_cpu_init()
+static atomic_llong ggml_cpu_conv_fwd_total = 0;   // forwarded CONCAT nodes, process lifetime
+
+static inline bool ggml_cpu_node_conv_skipped(const struct ggml_tensor * t) {
+    return (t->flags & GGML_CPU_TFLAG_CONV_SKIP) != 0;
+}
+
+static int ggml_cpu_graph_find_back(const struct ggml_cgraph * g, int from, const struct ggml_tensor * t, int window) {
+    for (int j = from; j >= 0 && j >= from - window; j--) {
+        if (g->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+static void ggml_cpu_conv_fwd_setup(struct ggml_threadpool * tp, struct ggml_cgraph * g) {
+    tp->n_conv_fwd = 0;
+    if (!ggml_cpu_conv_state_fwd) {
+        return;
+    }
+    for (int i = 0; i < g->n_nodes && tp->n_conv_fwd < GGML_CONV_FWD_MAX; i++) {
+        struct ggml_tensor * C = g->nodes[i];
+        if (C->op != GGML_OP_CONCAT || (C->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_get_op_params_i32(C, 0) != 0 ||
+            C->type != GGML_TYPE_F32 || C->src[0] == NULL || C->src[1] == NULL || C->src[1]->type != GGML_TYPE_F32) {
+            continue;
+        }
+        struct ggml_tensor * T = C->src[0];
+        if (T->type != GGML_TYPE_F32 || T->view_src == NULL || T->view_offs != 0 || !ggml_is_contiguous(T) ||
+            (T->op != GGML_OP_RESHAPE && T->op != GGML_OP_VIEW) || T->ne[3] != 1 || (T->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        struct ggml_tensor * R = T->view_src;
+        if (R->op != GGML_OP_GET_ROWS || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) || R->view_src != NULL ||
+            (R->flags & GGML_TENSOR_FLAG_OUTPUT) || (R->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            R->ne[2] != 1 || R->ne[3] != 1 || T->ne[2] != R->ne[1] || T->ne[0] * T->ne[1] != R->ne[0] ||
+            T->nb[2] != R->nb[1]) {
+            continue;
+        }
+        const struct ggml_tensor * rs = R->src[0];
+        const struct ggml_tensor * ri = R->src[1];
+        const int64_t ns = R->ne[1];
+        if (rs == NULL || ri == NULL || rs->type != GGML_TYPE_F32 || rs->nb[0] != sizeof(float) ||
+            rs->ne[0] != R->ne[0] || rs->ne[2] != 1 || rs->ne[3] != 1 || ri->type != GGML_TYPE_I32 || ri->ne[0] != ns ||
+            ri->ne[1] != 1 || !ggml_is_contiguous(ri) || rs->data == NULL || ri->data == NULL) {
+            continue;
+        }
+        const int tpos = ggml_cpu_graph_find_back(g, i - 1, T, 4096);
+        const int rpos = tpos >= 0 ? ggml_cpu_graph_find_back(g, tpos - 1, R, 4096) : -1;
+        if (tpos < 0 || rpos < 0 || ggml_node_get_use_count(g, rpos) != 1 || ggml_node_get_use_count(g, tpos) != 1) {
+            continue;
+        }
+        // run-time: index in range; no compute node in (R, C) writes an indexed cache row
+        const int32_t * idx = (const int32_t *) ri->data;
+        bool ok = true;
+        for (int64_t s = 0; s < ns && ok; s++) {
+            ok = idx[s] >= 0 && idx[s] < rs->ne[1];
+        }
+        for (int j = rpos + 1; ok && j < i; j++) {
+            const struct ggml_tensor * m = g->nodes[j];
+            if (ggml_op_is_empty(m->op) || (m->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || m->data == NULL ||
+                ggml_nelements(m) == 0) {
+                continue;
+            }
+            const char * lo = (const char *) m->data;
+            const char * hi = lo + ggml_nbytes(m);
+            for (int64_t s = 0; s < ns && ok; s++) {
+                const char * row = (const char *) rs->data + (size_t) idx[s] * rs->nb[1];
+                ok = !(lo < row + rs->nb[1] && row < hi);
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        tp->conv_fwd[tp->n_conv_fwd].concat = C;
+        tp->conv_fwd[tp->n_conv_fwd].R      = R;
+        tp->n_conv_fwd++;
+        R->flags |= GGML_CPU_TFLAG_CONV_SKIP;
+        C->flags |= GGML_CPU_TFLAG_CONV_FWD;
+    }
+    if (tp->n_conv_fwd > 0) {
+        const long long n0 = atomic_fetch_add_explicit(&ggml_cpu_conv_fwd_total, tp->n_conv_fwd, memory_order_relaxed);
+        for (long long n = n0 + 1; n <= n0 + tp->n_conv_fwd; n++) {
+            ggml_cpu_lever_witness("conv-state-fwd", "GGML_CONV_STATE_FWD_QUIET", n);
+        }
+    }
+}
+
+static void ggml_cpu_conv_fwd_teardown(struct ggml_threadpool * tp) {
+    for (int k = 0; k < tp->n_conv_fwd; k++) {
+        ((struct ggml_tensor *) tp->conv_fwd[k].R)->flags      &= ~GGML_CPU_TFLAG_CONV_SKIP;
+        ((struct ggml_tensor *) tp->conv_fwd[k].concat)->flags &= ~GGML_CPU_TFLAG_CONV_FWD;
+    }
+    tp->n_conv_fwd = 0;
+}
+
+bool ggml_cpu_conv_fwd_lookup(const struct ggml_compute_params * params, const struct ggml_tensor * concat,
+                              const struct ggml_tensor ** R) {
+    const struct ggml_threadpool * tp = params->threadpool;
+    if (tp == NULL || (concat->flags & GGML_CPU_TFLAG_CONV_FWD) == 0) {
+        return false;
+    }
+    for (int k = 0; k < tp->n_conv_fwd; k++) {
+        if (tp->conv_fwd[k].concat == concat) {
+            *R = tp->conv_fwd[k].R;
+            return true;
+        }
+    }
+    return false;
+}
+
+long long ggml_cpu_conv_state_fwd_count(void) {
+    return atomic_load_explicit(&ggml_cpu_conv_fwd_total, memory_order_relaxed);
+}
+
 // index of the next node the graph loop would actually execute and barrier on, or n_nodes.
 // Nodes the loop skips -- empty ops, non-COMPUTE nodes, and (with the knob on) zero-element
 // nodes -- are transparent, so a solo run may span them.
@@ -3078,7 +3208,8 @@ static int ggml_cpu_next_exec_node(const struct ggml_cgraph * cgraph, int from) 
     while (i < cgraph->n_nodes &&
            (ggml_op_is_empty(cgraph->nodes[i]->op) ||
             (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            (ggml_cpu_empty_skip && ggml_nelements(cgraph->nodes[i]) == 0))) {
+            (ggml_cpu_empty_skip && ggml_nelements(cgraph->nodes[i]) == 0) ||
+            ggml_cpu_node_conv_skipped(cgraph->nodes[i]))) {
         i++;
     }
     return i;
@@ -5429,6 +5560,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // AK-CPU-CONV-STATE-FWD: a forwarded conv-state GET_ROWS -- the CONCAT reads the cache rows itself.
+        // The flag is set before the team starts, so every thread skips it (and its barrier) alike.
+        if (ggml_cpu_node_conv_skipped(node)) {
+            continue;
+        }
+
         // INF-70 SYNC-2: a node with zero elements writes nothing at all -- ggml_compute_forward()
         // already returns immediately on ggml_is_empty() -- yet it still pays a full graph barrier.
         // 219/token here (the recurrent-state rollback SCALE/GET_ROWS/CPY triples and SYNC-3's 72
@@ -5468,7 +5605,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     for (int k = node_n; k <= last; k++) {
                         struct ggml_tensor * nk = cgraph->nodes[k];
                         if (ggml_op_is_empty(nk->op) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0)) {
+                            (ggml_cpu_empty_skip && ggml_nelements(nk) == 0) || ggml_cpu_node_conv_skipped(nk)) {
                             continue;
                         }
                         ggml_compute_forward(&sp, nk);
@@ -5853,6 +5990,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    // AK-CPU-CONV-STATE-FWD: single-threaded plan-time forwarding analysis (no-op with the knob off)
+    ggml_cpu_conv_fwd_setup(threadpool, cgraph);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -5892,6 +6032,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    ggml_cpu_conv_fwd_teardown(threadpool);
 
     enum ggml_status ret = threadpool->ec;
 
@@ -6358,6 +6500,16 @@ void ggml_cpu_init(void) {
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
 
+        {
+            // AK-CPU-CONV-STATE-FWD: default OFF; =1 lets the conv CONCAT read the conv-state cache rows directly
+            const char * env = getenv("GGML_CONV_STATE_FWD");
+            ggml_cpu_conv_state_fwd = (env != NULL && atoi(env) != 0);
+            if (ggml_cpu_conv_state_fwd && getenv("GGML_CONV_STATE_FWD_QUIET") == NULL) {
+                fprintf(stderr, "[conv-state-fwd] CONV_STATE_FWD enabled\n");
+            }
+        }
+
+        {
             // AK-CPU-MOE-WSUM-FOLD: default OFF; =1 folds the MoE weighting MUL + expert-sum ADDs into one pass
             const char * env = getenv("GGML_MOE_WSUM_FOLD");
             ggml_cpu_moe_wsum_fold = (env != NULL && atoi(env) != 0);

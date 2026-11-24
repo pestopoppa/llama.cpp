@@ -46,6 +46,8 @@ extern "C" {
     GGML_BACKEND_API long long ggml_cpu_router_bf16_count(void);
     // AK-CPU-MOE-WSUM-FOLD: fused MoE weighted-sum tails executed so far (GGML_MOE_WSUM_FOLD=1)
     GGML_BACKEND_API long long ggml_cpu_moe_wsum_fold_count(void);
+    // AK-CPU-CONV-STATE-FWD: conv-state CONCATs forwarded so far (GGML_CONV_STATE_FWD=1)
+    GGML_BACKEND_API long long ggml_cpu_conv_state_fwd_count(void);
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
