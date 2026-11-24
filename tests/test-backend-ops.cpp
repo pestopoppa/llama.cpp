@@ -12818,9 +12818,20 @@ static void mmvf_add_i64_offset_cases(std::vector<std::unique_ptr<test_case>> & 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 4, false, 32768, 8, 8192));
 }
 
+// MMVF-MMID-EVEN-NE00 (intake-2865): the AMD MMVF_MMID branch sent every float expert tensor to MMVF, but MMVF
+// reads src0 in pairs (GGML_ASSERT(ncols % 2 == 0) in mmvf.cu), so an odd ne00 aborted. Cheap, always on.
+static void mmvf_add_mmid_odd_ne00_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {1, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, n, 255));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     mmvf_add_i64_offset_cases(test_cases);      // MMVF-I64-OFFSET
+    mmvf_add_mmid_odd_ne00_cases(test_cases);   // MMVF-MMID-EVEN-NE00
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
