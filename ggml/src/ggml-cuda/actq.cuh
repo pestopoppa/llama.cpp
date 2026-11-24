@@ -40,3 +40,23 @@ static __device__ __forceinline__ void actq_zero_dsts(const actq_zero & z) {
         }
     }
 }
+
+// ---- bit 1: sibling sharing (host side, actq.cu) --------------------------------------------------------------------
+// kinds of shared activation layout
+#define ACTQ_KIND_Q8MF 1   // q8mf_pre_i8 stage-major act (q8mf6)
+#define ACTQ_KIND_Q8SK 2   // q8sk yq [16][nblk*32] int8 + yd [16][nblk] f32
+
+// graph-eval hooks (ggml-cuda.cu): begin of every evaluate pass, and the node about to be dispatched (-1 = none)
+void ggml_cuda_actq_graph_begin();
+void ggml_cuda_actq_set_node(const ggml_cgraph * g, int i, int stream_no);
+
+// Later sibling: returns the shared quantized activation already written by this node's group leader (skip the
+// pre-pass and the dst zero-init), or nullptr (run the normal path).
+const char * ggml_cuda_actq_reuse(ggml_backend_cuda_context & ctx, int kind, const ggml_tensor * src1,
+                                  const ggml_tensor * dst);
+
+// Group leader: if dst is the node being dispatched and the next non-view nodes are MUL_MATs on the same src1 that
+// sib_ok accepts, returns a persistent per-context buffer of >= bytes to quantize into and fills z with the zero-init
+// set (own dst first, then each sibling's); otherwise nullptr (run the normal path).
+char * ggml_cuda_actq_begin(ggml_backend_cuda_context & ctx, int kind, const ggml_tensor * src1, const ggml_tensor * dst,
+                            size_t bytes, actq_zero & z, bool (*sib_ok)(const ggml_tensor * node));

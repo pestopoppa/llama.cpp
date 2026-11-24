@@ -12694,6 +12694,48 @@ static void dtree_add_q8v5_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     }
 }
 
+// AK-BW-27B-ACTQUANT-FUSE (GGML_HIP_ACTQ_FUSE=2|3): n_sib Q8_0 MUL_MATs on one shared src1, adjacent in the graph
+// (out = mm0 + (mm1 + mm2)), so the CUDA backend forms one sibling group and the later siblings reuse the leader's
+// quantized activation. Run with GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_MIN_BYTES=0
+// for the q8mf6 group, and without GGML_HIP_Q8_MF for the q8sk group. Off by default they are ordinary MUL_MAT + ADD graphs.
+struct test_actq_siblings : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int     n_sib;
+
+    test_actq_siblings(int64_t m, int64_t n, int64_t k, int n_sib) : m(m), n(n), k(k), n_sib(n_sib) {}
+
+    std::string vars() override { return VARS_TO_STR4(m, n, k, n_sib); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "ACTQ_SIBLINGS"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * mm[3];
+        for (int i = 0; i < n_sib; ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+            mm[i] = ggml_mul_mat(ctx, w, x);
+        }
+        ggml_tensor * out = n_sib == 2 ? ggml_add(ctx, mm[0], mm[1]) : ggml_add(ctx, mm[0], ggml_add(ctx, mm[1], mm[2]));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+static void ak_add_actq_sibling_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t m : {1024, 4096}) {
+        for (int64_t n : {1, 3, 8, 16}) {
+            for (int n_sib : {2, 3}) {
+                test_cases.emplace_back(new test_actq_siblings(m, n, 5120, n_sib));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_actq_siblings(17408, 8, 5120, 2));   // 27B ffn gate + up shape
+}
+
 // DTREE-0-Q8MF-V2 roofline table: the 27B Q8_0 verify shapes {m = rows, k} at M (= n) 1/8/12/16. Run with
 // GGML_HIP_Q8_MF=1|2 GGML_HIP_Q8_MF_MIN=1 to time the MF kernels at every M (GB/s = m * k * 34/32 / (us/op)).
 static void dtree_add_q8mf_perf_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
@@ -12812,6 +12854,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
+    ak_add_actq_sibling_cases(test_cases);      // AK-BW-27B-ACTQUANT-FUSE
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);

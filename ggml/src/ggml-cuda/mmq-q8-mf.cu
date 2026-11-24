@@ -87,6 +87,7 @@
 //  MFMA load per CU per 2 stages (one per WG): 2 x 4 waves x 16 MFMA x 32 clk on 4 SIMDs = 1024 clk per 34.8 KB -> cap
 //  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
+#include "actq.cuh"
 
 #include "quantize.cuh"
 #include "mmq.cuh"
@@ -194,6 +195,33 @@ static __global__ void q8mf_pre_i8(const float * __restrict__ y, const int64_t s
             z[(int64_t) (i / zN) * zs1 + i % zN] = 0.0f;
         }
     }
+    const int c   = blockIdx.y;
+    const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int i   = threadIdx.x % 32;
+    if (blk >= nblk) {
+        return;
+    }
+    const float x = c < M ? y[c * s1 + (int64_t) blk * 32 + i] : 0.0f;
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    }
+    const float d = amax / 127.0f;
+    const int   q = amax == 0.0f ? 0 : (int) roundf(x / d);
+    char * st = act + (int64_t) (blk / Q8MF_KS) * Q8MF_A1;
+    const int b = blk % Q8MF_KS;
+    st[b * 512 + ((i / 8) * 16 + c) * 8 + (i % 8)] = (char) q;
+    if (i == 0) {
+        ((float *) (st + Q8MF_KS * 512))[b * 16 + c] = d;
+    }
+}
+
+// AK-BW-27B-ACTQUANT-FUSE bit 1: q8mf_pre_i8 (MF=1 / V5 layout, no stream-K counters) plus the zero-init of every
+// sibling dst in z. Quantization arithmetic is the q8mf_pre_i8 body verbatim (bit-identical act).
+static __global__ void q8mf_pre_i8_z(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
+                                     char * __restrict__ act, const actq_zero z) {
+    actq_zero_dsts(z);
     const int c   = blockIdx.y;
     const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int i   = threadIdx.x % 32;
@@ -1495,6 +1523,13 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+// AK-BW-27B-ACTQUANT-FUSE bit 1: a sibling may join a q8mf6 group when it can read the same V5 act layout
+static bool q8mf6_sib_ok(const ggml_tensor * node) {
+    const ggml_tensor * w = node->src[0];
+    return w->type == GGML_TYPE_Q8_0 && ggml_cuda_q8ip_is_packed(w) && w->ne[1] % Q8MF_RT == 0 &&
+        node->ne[1] >= 1 && node->ne[1] <= Q8MF_MAXM;
+}
+
 static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8mf_cfg & cfg = q8mf_get_cfg();
     constexpr int p = 2;
@@ -1517,15 +1552,25 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
     const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
     const size_t abytes = (size_t) S * Q8MF_A1;
-    ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
+    ggml_cuda_pool_alloc<char> act(ctx.pool());
     float * d = (float *) dst->data;
-    {
+    const char * actp = ggml_cuda_actq_reuse(ctx, ACTQ_KIND_Q8MF, src1, dst);   // AK-BW-27B-ACTQUANT-FUSE bit 1
+    if (actp == nullptr) {
+        actq_zero z;
+        char * shared = ggml_cuda_actq_begin(ctx, ACTQ_KIND_Q8MF, src1, dst, abytes, z, q8mf6_sib_ok);
         const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
-        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+        if (shared != nullptr) {
+            q8mf_pre_i8_z<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, shared, z);
+            actp = shared;
+        } else {
+            act.alloc(abytes);
+            q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+            actp = act.get();
+        }
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, actp, (uint32_t) abytes, S, U, G, M, d, dst_s1)
     if (cfg.slc) {
         Q8MF6_L(2, 2);
     } else {

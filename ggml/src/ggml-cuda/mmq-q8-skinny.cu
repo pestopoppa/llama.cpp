@@ -282,6 +282,11 @@ q8sk_mul_mat(const char * __restrict__ W, const int64_t nb01, const int nblk, co
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+// AK-BW-27B-ACTQUANT-FUSE bit 1: a sibling may join a q8sk group when it is a Q8_0 skinny-M MUL_MAT
+static bool q8sk_sib_ok(const ggml_tensor * node) {
+    return node->src[0]->type == GGML_TYPE_Q8_0 && node->ne[1] >= 1 && node->ne[1] <= Q8SK_MAXM;
+}
+
 void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const q8sk_cfg & cfg = q8sk_get_cfg();
     {
@@ -313,29 +318,43 @@ void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_ten
     GGML_ASSERT(n_items < INT32_MAX);
     nwaves = (int) std::min<int64_t>(nwaves, n_items);
 
-    ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) Q8SK_MAXM * nblk * 32);
-    ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) Q8SK_MAXM * nblk);
+    ggml_cuda_pool_alloc<int8_t> yq(ctx.pool());
+    ggml_cuda_pool_alloc<float>  yd(ctx.pool());
     float * dstd = (float *) dst->data;
-    if (ggml_cuda_actq_mode() & 1) {   // AK-BW-27B-ACTQUANT-FUSE bit 0: zero-init folded into the quantize launch
-        static std::atomic<int64_t> n_fz{0};
-        if (n_fz.fetch_add(1) == 0) {
-            GGML_LOG_INFO("ggml_cuda_actq: q8sk zero-fold ran (call 1, GGML_HIP_ACTQ_FUSE=%d)\n", ggml_cuda_actq_mode());
-        }
-        actq_zero z = {};
-        z.p[0] = dstd; z.N[0] = N; z.s1[0] = (int) dst_s1; z.n = 1; z.M = M;
-        const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
-        q8sk_quantize_z<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get(), z);
+    const size_t yq_bytes = (size_t) Q8SK_MAXM * nblk * 32;
+    int8_t * yqp = nullptr;
+    float  * ydp = nullptr;
+    if (const char * sh = ggml_cuda_actq_reuse(ctx, ACTQ_KIND_Q8SK, src1, dst)) {   // AK-BW-27B-ACTQUANT-FUSE bit 1
+        yqp = (int8_t *) sh;
+        ydp = (float *) (sh + yq_bytes);
     } else {
-        {
-            const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
-            q8sk_quantize<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get());
-        }
-        {
-            const dim3 grid((N + 255) / 256, M, 1);
-            q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+        actq_zero z;
+        char * shared = ggml_cuda_actq_begin(ctx, ACTQ_KIND_Q8SK, src1, dst, yq_bytes + (size_t) Q8SK_MAXM * nblk * sizeof(float),
+                                             z, q8sk_sib_ok);
+        const dim3 qgrid((nblk + 7) / 8, Q8SK_MAXM, 1);
+        if (shared != nullptr) {
+            yqp = (int8_t *) shared;
+            ydp = (float *) (shared + yq_bytes);
+            q8sk_quantize_z<<<qgrid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yqp, ydp, z);
+        } else {
+            yqp = yq.alloc(yq_bytes);
+            ydp = yd.alloc((size_t) Q8SK_MAXM * nblk);
+            if (ggml_cuda_actq_mode() & 1) {   // AK-BW-27B-ACTQUANT-FUSE bit 0: zero-init folded into the quantize launch
+                static std::atomic<int64_t> n_fz{0};
+                if (n_fz.fetch_add(1) == 0) {
+                    GGML_LOG_INFO("ggml_cuda_actq: q8sk zero-fold ran (call 1, GGML_HIP_ACTQ_FUSE=%d)\n", ggml_cuda_actq_mode());
+                }
+                z = {};
+                z.p[0] = dstd; z.N[0] = N; z.s1[0] = (int) dst_s1; z.n = 1; z.M = M;
+                q8sk_quantize_z<<<qgrid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yqp, ydp, z);
+            } else {
+                q8sk_quantize<<<qgrid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yqp, ydp);
+                const dim3 grid((N + 255) / 256, M, 1);
+                q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+            }
         }
     }
-    q8sk_mul_mat<<<nwaves, 64, 0, stream>>>((const char *) src0->data, src0->nb[1], nblk, N, M, yq.get(), yd.get(),
+    q8sk_mul_mat<<<nwaves, 64, 0, stream>>>((const char *) src0->data, src0->nb[1], nblk, N, M, yqp, ydp,
                                             (int) n_items, nwaves, dstd, dst_s1);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq-q8-skinny.cuh"
 #include "ggml-cuda/mmq-q8-wvsk.cuh"
 #include "ggml-cuda/mmq-q8-mf.cuh"
+#include "ggml-cuda/actq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -4406,6 +4407,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_hc_fuse_plan(cgraph, hc_plan);
             }
 
+            ggml_cuda_actq_graph_begin();   // AK-BW-27B-ACTQUANT-FUSE: groups never span evaluate passes
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4484,7 +4486,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                ggml_cuda_actq_set_node(cgraph, i, cuda_ctx->curr_stream_no);
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                ggml_cuda_actq_set_node(nullptr, -1, -1);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
