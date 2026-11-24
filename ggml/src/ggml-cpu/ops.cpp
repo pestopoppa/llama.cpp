@@ -2451,7 +2451,7 @@ static void ggml_compute_forward_concat_conv_fwd(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     GGML_ASSERT(ne03 == 1 && ne3 == 1);
-    GGML_ASSERT(nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float) && nb0 == sizeof(float)); // src1 may be transposed (strided nb10)
 
     const int64_t n_rows = ne1 * ne2;
     const int64_t dr     = (n_rows + nth - 1) / nth;
