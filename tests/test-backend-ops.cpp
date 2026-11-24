@@ -15876,7 +15876,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // AK-RF-A3B-ROUTER-FUSE perf (label ROUTER_FUSE): the A3B router graph at decode, MTP verify and tree widths;
     // run once with GGML_HIP_ROUTER_FUSE unset and once with =1 for the op on/off timing
     {
-        for (int64_t n_tok : { 1, 2, 4, 8 }) {
+        for (int64_t n_tok : { 1, 2, 3, 4, 8 }) {  // 3 = draft-mtp n-max 2 verify width (served A3B GPU recipe)
             test_cases.emplace_back(new test_router_fuse(2048, 256, n_tok, 8, true, 0.0f));
         }
     }
