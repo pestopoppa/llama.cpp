@@ -24,6 +24,7 @@
 //       GGML_HIP_Q8_SKINNY_MAX (default 16, cap 16), GGML_HIP_Q8_SKINNY_WAVES (persistent wave count, default
 //       CUs x occupancy), GGML_HIP_Q8_SKINNY_MAX_BYTES (shape gate, default 6 MiB of Q8_0 weight; 0 = no limit).
 #include "mmq-q8-skinny.cuh"
+#include "actq.cuh"
 
 #include <atomic>
 #include <cstdlib>
@@ -89,6 +90,31 @@ bool ggml_cuda_q8_skinny_eligible(const ggml_tensor * src0, const ggml_tensor * 
 // y: [M][K] f32 (row stride s1 floats) -> yq: [16][nblk*32] int8, yd: [16][nblk] f32; columns >= M are zero.
 static __global__ void q8sk_quantize(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
                                      int8_t * __restrict__ yq, float * __restrict__ yd) {
+    const int c   = blockIdx.y;
+    const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int i   = threadIdx.x % 32;
+    if (blk >= nblk) {
+        return;
+    }
+    const float x = c < M ? y[c * s1 + (int64_t) blk * 32 + i] : 0.0f;
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+    }
+    const float d  = amax / 127.0f;
+    const int   q  = amax == 0.0f ? 0 : (int) roundf(x / d);
+    yq[((int64_t) c * nblk + blk) * 32 + i] = (int8_t) q;
+    if (i == 0) {
+        yd[(int64_t) c * nblk + blk] = d;
+    }
+}
+
+// AK-BW-27B-ACTQUANT-FUSE (GGML_HIP_ACTQ_FUSE bit 0): q8sk_quantize plus the dst zero-init of every dst in z, one launch.
+// Quantization arithmetic is the q8sk_quantize body verbatim (bit-identical yq / yd).
+static __global__ void q8sk_quantize_z(const float * __restrict__ y, const int64_t s1, const int nblk, const int M,
+                                       int8_t * __restrict__ yq, float * __restrict__ yd, const actq_zero z) {
+    actq_zero_dsts(z);
     const int c   = blockIdx.y;
     const int blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int i   = threadIdx.x % 32;
@@ -289,14 +315,25 @@ void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_ten
 
     ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) Q8SK_MAXM * nblk * 32);
     ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) Q8SK_MAXM * nblk);
-    {
-        const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
-        q8sk_quantize<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get());
-    }
     float * dstd = (float *) dst->data;
-    {
-        const dim3 grid((N + 255) / 256, M, 1);
-        q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+    if (ggml_cuda_actq_mode() & 1) {   // AK-BW-27B-ACTQUANT-FUSE bit 0: zero-init folded into the quantize launch
+        static std::atomic<int64_t> n_fz{0};
+        if (n_fz.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_actq: q8sk zero-fold ran (call 1, GGML_HIP_ACTQ_FUSE=%d)\n", ggml_cuda_actq_mode());
+        }
+        actq_zero z = {};
+        z.p[0] = dstd; z.N[0] = N; z.s1[0] = (int) dst_s1; z.n = 1; z.M = M;
+        const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
+        q8sk_quantize_z<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get(), z);
+    } else {
+        {
+            const dim3 grid((nblk + 7) / 8, Q8SK_MAXM, 1);
+            q8sk_quantize<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, yq.get(), yd.get());
+        }
+        {
+            const dim3 grid((N + 255) / 256, M, 1);
+            q8sk_zero<<<grid, 256, 0, stream>>>(dstd, N, dst_s1);
+        }
     }
     q8sk_mul_mat<<<nwaves, 64, 0, stream>>>((const char *) src0->data, src0->nb[1], nblk, N, M, yq.get(), yd.get(),
                                             (int) n_items, nwaves, dstd, dst_s1);
