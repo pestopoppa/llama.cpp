@@ -4520,6 +4520,91 @@ struct test_ak_add_rms_norm : public test_case {
 };
 
 // AK-ASM-H15: gated-DeltaNet decode conv chain as emitted by llm_build_delta_net_base::build_conv_state +
+// AK-RF-27B-TAIL-FUSE-2: shared path witness for the GGML_CUDA_AK_TF2_G<n> fusions. Under the group's knob the fused
+// launch must run on every eligible case and never on an ineligible one (ggml_backend_cuda_ak_tf2_n_calls(group)); off,
+// it must never run. Each case prints one "AK_TF2_WITNESS g=<n> ... verdict=PASS|FAIL" line.
+struct test_ak_tf2_base : public test_case {
+    using n_calls_t = uint64_t (*)(int);
+    n_calls_t   n_calls = nullptr;
+    bool        armed   = false;
+    bool        expect  = false;
+    uint64_t    before  = 0;
+
+    virtual int  tf2_group() const = 0;
+    virtual bool tf2_eligible() const { return true; }
+    bool run_whole_graph() override { return true; }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ak_tf2_n_calls");
+        if (n_calls == nullptr) {
+            return;
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "GGML_CUDA_AK_TF2_G%d", tf2_group());
+        const char * e = getenv(name);
+        expect = e != nullptr && atoi(e) == 1 && tf2_eligible();
+        before = n_calls(tf2_group());
+        armed  = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls(tf2_group()) - before;
+        std::string reason;
+        if (expect && advanced == 0) {
+            reason = "AK_TF2_WITNESS: fused kernel did not run";
+        } else if (!expect && advanced != 0) {
+            reason = "AK_TF2_WITNESS: fused kernel ran where it must not";
+        }
+        fprintf(stderr, "AK_TF2_WITNESS g=%d %s expect=%s calls_advanced=%" PRIu64 " verdict=%s\n", tf2_group(),
+                vars().c_str(), expect ? "fused" : "unfused", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
+// AK-RF-27B-TAIL-FUSE-2 G3 (GGML_CUDA_AK_TF2_G3=1): qwen35 GDN gate = MUL(SOFTPLUS(ADD(alpha, ssm_dt)), ssm_a), alpha
+// [n_v_heads, n_tokens, n_seqs], dt / a one row of n_v_heads. dt_rows / a_rows = 2 broadcast a 2-row operand: must not fuse.
+struct test_ak_tf2_g3 : public test_ak_tf2_base {
+    const int64_t nh, nt, ns, dt_rows;
+    const bool    swap;   // ADD(dt, alpha) and MUL(a, sp) operand order
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_TF2_G3"; }
+    std::string vars() override { return VARS_TO_STR5(nh, nt, ns, dt_rows, swap); }
+    int  tf2_group() const override { return 3; }
+    bool tf2_eligible() const override { return dt_rows == 1; }
+
+    test_ak_tf2_g3(int64_t nh, int64_t nt, int64_t ns = 1, int64_t dt_rows = 1, bool swap = false)
+        : nh(nh), nt(nt), ns(ns), dt_rows(dt_rows), swap(swap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, nt * dt_rows, ns);
+        ggml_set_name(alpha, "alpha");
+        ggml_tensor * dt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nh, dt_rows);
+        ggml_set_name(dt, "dt");
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(a, "a");
+        ggml_tensor * add = swap && dt_rows == 1 ? ggml_add(ctx, dt, alpha) : ggml_add(ctx, alpha, dt);
+        ggml_tensor * sp  = ggml_softplus(ctx, add);
+        ggml_tensor * out = swap ? ggml_mul(ctx, a, sp) : ggml_mul(ctx, sp, a);
+        ggml_set_name(out, "gate");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -25.0f, 25.0f);   // both softplus branches (x > 20 and the log1p(exp) side)
+        }
+    }
+};
+
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
 // reachable from one root while keeping the fused chain contiguous in graph order.
@@ -13632,6 +13717,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
+
+    // AK-RF-27B-TAIL-FUSE-2 G3 (GGML_CUDA_AK_TF2_G3=1): 27B 48 v-heads, A3B 32, ragged 24 x 10; 2-row dt must not fuse
+    for (int64_t nt : { 1, 8, 10, 16 }) {
+        for (int64_t nh : { 48, 32, 24 }) {
+            test_cases.emplace_back(new test_ak_tf2_g3(nh, nt));
+        }
+        test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 1, true));
+        test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 2));
+    }
+    test_cases.emplace_back(new test_ak_tf2_g3(48, 4, 3));
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,
     // a ragged width, multi-channel rows; 1536 (float4 variant) and a broadcast weight are the must-not-fuse witnesses
