@@ -1,7 +1,7 @@
 // CKPT-COPY-1: context-checkpoint save -> greedy generate -> restore from the checkpoint -> greedy generate again.
 // The checkpoint is taken exactly as the server's create_checkpoint takes it (llama_state_seq_get_data_ext with
-// LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY), the restore exactly as the server's rollback (seq_rm of the generated tail, then
-// llama_state_seq_set_data_ext). PASS = both greedy continuations are token-identical. Run once with LLAMA_CKPT_PINNED=1
+// LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY), the restore exactly as the server's rollback (llama_state_seq_set_data_ext, then
+// seq_rm of the generated tail). PASS = both greedy continuations are token-identical. Run once with LLAMA_CKPT_PINNED=1
 // and once without: the printed blob hash must match across the two runs (byte-identical checkpoint content).
 #include "arg.h"
 #include "common.h"
@@ -87,15 +87,16 @@ int main(int argc, char ** argv) {
         LOG_ERR("generate A failed\n");
         return 1;
     }
-    if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, n_prompt, -1)) {
-        LOG_ERR("seq_rm failed\n");
-        return 1;
-    }
+    // restore first, then drop the generated tail, in the server's order (rollback: load_tgt, then seq_rm [n_past, end))
     t0 = ggml_time_us();
     const size_t nr = llama_state_seq_set_data_ext(ctx, ckpt.data(), ckpt.size(), 0, fl);
     const int64_t restore_us = ggml_time_us() - t0;
     if (nr != ckpt.size()) {
         LOG_ERR("checkpoint restore failed (%zu of %zu)\n", nr, ckpt.size());
+        return 1;
+    }
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, n_prompt, -1)) {
+        LOG_ERR("seq_rm failed\n");
         return 1;
     }
     llama_sampler_reset(smpl.get());
