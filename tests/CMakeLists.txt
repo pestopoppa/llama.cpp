@@ -225,6 +225,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv41-dspark-width.cpp)
     llama_build_and_test(test-mtp-svd-head.cpp)
     llama_build_and_test(test-mtp-vocab-head.cpp) # Q38FN-GEMV2 DRAFTVOCAB subset draft head
+    llama_build_and_test(test-q38fn-iq4nl-dispatch.cpp ARGS repack) # Q38FN-GEMV2 F1: server-shaped buffer choice + dispatch
     llama_build_and_test(test-kld-ear.cpp)
     target_include_directories(test-kld-ear PRIVATE ${PROJECT_SOURCE_DIR}/tools/perplexity)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

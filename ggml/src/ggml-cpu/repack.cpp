@@ -4566,6 +4566,13 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                     return nullptr;
                 default: break;
             }
+            // Q38FN-GEMV2 F1 fix: GGML_IQK_IQ4_NL=1 adds IQ4_NL to iqk_typeA_supported at runtime, so it must leave
+            // CPU_REPACK too; otherwise the served model's IQ4_NL experts are repacked to iq4_nl_8x8 and the extra-buffer
+            // forward claims them before the iqk hook (smoke ak-q38fn-cpu-gemv2-gate-20261125: knob set, never engaged).
+            static const bool iq4nl_on = []() { const char * s = getenv("GGML_IQK_IQ4_NL"); return s && atoi(s) != 0; }();
+            if (iq4nl_on && cur->type == GGML_TYPE_IQ4_NL) {
+                return nullptr;
+            }
         }
     }
 #endif
