@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/ak-tf2.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -3614,6 +3615,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // AK-RF-27B-TAIL-FUSE-2 G3: GDN gate ADD(alpha, dt) -> SOFTPLUS -> MUL(a) in one launch (GGML_CUDA_AK_TF2_G3=1, default off)
+    if (node->op == GGML_OP_ADD && ggml_cuda_ak_tf2_enabled(3) && i + 2 < cgraph->n_nodes &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 }) &&
+        ggml_cuda_ak_tf2_g3_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_ak_tf2_g3(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     // AK-ASM-H14: rms_norm + mul + rope [+ view + set_rows] (GGML_CUDA_AK_H14=0 disables)
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_skip = ggml_cuda_ak_h14_try(*cuda_ctx, cgraph, i);
@@ -5903,6 +5912,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_gdn_chunked_usable") == 0) {
         return (void *)ggml_cuda_gdn_chunked_usable;
+    }
+    // AK-RF-27B-TAIL-FUSE-2 test witness: uint64_t (*)(int group), fused launches of that group since process start
+    if (strcmp(name, "ggml_backend_cuda_ak_tf2_n_calls") == 0) {
+        return (void *)ggml_cuda_ak_tf2_n_calls;
     }
     // AK-RF-27B-TAIL-FUSE G1 test witness: fused add+rms_norm+mul launches since process start
     if (strcmp(name, "ggml_backend_cuda_ak_add_rms_norm_n_calls") == 0) {
