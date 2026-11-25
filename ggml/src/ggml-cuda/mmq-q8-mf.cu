@@ -1351,22 +1351,34 @@ static __device__ __forceinline__ int q8mf6_owner(const int u, const int U, cons
     return (int) ((((int64_t) u + 1) * G - 1) / U);
 }
 
-static bool q8mf6_det() {
-    static const bool on = [] {
-        const bool v = q8mf_env_int("GGML_HIP_Q8_MF6_DET", 0) != 0;
-        if (v) {
+// Q8IP-DET2 (GGML_HIP_Q8_MF6_DET=2): no slots, no counters, no extra pass. When the unit-balanced split would give a
+// half-tile >= 3 contributors (floor(U/G) < S - 1), the split is instead balanced over HALF half-tiles: V = 2 x (U/S)
+// pieces, piece h = units [hb(h), hb(h+1)), hb(h) = (h/2) S + (h%2) floor(S/2), and WG g takes pieces
+// [g V / G, (g + 1) V / G) with G = ceil(V / ceil(V / G0)). Every WG boundary then falls on a half-tile start or midpoint,
+// so a half-tile has <= 2 contributors, and 2 float atomic adds into the zeroed dst commute: fl(fl(0+a)+b) ==
+// fl(fl(0+b)+a). Shapes whose unit split already has <= 2 contributors are launched unchanged (bitwise as BASE).
+static int q8mf6_det() {
+    static const int on = [] {
+        const int v = q8mf_env_int("GGML_HIP_Q8_MF6_DET", 0);
+        if (v == 1) {
             GGML_LOG_INFO("ggml_cuda_q8_mf: V5 deterministic split-tile reduction enabled (GGML_HIP_Q8_MF6_DET=1)\n");
+        } else if (v == 2) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V5 deterministic half-aligned split enabled (GGML_HIP_Q8_MF6_DET=2, <= 2 contributors per half-tile)\n");
         }
-        return v;
+        return v == 1 || v == 2 ? v : 0;
     }();
     return on;
+}
+
+static __device__ __forceinline__ int q8mf6_hb(const int h, const int S) {
+    return (h >> 1) * S + (h & 1) * (S >> 1);
 }
 
 template <int P, int AUX>
 static __global__ void __launch_bounds__(Q8MF_NT, 4)
 q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
               const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1,
-              float * __restrict__ part, int * __restrict__ cnt) {
+              float * __restrict__ part, int * __restrict__ cnt, const int V) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     __shared__ __attribute__((aligned(16))) char lds[Q8MF6_HB + Q8MF_A1 + Q8MF6_RED];
     __shared__ int s_last;
@@ -1374,8 +1386,8 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
     const int lane = tid & 63;
     const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
     const int g    = blockIdx.x;
-    const int u0   = (int) (((int64_t) g * U) / G);
-    const int u1   = (int) (((int64_t) (g + 1) * U) / G);
+    const int u0   = V > 0 ? q8mf6_hb((int) (((int64_t) g * V) / G), S)       : (int) (((int64_t) g * U) / G);
+    const int u1   = V > 0 ? q8mf6_hb((int) (((int64_t) (g + 1) * V) / G), S) : (int) (((int64_t) (g + 1) * U) / G);
 
     constexpr uint32_t OOB = 0x80000000u;
     const uint32_t vb2 = tid < 32 ? (uint32_t) ((tid + 512) * 16) : OOB;
@@ -1543,7 +1555,7 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
     } while (u < u1);
 #else
     GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S); GGML_UNUSED(U);
-    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1); GGML_UNUSED(part); GGML_UNUSED(cnt);
+    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1); GGML_UNUSED(part); GGML_UNUSED(cnt); GGML_UNUSED(V);
     NO_DEVICE_CODE;
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
@@ -1568,12 +1580,23 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     const int     U      = (N / Q8MF_RT) * 2 * S;
     const int     ncu    = ggml_cuda_info().devices[ctx.device].nsm;
     GGML_ASSERT(M >= 1 && M <= Q8MF_MAXM && nblk % Q8MF_KS == 0 && N % Q8MF_RT == 0);
-    const int G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    int       G = std::max(1, std::min(cfg.wg > 0 ? cfg.wg : 4 * ncu, U));
+    const int dmode = q8mf6_det();
+    int       V = 0;
+    if (dmode == 2 && U / G < S - 1) {   // Q8IP-DET2: half-aligned split, <= 2 contributors per half-tile
+        V = 2 * (U / S);
+        const int k = (V + G - 1) / G;
+        G = (V + k - 1) / k;
+        static std::atomic<int> n_w{0};
+        if (n_w.fetch_add(1) == 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V5 DET2 half-aligned split ran (call 1, N=%d S=%d pieces=%d G=%d)\n", N, S, V, G);
+        }
+    }
     const size_t abytes = (size_t) S * Q8MF_A1;
     ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
     float * d = (float *) dst->data;
     // Q8IP-DET: per-contributor slots; a half-tile of S units spans at most ceil((S - 1) / floor(U / G)) + 1 WGs
-    const bool det = q8mf6_det();
+    const bool det = dmode == 1;
     ggml_cuda_pool_alloc<float> part(ctx.pool());
     ggml_cuda_pool_alloc<int>   hcnt(ctx.pool());
     if (det) {
@@ -1590,7 +1613,7 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1, pp, pc)
+#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1, pp, pc, V)
     if (cfg.slc) {
         Q8MF6_L(2, 2);
     } else {

@@ -5,7 +5,7 @@
 //       [-p "prompt one|||prompt two|||..."] [-n 64]
 //
 // Run with the served in-place packed recipe (GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_INPLACE=1): with the V5 atomic split-tile
-// tail (default) it is expected to FAIL intermittently; with GGML_HIP_Q8_MF6_DET=1 it must PASS on every run.
+// tail (default) it is expected to FAIL intermittently; with GGML_HIP_Q8_MF6_DET=1 or =2 it must PASS on every run.
 // Output lines ("mode: AA", "prompt k: ... MATCH|MISMATCH", "prompt k detail: ...", "summary: ...") follow
 // test-dflash-dev-inject so the same parser reads both ("engaged" is always 0 here). Exit 0 iff every prompt matches.
 

@@ -12686,7 +12686,11 @@ static void dtree_add_q8ip_eval_cases(std::vector<std::unique_ptr<test_case>> & 
 // (atomic tail) vs. fit one WG (plain store). Run with GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2
 // GGML_HIP_Q8_MF_MIN_BYTES=0.
 static void dtree_add_q8v5_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
-    static const std::array<int64_t, 2> sh[] = {{1024, 2048}, {17408, 5120}, {12288, 5120}, {5120, 6144}};
+    // Q8IP-DET2 (GGML_HIP_Q8_MF6_DET=2): {5120,5120} {6144,5120} {5120,17408} {1024,2048} take the half-aligned split
+    // (unit split would give >= 3 contributors), {1024,2304} has odd S = 9 (floor/ceil halves); {17408,5120} keeps the
+    // unit split (already <= 2 contributors).
+    static const std::array<int64_t, 2> sh[] = {{1024, 2048}, {17408, 5120}, {12288, 5120}, {5120, 6144},
+                                                {5120, 5120}, {6144, 5120}, {5120, 17408}, {1024, 2304}};
     for (const auto & s : sh) {
         for (int64_t n : {1, 3, 5, 7, 13, 16}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
