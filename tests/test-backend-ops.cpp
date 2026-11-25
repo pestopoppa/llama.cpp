@@ -4443,6 +4443,94 @@ struct test_ak_h14 : public test_case {
 // residual ADD (the qwen35 attn_residual / l_out -> attn_post_norm / attn_norm pattern). Run with
 // GGML_CUDA_AK_ADD_RMS_NORM=1 to exercise the fused launch; the witness then requires the fused kernel to have run on every
 // eligible shape (ncols != 1536, one-row weight) and never on an ineligible one. Default off it is an ordinary chain.
+// AK-C22-SMALLOP-FUSE F1 (GGML_CUDA_AK_CPY_BATCH=1): the K = n_rs_seq + 1 per-token conv-state rollback snapshots of
+// llm_build_delta_net_base::build_conv_state (overlapping strided views of concat(conv_states, qkv^T) copied to K slots
+// of the state cache) must run as one batched launch and equal the CPU copies exactly. n_slots = 1 (a single copy),
+// a ragged channel count and 2 sequences are covered; the witness requires >= 1 batched launch iff knob on and n_slots >= 2.
+struct test_ak_cpy_batch : public test_case {
+    const int64_t channels, n_tokens, n_seqs, d_conv, n_slots;
+    const ggml_type type;
+    std::vector<ggml_tensor *> cpys;
+
+    using n_calls_t = uint64_t (*)();
+    n_calls_t n_calls = nullptr;
+    bool      armed   = false;
+    bool      expect  = false;
+    uint64_t  before  = 0;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_CPY_BATCH"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return cpys; }
+    double max_nmse_err() override { return 1e-12; }
+    std::string vars() override { return VARS_TO_STR6(channels, n_tokens, n_seqs, d_conv, n_slots, type); }
+
+    test_ak_cpy_batch(int64_t channels, int64_t n_tokens, int64_t n_seqs = 1, int64_t d_conv = 4, int64_t n_slots = 8,
+                      ggml_type type = GGML_TYPE_F32)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), d_conv(d_conv), n_slots(n_slots), type(type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        cpys.clear();
+        ggml_tensor * conv_states = ggml_new_tensor_3d(ctx, type, d_conv - 1, channels, n_seqs);
+        ggml_set_name(conv_states, "conv_states");
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, type, channels, n_tokens, n_seqs);
+        ggml_set_name(qkv, "qkv_mixed");
+        const int64_t row_count = (d_conv - 1)*channels;
+        ggml_tensor * state_all = ggml_new_tensor_2d(ctx, type, row_count, n_seqs*n_slots + 2);
+        ggml_set_name(state_all, "state_all");
+
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
+        for (int64_t t = 1; t <= n_slots; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - (d_conv - 1) - n_slots + t);
+            const int64_t s_slot = n_slots - t;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, channels, n_seqs, conv_input->nb[1], conv_input->nb[2],
+                                              ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * upd  = ggml_view_2d(ctx, state_all, row_count, n_seqs, state_all->nb[1], (s_slot*n_seqs + 1)*state_all->nb[1]);
+            cpys.push_back(ggml_cpy(ctx, last, upd));
+        }
+        // out = cpy0 + (cpy1 + (... + cpy_{K-1})): the DFS visits the copies back to back, as the model's K
+        // consecutive ggml_build_forward_expand(cpy) calls place them
+        ggml_tensor * out = n_slots == 1 ? ggml_scale(ctx, cpys[0], 1.0f) : cpys[n_slots - 1];
+        for (int64_t s = n_slots - 2; s >= 0; --s) {
+            out = ggml_add(ctx, cpys[s], out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ak_cpy_batch_n_calls");
+        if (n_calls == nullptr) {
+            return;
+        }
+        const char * e = getenv("GGML_CUDA_AK_CPY_BATCH");
+        expect = e != nullptr && atoi(e) == 1 && n_slots >= 2;
+        before = n_calls();
+        armed  = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls() - before;
+        std::string reason;
+        if (expect && advanced == 0) {
+            reason = "AK_CPY_BATCH_WITNESS: batched cpy kernel did not run";
+        } else if (!expect && advanced != 0) {
+            reason = "AK_CPY_BATCH_WITNESS: batched cpy kernel ran where it must not";
+        }
+        fprintf(stderr, "AK_CPY_BATCH_WITNESS %s expect=%s calls_advanced=%" PRIu64 " verdict=%s\n", vars().c_str(),
+                expect ? "fused" : "unfused", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 struct test_ak_add_rms_norm : public test_case {
     const int64_t ncols, nrows, nchan;
     const int64_t w_rows; // 1 = eligible weight row; 2 = broadcast weight, must not fuse
@@ -13727,6 +13815,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 2));
     }
     test_cases.emplace_back(new test_ak_tf2_g3(48, 4, 3));
+
+    // AK-C22-SMALLOP-FUSE F1 (GGML_CUDA_AK_CPY_BATCH=1): 27B conv channels 10240 (K = 8 slots, verify widths 8 / 16 and
+    // the clamped 2 / 5), A3B 8192, a ragged 1000 with 2 sequences; n_slots = 1 must not fuse
+    for (int64_t nt : { 2, 5, 8, 16 }) {
+        test_cases.emplace_back(new test_ak_cpy_batch(10240, nt));
+        test_cases.emplace_back(new test_ak_cpy_batch(8192, nt));
+        test_cases.emplace_back(new test_ak_cpy_batch(1000, nt, 2, 4, 4));
+    }
+    test_cases.emplace_back(new test_ak_cpy_batch(10240, 8, 1, 4, 1));
+    test_cases.emplace_back(new test_ak_cpy_batch(10240, 1, 1, 4, 1));
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,
     // a ragged width, multi-channel rows; 1536 (float4 variant) and a broadcast weight are the must-not-fuse witnesses
