@@ -332,6 +332,30 @@ public:
         }
     }
 
+    // as for_each_token_in, but visits the used cells in REVERSE cell order and stops as soon as f returns true
+    // (Q38FN-CPU-HOST-DEPTH-1: the newest predecessors sit in the highest cells, so a decode step stops after O(n) cells)
+    template<typename F>
+    bool for_each_token_in_rev(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
+        for (auto it = used.rbegin(); it != used.rend(); ++it) {
+            const uint32_t i = *it;
+            if (pos[i] < p0 || pos[i] >= p1) {
+                continue;
+            }
+
+            const auto m = seq[i] & seqs;
+            if (m.none()) {
+                continue;
+            }
+
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (m.test(s) && f(s, pos[i], ext[i].tok)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-prev-tokens.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -7,6 +8,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -2132,18 +2134,27 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     // handle M-RoPE gaps: multiple tokens share the same temporal pos
     // TODO @ngxson : improve this in the future
     std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
-    below.fill({ -1, LLAMA_TOKEN_NULL });
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
-            [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
+    // Q38FN-CPU-HOST-DEPTH-1 (default off): LLAMA_KV_PREV_FAST=1 stops the cell walk once every key the lookup asks for is found.
+    // Text ubatches only: an embd ubatch resolves predecessors by ubatch order and can fall into M-RoPE gaps.
+    static const bool prev_fast = [] {
+        const char * e = getenv("LLAMA_KV_PREV_FAST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    if (prev_fast && ubatch.token) {
+        std::unordered_set<uint64_t> needed;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            for (uint32_t d = 1; d <= n; ++d) {
+                const llama_pos p = ubatch.pos[i] - (llama_pos) d;
+                if (p >= 0) {
+                    needed.insert(key(ubatch.seq_id[i][0], p));
                 }
-            });
+            }
+        }
+        llama_kv_prev_collect(v_cells, n_stream, seqs, w0, p_max, &needed, hist, below);
+    } else {
+        llama_kv_prev_collect(v_cells, n_stream, seqs, w0, p_max, nullptr, hist, below);
     }
 
     // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
