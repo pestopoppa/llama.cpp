@@ -5008,6 +5008,21 @@ static int ggml_cpu_try_fuse_ops(
             return 2;
         }
     }
+    // AK Q38FN-CPU-MOE-GEMV-1 lever 1: GGML_MOE_UPGATE_SLAB (default off). Both single-token
+    // MUL_MAT_IDs in one flat iqk slab, then the STOCK GLU op after one barrier -- bit-identical
+    // to the unfused nodes (same per-row kernels, same GLU code). Types that already have a
+    // fused route (Q4_K/Q5_K C5, Q8_0 CH-19 when switched on) never reach here with it engaged.
+    if (node->op == GGML_OP_MUL_MAT_ID && node_n + 2 < cgraph->n_nodes &&
+            ggml_iqk_moe_upgate_slab_enabled()) {
+        struct ggml_tensor * up = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (ggml_cpu_can_fuse_moe_up_gate(cgraph, node_n, &up, &gate) &&
+                ggml_iqk_try_moe_upgate_slab(params, cgraph->nodes[node_n], cgraph->nodes[node_n + 1])) {
+            ggml_barrier(params->threadpool);
+            ggml_compute_forward_glu(params, cgraph->nodes[node_n + 2]);
+            return 2;
+        }
+    }
 #endif
 
     // AK-Q38FN-CPU-GDNPROJ-FUSE: adjacent single-row MUL_MATs sharing src1 -> one pass, one barrier

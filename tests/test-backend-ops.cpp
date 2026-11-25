@@ -7274,6 +7274,67 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// AK Q38FN-CPU-MOE-GEMV-1: MoE up + gate MUL_MAT_ID -> SWIGLU (split), the node pattern
+// build_moe_ffn emits. Run as a whole graph so CPU fusions (GGML_MOE_UPGATE_SLAB) engage.
+struct test_moe_upgate_glu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_moe_upgate_glu(ggml_type type_a = GGML_TYPE_IQ3_S, int n_mats = 64, int n_used = 10,
+            int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wu = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(wu, "wu");
+        ggml_tensor * wg = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(wg, "wg");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, wu, x, ids);
+        ggml_set_name(up, "up");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, wg, x, ids);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out  = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_UPGATE_GLU";
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -13863,6 +13924,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    // AK Q38FN-CPU-MOE-GEMV-1: Q38FN served shapes. MOE_UPGATE_GLU = lever 1 (GGML_MOE_UPGATE_SLAB);
+    // the skinny MUL_MATs (hc_*_down 320 rows, shexp 640/2560 rows) = lever 2 (GGML_IQK_SKINNY_BALANCE).
+    for (ggml_type t : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_moe_upgate_glu(t, 64, 10, 640, 1, 2560));
+        test_cases.emplace_back(new test_moe_upgate_glu(t, 16, 3, 64, 1, 256));
+        test_cases.emplace_back(new test_moe_upgate_glu(t, 64, 10, 640, 5, 2560)); // MTP verify: unfused path
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

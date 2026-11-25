@@ -943,6 +943,144 @@ extern "C" bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * para
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// AK Q38FN-CPU-MOE-GEMV-1 lever 1: GGML_MOE_UPGATE_SLAB (default OFF).
+// Single-token MoE up AND gate MUL_MAT_IDs computed in ONE parallel region over ONE flat
+// slab of 2 * n_used * ne01 rows (node a's experts ascending, then node b's), instead of
+// two separate MUL_MAT_ID nodes, each with its own fan-out, private activation quantization
+// and trailing barrier. The caller then runs the stock GLU op on the same params after one
+// barrier. Bit-identical by construction: every output row of `a` and `b` is produced by
+// the same iqk_mul_mat_moe_rows kernel over the same row as the unfused B3-k slab path
+// (each row accumulates independently, see INF-70 B3-k), and the GLU is the stock op.
+// Scope: iqk weight families that the unfused batch-1 MMID would itself route to iqk
+// (Q8_0 excluded unless its own iqk route is on), distinct experts, ids->ne[1] == 1.
+// Q38FN UD-IQ4_XS: ffn_{gate,up}_exps are IQ3_S (47 layers) / IQ4_XS (1 layer) and the
+// Q4_K/Q5_K-only C5 fusion never engages, so each layer paid two MMID passes + GLU.
+// ---------------------------------------------------------------------------
+static bool iqk_moe_upgate_slab_enabled() {
+    static const bool e = []() {
+        const char * s = getenv("GGML_MOE_UPGATE_SLAB");
+        return s && atoi(s) != 0;
+    }();
+    return e;
+}
+
+extern "C" bool ggml_iqk_moe_upgate_slab_enabled(void) {
+    return iqk_enabled() && iqk_moe_upgate_slab_enabled();
+}
+
+extern "C" bool ggml_iqk_try_moe_upgate_slab(const struct ggml_compute_params * params,
+        struct ggml_tensor * a, struct ggml_tensor * b) {
+    if (!iqk_enabled() || !iqk_moe_upgate_slab_enabled() || params->use_ref) return false;
+    if (!iqk_mmid_slab_enabled()) return false;
+    if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID) return false;
+    const struct ggml_tensor * Wa = a->src[0];
+    const struct ggml_tensor * Wb = b->src[0];
+    const struct ggml_tensor * src1 = a->src[1];
+    const struct ggml_tensor * ids  = a->src[2];
+    if (!Wa || !Wb || !src1 || !ids) return false;
+    if (b->src[1] != src1 || b->src[2] != ids) return false;
+    if (Wa->type != Wb->type) return false;
+    for (int d = 0; d < 4; ++d) { if (Wa->ne[d] != Wb->ne[d] || Wa->nb[d] != Wb->nb[d]) return false; }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) return false;
+    if (ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
+    if (!ggml_are_same_shape(a, b) || a->nb[1] != b->nb[1] || a->nb[2] != b->nb[2]) return false;
+
+    const int tA = (int) Wa->type;
+    if (!iqk_typeA_supported(tA)) return false;
+    if (!iqk_shape_supported(tA, Wa->ne[1])) return false;
+    if (!iqk_mmid_shape_supported(tA, 1)) return false;
+    if (tA == GGML_TYPE_Q8_0 && !iqk_q8_0_route(1)) return false;
+
+    const int64_t ne01 = Wa->ne[1], n_as = Wa->ne[2];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const int64_t n_ids = ids->ne[0];
+    constexpr int MAX_IDS = 64;
+    if (ne13 != 1 || Wa->ne[0] != ne10 || n_ids <= 0 || n_ids > MAX_IDS) return false;
+    const int activation_type = iqk_activation_type(tA);
+    if (activation_type == GGML_TYPE_Q8_K ? ne10 % QK_K != 0 : ne10 % 32 != 0) return false;
+    const int64_t gran = iqk_mul_mat_moe_row_granularity(tA);
+    if (gran <= 0 || ne01 % gran != 0 || iqk_dequant_type(tA, 1) != tA) return false;
+
+    const int ith = params->ith, nth = params->nth;
+    const size_t act_row = iqk_activation_row_size(activation_type, ne10);
+    const size_t nbw1 = act_row, nbw2 = nbw1 * ne11;
+    const size_t b1_region = nbw2 * ne12;
+    if (!params->wdata || params->wsize < (size_t) nth * b1_region) return false;
+
+    // expert list, ascending (same order as the unfused batch-1 path); distinct experts only
+    int32_t  b1_expert[MAX_IDS];
+    iqk_mmid b1_row   [MAX_IDS];
+    int      b1_n = 0;
+    bool     any_invalid = false;
+    for (int64_t id = 0; id < n_ids; ++id) {
+        const int32_t i02 = *(const int32_t *)((const char *) ids->data + id*ids->nb[0]);
+        if (i02 < 0 || i02 >= (int32_t) n_as) { any_invalid = true; continue; }
+        int pos = b1_n;
+        while (pos > 0 && b1_expert[pos-1] > i02) { b1_expert[pos] = b1_expert[pos-1]; b1_row[pos] = b1_row[pos-1]; --pos; }
+        b1_expert[pos] = i02;
+        b1_row   [pos] = iqk_mmid{ (int32_t) id, 0 };
+        ++b1_n;
+    }
+    if (b1_n == 0) return false;
+    for (int i = 1; i < b1_n; ++i) { if (b1_expert[i] == b1_expert[i-1]) return false; }
+
+    // kernel-selection preflight BEFORE any write: same verdict on every thread
+    if (!iqk_mul_mat_moe_rows(ne01, 1, ne10, (int) ne11, tA, Wa->data, Wa->nb[1],
+            activation_type, params->wdata, act_row, (float *) a->data, a->nb[1], a->nb[2], b1_row, 0, 0)) {
+        return false;
+    }
+
+    char * const qact_priv = (char *) params->wdata + (size_t) ith * b1_region;
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t i11 = 0; i11 < ne11; ++i11) {
+            iqk_quantize_activation(activation_type,
+                    (const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
+                    qact_priv + i12*nbw2 + i11*nbw1, ne10);
+        }
+    }
+
+    if (any_invalid && ith == 0) {
+        for (int64_t id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *)((const char *) ids->data + id*ids->nb[0]);
+            if (i02 < 0 || i02 >= (int32_t) n_as) {
+                memset((char *) a->data + id*a->nb[1], 0, a->ne[0]*sizeof(float));
+                memset((char *) b->data + id*b->nb[1], 0, b->ne[0]*sizeof(float));
+            }
+        }
+    }
+
+    const int64_t units_per_group = ne01 / gran;
+    const int64_t units_per_mat   = units_per_group * b1_n;
+    const int64_t units_total     = 2 * units_per_mat;
+    const int64_t u0 = (units_total * ith) / nth;
+    const int64_t u1 = (units_total * (ith + 1)) / nth;
+    for (int64_t u = u0; u < u1; ) {
+        const int     m   = (int) (u / units_per_mat);
+        const int64_t um  = u - (int64_t) m * units_per_mat;
+        const int     g   = (int) (um / units_per_group);
+        const int64_t g0  = (int64_t) m * units_per_mat + (int64_t) g * units_per_group;
+        const int64_t ue  = u1 < g0 + units_per_group ? u1 : g0 + units_per_group;
+        const struct ggml_tensor * W = m == 0 ? Wa : Wb;
+        struct ggml_tensor *       D = m == 0 ? a  : b;
+        const char * A = (const char *) W->data + (size_t) b1_expert[g] * W->nb[2];
+        if (!iqk_mul_mat_moe_rows(ne01, 1, ne10, (int) ne11, tA, A, W->nb[1],
+                activation_type, qact_priv, act_row,
+                (float *) D->data, D->nb[1], D->nb[2], b1_row + g, (u - g0) * gran, (ue - u) * gran)) {
+            GGML_ABORT("GGML_MOE_UPGATE_SLAB: kernel selection changed after preflight");
+        }
+        u = ue;
+    }
+    if (ith == 0) {
+        static std::atomic<uint64_t> logged{0};
+        if (iqk_first_engagement(logged, tA)) {
+            fprintf(stderr, "[iqk] ACTIVE: GGML_MOE_UPGATE_SLAB fused up+gate MMID slab (type=%d n_used=%d ne01=%lld nth=%d)\n",
+                    tA, b1_n, (long long) ne01, nth);
+        }
+    }
+    return true;
+}
+
 // Option R test witnesses (CPU backend get_proc_address). No behaviour depends on them.
 extern "C" uint64_t ggml_cpu_iqk_q8_0_n_calls(void) {
     return iqk_q8_0_n_calls.load(std::memory_order_relaxed);
@@ -994,6 +1132,16 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
 extern "C" bool ggml_iqk_try_moe_up_gate(const struct ggml_compute_params * params,
         struct ggml_tensor * up, struct ggml_tensor * gate, struct ggml_tensor * glu) {
     (void) params; (void) up; (void) gate; (void) glu;
+    return false;
+}
+
+extern "C" bool ggml_iqk_moe_upgate_slab_enabled(void) {
+    return false;
+}
+
+extern "C" bool ggml_iqk_try_moe_upgate_slab(const struct ggml_compute_params * params,
+        struct ggml_tensor * a, struct ggml_tensor * b) {
+    (void) params; (void) a; (void) b;
     return false;
 }
 
