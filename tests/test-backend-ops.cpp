@@ -12805,8 +12805,22 @@ static void a3b_add_router_chunk_cases(std::vector<std::unique_ptr<test_case>> &
     }
 }
 
+// MMVF-I64-OFFSET (intake-2865, upstream PR #32533): MMVF computed channel_x*stride_channel_x as int*int,
+// so a float-expert MUL_MAT_ID whose expert stride times expert index reaches 2^31 elements read a wrong
+// src0 pointer. 16 F16 experts of 32768 x 8192 (2^28 elements each): every expert id >= 8 overflows, and
+// ne2 = 8 tokens keeps the call on the AMD MMVF_MMID route. ~8.6 GB of weights per backend, so the case is
+// opt-in: GGML_TEST_MMVF_I64=1.
+static void mmvf_add_i64_offset_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const char * s = std::getenv("GGML_TEST_MMVF_I64");
+    if (s == nullptr || std::atoi(s) == 0) {
+        return;
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 4, false, 32768, 8, 8192));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    mmvf_add_i64_offset_cases(test_cases);      // MMVF-I64-OFFSET
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
