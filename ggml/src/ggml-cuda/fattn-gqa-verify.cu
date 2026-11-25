@@ -769,7 +769,7 @@ static __device__ __forceinline__ gv_floatx4 gv7_qk(const gv7_kraw & r, const _F
 
 // online softmax over the lane's 4 keys of row l%16; returns P^T (the PV B operand) and the O rescale factor
 static __device__ __forceinline__ gv_halfx4 gv7_softmax(const gv_floatx4 S, const gv7_u32x2 mraw, float & m_run,
-        float & l_run, const float scale, float & alpha) {
+        float & l_run, const float scale, float & alpha, float (&p)[4]) {
     const gv7_halfx2 mk01 = __builtin_bit_cast(gv7_halfx2, mraw.x);
     const gv7_halfx2 mk23 = __builtin_bit_cast(gv7_halfx2, mraw.y);
     float sv[4];
@@ -783,7 +783,6 @@ static __device__ __forceinline__ gv_halfx4 gv7_softmax(const gv_floatx4 S, cons
     const float m_new = fmaxf(m_run, mx);          // m_run starts at -FLT_MAX: finite even for an all -inf chunk
     alpha = __expf(m_run - m_new);
     m_run = m_new;
-    float p[4];
     float psum = 0.0f;
 #pragma unroll
     for (int v = 0; v < 4; ++v) {
@@ -824,13 +823,72 @@ static __device__ __forceinline__ void gv7_pv(const gv7_vraw & r, const gv_halfx
         o[n] = __builtin_amdgcn_mfma_f32_16x16x16f16(va, pb, o[n], 0, 0, 0);
     }
 }
+
+// GGML_HIP_VATTN_RF7_PREC (VATTN-ROOFLINE-5 r2): the same lane data through v_mfma_f32_16x16x4f32, one f16 MFMA = 4 f32
+// MFMAs on sub-step t (A[i][k=kq] / B[k=kq][j] = element t of the f16 fragment). Dequant q*d is exact in f32 and P/Q stay
+// f32, so no operand is rounded to f16 (C21/RF1 round Q, K, V and P to f16).
+static __device__ __forceinline__ void gv7_k4f(const uint32_t x, const float d, float (&k)[4]) {
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        k[t] = (float) (int8_t) (uint8_t) (x >> (8 * t)) * d;
+    }
+}
+
+static __device__ __forceinline__ gv_floatx4 gv7_qk32(const gv7_kraw & r, const float * __restrict__ sq) {
+    uint32_t kd[17];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        kd[i] = r.k[i / 4][i % 4];
+    }
+    kd[16] = r.k16;
+    const float ks0 = (float) __builtin_bit_cast(_Float16, (uint16_t) (kd[0] & 0xffffu));
+    const float ks1 = (float) __builtin_bit_cast(_Float16, (uint16_t) (kd[8] >> 16));
+    gv_floatx4 S = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+        const float4 qb = *(const float4 *) (sq + 4 * s);
+        const uint32_t x = s < 8 ? __builtin_amdgcn_alignbyte(kd[s + 1], kd[s], 2) : kd[s + 1];
+        float ka[4];
+        gv7_k4f(x, s < 8 ? ks0 : ks1, ka);
+        S = __builtin_amdgcn_mfma_f32_16x16x4f32(ka[0], qb.x, S, 0, 0, 0);
+        S = __builtin_amdgcn_mfma_f32_16x16x4f32(ka[1], qb.y, S, 0, 0, 0);
+        S = __builtin_amdgcn_mfma_f32_16x16x4f32(ka[2], qb.z, S, 0, 0, 0);
+        S = __builtin_amdgcn_mfma_f32_16x16x4f32(ka[3], qb.w, S, 0, 0, 0);
+    }
+    return S;
+}
+
+static __device__ __forceinline__ void gv7_pv32(const gv7_vraw & r, const float (&p)[4], const float alpha,
+        gv_floatx4 (&o)[GV_D / 16], const int vshift, const int sshift) {
+    uint32_t vq[4][4];
+    float sc[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        vq[t][0] = __builtin_amdgcn_alignbyte(r.v[t][1], r.v[t][0], vshift);
+        vq[t][1] = __builtin_amdgcn_alignbyte(r.v[t][2], r.v[t][1], vshift);
+        vq[t][2] = __builtin_amdgcn_alignbyte(r.v[t][3], r.v[t][2], vshift);
+        vq[t][3] = __builtin_amdgcn_alignbyte(r.v4[t],   r.v[t][3], vshift);
+        sc[t] = (float) __builtin_bit_cast(_Float16, (uint16_t) ((r.vs[t] >> sshift) & 0xffffu));
+    }
+#pragma unroll
+    for (int n = 0; n < GV_D / 16; ++n) {
+        o[n] *= alpha;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const float va = (float) (int8_t) (uint8_t) (vq[t][n / 4] >> (8 * (n % 4))) * sc[t];
+            o[n] = __builtin_amdgcn_mfma_f32_16x16x4f32(va, p[t], o[n], 0, 0, 0);
+        }
+    }
+}
 #endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
 
+#define GV7_QSTR32 (GV_D + 4)    // PREC 2 sQ row stride (floats): 1040 B, 16-byte aligned rows
 #define GV7_QSTR  (GV_D + 8)     // sQ row stride (halves): 528 B, 16-byte aligned rows, 2-way banked fragment reads
 #define GV7_SLOT  ((GV_D / 16) * 4 * 64)   // floats: one wave's O^T partial (16 KB)
 
 // grid (row tile, split, KV head), 4 waves, 2 WG per CU (8 independent waves per CU; at the 3 WG/CU budget of 168
 // VGPRs the compiler spilled 44). Opart rows: ((split * n_head_kv + hkv) * R + r), MLpart = (max, sum).
+template <int PREC>
 static __global__ void __launch_bounds__(64 * GV7_WAVES, 2) gv7_kernel(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
@@ -839,9 +897,10 @@ static __global__ void __launch_bounds__(64 * GV7_WAVES, 2) gv7_kernel(
         const int64_t nb21, const int64_t nb22, const int64_t nb31) {
 #if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
     // sQ (16 x GV7_QSTR f16, 8.4 KB) during the key loop; one O slot (16 KB) for the end-of-split combine; sml apart
-    __shared__ float sbuf[GV7_SLOT];
+    __shared__ float sbuf[16 * GV7_QSTR32 > GV7_SLOT ? 16 * GV7_QSTR32 : GV7_SLOT];
     __shared__ float sml[GV7_WAVES * 32];
     _Float16 * sQ = (_Float16 *) sbuf;
+    float * sQ32 = sbuf;
 
     const int tile  = blockIdx.x;
     const int split = blockIdx.y;
@@ -866,19 +925,28 @@ static __global__ void __launch_bounds__(64 * GV7_WAVES, 2) gv7_kernel(
         for (int i = 0; i < 4; ++i) {
             f[i] = ok ? Qr[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-        gv_halfx4 hq[4];
+        if constexpr (PREC == 2) {
+            float4 * dq = (float4 *) (sQ32 + rr * GV7_QSTR32 + 16 * (tid % 16));
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            hq[i] = (gv_halfx4) {(_Float16) f[i].x, (_Float16) f[i].y, (_Float16) f[i].z, (_Float16) f[i].w};
-        }
-        gv_halfx4 * dq = (gv_halfx4 *) (sQ + rr * GV7_QSTR + 16 * (tid % 16));
+            for (int i = 0; i < 4; ++i) {
+                dq[i] = f[i];
+            }
+        } else {
+            gv_halfx4 hq[4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            dq[i] = hq[i];
+            for (int i = 0; i < 4; ++i) {
+                hq[i] = (gv_halfx4) {(_Float16) f[i].x, (_Float16) f[i].y, (_Float16) f[i].z, (_Float16) f[i].w};
+            }
+            gv_halfx4 * dq = (gv_halfx4 *) (sQ + rr * GV7_QSTR + 16 * (tid % 16));
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                dq[i] = hq[i];
+            }
         }
     }
     __syncthreads();
     const _Float16 * sq = sQ + li * GV7_QSTR + 64 * kq;   // B operand of lane (row li, kq): + 4s per MFMA step
+    const float * sq32 = sQ32 + li * GV7_QSTR32 + 64 * kq;
 
     gv_floatx4 o[GV_D / 16];
 #pragma unroll
@@ -921,14 +989,24 @@ static __global__ void __launch_bounds__(64 * GV7_WAVES, 2) gv7_kernel(
     }
     for (; c < ce; c += GV7_WAVES) {
         const int cn = c + GV7_WAVES;
-        const gv_floatx4 S = gv7_qk(rk, sq);
+        gv_floatx4 S;
+        if constexpr (PREC == 2) {
+            S = gv7_qk32(rk, sq32);
+        } else {
+            S = gv7_qk(rk, sq);
+        }
         const gv7_u32x2 mraw = rk.m;
         if (cn < ce) {
             gv7_load_k(rk, GV7_KC_PTR(cn), koff, GV7_MC_PTR(cn), moff);
         }
         float alpha;
-        const gv_halfx4 pb = gv7_softmax(S, mraw, m_run, l_run, scale, alpha);
-        gv7_pv(rv, pb, alpha, o, vshift, sshift);
+        float pf[4];
+        const gv_halfx4 pb = gv7_softmax(S, mraw, m_run, l_run, scale, alpha, pf);
+        if constexpr (PREC >= 1) {
+            gv7_pv32(rv, pf, alpha, o, vshift, sshift);
+        } else {
+            gv7_pv(rv, pb, alpha, o, vshift, sshift);
+        }
         if (cn < ce) {
             gv7_load_v(rv, GV7_VC_PTR(cn), nb21, vsoff, vwoff, v4off);
         }
@@ -1240,18 +1318,27 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         ggml_cuda_pool_alloc<float>  Opart(ctx.pool(), n_rows_part * GV_D);
         ggml_cuda_pool_alloc<float2> MLpart(ctx.pool(), n_rows_part);
         cudaStream_t stream = ctx.stream();
-        gv7_kernel<<<dim3(nrt, n_splits, n_head_kv), dim3(64 * GV7_WAVES), 0, stream>>>(
-            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
-            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
-            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+        static const int prec = std::max(0, std::min(2, gv_env_int("GGML_HIP_VATTN_RF7_PREC", 2)));
+#define GV7_LAUNCH(P_) gv7_kernel<P_><<<dim3(nrt, n_splits, n_head_kv), dim3(64 * GV7_WAVES), 0, stream>>>( \
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, \
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks, \
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1])
+        if (prec == 2) {
+            GV7_LAUNCH(2);
+        } else if (prec == 1) {
+            GV7_LAUNCH(1);
+        } else {
+            GV7_LAUNCH(0);
+        }
+#undef GV7_LAUNCH
         CUDA_CHECK(cudaGetLastError());
         gv7_merge_kernel<<<dim3(R, n_head_kv), dim3(GV_D), 0, stream>>>(
             Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv);
         CUDA_CHECK(cudaGetLastError());
         static int n_rf7_calls = 0;
         if (n_rf7_calls++ == 0) {
-            GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=7 wave-stream launch ran (splits=%d tiles=%d R=%d chunks/split=%d)\n",
-                n_splits, nrt, R, chunks_per_split);
+            GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=7 wave-stream launch ran (prec=%d splits=%d tiles=%d R=%d chunks/split=%d)\n",
+                prec, n_splits, nrt, R, chunks_per_split);
         }
         return;
     }
