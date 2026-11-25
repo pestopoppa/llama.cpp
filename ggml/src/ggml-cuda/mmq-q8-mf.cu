@@ -1440,13 +1440,17 @@ void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, boo
         }
         q8ip_progress.erase(t->data);
     }
-    // C22 fold: I8PC and q8wp are exclusive layouts; q8wp wins for a tensor both accept (Q8-W8-INPLACE-E2E-1 rule)
-    const bool wp = q8ip_want_wp(t, weights_buffer);
-    const bool pc = !wp && q8pc_on() && q8pc_shape_ok(t);
-    if (wp) {
-        ggml_cuda_q8wp_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
-    } else if (pc) {   // AK-ASM-I8GEMM-PERCHANNEL-GEMV: requantize to the per-row int8 layout instead of the Q8_0 permutation
+    // C22 fold (coordinator ruling 2026-11-25): I8PC and q8wp are exclusive layouts; I8PC (+5.7 % served) wins for a tensor
+    // both accept, q8wp (~+1 %) takes only the shapes I8PC rejects. I8PC keeps its C21-era precondition: the V5I in-place
+    // mode must want the tensor (q8ip_mode + q8ip_shape_ok), exactly as in the I8PC-only store.
+    const int  ipm = q8ip_mode();
+    const bool ip_want = !(ipm == 0 || (ipm == 1 && !weights_buffer)) && q8ip_shape_ok(t);
+    const bool pc = ip_want && q8pc_on() && q8pc_shape_ok(t);
+    const bool wp = !pc && q8ip_want_wp(t, weights_buffer);
+    if (pc) {   // AK-ASM-I8GEMM-PERCHANNEL-GEMV: requantize to the per-row int8 layout instead of the Q8_0 permutation
         q8pc_pack_inplace((char *) t->data, t->ne[1], t->ne[0], stream);
+    } else if (wp) {
+        ggml_cuda_q8wp_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
     } else {
         q8ip_permute_inplace((char *) t->data, t->ne[1], t->ne[0], true, stream);
     }
