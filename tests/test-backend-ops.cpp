@@ -12593,6 +12593,9 @@ static bool test_backend_ops_extra_case_set(const char * name) {
 }
 
 
+// Q8-W8-GEMV-1 (GGML_HIP_Q8W8=1): the 27B Q8_0 verify shapes at n = 1, 4, 8 against the CPU (only n = 8 takes Q8W8 when
+// armed; n = 1 / 4 are route guards). Defined after akh1_q38_27b_shapes below.
+static void q8w8_add_cases(std::vector<std::unique_ptr<test_case>> & test_cases);
 // AK-ASM-H1/H7: Qwen3.8-27B Q8_0 weight shapes (from the GGUF: {m = rows, k}) for the skinny-M split-K path.
 static const std::array<int64_t, 2> akh1_q38_27b_shapes[] = {
     { 6144, 5120},  // attn_gate
@@ -12630,6 +12633,17 @@ static void akh1_add_q8_skinny_eval_cases(std::vector<std::unique_ptr<test_case>
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 129, 7, 2112, {1, 1}, {1, 1}));  // ne00 % 256 != 0 -> fallback
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, 8, 256, {1, 1}, {1, 1}));  // ksplit == 1, row tail
+}
+
+static void q8w8_add_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (const auto & sh : akh1_q38_27b_shapes) {
+        for (int64_t n : {1, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, sh[0], n, sh[1], {1, 1}, {1, 1}));
+        }
+    }
+    // row tail (N % 4 != 0), nblk not a multiple of the 64-block step, and a multi-page K (3 LDS pages)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8194, 8, 5184, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4098, 8, 17472, {1, 1}, {1, 1}));
 }
 
 // DTREE-0-Q8MF: Q8_0 x F32 at M (= n here) 9..16 for the gfx90a MFMA i8 small-M path (GGML_HIP_Q8_MF=1), over the
@@ -12808,6 +12822,7 @@ static void a3b_add_router_chunk_cases(std::vector<std::unique_ptr<test_case>> &
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_eval_cases(test_cases);  // AK-ASM-H1
+    q8w8_add_cases(test_cases);                 // Q8-W8-GEMV-1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
@@ -15272,6 +15287,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
+    q8w8_add_cases(test_cases);                 // Q8-W8-GEMV-1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
