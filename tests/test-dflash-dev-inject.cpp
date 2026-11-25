@@ -243,6 +243,37 @@ int main(int argc, char ** argv) {
     const char * aa_env = getenv("LLAMA_TEST_INJECT_AA");
     const bool aa = aa_env != nullptr && atoi(aa_env) != 0;
     fprintf(stderr, "mode: %s\n", aa ? "AA (OFF vs OFF)" : "AB (OFF vs ON)");
+    // LLAMA_TEST_INJECT_SINGLE=off|on (+ LLAMA_TEST_INJECT_PROMPT=k): run ONE arm on ONE prompt as the process's first
+    // context and print its full trace; the caller compares traces across processes. Isolates the inject path from the
+    // in-process second-context nondeterminism seen in the 20261125 A/A diagnostic (GPU-27B-SECOND-CONTEXT-NONDET).
+    if (const char * single = getenv("LLAMA_TEST_INJECT_SINGLE")) {
+        const bool on1 = std::string(single) == "on";
+        const char * pk = getenv("LLAMA_TEST_INJECT_PROMPT");
+        const size_t k = pk ? (size_t) atoi(pk) : 0;
+        if (k >= prompts.size()) {
+            fprintf(stderr, "FAIL: prompt index %zu out of range\n", k);
+            return 2;
+        }
+        const run_trace tr = run_once(params, model_tgt, prompts[k], on1);
+        auto fmt = [](const llama_tokens & t) {
+            std::string s;
+            for (llama_token x : t) { s += std::to_string(x); s += ','; }
+            return s;
+        };
+        std::string acc;
+        for (int a : tr.accepted) { acc += std::to_string(a); acc += ','; }
+        fprintf(stderr, "single: arm=%s prompt=%zu ok=%d engaged=%d rounds=%zu ms=%.1f\n", on1 ? "on" : "off", k,
+                (int) tr.ok, (int) tr.engaged, tr.drafts.size(), tr.ms);
+        for (size_t r = 0; r < tr.drafts.size(); ++r) {
+            fprintf(stderr, "single-draft: %zu %s\n", r, fmt(tr.drafts[r]).c_str());
+        }
+        fprintf(stderr, "single-accepted: %s\n", acc.c_str());
+        fprintf(stderr, "single-output: %s\n", fmt(tr.output).c_str());
+        llama_backend_free();
+        const bool good = tr.ok && tr.engaged == on1;
+        fprintf(stderr, "%s\n", good ? "SINGLE-DONE" : "FAIL");
+        return good ? 0 : 1;
+    }
     int n_fail = 0;
     bool engaged_all = true;
     double ms_off = 0, ms_on = 0;
