@@ -2194,7 +2194,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // MMVF-MMID-EVEN-NE00 (intake-2865): MMVF reads src0 in pairs (half2/nv_bfloat162/float2), so it
+                // needs an even ne00, a contiguous row and pair-aligned strides; otherwise mmvf.cu asserts. Same
+                // layout test as ggml_cuda_should_use_mmvf and upstream ggml_cuda_mul_mat_id_use_mmvf_float.
+                bool mmvf_layout_ok = src0->ne[0] % 2 == 0 && src0->nb[0] == ggml_type_size(src0->type);
+                for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                    mmvf_layout_ok = mmvf_layout_ok && src0->nb[i] % (2*ggml_type_size(src0->type)) == 0;
+                }
+                if (GGML_CUDA_CC_IS_AMD(cc) && mmvf_layout_ok) {
                     ggml_cuda_log_mul_mat_route("MMVF_MMID", src0, src1, dst, cc, ne2);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
