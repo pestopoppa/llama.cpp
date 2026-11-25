@@ -1050,6 +1050,76 @@ static void mul_mat_iq2_xxs_q8_2_IQ_N(int n, const void * vx, size_t bx, const D
     }
 }
 
+#ifdef HAVE_FANCY_SIMD
+// Q38FN-GEMV2 IQ3REUSE: multi-row (nrc_y = 2..8, MTP verify) version of the IQ3_S ZMM grid-gather kernel above.
+// Each 16-qs grid gather, the sign bits and the block scales are computed ONCE per weight block and reused for
+// every activation row; only the per-row q8 load, sign application and dot run nrc_y times. Per row the integer
+// lanes and the float accumulation order are exactly those of mul_mat_qX_K_q8_K_IQ_1<DequantizerIQ3S>, so every
+// row equals the single-row (decode) result bit-for-bit. Enabled by GGML_IQK_IQ3S_REUSE=1 (default off).
+template <int nrc_y>
+static void mul_mat_iq3s_q8_K_reuse(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    const int nb = n / QK_K;
+    Q8<nrc_y> q8(info);
+    DequantizerIQ3S deq(vx, bx);
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i offset = _mm512_set1_epi32(256);
+    const auto gather16 = [&offset](const uint8_t * qs, const uint8_t * qh) {
+        uint16_t high;
+        std::memcpy(&high, qh, sizeof(high));
+        const __m512i low = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)qs));
+        return _mm512_i32gather_epi32(_mm512_mask_add_epi32(low, (__mmask16) high, low, offset), (const void *)iq3s_grid, 4);
+    };
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        __m256 accd[nrc_y];
+        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
+        deq.new_row(ix);
+        for (int i = 0; i < nb; ++i) {
+            __m256i all_scales[1];
+            deq.new_block(i, all_scales);
+            __m512i sumi[nrc_y];
+            for (int iy = 0; iy < nrc_y; ++iy) sumi[iy] = zero;
+            for (int j = 0; j < QK_K/128; ++j) {
+                const uint8_t * qs = deq.x[i].qs + 32*j;
+                const uint8_t * qh = deq.x[i].qh +  4*j;
+                const uint8_t * signs = deq.x[i].signs + 16*j;
+                uint64_t sign_bits[2];
+                std::memcpy(sign_bits, signs, sizeof(sign_bits));
+                const __m512i g01 = gather16(qs+ 0, qh+0);
+                const __m512i g23 = gather16(qs+16, qh+2);
+                __m256i scales8[2];
+                set_scales_8_iq(j, all_scales[0], scales8);
+                const __m512i scales16 = _mm512_inserti64x4(_mm512_castsi256_si512(scales8[0]), scales8[1], 1);
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    __m512i q8_01 = q8.load_quants64(iy, i, 2*j+0);
+                    __m512i q8_23 = q8.load_quants64(iy, i, 2*j+1);
+                    q8_01 = _mm512_mask_sub_epi8(q8_01, (__mmask64) sign_bits[0], zero, q8_01);
+                    q8_23 = _mm512_mask_sub_epi8(q8_23, (__mmask64) sign_bits[1], zero, q8_23);
+                    const __m512i dot_01 = _mm512_dpbusd_epi32(zero, g01, q8_01);
+                    const __m512i dot_23 = _mm512_dpbusd_epi32(zero, g23, q8_23);
+                    const __m512i packed = _mm512_packs_epi32(_mm512_shuffle_i64x2(dot_01, dot_23, 0x44),
+                                                              _mm512_shuffle_i64x2(dot_01, dot_23, 0xEE));
+                    sumi[iy] = _mm512_dpwssd_epi32(sumi[iy], scales16, packed);
+                }
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                const __m256i sum = _mm256_add_epi32(_mm512_castsi512_si256(sumi[iy]), _mm512_extracti64x4_epi64(sumi[iy], 1));
+                accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(deq.d*q8.scale(iy, i)), _mm256_cvtepi32_ps(sum), accd[iy]);
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) info.store(ix, iy, hsum_float_8(accd[iy]));
+    }
+}
+static bool iqk_iq3s_reuse_enabled() {
+    static const bool e = []() {
+        const char * s = getenv("GGML_IQK_IQ3S_REUSE");
+        const bool on = s && atoi(s) != 0;
+        fprintf(stderr, "[iqk] INFO: GGML_IQK_IQ3S_REUSE=%d (Q38FN-GEMV2: IQ3_S multi-row kernel reuses each dequantized block)\n", on ? 1 : 0);
+        return on;
+    }();
+    return e;
+}
+#endif
+
 template <typename Dequantizer, int nrc_y>
 static void mul_mat_qX_K_q8_K_IQ(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n % QK_K == 0);
@@ -2819,6 +2889,17 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             break;
         case GGML_TYPE_IQ3_S:
             set_functions<DequantizerIQ3S>(kernels);
+#ifdef HAVE_FANCY_SIMD
+            if (iqk_iq3s_reuse_enabled()) {
+                kernels[1] = mul_mat_iq3s_q8_K_reuse<2>;
+                kernels[2] = mul_mat_iq3s_q8_K_reuse<3>;
+                kernels[3] = mul_mat_iq3s_q8_K_reuse<4>;
+                kernels[4] = mul_mat_iq3s_q8_K_reuse<5>;
+                kernels[5] = mul_mat_iq3s_q8_K_reuse<6>;
+                kernels[6] = mul_mat_iq3s_q8_K_reuse<7>;
+                kernels[7] = mul_mat_iq3s_q8_K_reuse<8>;
+            }
+#endif
             break;
         case GGML_TYPE_IQ2_XXS_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq2_xxs_r4_q8_k, kernels);
