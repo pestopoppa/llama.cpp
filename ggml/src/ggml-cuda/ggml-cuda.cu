@@ -909,6 +909,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_q8w8_invalidate(dst->data, ggml_nbytes(dst));   // Q8W8 design 5 packed-copy cache
     if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
                                  ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {
         return false;   // in-place packed Q8_0: generic get_tensor / set_tensor path (layout-aware)
@@ -1547,7 +1548,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if (ggml_is_contiguously_allocated(src0)) {
             bool h20_done = false;
             if constexpr (compute_type == GGML_TYPE_F16) {
-                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
+                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_q8wp(src0)) {   // Q8-W8-INPLACE-E2E-1: q8wp layout
+                    ggml_cuda_q8wp_convert_f16(src0->data, (half *) src0_alloc.get(), ne01, ne00, main_stream);
+                    h20_done = true;
+                } else
+                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_stage(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
                     ggml_cuda_h20_convert_q8_0_packed_f16(src0->data, (half *) src0_alloc.get(), ggml_nelements(src0), ne00 / QK8_0, main_stream);
                     h20_done = true;
                 } else
@@ -2057,6 +2062,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // DTREE-0-Q8MF-REPACK-INPLACE: an in-place packed weight is read directly by V3 at n <= 16 (any n >= 1);
     // other shapes reach here only with a substituted natural copy (ggml_cuda_compute_forward).
+    // Q8-W8-INPLACE-E2E-1: a q8wp in-place weight at n 1..8 is read by q8wp directly (GGML_HIP_Q8W8=4 + Q8W8_INPLACE)
+    if (ggml_cuda_q8ip_any() && ggml_cuda_q8_w8_packed_handles(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("Q8_W8_INPLACE", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_w8(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_mf_handles(src0, src1, dst)) {
         ggml_cuda_log_mul_mat_route("Q8_MF_INPLACE", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q8_mf(ctx, src0, src1, dst);
@@ -2798,6 +2809,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
+    ggml_cuda_q8w8_invalidate(dst->data, ggml_nbytes(dst));   // Q8W8 design 5 packed-copy cache
 
     if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
                                  ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {

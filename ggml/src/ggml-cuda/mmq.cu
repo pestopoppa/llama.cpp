@@ -120,7 +120,7 @@ void ggml_cuda_mul_mat_q(
 
     // DTREE-0-Q8MF-PACKED-CONSUMERS: a negative row stride tells the Q8_0 tile loader the weight is in the in-place
     // packed [tile][k-stage][64 rows][272 B] layout (2D, no ids only).
-    const bool q8ip_packed = !ids && ggml_cuda_q8ip_is_packed(src0);
+    const bool q8ip_packed = !ids && ggml_cuda_q8ip_is_stage(src0);   // stage layout only (q8wp never reaches MMQ)
     GGML_ASSERT(!q8ip_packed || (ne02 == 1 && ne03 == 1));
     if (q8ip_packed) {
         static std::atomic<int64_t> n_calls{0};
