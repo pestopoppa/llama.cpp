@@ -4439,6 +4439,86 @@ struct test_ak_h14 : public test_case {
     }
 };
 
+// AK-RF-27B-TAIL-FUSE G1: residual ADD -> RMS_NORM -> MUL(weight), with the ADD result also consumed by a later
+// residual ADD (the qwen35 attn_residual / l_out -> attn_post_norm / attn_norm pattern). Run with
+// GGML_CUDA_AK_ADD_RMS_NORM=1 to exercise the fused launch; the witness then requires the fused kernel to have run on every
+// eligible shape (ncols != 1536, one-row weight) and never on an ineligible one. Default off it is an ordinary chain.
+struct test_ak_add_rms_norm : public test_case {
+    const int64_t ncols, nrows, nchan;
+    const int64_t w_rows; // 1 = eligible weight row; 2 = broadcast weight, must not fuse
+    const float eps;
+
+    ggml_tensor * t_sum = nullptr;
+    ggml_tensor * t_norm = nullptr;
+    ggml_tensor * t_out = nullptr;
+
+    using n_calls_t = uint64_t (*)();
+    n_calls_t n_calls = nullptr;
+    bool      armed   = false;
+    bool      expect  = false;
+    uint64_t  before  = 0;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_ADD_RMS_NORM"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { t_sum, t_norm, t_out }; }
+    std::string vars() override { return VARS_TO_STR5(ncols, nrows, nchan, w_rows, eps); }
+
+    test_ak_add_rms_norm(int64_t ncols, int64_t nrows, int64_t nchan = 1, int64_t w_rows = 1, float eps = 1e-6f)
+        : ncols(ncols), nrows(nrows), nchan(nchan), w_rows(w_rows), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nrows, nchan);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, nrows, nchan);
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, w_rows);
+        ggml_set_name(w, "w");
+
+        t_sum = ggml_add(ctx, a, b);
+        ggml_set_name(t_sum, "residual");
+        t_norm = ggml_mul(ctx, ggml_rms_norm(ctx, t_sum, eps), w);
+        ggml_set_name(t_norm, "normed");
+        // the residual is consumed again downstream (scale keeps the trailing ADD off the RMS_NORM+MUL+ADD fusion)
+        t_out = ggml_add(ctx, ggml_scale(ctx, t_norm, 0.5f), t_sum);
+        ggml_set_name(t_out, "out");
+        return t_out;
+    }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ak_add_rms_norm_n_calls");
+        if (n_calls == nullptr) {
+            return;
+        }
+        const char * e = getenv("GGML_CUDA_AK_ADD_RMS_NORM");
+        const bool on = e != nullptr && atoi(e) == 1;
+        expect = on && ncols != 1536 && w_rows == 1;
+        before = n_calls();
+        armed  = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls() - before;
+        std::string reason;
+        if (expect && advanced == 0) {
+            reason = "AK_ADD_RMS_NORM_WITNESS: fused add+rms_norm+mul kernel did not run";
+        } else if (!expect && advanced != 0) {
+            reason = "AK_ADD_RMS_NORM_WITNESS: fused kernel ran where it must not";
+        }
+        fprintf(stderr, "AK_ADD_RMS_NORM_WITNESS ncols=%" PRId64 " nrows=%" PRId64 " w_rows=%" PRId64 " expect=%s calls_advanced=%" PRIu64 " verdict=%s\n",
+                ncols, nrows, w_rows, expect ? "fused" : "unfused", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 // AK-ASM-H15: gated-DeltaNet decode conv chain as emitted by llm_build_delta_net_base::build_conv_state +
 // qwen35 build_layer_attn_linear: CONCAT(conv_state, qkv^T) -> (VIEW, VIEW, CPY) x K -> SSM_CONV -> SILU
 // -> VIEW -> L2_NORM(q) -> VIEW -> L2_NORM(k). The trailing CONCAT/SUM/ADD only make every output
@@ -13679,6 +13759,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
+    }
+
+    // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,
+    // a ragged width, multi-channel rows; 1536 (float4 variant) and a broadcast weight are the must-not-fuse witnesses
+    for (int64_t nt : { 1, 5, 8, 16 }) {
+        for (int64_t nc : { 5120, 2048, 512, 4100 }) {
+            test_cases.emplace_back(new test_ak_add_rms_norm(nc, nt));
+        }
+        test_cases.emplace_back(new test_ak_add_rms_norm(1536, nt));
+        if (nt % 2 == 0) {
+            test_cases.emplace_back(new test_ak_add_rms_norm(5120, nt, 1, 2));
+        }
+    }
+    test_cases.emplace_back(new test_ak_add_rms_norm(5120, 4, 3));
+    for (float eps : { 0.0f, 1e-5f, 1.0f }) {
+        test_cases.emplace_back(new test_ak_add_rms_norm(5120, 8, 1, 1, eps));
     }
 
     // AK-ASM-H14 / H15 (qwen35 / qwen35moe decode + verify shapes)

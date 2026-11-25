@@ -1,5 +1,8 @@
 #include "norm.cuh"
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -720,6 +723,137 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                           eps, stream);
+}
+
+// AK-RF-27B-TAIL-FUSE G1: residual ADD + RMS_NORM + MUL(weight) in one launch (GGML_CUDA_AK_ADD_RMS_NORM=1, default
+// off). One block per row writes the residual sum s = a + b (the ADD node, still consumed by the next residual add) and
+// dst = rsqrt(mean(s^2) + eps) * s * w (the MUL node). The per-thread column loop, the block size (256 below 1024 columns,
+// else 1024) and the expression order are those of rms_norm_f32<block_size, true> fed by k_bin_bcast's fp32 a + b, so
+// the fused outputs are bit-identical to the unfused ADD -> rms_norm+mul pair. ncols == 1536 (the 384-thread float4
+// variant) is not fused.
+template <int block_size>
+static __global__ void ak_add_rms_norm_mul_f32(const float * __restrict__ a, const float * __restrict__ b,
+                                               float * sum, float * dst, const float * __restrict__ w,
+                                               const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.x * ncols;
+    const int     tid = threadIdx.x;
+
+    a   += row;
+    b   += row;
+    sum += row;
+    dst += row;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = a[col] + b[col];
+        sum[col] = xi;
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // sum[col] was written by this same thread above (and may alias a or b element-for-element)
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * sum[col] * w[col];
+    }
+}
+
+static std::atomic<uint64_t> g_ak_add_rms_norm_n_calls{0};
+
+uint64_t ggml_cuda_ak_add_rms_norm_n_calls() {
+    return g_ak_add_rms_norm_n_calls.load();
+}
+
+bool ggml_cuda_ak_add_rms_norm_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_AK_ADD_RMS_NORM");
+        return e != nullptr && atoi(e) == 1;
+    }();
+    return enabled;
+}
+
+// [a, b] -> add -> rms_norm -> mul(w). Every tensor is F32, a / b / add / rms_norm / mul share one contiguous shape, w is
+// one contiguous row of ncols; the edges are checked here (the caller checks uses with ggml_can_fuse_subgraph).
+bool ggml_cuda_ak_add_rms_norm_supported(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (rms_norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (w == nullptr || w == rms_norm) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    for (const ggml_tensor * t : { a, b, add, rms_norm, mul, w }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_are_same_shape(rms_norm, add) ||
+        !ggml_are_same_shape(mul, add)) {
+        return false;
+    }
+    const int64_t ncols = add->ne[0];
+    if (ncols == 1536 || ncols > INT32_MAX || w->ne[0] != ncols || ggml_nrows(w) != 1 || ggml_nrows(add) > INT32_MAX) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    if (!(eps >= 0.0f)) {
+        return false;
+    }
+    // aliasing: the add result may reuse a / b element-for-element (same shape, contiguous) and so may the mul result;
+    // any other overlap (and mul over the add result, or over w) is refused
+    auto range = [](const ggml_tensor * t, int64_t & lo, int64_t & hi) {
+        lo = (int64_t) t->data;
+        hi = lo + (int64_t) ggml_nbytes(t);
+    };
+    auto ok_pair = [&](const ggml_tensor * out, const ggml_tensor * in, bool exact_ok) {
+        int64_t olo, ohi, ilo, ihi;
+        range(out, olo, ohi);
+        range(in, ilo, ihi);
+        if (ohi <= ilo || ihi <= olo) {
+            return true;
+        }
+        return exact_ok && olo == ilo && ohi == ihi;
+    };
+    return ok_pair(add, a, true) && ok_pair(add, b, true) && ok_pair(add, w, false) &&
+           ok_pair(mul, a, true) && ok_pair(mul, b, true) && ok_pair(mul, w, false) && ok_pair(mul, add, false);
+}
+
+void ggml_cuda_op_ak_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm,
+                                        ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int   ncols = (int) add->ne[0];
+    const int   nrows = (int) ggml_nrows(add);
+    const float * a_d = (const float *) add->src[0]->data;
+    const float * b_d = (const float *) add->src[1]->data;
+    float *     sum_d = (float *) add->data;
+    float *     dst_d = (float *) mul->data;
+    const float * w_d = (const float *) w->data;
+    cudaStream_t stream = ctx.stream();
+
+    if (g_ak_add_rms_norm_n_calls.fetch_add(1) == 0) {
+        GGML_LOG_INFO("%s: AK-RF-27B-TAIL-FUSE G1 add+rms_norm+mul fused path ran (call 1, ncols=%d, nrows=%d)\n",
+                      __func__, ncols, nrows);
+    }
+
+    if (ncols < 1024) {
+        ak_add_rms_norm_mul_f32<256><<<nrows, 256, 32 * sizeof(float), stream>>>(a_d, b_d, sum_d, dst_d, w_d, ncols, eps);
+    } else {
+        ak_add_rms_norm_mul_f32<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(a_d, b_d, sum_d, dst_d, w_d, ncols, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
