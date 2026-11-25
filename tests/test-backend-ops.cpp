@@ -13932,6 +13932,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_upgate_glu(t, 16, 3, 64, 1, 256));
         test_cases.emplace_back(new test_moe_upgate_glu(t, 64, 10, 640, 5, 2560)); // MTP verify: unfused path
     }
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 1, 5 }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  320, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  640, n,  2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2560, n,   768, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,   48, n,  2560, {1, 1}, {1, 1}));
+        }
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
