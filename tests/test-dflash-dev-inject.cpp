@@ -257,6 +257,29 @@ int main(int argc, char ** argv) {
                 "ms off=%.1f on=%.1f  engaged on=%d off=%d  %s (first draft divergence at round %zu)\n",
                 k, off.drafts.size(), on.drafts.size(), n_acc_off, off.output.size(), on.output.size(),
                 off.ms, on.ms, (int) on.engaged, (int) off.engaged, same ? "MATCH" : "MISMATCH", first_div);
+        // attribution: which of drafts / accepts / output differ, and where (first_div == rounds means none)
+        size_t first_out = 0;
+        while (first_out < std::min(off.output.size(), on.output.size()) && off.output[first_out] == on.output[first_out]) {
+            ++first_out;
+        }
+        size_t first_acc = 0;
+        while (first_acc < std::min(off.accepted.size(), on.accepted.size()) && off.accepted[first_acc] == on.accepted[first_acc]) {
+            ++first_acc;
+        }
+        fprintf(stderr, "prompt %zu detail: drafts_eq=%d accepted_eq=%d output_eq=%d first_accept_div=%zu first_output_div=%zu\n",
+                k, (int) (off.drafts == on.drafts), (int) (off.accepted == on.accepted), (int) (off.output == on.output),
+                first_acc, first_out);
+        if (first_div < std::min(off.drafts.size(), on.drafts.size())) {
+            auto fmt = [](const llama_tokens & t) {
+                std::string s;
+                for (llama_token x : t) { s += std::to_string(x); s += ' '; }
+                return s;
+            };
+            fprintf(stderr, "prompt %zu round %zu draft off: [ %s] accepted=%d\n", k, first_div,
+                    fmt(off.drafts[first_div]).c_str(), first_div < off.accepted.size() ? off.accepted[first_div] : 0);
+            fprintf(stderr, "prompt %zu round %zu draft on:  [ %s] accepted=%d\n", k, first_div,
+                    fmt(on.drafts[first_div]).c_str(), first_div < on.accepted.size() ? on.accepted[first_div] : 0);
+        }
         n_fail += same ? 0 : 1;
         ms_off += off.ms;
         ms_on  += on.ms;
