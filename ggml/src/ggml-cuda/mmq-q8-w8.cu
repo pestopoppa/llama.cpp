@@ -28,12 +28,14 @@
 //      GGML_HIP_Q8W8=1 enables design 1, =2 design 3 (q8wo, below; GGML_HIP_Q8W8_YT 2|4, default 2); GGML_HIP_Q8W8_DEPTH 2|3 (default 3); GGML_HIP_Q8W8_WAVES (max waves per WG, <= 8,
 //      default 8); GGML_HIP_Q8W8_MIN_BYTES (default 8 MiB, weight strictly larger; 27B attn_k/v stays stock).
 #include "mmq-q8-w8.cuh"
+#include "mmq-q8-mf.cuh"
 
 #include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <cstring>
 
 #define Q8W8_M       8
 #define Q8W8_YT      4
@@ -48,7 +50,7 @@ static int q8w8_env_int(const char * name, int def) {
 }
 
 struct q8w8_cfg {
-    bool enabled; int mode; int depth; int waves; int yt; int myt; int ks; int64_t min_bytes;
+    bool enabled; int mode; int depth; int waves; int yt; int myt; int ks; int64_t min_bytes; int inplace;
 };
 
 static const q8w8_cfg & q8w8_get_cfg() {
@@ -65,6 +67,12 @@ static const q8w8_cfg & q8w8_get_cfg() {
                              std::max(1, q8w8_env_int("GGML_HIP_Q8W8_WAVES", c.mode == 2 ? Q8WO_MAXWAVE : Q8W8_MAXWAVE)));
         const char * mb = getenv("GGML_HIP_Q8W8_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (8ll << 20);
+        // Q8-W8-INPLACE-E2E-1: GGML_HIP_Q8W8_INPLACE=1 (weights buffers) / =2 (any buffer, test-backend-ops), design 5 only
+        c.inplace = c.mode == 4 ? std::max(0, std::min(2, q8w8_env_int("GGML_HIP_Q8W8_INPLACE", 0))) : 0;
+        if (c.inplace > 0) {
+            GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8_INPLACE=%d design 5 q8wp layout repacked IN PLACE at load "
+                          "(no cached copy; q8wp reads it at n 1..8, prefill cuBLAS converts it, others unpack on read)\n", c.inplace);
+        }
         if (c.enabled && c.mode == 4) {
             GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8=4 w8 Q8_0 GEMV armed (design 5 q8wp: MFMA-order packed weight copy, "
                           "1 KB contiguous dwordx4 per wave load, int8 MFMA 16x16x16, YT %d x 16 rows, KS %d, > %lld B)\n",
@@ -87,8 +95,8 @@ static const q8w8_cfg & q8w8_get_cfg() {
 bool ggml_cuda_q8_w8_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
 #if defined(GGML_USE_HIP)
     const q8w8_cfg & cfg = q8w8_get_cfg();
-    if (!cfg.enabled || !GGML_CUDA_CC_IS_CDNA2(cc)) {
-        return false;
+    if (!cfg.enabled || !GGML_CUDA_CC_IS_CDNA2(cc) || cfg.inplace > 0) {
+        return false;   // Q8W8_INPLACE: no cached copies; packed weights route through ggml_cuda_q8_w8_packed_handles
     }
     const int64_t nbytes = (int64_t) ggml_nbytes(src0);
     return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -762,7 +770,7 @@ static __global__ void q8wp_repack(const char * __restrict__ W, const int nb01, 
 }
 
 // y: [8][K] f32 -> actA [npairs][64 lanes][4] int8x4, actD [npairs][16 c'] f32. One WG (256 threads) per pair.
-static __global__ void __launch_bounds__(256) q8wp_prep(const float * __restrict__ y, const int64_t s1,
+static __global__ void __launch_bounds__(256) q8wp_prep(const float * __restrict__ y, const int64_t s1, const int M,
                                                         int * __restrict__ actA, float * __restrict__ actD) {
     __shared__ int8_t sq[16][32];   // [c' = 8 p + col][i]
     const int pr  = blockIdx.x;
@@ -774,7 +782,7 @@ static __global__ void __launch_bounds__(256) q8wp_prep(const float * __restrict
         const int i   = t & 31;
         const int p   = e >> 3;
         const int col = e & 7;
-        const float x = y[col * s1 + (int64_t) pr * 64 + 32 * p + i];
+        const float x = col < M ? y[col * s1 + (int64_t) pr * 64 + 32 * p + i] : 0.0f;   // M < 8: zero columns
         float amax = fabsf(x);
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -804,7 +812,7 @@ template <int YT>
 static __global__ void __launch_bounds__(1024)
 q8wp_mul_mat(const char * __restrict__ P, const int npairs, const int N, const uint32_t pbytes,
              const int * __restrict__ actA, const uint32_t abytes, const float * __restrict__ actD, const uint32_t dbytes,
-             float * __restrict__ dst, const int64_t dst_s1) {
+             float * __restrict__ dst, const int64_t dst_s1, const int M) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     extern __shared__ float q8wp_red[];   // [KS][YT][4][64]
     constexpr int OOB = 0x7ffffff0;
@@ -912,14 +920,16 @@ q8wp_mul_mat(const char * __restrict__ P, const int npairs, const int N, const u
             if (row < N) {
 #pragma unroll
                 for (int v = 0; v < 4; ++v) {
-                    dst[(int64_t) (4 * g + v) * dst_s1 + row] = acc[y][v];
+                    if (4 * g + v < M) {
+                        dst[(int64_t) (4 * g + v) * dst_s1 + row] = acc[y][v];
+                    }
                 }
             }
         }
     }
 #else
     GGML_UNUSED(P); GGML_UNUSED(npairs); GGML_UNUSED(N); GGML_UNUSED(pbytes); GGML_UNUSED(actA);
-    GGML_UNUSED(abytes); GGML_UNUSED(actD); GGML_UNUSED(dbytes); GGML_UNUSED(dst); GGML_UNUSED(dst_s1);
+    GGML_UNUSED(abytes); GGML_UNUSED(actD); GGML_UNUSED(dbytes); GGML_UNUSED(dst); GGML_UNUSED(dst_s1); GGML_UNUSED(M);
     NO_DEVICE_CODE;
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
@@ -927,7 +937,7 @@ q8wp_mul_mat(const char * __restrict__ P, const int npairs, const int N, const u
 // KS over whole 4-pair groups: best wave-slot fill over ncu x 16 resident waves, at least 2 groups per wave.
 template <int YT>
 static void q8wp_launch(const char * P, int nblk, int N, uint32_t pbytes, const int * actA, const float * actD,
-                        int ncu, int ks_env, float * dst, int64_t dst_s1, cudaStream_t stream) {
+                        int ncu, int ks_env, float * dst, int64_t dst_s1, int M, cudaStream_t stream) {
     const int npairs = nblk / 2;
     const int ng     = npairs / 4;
     const int tiles  = (N / 16 + YT - 1) / YT;
@@ -949,7 +959,7 @@ static void q8wp_launch(const char * P, int nblk, int N, uint32_t pbytes, const 
     const dim3   block(64, ks, 1);
     const size_t shm = ks > 1 ? (size_t) ks * YT * 4 * 64 * sizeof(float) : 0;
     q8wp_mul_mat<YT><<<tiles, block, shm, stream>>>(P, npairs, N, pbytes, actA, (uint32_t) (npairs * 1024), actD,
-                                                    (uint32_t) (npairs * 64), dst, dst_s1);
+                                                    (uint32_t) (npairs * 64), dst, dst_s1, M);
 }
 
 static std::mutex                                        q8wp_mu;
@@ -1003,6 +1013,168 @@ static const char * q8wp_get_packed(const ggml_tensor * src0, cudaStream_t strea
                       (long long) nbytes, (long long) src0->ne[1], (long long) src0->ne[0]);
     }
     return P;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Q8-W8-INPLACE-E2E-1 (GGML_HIP_Q8W8=4 + GGML_HIP_Q8W8_INPLACE=1|2): the q8wp layout REPLACES the natural bytes of a weight
+// once at upload, through the q8ip in-place mechanism (mmq-q8-mf.cu keeps the registry; a tensor is in exactly one format:
+// natural, V5I stage, or q8wp). The q8wp layout is a permutation inside each 16-row tile (16 * nb01 B in both layouts),
+// so the repack is done in place through a <= 16 MiB scratch, whole tiles at a time; no extra VRAM persists.
+// Consumers of a q8wp-packed weight (safety argument: every one either reads the layout or gets the natural bytes):
+//   MUL_MAT n 1..8            -> q8wp reads it directly (n < 8: activation columns >= n are zero, dst rows >= n not stored)
+//   MUL_MAT n > 16 (prefill)  -> cuBLAS route: q8wp -> natural f16 convert in one pass (ggml_cuda_q8wp_convert_f16)
+//   anything else (n 9..16, MMQ, MMVQ fusions, GET_ROWS, CPY, ...) -> transient natural copy (ggml_cuda_q8ip_substitute
+//                                with ggml_cuda_q8wp_unpack), fusions over the weight are disabled (is_packed is true)
+//   get_tensor / buffer cpy / partial set_tensor -> natural layout (q8ip get / unpack-before-write)
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8wpip_build_marker[] __attribute__((used)) =
+    "ggml-cuda: Q8W8 design 5 q8wp IN-PLACE load-time repack (GGML_HIP_Q8W8_INPLACE)";
+
+// packed word q -> natural: qs words are 4 contiguous natural bytes; scale words hold two f16 d (2 natural offsets)
+static __device__ __forceinline__ void q8wp_word_src(const int64_t q, const int64_t tw, const int npairs, const int64_t nb01,
+                                                     int64_t & o0, int64_t & o1, bool & is_scale) {
+    const int64_t T = q / tw;
+    const int     c = (int) (q % tw);
+    if (c < npairs * 256) {
+        const int pr = c >> 8, lane = (c >> 2) & 63, j = c & 3;
+        const int r  = lane & 15, g = lane >> 4;
+        o0 = (T * 16 + r) * nb01 + (2 * pr + (j >> 1)) * 34 + 2 + 16 * (j & 1) + 4 * g;
+        o1 = 0;
+        is_scale = false;
+    } else {
+        const int sc = c - npairs * 256;
+        const int pg = sc >> 6, lane = sc & 63;
+        const int r  = lane & 15, g = lane >> 4;
+        const int64_t row = (T * 16 + r) * nb01;
+        o0 = row + (2 * (4 * pg + 2 * (g & 1) + 0) + (g >> 1)) * 34;
+        o1 = row + (2 * (4 * pg + 2 * (g & 1) + 1) + (g >> 1)) * 34;
+        is_scale = true;
+    }
+}
+
+static __global__ void q8wp_unpack(const uint32_t * __restrict__ P, const int nb01, const int npairs, const int64_t nwords,
+                                   char * __restrict__ W) {
+    const int64_t tw = (int64_t) nb01 * 4;
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < nwords; q += (int64_t) gridDim.x * blockDim.x) {
+        int64_t o0, o1;
+        bool    sc;
+        q8wp_word_src(q, tw, npairs, nb01, o0, o1, sc);
+        const uint32_t v = P[q];
+        if (sc) {   // f16 d at the start of a 34 B block: 2 B aligned
+            *(uint16_t *) (W + o0) = (uint16_t) (v & 0xffffu);
+            *(uint16_t *) (W + o1) = (uint16_t) (v >> 16);
+        } else {    // qs bytes at block + 2 + 4 k: 2 B aligned
+            *(uint16_t *) (W + o0)     = (uint16_t) (v & 0xffffu);
+            *(uint16_t *) (W + o0 + 2) = (uint16_t) (v >> 16);
+        }
+    }
+}
+
+// q8wp-packed Q8_0 [N][K] -> natural f16 [N][K]; one thread per 8 outputs (row, block b, quarter sub)
+static __global__ void q8wp_to_f16(const char * __restrict__ P, half * __restrict__ y, const int64_t nthr, const int nblk) {
+    const int64_t t = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (t >= nthr) {
+        return;
+    }
+    const int     npairs = nblk / 2;
+    const int64_t n   = t / 4;
+    const int     sub = (int) (t % 4);
+    const int64_t row = n / nblk;
+    const int     b   = (int) (n - row * nblk);
+    const int64_t T   = row >> 4;
+    const int     r   = (int) (row & 15);
+    const uint32_t * tile = (const uint32_t *) (P + T * (int64_t) npairs * 1088);
+    const int pr = b >> 1, j = 2 * (b & 1) + (sub >> 1), g0 = 2 * (sub & 1);
+    const uint32_t w0 = tile[pr * 256 + (16 * g0 + r) * 4 + j];
+    const uint32_t w1 = tile[pr * 256 + (16 * (g0 + 1) + r) * 4 + j];
+    const int pair = b >> 1, h = b & 1, tq = pair & 3;
+    const int g  = 2 * h + (tq >> 1);
+    const uint32_t sw = tile[npairs * 256 + (pair >> 2) * 64 + 16 * g + r];
+    const half d = __ushort_as_half((unsigned short) ((tq & 1) ? (sw >> 16) : (sw & 0xffffu)));
+    const uint32_t ws[2] = {w0, w1};
+    half2 o[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t w = ws[k >> 1];
+        const int sh = 16 * (k & 1);
+        o[k] = __hmul2(make_half2((int8_t) ((w >> sh) & 0xff), (int8_t) ((w >> (sh + 8)) & 0xff)), __half2half2(d));
+    }
+    *((uint4 *) (y + 8 * t)) = *((const uint4 *) o);
+}
+
+int ggml_cuda_q8wp_ip_mode() {
+#if defined(GGML_USE_HIP)
+    return q8w8_get_cfg().inplace;
+#else
+    return 0;
+#endif
+}
+
+bool ggml_cuda_q8wp_ip_shape_ok(const ggml_tensor * t) {
+    const q8w8_cfg & cfg = q8w8_get_cfg();
+    const int64_t nbytes = (int64_t) ggml_nbytes(t);
+    // GET_ROWS-only weights (token_embd*, DFlash2 selector_predecessor / selector_successor) stay natural
+    return t->type == GGML_TYPE_Q8_0 && t->view_src == nullptr && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t) &&
+        t->ne[0] % 256 == 0 && t->ne[1] % 16 == 0 && ((uintptr_t) t->data) % 16 == 0 &&
+        nbytes > cfg.min_bytes && nbytes < (int64_t) INT32_MAX - 4096 && strncmp(t->name, "token_embd", 10) != 0 &&
+        strstr(t->name, "selector_successor") == nullptr && strstr(t->name, "selector_predecessor") == nullptr;
+}
+
+// out of place (src != dst), whole 16-row tiles; to_packed: natural src -> packed dst, else packed src -> natural dst
+void ggml_cuda_q8wp_permute(const char * src, char * dst, int64_t N, int64_t K, bool to_packed, cudaStream_t stream) {
+    const int     nb01   = (int) (K / 32 * 34);
+    const int     npairs = (int) (K / 64);
+    const int64_t nwords = N * nb01 / 4;
+    const int     grid   = (int) std::min<int64_t>((nwords + 255) / 256, 65535);
+    if (to_packed) {
+        q8wp_repack<<<grid, 256, 0, stream>>>(src, nb01, npairs, nwords, (uint32_t *) dst);
+    } else {
+        q8wp_unpack<<<grid, 256, 0, stream>>>((const uint32_t *) src, nb01, npairs, nwords, dst);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// in place through a transient scratch (<= 16 MiB, whole tiles), synchronous on `stream`
+void ggml_cuda_q8wp_permute_inplace(char * data, int64_t N, int64_t K, bool to_packed, cudaStream_t stream) {
+    const int64_t tileb = 16 * (K / 32 * 34);
+    const int64_t ntile = N / 16;
+    const int64_t bt    = std::max<int64_t>(1, std::min<int64_t>(ntile, (16ll << 20) / tileb));
+    char * scratch = nullptr;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMalloc((void **) &scratch, (size_t) (bt * tileb)));
+    for (int64_t t0 = 0; t0 < ntile; t0 += bt) {
+        const int64_t nt = std::min(bt, ntile - t0);
+        char * p = data + t0 * tileb;
+        CUDA_CHECK(cudaMemcpyAsync(scratch, p, (size_t) (nt * tileb), cudaMemcpyDeviceToDevice, stream));
+        ggml_cuda_q8wp_permute(scratch, p, nt * 16, K, to_packed, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(scratch));
+}
+
+void ggml_cuda_q8wp_convert_f16(const void * P, half * y, int64_t N, int64_t K, cudaStream_t stream) {
+    GGML_ASSERT(K % 256 == 0 && N % 16 == 0 && (uintptr_t) y % 16 == 0);
+    const int64_t nthr = N * K / 8;
+    q8wp_to_f16<<<(nthr + 255) / 256, 256, 0, stream>>>((const char *) P, y, nthr, (int) (K / 32));
+    CUDA_CHECK(cudaGetLastError());
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("ggml_cuda_q8_w8: q8wp in-place packed q8_0->f16 prefill convert ran\n");
+    }
+}
+
+// n 1..8 on an in-place q8wp weight (the base tensor itself, not a view)
+bool ggml_cuda_q8_w8_packed_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+#if defined(GGML_USE_HIP)
+    return q8w8_get_cfg().inplace > 0 && GGML_CUDA_CC_IS_CDNA2(cc) && src0->view_src == nullptr &&
+        ggml_cuda_q8ip_is_q8wp(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= Q8W8_M && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % sizeof(float) == 0 &&
+        dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float) == 0;
+#else
+    GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst); GGML_UNUSED(cc);
+    return false;
+#endif
 }
 
 // KS (waves per WG splitting K): best wave-slot fill over ncu x 16 resident waves, at least 8 pairs per wave.
@@ -1085,22 +1257,33 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int     nblk   = (int) (src0->ne[0] / 32);
     const int64_t s1     = src1->nb[1] / sizeof(float);
     const int64_t dst_s1 = dst->nb[1]  / sizeof(float);
-    GGML_ASSERT(src1->ne[1] == Q8W8_M);
+    const bool    ip     = cfg.mode == 4 && cfg.inplace > 0 && ggml_cuda_q8ip_is_q8wp(src0);   // Q8-W8-INPLACE-E2E-1
+    const int     M      = (int) src1->ne[1];
+    GGML_ASSERT(ip ? (M >= 1 && M <= Q8W8_M && src0->view_src == nullptr) : M == Q8W8_M);
 
     if (cfg.mode == 4) {
+        if (ip) {
+            static std::atomic<int64_t> n_ip{0};
+            const int64_t c = n_ip.fetch_add(1) + 1;
+            if (c == 1 || (M != Q8W8_M && c < 4096 && (c & (c - 1)) == 0)) {
+                GGML_LOG_INFO("ggml_cuda_q8_w8: design 5 q8wp ran on IN-PLACE packed weight (call %lld, n=%d, %s)
+",
+                              (long long) c, M, src0->name);
+            }
+        }
         const int npairs = nblk / 2;
         ggml_cuda_pool_alloc<int>   actA(ctx.pool(), (size_t) npairs * 256);
         ggml_cuda_pool_alloc<float> actD(ctx.pool(), (size_t) npairs * 16);
-        q8wp_prep<<<npairs, 256, 0, stream>>>((const float *) src1->data, s1, actA.get(), actD.get());
-        const char *   P      = q8wp_get_packed(src0, stream);
+        q8wp_prep<<<npairs, 256, 0, stream>>>((const float *) src1->data, s1, M, actA.get(), actD.get());
+        const char *   P      = ip ? (const char *) src0->data : q8wp_get_packed(src0, stream);
         const uint32_t pbytes = (uint32_t) ggml_nbytes(src0);
         const int      ncu    = ggml_cuda_info().devices[ctx.device].nsm;
         float *        d      = (float *) dst->data;
         // YT 4 is not instantiated: it spills (128 VGPR + 48 B scratch per lane, static gate). MYT=4 runs YT 2.
         if (cfg.myt == 1) {
-            q8wp_launch<1>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
+            q8wp_launch<1>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, M, stream);
         } else {
-            q8wp_launch<2>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
+            q8wp_launch<2>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, M, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

@@ -18,7 +18,9 @@ struct ggml_cuda_q8ip_subst {
     ggml_cuda_pool_alloc<char> buf[GGML_MAX_SRC];
 };
 bool ggml_cuda_q8ip_any();
-bool ggml_cuda_q8ip_is_packed(const ggml_tensor * t);
+bool ggml_cuda_q8ip_is_packed(const ggml_tensor * t);   // either in-place layout
+bool ggml_cuda_q8ip_is_stage(const ggml_tensor * t);    // V5I stage layout (MF / MMQ / packed-convert readers)
+bool ggml_cuda_q8ip_is_q8wp(const ggml_tensor * t);     // Q8W8 design 5 q8wp layout (GGML_HIP_Q8W8_INPLACE)
 bool ggml_cuda_q8ip_want(const ggml_tensor * t, bool weights_buffer);
 void ggml_cuda_q8ip_before_write(ggml_tensor * t, size_t offset, size_t size, cudaStream_t stream);
 void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, bool weights_buffer, cudaStream_t stream);

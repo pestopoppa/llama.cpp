@@ -1548,7 +1548,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if (ggml_is_contiguously_allocated(src0)) {
             bool h20_done = false;
             if constexpr (compute_type == GGML_TYPE_F16) {
-                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_packed(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
+                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_q8wp(src0)) {   // Q8-W8-INPLACE-E2E-1: q8wp layout
+                    ggml_cuda_q8wp_convert_f16(src0->data, (half *) src0_alloc.get(), ne01, ne00, main_stream);
+                    h20_done = true;
+                } else
+                if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_is_stage(src0)) {   // DTREE-0-Q8MF-PACKED-CONSUMERS
                     ggml_cuda_h20_convert_q8_0_packed_f16(src0->data, (half *) src0_alloc.get(), ggml_nelements(src0), ne00 / QK8_0, main_stream);
                     h20_done = true;
                 } else
@@ -2058,6 +2062,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // DTREE-0-Q8MF-REPACK-INPLACE: an in-place packed weight is read directly by V3 at n <= 16 (any n >= 1);
     // other shapes reach here only with a substituted natural copy (ggml_cuda_compute_forward).
+    // Q8-W8-INPLACE-E2E-1: a q8wp in-place weight at n 1..8 is read by q8wp directly (GGML_HIP_Q8W8=4 + Q8W8_INPLACE)
+    if (ggml_cuda_q8ip_any() && ggml_cuda_q8_w8_packed_handles(src0, src1, dst, cc)) {
+        ggml_cuda_log_mul_mat_route("Q8_W8_INPLACE", src0, src1, dst, cc, ne11);
+        ggml_cuda_mul_mat_q8_w8(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_q8ip_any() && ggml_cuda_q8ip_mf_handles(src0, src1, dst)) {
         ggml_cuda_log_mul_mat_route("Q8_MF_INPLACE", src0, src1, dst, cc, ne11);
         ggml_cuda_mul_mat_q8_mf(ctx, src0, src1, dst);

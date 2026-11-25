@@ -12696,6 +12696,28 @@ static void dtree_add_q8ip_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 5120, 128, 3));
 }
 
+// Q8-W8-INPLACE-E2E-1: run with GGML_HIP_Q8W8=4 GGML_HIP_Q8W8_INPLACE=2 (any buffer), alone and with the served V5I env
+// (GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_SLC=1). Every Q8_0 src0 > 8 MiB with
+// K % 256 == 0 and N % 16 == 0 is repacked IN PLACE to the q8wp layout at upload, so each consumer path reads a packed
+// weight: n 1..8 q8wp directly (n < 8: zero-padded columns), n 9 / 12 / 16 the unpack-on-read copy into V5/V3/MMVQ,
+// n 17 / 33 / 64 / 512 the prefill q8wp -> f16 convert + cuBLAS (or the unpack copy into MMQ), GET_ROWS and CPY the
+// generic unpack-on-read substitution. 4112 x 2304 has N % 64 != 0 (q8wp only, never stage), 4100 x 2304 has
+// N % 16 != 0 (never packed: natural route guard). Off by default these are ordinary cases.
+static void q8wpip_add_eval_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> sh[] = {{6144, 5120}, {4112, 2304}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 33, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {1, 4, 7, 8, 16, 512}) {   // ffn_down: K = 17408 (KS split over 4-pair groups)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, 8, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 5120, 2048, 7));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_F32, {5120, 2048, 1, 1}));
+}
+
 // DTREE-0-Q8MF-V5 (GGML_HIP_Q8_MF=6): odd M, the 27B verify shapes, and shapes whose half-tile units split across WGs
 // (atomic tail) vs. fit one WG (plain store). Run with GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2
 // GGML_HIP_Q8_MF_MIN_BYTES=0.
@@ -12827,6 +12849,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
+    q8wpip_add_eval_cases(test_cases);          // Q8-W8-INPLACE-E2E-1
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);

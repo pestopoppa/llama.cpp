@@ -9,3 +9,10 @@ bool ggml_cuda_q8_w8_eligible(const ggml_tensor * src0, const ggml_tensor * src1
 void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 // Design 5 (GGML_HIP_Q8W8=4): drop cached MFMA-order packed copies overlapping a write / free (no-op when unused).
 void ggml_cuda_q8w8_invalidate(const void * base, size_t size);
+// Q8-W8-INPLACE-E2E-1 (GGML_HIP_Q8W8=4 + GGML_HIP_Q8W8_INPLACE=1 weights / =2 any buffer): q8wp layout in place.
+int  ggml_cuda_q8wp_ip_mode();
+bool ggml_cuda_q8wp_ip_shape_ok(const ggml_tensor * t);
+void ggml_cuda_q8wp_permute(const char * src, char * dst, int64_t N, int64_t K, bool to_packed, cudaStream_t stream);
+void ggml_cuda_q8wp_permute_inplace(char * data, int64_t N, int64_t K, bool to_packed, cudaStream_t stream);
+void ggml_cuda_q8wp_convert_f16(const void * P, half * y, int64_t N, int64_t K, cudaStream_t stream);
+bool ggml_cuda_q8_w8_packed_handles(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
