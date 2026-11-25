@@ -2526,7 +2526,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                // Q8-SERVED-DEV-SELECT-1: a graph may emit a smaller nextn tensor (the device-selected DFlash2
+                // draft ids); copy only what it holds
+                const size_t nb_h = std::min((size_t) n_rows*n_embd*sizeof(float), ggml_nbytes(t_h_nextn));
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, nb_h);
             }
         }
 
