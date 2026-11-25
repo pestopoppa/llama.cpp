@@ -7,3 +7,5 @@
 
 bool ggml_cuda_q8_w8_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
 void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// Design 5 (GGML_HIP_Q8W8=4): drop cached MFMA-order packed copies overlapping a write / free (no-op when unused).
+void ggml_cuda_q8w8_invalidate(const void * base, size_t size);

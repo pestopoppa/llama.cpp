@@ -909,6 +909,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_q8w8_invalidate(dst->data, ggml_nbytes(dst));   // Q8W8 design 5 packed-copy cache
     if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
                                  ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {
         return false;   // in-place packed Q8_0: generic get_tensor / set_tensor path (layout-aware)
@@ -2791,6 +2792,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
+    ggml_cuda_q8w8_invalidate(dst->data, ggml_nbytes(dst));   // Q8W8 design 5 packed-copy cache
 
     if (ggml_cuda_q8ip_any() && (ggml_cuda_q8ip_is_packed(src->view_src ? src->view_src : src) ||
                                  ggml_cuda_q8ip_is_packed(dst->view_src ? dst->view_src : dst))) {

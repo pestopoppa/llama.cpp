@@ -87,6 +87,7 @@
 //  MFMA load per CU per 2 stages (one per WG): 2 x 4 waves x 16 MFMA x 32 clk on 4 SIMDs = 1024 clk per 34.8 KB -> cap
 //  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
+#include "mmq-q8-w8.cuh"
 
 #include "quantize.cuh"
 #include "mmq.cuh"
@@ -1172,6 +1173,7 @@ static void q8ip_permute_inplace(char * data, const int64_t N, const int64_t K, 
 }
 
 void ggml_cuda_q8ip_before_write(ggml_tensor * t, size_t offset, size_t size, cudaStream_t stream) {
+    ggml_cuda_q8w8_invalidate((const char *) t->data + offset, size);   // Q8W8 design 5 packed-copy cache
     if (!ggml_cuda_q8ip_any()) {
         return;
     }
@@ -1226,6 +1228,7 @@ void ggml_cuda_q8ip_after_write(ggml_tensor * t, size_t offset, size_t size, boo
 }
 
 void ggml_cuda_q8ip_forget_range(const void * base, size_t size) {
+    ggml_cuda_q8w8_invalidate(base, size);   // Q8W8 design 5 packed-copy cache
     if (!ggml_cuda_q8ip_any()) {
         std::lock_guard<std::mutex> lk(q8ip_mu);
         q8ip_progress.clear();
