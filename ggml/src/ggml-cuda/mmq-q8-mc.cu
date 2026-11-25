@@ -14,7 +14,7 @@
 //  * a two-deep register pipeline: step k+1's weight windows are issued before step k's math, so every wave always
 //    has 4 rows x 1088 B outstanding while it computes (2x the in-flight bytes of q8wv at the same occupancy);
 //  * exact-M instantiations 2..8 (no zero column), one code path for widths 2..8.
-// Env: GGML_HIP_Q8MC=1 enables; GGML_HIP_Q8MC_MIN / _MAX (ne11 range, default 2..8); GGML_HIP_Q8MC_MIN_BYTES (default
+// Env: GGML_HIP_Q8MC=1 enables; GGML_HIP_Q8MC_MIN / _MAX (ne11 range, default 2..6; C22 r3); GGML_HIP_Q8MC_MIN_BYTES (default
 //      8 MiB, weight strictly larger); GGML_HIP_Q8MC_WAVES (max waves per WG, default 16).
 // Size floor (C22 r1): small-N weights (27B attn_k/v, 1024 x 5120 = 5.6 MB) regressed (x_off 0.75/0.91/0.94 at w2/4/8):
 // 1024 rows at YT 4 = 256 tiles fill only 2.5 waves/CU, too little in flight; they stay on the stock path (q8sk/MMVQ).
@@ -25,6 +25,9 @@
 #include <cstdlib>
 
 #define Q8MC_MAXM    8
+// C22 r3: default routed range 2..6. M >= 7 goes to stock q8wv: C22 r1 (YT=4) w8 0.98x, r2 (YT=2, 3-deep) w8 0.89x,
+// stock 1.00x. The M=7/8 instantiations stay for GGML_HIP_Q8MC_MAX=8 experiments.
+#define Q8MC_DEFMAX  6
 #define Q8MC_YT      4
 // rows per wave: M=7 at YT=4 spilled (ScratchSize 16 @128 VGPRs); the doc fallback YT=2 applies to it only
 // (M=8 at YT=4 fits 128 VGPRs with no spill and keeps the wider pipeline).
@@ -51,7 +54,7 @@ static const q8mc_cfg & q8mc_get_cfg() {
         q8mc_cfg c;
         c.enabled = q8mc_env_int("GGML_HIP_Q8MC", 0) == 1;
         c.mmin    = std::max(2, q8mc_env_int("GGML_HIP_Q8MC_MIN", 2));
-        c.mmax    = std::min(Q8MC_MAXM, q8mc_env_int("GGML_HIP_Q8MC_MAX", Q8MC_MAXM));
+        c.mmax    = std::min(Q8MC_MAXM, q8mc_env_int("GGML_HIP_Q8MC_MAX", Q8MC_DEFMAX));
         c.waves   = std::min(Q8MC_MAXWAVE, std::max(1, q8mc_env_int("GGML_HIP_Q8MC_WAVES", Q8MC_MAXWAVE)));
         const char * mb = getenv("GGML_HIP_Q8MC_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (8ll << 20);
