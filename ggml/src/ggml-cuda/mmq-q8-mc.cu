@@ -15,7 +15,9 @@
 //    has 4 rows x 1088 B outstanding while it computes (2x the in-flight bytes of q8wv at the same occupancy);
 //  * exact-M instantiations 2..8 (no zero column), one code path for widths 2..8.
 // Env: GGML_HIP_Q8MC=1 enables; GGML_HIP_Q8MC_MIN / _MAX (ne11 range, default 2..8); GGML_HIP_Q8MC_MIN_BYTES (default
-//      1 MiB, weight strictly larger); GGML_HIP_Q8MC_WAVES (max waves per WG, default 16).
+//      8 MiB, weight strictly larger); GGML_HIP_Q8MC_WAVES (max waves per WG, default 16).
+// Size floor (C22 r1): small-N weights (27B attn_k/v, 1024 x 5120 = 5.6 MB) regressed (x_off 0.75/0.91/0.94 at w2/4/8):
+// 1024 rows at YT 4 = 256 tiles fill only 2.5 waves/CU, too little in flight; they stay on the stock path (q8sk/MMVQ).
 #include "mmq-q8-mc.cuh"
 
 #include <atomic>
@@ -26,7 +28,11 @@
 #define Q8MC_YT      4
 // rows per wave: M=7 at YT=4 spilled (ScratchSize 16 @128 VGPRs); the doc fallback YT=2 applies to it only
 // (M=8 at YT=4 fits 128 VGPRs with no spill and keeps the wider pipeline).
-template <int M> struct q8mc_yt { static constexpr int v = M == 7 ? 2 : Q8MC_YT; };
+// M=8 (the served DFlash2 n-max-7 verify width): YT=4 sat at 128 VGPRs (32 accumulators + two 4-row windows) and gained
+// nothing over q8wv (C22 r1: x_off 0.95-1.01 at w8). M=8 now runs YT=2 with a THREE-deep weight pipeline: the same
+// 4 rows x 1088 B in flight per wave as YT=4 two-deep, with half the accumulators (16) and per-step math.
+template <int M> struct q8mc_yt { static constexpr int v = (M == 7 || M == 8) ? 2 : Q8MC_YT; };
+template <int M> struct q8mc_depth { static constexpr int v = M == 8 ? 3 : 2; };
 #define Q8MC_LDS_B   65536
 #define Q8MC_MAXWAVE 16
 #define Q8MC_STEP    32
@@ -48,7 +54,7 @@ static const q8mc_cfg & q8mc_get_cfg() {
         c.mmax    = std::min(Q8MC_MAXM, q8mc_env_int("GGML_HIP_Q8MC_MAX", Q8MC_MAXM));
         c.waves   = std::min(Q8MC_MAXWAVE, std::max(1, q8mc_env_int("GGML_HIP_Q8MC_WAVES", Q8MC_MAXWAVE)));
         const char * mb = getenv("GGML_HIP_Q8MC_MIN_BYTES");
-        c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (1ll << 20);
+        c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (8ll << 20);
         if (c.enabled) {
             GGML_LOG_INFO("ggml_cuda_q8_mc: GGML_HIP_Q8MC=1 multi-column Q8_0 GEMV armed (M %d..%d, > %lld B, %d waves)\n",
                           c.mmin, c.mmax, (long long) c.min_bytes, c.waves);
@@ -155,6 +161,8 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
              float * __restrict__ dst, const int64_t dst_s1) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     constexpr int YT = q8mc_yt<M>::v;
+    constexpr int DP = q8mc_depth<M>::v;
+    static_assert(DP == 2 || DP == 3, "q8mc pipeline depth");
     __shared__ q8mc_int4 lds[Q8MC_LDS_B / 16];
     float * lds_d = (float *) &lds[M * P * 2];
 
@@ -183,13 +191,18 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
             }
         }
 
-        q8mc_win<YT> cur;
+        q8mc_win<YT> cur, mid;
         q8mc_issue(cur, rsrc, 0, hb, h, row0, active, N, nb01, nblk);
+        if constexpr (DP == 3) {
+            q8mc_issue(mid, rsrc, Q8MC_STEP, hb, h, row0, active && Q8MC_STEP < nblk, N, nb01, nblk);
+        }
 
         for (int k1 = 0; k1 < nblk; k1 += Q8MC_STEP) {
             // 1) next step's windows leave before this step's wait (past-the-end steps read 0 and are discarded)
+            // (DP 3: the window two steps ahead, so two steps of weights are outstanding during this step's math)
+            constexpr int AHEAD = (DP - 1) * Q8MC_STEP;
             q8mc_win<YT> nxt;
-            q8mc_issue(nxt, rsrc, k1 + Q8MC_STEP, hb, h, row0, active && k1 + Q8MC_STEP < nblk, N, nb01, nblk);
+            q8mc_issue(nxt, rsrc, k1 + AHEAD, hb, h, row0, active && k1 + AHEAD < nblk, N, nb01, nblk);
 
             // 2) activation page restage, uniform across the WG
             if (k1 < page || k1 >= page + P) {
@@ -240,7 +253,12 @@ q8mc_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
                     acc[y][n] += (float) s * (dw[y] * da);
                 }
             }
-            cur = nxt;
+            if constexpr (DP == 3) {
+                cur = mid;
+                mid = nxt;
+            } else {
+                cur = nxt;
+            }
         }
 
 #pragma unroll
@@ -295,7 +313,7 @@ void ggml_cuda_mul_mat_q8_mc(ggml_backend_cuda_context & ctx, const ggml_tensor 
         // Path witness (gate rows grep it; also the build's strings content marker).
         static std::atomic<int64_t> n_calls{0};
         if (n_calls.fetch_add(1) == 0) {
-            GGML_LOG_INFO("ggml_cuda_q8_mc: gfx90a Q8MC multi-column Q8_0 GEMV ran (call 1, 2-deep weight pipeline)\n");
+            GGML_LOG_INFO("ggml_cuda_q8_mc: gfx90a Q8MC multi-column Q8_0 GEMV ran (call 1, 2/3-deep weight pipeline)\n");
         }
     }
     cudaStream_t stream = ctx.stream();
