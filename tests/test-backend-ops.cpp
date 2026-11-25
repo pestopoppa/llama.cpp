@@ -12682,6 +12682,25 @@ static void dtree_add_q8ip_eval_cases(std::vector<std::unique_ptr<test_case>> & 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 5120, 128, 3));
 }
 
+// Q8-GEMV-85PCT-1 design 6 q8wt (GGML_HIP_Q8_MF=7): run with GGML_HIP_Q8_MF=7 GGML_HIP_Q8_MF_MIN=1
+// GGML_HIP_Q8_MF_INPLACE=2 GGML_HIP_Q8_MF_SLC=1 (the served V5I env with MF=7). Every 27B Q8_0 served shape at the verify
+// widths 1..8 (+ 16, the MAXM edge) against the CPU; perf mode times the same set (op-perf harness:
+// test-backend-ops perf -b ROCm0 -o MUL_MAT -p type_a=q8_0). 1024 x 2048 at n 3 / 13 (MIN_BYTES=0) has fewer 16-row groups
+// than waves (G capped at N/16, single-contributor groups) and 4096 x 256 has S = 1 (every range = whole groups).
+static void q8wt_add_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    static const std::array<int64_t, 2> sh[] = {{12288, 5120}, {17408, 5120}, {5120, 17408}, {5120, 6144}, {6144, 5120},
+                                                {10240, 5120}};
+    for (const auto & s : sh) {
+        for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {3, 13}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, n, 2048, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 8, 256, {1, 1}, {1, 1}));
+}
+
 // DTREE-0-Q8MF-V5 (GGML_HIP_Q8_MF=6): odd M, the 27B verify shapes, and shapes whose half-tile units split across WGs
 // (atomic tail) vs. fit one WG (plain store). Run with GGML_HIP_Q8_MF=6 GGML_HIP_Q8_MF_MIN=1 GGML_HIP_Q8_MF_INPLACE=2
 // GGML_HIP_Q8_MF_MIN_BYTES=0.
@@ -12812,6 +12831,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     dtree_add_q8mf_eval_cases(test_cases);      // DTREE-0-Q8MF
     dtree_add_q8ip_eval_cases(test_cases);      // DTREE-0-Q8MF-REPACK-INPLACE
     dtree_add_q8v5_eval_cases(test_cases);      // DTREE-0-Q8MF-V5
+    q8wt_add_cases(test_cases);                 // Q8-GEMV-85PCT-1 design 6 q8wt
     autokernel_add_served_shape_lowbit_cases(test_cases);  // AK-SERVED-SHAPE-CALL
     add_near_f16_max_mul_mat_cases(test_cases);           // AKX-ALL-31.EDGE-HIP-NONFINITE
     std::default_random_engine rng(0);
@@ -15274,6 +15294,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     akh1_add_q8_skinny_perf_cases(test_cases);  // AK-ASM-H1
     a3b_add_router_chunk_cases(test_cases);     // AK-A3B-VERIFY-CHUNK
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
+    q8wt_add_cases(test_cases);                 // Q8-GEMV-85PCT-1 design 6 q8wt (op-perf harness)
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
     // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
     if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
