@@ -986,11 +986,17 @@ bool ggml_cuda_ak_tf2_g5_supported(const ggml_tensor * norm, const ggml_tensor *
     if (!(eps >= 0.0f)) {
         return false;
     }
-    // out must not overlap any input (each block reads its whole x row twice and writes its out row last)
+    // aliasing: ggml-alloc runs RMS_NORM / MUL / UNARY in place, so in the served graph out routinely reuses x's (or
+    // z's) buffer. That is safe element-for-element (same range, x / z contiguous with out's shape): each thread reads
+    // x[col] and z[col] before it writes dst[col], and the reduction pass only reads. Partial overlap, or any overlap
+    // with w, is refused. (Before this rule G5 never fired in llama-server: the smoke's G5 witness stayed absent.)
     const int64_t olo = (int64_t) out->data, ohi = olo + (int64_t) ggml_nbytes(out);
     for (const ggml_tensor * t : { x, w, z }) {
         const int64_t lo = (int64_t) t->data, hi = lo + (int64_t) ggml_nbytes(t);
-        if (!(ohi <= lo || hi <= olo)) {
+        if (ohi <= lo || hi <= olo) {
+            continue;
+        }
+        if (t == w || lo != olo || hi != ohi || !ggml_is_contiguous(t)) {
             return false;
         }
     }
