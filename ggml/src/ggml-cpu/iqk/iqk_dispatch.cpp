@@ -216,6 +216,23 @@ constexpr bool iqk_typeA_supported(int t) {
     }
 }
 
+// Q38FN-GEMV2 F1: GGML_IQK_IQ4_NL=1 routes IQ4_NL weights (Qwen3.8-Flash-Next ffn_down_exps) through the
+// iqk legacy-quant kernels (IQ4_NL_UnpackerU x Q8_2_X4 activations on AVX512) instead of the native
+// vec_dot_iq4_nl_q8_0 path, which re-dequantizes every weight block once per src1 column. Default OFF:
+// the activation quantizer differs from the native Q8_0 one, so the stream is not bit-identical to OFF.
+inline bool iqk_iq4_nl_enabled() {
+    static const bool e = []() {
+        const char * s = getenv("GGML_IQK_IQ4_NL");
+        const bool on = s && atoi(s) != 0;
+        fprintf(stderr, "[iqk] INFO: GGML_IQK_IQ4_NL=%d (Q38FN-GEMV2 F1: IQ4_NL weights via iqk kernels)\n", on ? 1 : 0);
+        return on;
+    }();
+    return e;
+}
+inline bool iqk_typeA_supported_rt(int t) {
+    return iqk_typeA_supported(t) || (t == GGML_TYPE_IQ4_NL && iqk_iq4_nl_enabled());
+}
+
 // Keep rejected types out of both dense and MoE hooks: eligibility is checked
 // before iqk_activation_type() and iqk_quantize_activation() in each path.
 static_assert(!iqk_typeA_supported(GGML_TYPE_Q2_K));
@@ -349,7 +366,7 @@ extern "C" bool ggml_iqk_try_mul_mat(const struct ggml_compute_params * params, 
 
     if (dst->type  != GGML_TYPE_F32) return false;
     if (src1->type != GGML_TYPE_F32) return false;          // Stage 1: F32 activations only
-    if (!iqk_typeA_supported((int) src0->type)) return false;
+    if (!iqk_typeA_supported_rt((int) src0->type)) return false;
     if (!iqk_shape_supported((int) src0->type, src0->ne[1])) return false;
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
@@ -507,7 +524,7 @@ extern "C" bool ggml_iqk_try_mul_mat_id(const struct ggml_compute_params * param
     const int tA = (int) src0->type;
     // Same families as the dense hook. iqk_mul_mat_moe returns false for any it
     // cannot handle, in which case the native path reruns the operation.
-    if (!iqk_typeA_supported(tA)) return false;
+    if (!iqk_typeA_supported_rt(tA)) return false;
     if (!iqk_shape_supported(tA, src0->ne[1])) return false;
     if (!iqk_mmid_shape_supported(tA, ids->ne[1])) return false;
     // Option R: logical rows = tokens (ids->ne[1]), excluding the top-k expansion.

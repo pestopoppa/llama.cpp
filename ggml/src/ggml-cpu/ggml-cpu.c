@@ -3640,6 +3640,20 @@ struct ggml_cplan ggml_graph_plan(
                                 (size_t) n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping);
                             cur = MAX(cur, iqk_carve);
                         }
+                        // Q38FN-GEMV2 F1: GGML_IQK_IQ4_NL=1 sends IQ4_NL experts through the same hook. Reserve its
+                        // carve; at one token (D1 fast path) every thread needs a private activation slice.
+                        if (src0->type == GGML_TYPE_IQ4_NL && src1->type == GGML_TYPE_F32) {
+                            const char * e = getenv("GGML_IQK_IQ4_NL");
+                            if (e && atoi(e) != 0) {
+                                const size_t q8k_act = ggml_type_size(GGML_TYPE_Q8_K) * (size_t) ggml_nelements(src1) /
+                                                       (size_t) ggml_blck_size(GGML_TYPE_Q8_K);
+                                const size_t n_act = ids->ne[1] == 1 ? (size_t) n_tasks : 1;
+                                const size_t iqk_carve = n_act * GGML_PAD(q8k_act, sizeof(int64_t)) +
+                                    GGML_PAD((size_t) n_as * sizeof(int64_t), sizeof(int64_t)) +
+                                    (size_t) n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping);
+                                cur = MAX(cur, iqk_carve);
+                            }
+                        }
 #endif
                     } break;
                 case GGML_OP_OUT_PROD:
