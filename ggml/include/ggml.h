@@ -2731,10 +2731,11 @@ extern "C" {
             int64_t               K,
             bool                  keep);
 
-    // [Q38FN-GDN-SNAP] write the K snapshot slots of a plain (non-replay, non-tree) gated delta net
+    // [Q38FN-GDN-SNAP] write the K snapshot slots of a non-replay gated delta net (chain or tree)
     // straight into snap_dst instead of the state region of the result, so no ggml_cpy has to move
     // them afterwards. snap_dst is a 3D F32 view [S_v*S_v*H, n_seqs, n_written] (nb[1] = per-seq,
-    // nb[2] = per-slot stride); slot i lands at snap_dst + i*nb[2]. Sets op param 3 and src[7].
+    // nb[2] = per-slot stride); slot i lands at snap_dst + i*nb[2]. A tree op reads its parents' snapshots
+    // back from snap_dst, so it needs every slot (ne[2] == n_tokens). Sets op param 3 and src[7].
     // Backends that do not implement it must reject the op (op param 3 != 0).
     GGML_API void ggml_gated_delta_net_set_snap_dst(
             struct ggml_tensor  * gdn,

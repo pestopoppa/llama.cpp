@@ -12588,7 +12588,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_tensor * src_parent = replay_op ? nullptr : dst->src[6];
     const int32_t * par_d = src_parent ? (const int32_t *) src_parent->data : nullptr;
     GGML_ASSERT(par_d == nullptr || K == n_tokens);
-    GGML_ASSERT(src_snap == nullptr || par_d == nullptr);
+    // a tree reads parent snapshots back, from wherever they were written
+    GGML_ASSERT(src_snap == nullptr || par_d == nullptr || src_snap->ne[2] == n_tokens);
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -12671,6 +12672,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 GGML_ASSERT(p >= -1 && p < t);
                 if (p != t - 1) {
                     const float * src_s = p < 0 ? s_in
+                        : src_snap ? (const float *) ((const char *) src_snap->data + (n_tokens - 1 - p) * src_snap->nb[2] + iv3 * src_snap->nb[1]) + iv1 * S_v * S_v
                         : state_out_base + (n_tokens - 1 - p) * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(s_out, src_s, S_v * S_v * sizeof(float));
                 }

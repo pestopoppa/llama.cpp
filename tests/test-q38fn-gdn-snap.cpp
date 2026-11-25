@@ -1,6 +1,8 @@
 // [Q38FN-GDN-SNAP] ggml_gated_delta_net_set_snap_dst (snapshots written into the cache view) vs the reference
 // result + ggml_cpy into the same view: cache bytes and attention output bytes identical, for n_tokens == K,
-// n_tokens < K, one and two sequences, nonzero kv_head, and the Q38FN layer shape. Exit 0 = pass.
+// n_tokens < K, one and two sequences, nonzero kv_head, the Q38FN layer shape, and the AK-DTREE-2 tree op
+// (chain parents, as the served MTP verify uses, and a branching tree whose columns read parent snapshots
+// back from the destination). Exit 0 = pass.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -41,7 +43,11 @@ static void fill(ggml_tensor * t, float lo, float hi) {
     }
 }
 
-static bool gdn_case(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, int64_t K, int64_t mem_size, int64_t kv_head) {
+// tree: 0 = plain op, 1 = tree op with chain parents, 2 = tree op with a branching parent array (K = n_tokens)
+static bool gdn_case(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, int64_t K, int64_t mem_size, int64_t kv_head, int tree = 0) {
+    if (tree) {
+        K = n_tokens;
+    }
     ggml_context * ctx = new_ctx(512);
     const int64_t D = S_v * S_v * H;
 
@@ -66,14 +72,29 @@ static bool gdn_case(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, i
     };
     const int64_t attn_elems = S_v * H * n_tokens * n_seqs;
 
+    ggml_tensor * par = nullptr;
+    if (tree) {
+        par = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tokens, n_seqs);
+        int32_t * pd = (int32_t *) par->data;
+        for (int64_t q3 = 0; q3 < n_seqs; ++q3) {
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                // branching: 0 <- 1, 0 <- 2 (sibling), 2 <- 3, 1 <- 4 ...: every other column skips back
+                pd[q3 * n_tokens + t] = tree == 1 ? (int32_t) t - 1 : (int32_t) (t == 0 ? -1 : (t % 2 == 0 ? t - 2 : t - 1));
+            }
+        }
+    }
+    auto make = [&]() {
+        return tree ? ggml_gated_delta_net_tree(ctx, q, k, v, g, beta, s, par) : ggml_gated_delta_net(ctx, q, k, v, g, beta, s, K);
+    };
+
     // reference: result + ggml_cpy of the snapshot region (delta-net-base.cpp keep path)
-    ggml_tensor * ra = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, K);
+    ggml_tensor * ra = make();
     ggml_tensor * src = ggml_view_3d(ctx, ra, D, n_seqs, n_written,
             ggml_row_size(ra->type, D), ggml_row_size(ra->type, D * n_seqs), ggml_row_size(ra->type, attn_elems));
     ggml_tensor * cpy = ggml_cpy(ctx, src, cache_view(cache_a));
 
     // lever: the op writes the cache view itself
-    ggml_tensor * rb = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, K);
+    ggml_tensor * rb = make();
     ggml_gated_delta_net_set_snap_dst(rb, cache_view(cache_b));
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -91,8 +112,8 @@ static bool gdn_case(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, i
         changed = memcmp(a, o, row_size) == 0;   // slot 0, seq 0 equals the reference snapshot
     }
     const bool ok = cache_ok && attn_ok && changed;
-    printf("  gdn S_v=%lld H=%lld T=%lld seqs=%lld K=%lld mem=%lld head=%lld: cache %s attn %s written %s\n",
-           (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs, (long long) K, (long long) mem_size,
+    printf("  gdn %s S_v=%lld H=%lld T=%lld seqs=%lld K=%lld mem=%lld head=%lld: cache %s attn %s written %s\n",
+           tree == 0 ? "plain " : tree == 1 ? "chain " : "branch", (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs, (long long) K, (long long) mem_size,
            (long long) kv_head, cache_ok ? "==" : "!=", attn_ok ? "==" : "!=", changed ? "yes" : "NO");
     ggml_free(ctx);
     return ok;
@@ -105,6 +126,9 @@ static bool test_gdn() {
     ok &= gdn_case(128, 4, 2, 1, 5, 3, 2);   // shorter verify: n_tokens < K, trailing slots untouched
     ok &= gdn_case(64,  6, 5, 2, 5, 4, 1);   // two sequences
     ok &= gdn_case(128, 48, 5, 1, 5, 2, 0);  // the Q38FN layer shape (S_v 128, 48 v heads)
+    ok &= gdn_case(128, 48, 5, 1, 5, 2, 1, 1);  // served MTP verify: tree op, chain parents
+    ok &= gdn_case(128, 4, 5, 2, 5, 3, 1, 2);   // branching tree: parents read back from the cache view
+    ok &= gdn_case(64,  6, 4, 1, 4, 4, 2, 2);
     return ok;
 }
 
