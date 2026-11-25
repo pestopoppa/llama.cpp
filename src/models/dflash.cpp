@@ -673,6 +673,13 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     res->t_h_nextn = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // Q8-SERVED-DEV-INJECT-1: keep the encoder output on the device for the KV-inject decode
+    if (ggml_tensor * dst = cparams.dflash_dev_inject) {
+        GGML_ASSERT(cur->ne[0] == dst->ne[0] && n_tokens <= dst->ne[1]);
+        ggml_tensor * view = ggml_view_2d(ctx0, dst, dst->ne[0], n_tokens, dst->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, view));
+    }
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
@@ -1026,15 +1033,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection (embd-only batch; a token+embd batch is a draft block with state rows)
     if (ubatch.embd && !ubatch.token) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        ggml_tensor * inp_g = nullptr;
+        if (ggml_tensor * src = cparams.dflash_dev_inject) {
+            // Q8-SERVED-DEV-INJECT-1: read the encoder output straight from the persistent device buffer;
+            // batch.embd only selects this graph, its host contents are ignored (no H2D)
+            GGML_ASSERT(src->ne[0] == n_embd && n_tokens <= src->ne[1]);
+            inp_g = ggml_view_2d(ctx0, src, n_embd, n_tokens, src->nb[1], 0);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
 
-        ggml_tensor * inp_g = inp->embd;
+            inp_g = inp->embd;
+            res->add_input(std::move(inp));
+        }
         cb(inp_g, "inp_g_embeddings", -1);
-
-        res->add_input(std::move(inp));
 
         const auto & model_df = static_cast<const llama_model_dflash &>(model);
 

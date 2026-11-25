@@ -1328,6 +1328,48 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+bool llama_context::set_dflash_dev_inject(bool enable) {
+    if (!enable) {
+        cparams.dflash_dev_inject = nullptr;
+        dev_inject_buf.reset();
+        dev_inject_ctx.reset();
+        return true;
+    }
+    if (model.arch != LLM_ARCH_DFLASH) {
+        LLAMA_LOG_WARN("%s: dflash dev inject requires a DFlash draft model\n", __func__);
+        return false;
+    }
+    if (cparams.dflash_dev_inject) {
+        return true;
+    }
+    // place the buffer on the first GPU backend (the drafter's offload device), else the CPU backend
+    ggml_backend_t backend = backend_cpu;
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            backend = b.get();
+            break;
+        }
+    }
+    if (!backend) {
+        return false;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+    dev_inject_ctx.reset(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(dev_inject_ctx.get(), GGML_TYPE_F32, model.hparams.n_embd, cparams.n_ubatch);
+    ggml_set_name(t, "dflash_dev_inject");
+    dev_inject_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(dev_inject_ctx.get(), ggml_backend_get_default_buffer_type(backend)));
+    if (!dev_inject_buf) {
+        dev_inject_ctx.reset();
+        return false;
+    }
+    cparams.dflash_dev_inject = t;
+    LLAMA_LOG_INFO("%s: DFlash dev inject on: %s buffer [%lld, %u] (%.2f MiB)\n", __func__,
+            ggml_backend_name(backend), (long long) model.hparams.n_embd, cparams.n_ubatch,
+            ggml_backend_buffer_get_size(dev_inject_buf.get()) / 1048576.0);
+    return true;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2024,7 +2066,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // extract nextn embeddings (hidden state before the final output norm)
-    if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+    // (dev inject: the encoder graph wrote it to the persistent device buffer instead; no D2H)
+    if (embd_nextn.data && t_h_nextn && !cparams.dflash_dev_inject && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
@@ -4473,6 +4516,14 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_set_dflash_dev_inject(llama_context * ctx, bool enable) {
+    return ctx->set_dflash_dev_inject(enable);
+}
+
+bool llama_get_dflash_dev_inject(const llama_context * ctx) {
+    return ctx->get_dflash_dev_inject();
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -1332,6 +1332,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<llama_token> batch_lili_tokens;
 
     bool    is_dflash2     = false;
+    // Q8-SERVED-DEV-INJECT-1 (LLAMA_DFLASH_DEV_INJECT=1): encoder output stays on the device; the
+    // KV-inject decode reads it from ctx_dft's persistent buffer (no D2H, host copy, H2D or sync)
+    bool    dev_inject     = false;
     // DeepSeek-V4.1-Flash DSpark (arch "deepseek41-dspark"). Same two-phase hand-off as DFlash --
     // llama_encode projects the concatenated target features, llama_decode writes the ring -- but
     // the projection weights are blk.0.dspark_main_proj / dspark_main_norm (model.py:1113-1114,
@@ -1521,6 +1524,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 and LiLiCorr read their lattice from h_nextn and never consume raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
 
+        {
+            const char * env = getenv("LLAMA_DFLASH_DEV_INJECT");
+            if (env && atoi(env) != 0) {
+                if (is_dflash2 && !is_lilicorr && !is_dspark && !is_dspark41 && n_seq == 1) {
+                    dev_inject = llama_set_dflash_dev_inject(ctx_dft, true);
+                }
+                LOG_INF("%s: LLAMA_DFLASH_DEV_INJECT=%s -> dev_inject=%d (dflash2=%d np=%d)\n",
+                        __func__, env, (int) dev_inject, (int) is_dflash2, (int) n_seq);
+            }
+        }
+
         // Generic DFlash uses a non-causal noise block; Laguna is trained causal.
         bool causal = false;
         {
@@ -1680,8 +1694,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+                // dev inject: the encoder output is in ctx_dft's device buffer; reading it here would sync + D2H
+                const float * inp_g = dev_inject ? nullptr : llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT((dev_inject || inp_g) && "DFlash encoder produced no output.");
 
                 if (is_lilicorr) {
                     // keep the projected rows of the last block_size + 1 positions: the next draft block
@@ -1703,7 +1718,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // inject the draft decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                if (!dev_inject) {
+                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                }
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[rows[offset + i]];
@@ -1718,8 +1735,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
 
-                // The server may switch contexts before the next draft decode.
-                llama_synchronize(ctx_dft);
+                // The server may switch contexts before the next draft decode. Dev inject has no host
+                // buffer in flight (batch_inject.embd is not read), and ctx_dft's stream orders the draft.
+                if (!dev_inject) {
+                    llama_synchronize(ctx_dft);
+                }
             }
         }
 
