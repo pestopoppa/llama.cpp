@@ -3191,7 +3191,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*512 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -7244,6 +7244,140 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// Q38FN-GEMV2: Qwen3.8-Flash-Next served-shape MUL_MAT_ID. routing=indep: every row draws its own n_used of
+// n_mats experts (an n-row verify batch touches ~n*n_used distinct experts, the no-overlap bound);
+// routing=shared: all n rows route to the SAME n_used experts (the full-overlap bound). The n=1 vs n=5 time
+// ratio of the shared case isolates per-row weight re-reads (no reuse => ~5x; perfect reuse => ~1x).
+// Q38FN_GEMV_FAST_INIT=1 (perf mode only): fill quantized weights with bounded random bytes instead of
+// quantizing 0.8 G floats per case (fp16 fields stay finite: every byte < 0x40); timing-only, never compare.
+static bool q38fn_fast_init() {
+    const char * s = std::getenv("Q38FN_GEMV_FAST_INIT");
+    return s && std::atoi(s) != 0;
+}
+static void q38fn_init_weight(ggml_tensor * t) {
+    if (!q38fn_fast_init() || !ggml_is_quantized(t->type)) { init_tensor_uniform(t); return; }
+    std::mt19937 rng = suite_seed_rng();
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    for (auto & b : buf) b = (uint8_t) (rng() & 0x3f);
+    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+}
+struct test_mul_mat_id_q38fn : public test_mul_mat_id {
+    const bool shared;
+    test_mul_mat_id_q38fn(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool shared)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), shared(shared) {}
+    std::string vars() override { return test_mul_mat_id::vars() + (shared ? ",routing=shared" : ",routing=indep"); }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng = suite_seed_rng();
+        std::vector<int32_t> base(n_mats);
+        for (int i = 0; i < n_mats; i++) base[i] = i;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                std::shuffle(base.begin(), base.end(), rng);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    if (!shared && r > 0) std::shuffle(base.begin(), base.end(), rng);
+                    ggml_backend_tensor_set(t, base.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (t->type == type_a) {
+                q38fn_init_weight(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+struct test_mul_mat_q38fn : public test_mul_mat {
+    test_mul_mat_q38fn(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    std::string vars() override { return test_mul_mat::vars() + ",q38fn=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            q38fn_init_weight(t);
+        }
+    }
+};
+
+// Q38FN-GEMV2: L-layer chains so the perf loop streams weights from DRAM instead of re-reading an
+// L3-resident working set (a single MUL_MAT_ID repeated with fixed ids keeps its ~10-50 experts hot).
+// moe chain: x[k,n_used,n] -> per layer: mmid(gate_l: type_g, k->m) -> mmid(down_l: type_d, m->k) -> next.
+// hc chain: x[2560,n] -> per layer: Q8_0 2560->10240 -> 10240->320 -> 320->10240 -> first 2560 cols -> next.
+// Values are unnormalised (timing only; use under Q38FN_GEMV_FAST_INIT, never compare in test mode).
+struct test_q38fn_moe_chain : public test_case {
+    const ggml_type type_g, type_d; const int n_mats, n_used, n_layers; const int64_t m, n, k; const bool shared;
+    test_q38fn_moe_chain(ggml_type tg, ggml_type td, int n_mats, int n_used, int n_layers, int64_t m, int64_t n, int64_t k, bool shared)
+        : type_g(tg), type_d(td), n_mats(n_mats), n_used(n_used), n_layers(n_layers), m(m), n(n), k(k), shared(shared) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "Q38FN_MOE_CHAIN"; }
+    std::string vars() override {
+        return VARS_TO_STR8(type_g, type_d, n_mats, n_used, n_layers, m, n, k) + (shared ? ",routing=shared" : ",routing=indep");
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e30; }
+    // perf mode re-adds `out` (n_runs-1) times, which would time an L3-hot repeat of the last op; a huge
+    // flop count forces n_runs = 1 so every timed compute streams the whole chain once.
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return UINT64_C(1) << 50; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(x, "x");
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * g = ggml_new_tensor_3d(ctx, type_g, k, m, n_mats);
+            ggml_tensor * d = ggml_new_tensor_3d(ctx, type_d, m, k, n_mats);
+            ggml_tensor * h = ggml_mul_mat_id(ctx, g, x, ids);   // [m, n_used, n]
+            x = ggml_mul_mat_id(ctx, d, h, ids);                 // [k, n_used, n]
+        }
+        ggml_set_name(x, "out");
+        return x;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng = suite_seed_rng();
+        std::vector<int32_t> base(n_mats);
+        for (int i = 0; i < n_mats; i++) base[i] = i;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                std::shuffle(base.begin(), base.end(), rng);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    if (!shared && r > 0) std::shuffle(base.begin(), base.end(), rng);
+                    ggml_backend_tensor_set(t, base.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                q38fn_init_weight(t);
+            }
+        }
+    }
+};
+struct test_q38fn_hc_chain : public test_case {
+    const int n_layers; const int64_t n;
+    test_q38fn_hc_chain(int n_layers, int64_t n) : n_layers(n_layers), n(n) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "Q38FN_HC_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR2(n_layers, n); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e30; }
+    // perf mode re-adds `out` (n_runs-1) times, which would time an L3-hot repeat of the last op; a huge
+    // flop count forces n_runs = 1 so every timed compute streams the whole chain once.
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return UINT64_C(1) << 50; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, n);
+        ggml_set_name(x, "x");
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 10240);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 10240, 320);
+            ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 320, 10240);
+            ggml_tensor * y = ggml_mul_mat(ctx, c, ggml_mul_mat(ctx, b, ggml_mul_mat(ctx, a, x)));  // [10240, n]
+            x = ggml_cont(ctx, ggml_view_2d(ctx, y, 2560, n, y->nb[1], 0));
+        }
+        ggml_set_name(x, "out");
+        return x;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            q38fn_init_weight(t);
+        }
     }
 };
 
@@ -15499,6 +15633,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Qwen3.6-35B-A3B routed experts (256 experts, top-8, hidden 2048, expert ffn 512): ffn_gate_exps / ffn_up_exps
     // (m=512, k=2048) and ffn_down_exps (m=2048, k=512), Q8_0, at 1..16 verify rows. Used to read achieved GB/s of the
     // few-row expert GEMMs (the op's own byte count is all experts; the row scales it by the expected unique experts).
+    // Q38FN-GEMV2 (opt-in): Qwen3.8-Flash-Next served CPU weight-GEMV shapes at decode (n=1) and MTP verify
+    // (n=5). Routed experts 512/top-10: gate and up IQ3_S [k=2560 -> m=640], down IQ4_NL [640 -> 2560];
+    // hc_* Q8_0 [2560->10240], [10240->320], [320->10240]; lm_head Q6_K [2560 -> 248320].
+    //   TEST_BACKEND_OPS_EXTRA_CASES=q38fn_gemv test-backend-ops {perf|test} -b CPU -o MUL_MAT_ID|MUL_MAT
+    if (test_backend_ops_extra_case_set("q38fn_gemv")) {
+        for (int64_t n : {1, 2, 5, 8}) {
+            for (bool shared : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_q38fn(GGML_TYPE_IQ3_S,  512, 10, 640,  n, 2560, shared));
+                test_cases.emplace_back(new test_mul_mat_id_q38fn(GGML_TYPE_IQ4_NL, 512, 10, 2560, n, 640,  shared));
+            }
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 10240,  n, 2560));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 320,    n, 10240));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 10240,  n, 320));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q6_K, 248320, n, 2560));
+        }
+    }
     if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
         for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));
@@ -15709,6 +15859,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     dtree_add_q8mf_perf_cases(test_cases);      // DTREE-0-Q8MF-V2
     // DTREE-A3B-MOE-ROOFLINE: perf mode builds make_test_cases_perf(), not make_test_cases_eval(), so the opt-in set is listed here too
     // (same 18 cases as the eval block): TEST_BACKEND_OPS_EXTRA_CASES=a3b_moe_roofline test-backend-ops perf -b ROCm0 -o MUL_MAT_ID -p type_a=q8_0
+    // Q38FN-GEMV2 (opt-in): Qwen3.8-Flash-Next served CPU weight-GEMV shapes at decode (n=1) and MTP verify
+    // (n=5). Routed experts 512/top-10: gate and up IQ3_S [k=2560 -> m=640], down IQ4_NL [640 -> 2560];
+    // hc_* Q8_0 [2560->10240], [10240->320], [320->10240]; lm_head Q6_K [2560 -> 248320].
+    //   TEST_BACKEND_OPS_EXTRA_CASES=q38fn_gemv test-backend-ops {perf|test} -b CPU -o MUL_MAT_ID|MUL_MAT
+    if (test_backend_ops_extra_case_set("q38fn_gemv_chain")) {
+        for (int64_t n : {1, 5}) {
+            for (bool shared : {false, true}) {
+                test_cases.emplace_back(new test_q38fn_moe_chain(GGML_TYPE_IQ3_S,  GGML_TYPE_IQ4_NL, 128, 10, 48, 640, n, 2560, shared));
+                test_cases.emplace_back(new test_q38fn_moe_chain(GGML_TYPE_IQ3_S,  GGML_TYPE_IQ3_S,  128, 10, 48, 640, n, 2560, shared));
+                test_cases.emplace_back(new test_q38fn_moe_chain(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, 128, 10, 48, 640, n, 2560, shared));
+            }
+            test_cases.emplace_back(new test_q38fn_hc_chain(24, n));
+        }
+    }
+    if (test_backend_ops_extra_case_set("q38fn_gemv")) {
+        for (int64_t n : {1, 2, 5, 8}) {
+            for (bool shared : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_q38fn(GGML_TYPE_IQ3_S,  512, 10, 640,  n, 2560, shared));
+                test_cases.emplace_back(new test_mul_mat_id_q38fn(GGML_TYPE_IQ4_NL, 512, 10, 2560, n, 640,  shared));
+            }
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 10240,  n, 2560));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 320,    n, 10240));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q8_0, 10240,  n, 320));
+            test_cases.emplace_back(new test_mul_mat_q38fn(GGML_TYPE_Q6_K, 248320, n, 2560));
+        }
+    }
     if (test_backend_ops_extra_case_set("a3b_moe_roofline")) {
         for (int64_t n : {1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, n, 2048));

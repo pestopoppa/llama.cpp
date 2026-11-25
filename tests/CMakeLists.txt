@@ -226,6 +226,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-dsv41-dspark-mask.cpp)
     llama_build_and_test(test-dsv41-dspark-width.cpp)
     llama_build_and_test(test-mtp-svd-head.cpp)
+    llama_build_and_test(test-q38fn-iq4nl-dispatch.cpp ARGS repack) # Q38FN-GEMV2 F1: server-shaped buffer choice + dispatch
+    llama_build(test-q38fn-mmid-err.cpp) # Q38FN-GEMV2 KLD diagnosis: served-shape MMID error vs f64
     llama_build_and_test(test-kld-ear.cpp)
     target_include_directories(test-kld-ear PRIVATE ${PROJECT_SOURCE_DIR}/tools/perplexity)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
