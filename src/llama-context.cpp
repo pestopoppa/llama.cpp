@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -3152,6 +3153,133 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // state save/load
 //
 
+//
+// CKPT-COPY-1 (LLAMA_CKPT_PINNED=1, default off): stage the deferred state-save/restore tensor copies through ONE
+// reused pinned host buffer per device. Without it every write_tensor/read_tensor is a synchronous
+// ggml_backend_tensor_get/set between device memory and the caller's pageable std::vector, which the HIP runtime
+// serves through its pageable path (per-call pin or bounce + sync). With it, each copy is a pinned DMA, then one host
+// memcpy into the destination. The bytes copied are the same bytes in the same order: the blob is byte-identical.
+//
+static bool llama_ckpt_pinned_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_CKPT_PINNED");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            LLAMA_LOG_INFO("llama_ckpt_pinned: CKPT-COPY-1 pinned staging enabled (LLAMA_CKPT_PINNED=1)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+struct llama_ckpt_stage {
+    ggml_backend_buffer_type_t host_buft = nullptr;
+    ggml_backend_buffer_t      buf       = nullptr;
+    size_t                     size      = 0;
+};
+
+// one lock for the staging buffers: a flush holds it from llama_ckpt_stage_get to its last copy
+static std::mutex llama_ckpt_stage_mtx;
+
+// returns a pinned staging pointer of at least `need` bytes for tensors of `buffer`, or nullptr (fall back).
+// the caller holds llama_ckpt_stage_mtx.
+static uint8_t * llama_ckpt_stage_get(ggml_backend_buffer_t buffer, size_t need) {
+    static std::vector<llama_ckpt_stage> stages;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    ggml_backend_buffer_type_t hbt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbt == nullptr) {
+        return nullptr;
+    }
+    for (auto & st : stages) {
+        if (st.host_buft == hbt) {
+            if (st.size < need) {
+                ggml_backend_buffer_free(st.buf);
+                st.buf  = ggml_backend_buft_alloc_buffer(hbt, need);
+                st.size = st.buf ? need : 0;
+            }
+            return st.buf ? (uint8_t *) ggml_backend_buffer_get_base(st.buf) : nullptr;
+        }
+    }
+    llama_ckpt_stage st;
+    st.host_buft = hbt;
+    st.buf  = ggml_backend_buft_alloc_buffer(hbt, need);
+    st.size = st.buf ? need : 0;
+    stages.push_back(st);
+    return st.buf ? (uint8_t *) ggml_backend_buffer_get_base(st.buf) : nullptr;
+}
+
+// t: tensor, p: caller host pointer, n: bytes, o: tensor offset. to_host = save (D2H) else restore (H2D).
+template <bool to_host, typename T>
+static void llama_ckpt_flush(const std::vector<T> & infos) {
+    // group the device-resident copies by buffer type; host-resident tensors copy directly
+    size_t dev_bytes = 0;
+    ggml_backend_buffer_t first = nullptr;
+    bool one_buft = true;
+    for (const auto & w : infos) {
+        if (ggml_backend_buffer_is_host(w.tensor->buffer)) {
+            continue;
+        }
+        if (first == nullptr) {
+            first = w.tensor->buffer;
+        } else if (ggml_backend_buffer_get_type(w.tensor->buffer) != ggml_backend_buffer_get_type(first)) {
+            one_buft = false;
+        }
+        dev_bytes += w.size;
+    }
+    std::lock_guard<std::mutex> lock(llama_ckpt_stage_mtx);
+    uint8_t * stage = (first != nullptr && one_buft) ? llama_ckpt_stage_get(first, dev_bytes) : nullptr;
+    const int64_t t0 = ggml_time_us();
+    if (stage == nullptr) {
+        if (dev_bytes > 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("llama_ckpt_pinned: no pinned staging buffer (%s) - pageable fallback\n",
+                        one_buft ? "host buffer type unavailable or alloc failed" : "mixed device buffer types");
+            }
+        }
+        for (const auto & w : infos) {
+            if constexpr (to_host) {
+                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+            } else {
+                ggml_backend_tensor_set(w.tensor, w.ptr, w.offset, w.size);
+            }
+        }
+        return;
+    }
+    size_t off = 0;
+    if constexpr (to_host) {
+        for (const auto & w : infos) {
+            if (ggml_backend_buffer_is_host(w.tensor->buffer)) {
+                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+                continue;
+            }
+            ggml_backend_tensor_get(w.tensor, stage + off, w.offset, w.size);
+            off += w.size;
+        }
+        off = 0;
+        for (const auto & w : infos) {
+            if (!ggml_backend_buffer_is_host(w.tensor->buffer)) {
+                memcpy(w.ptr, stage + off, w.size);
+                off += w.size;
+            }
+        }
+    } else {
+        for (const auto & w : infos) {
+            if (ggml_backend_buffer_is_host(w.tensor->buffer)) {
+                ggml_backend_tensor_set(w.tensor, w.ptr, w.offset, w.size);
+                continue;
+            }
+            memcpy(stage + off, w.ptr, w.size);
+            ggml_backend_tensor_set(w.tensor, stage + off, w.offset, w.size);
+            off += w.size;
+        }
+    }
+    LLAMA_LOG_INFO("llama_ckpt_pinned: %s n_xfer=%zu dev_bytes=%zu us=%lld\n", to_host ? "save" : "restore",
+            infos.size(), dev_bytes, (long long) (ggml_time_us() - t0));
+}
+
 class llama_io_write_dummy : public llama_io_write_i {
 public:
     llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
@@ -3212,8 +3340,12 @@ public:
         }
 #else
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        if (llama_ckpt_pinned_enabled()) {
+            llama_ckpt_flush<true>(winfos);
+        } else {
+            for (const auto & winfo : winfos) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
         }
 #endif
     }
@@ -3295,8 +3427,12 @@ public:
         }
 #else
         // flush the reads
-        for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+        if (llama_ckpt_pinned_enabled()) {
+            llama_ckpt_flush<false>(rinfos);
+        } else {
+            for (const auto & rinfo : rinfos) {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
         }
 #endif
     }
