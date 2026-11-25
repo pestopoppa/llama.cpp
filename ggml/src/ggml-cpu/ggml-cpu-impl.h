@@ -538,6 +538,15 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
+// AK-CPU-CONV-STATE-FWD (GGML_CONV_STATE_FWD, default off): CPU-private tensor flag bits set for the
+// duration of one ggml_graph_compute. CONV_SKIP marks a conv-state GET_ROWS whose rows the CONCAT reads
+// straight from the cache; CONV_FWD marks that CONCAT.
+#define GGML_CPU_TFLAG_CONV_SKIP (1 << 25)
+#define GGML_CPU_TFLAG_CONV_FWD  (1 << 26)
+// returns true and sets R (the skipped GET_ROWS) when concat reads its src0 rows from the cache
+bool ggml_cpu_conv_fwd_lookup(const struct ggml_compute_params * params, const struct ggml_tensor * concat,
+                              const struct ggml_tensor ** R);
+
 #if defined(GGML_USE_IQK_MULMAT)
 // iqk port: dense quantized-GEMM fast path (ik_llama kernels); returns true if it
 // handled the mul_mat (env GGML_IQK=1 + supported type/dims), false to fall through.

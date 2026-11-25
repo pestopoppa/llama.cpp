@@ -2433,12 +2433,58 @@ static void ggml_compute_forward_concat_f32(
     }
 }
 
+// AK-CPU-CONV-STATE-FWD: dim-0 concat whose src0 GET_ROWS was skipped -- src0 row (i1, i2) is read from
+// cache row idx[i2] of the GET_ROWS source at the same in-row offset. Same bytes, same row partition.
+static void ggml_compute_forward_concat_conv_fwd(
+    const ggml_compute_params * params,
+    ggml_tensor * dst,
+    const ggml_tensor * R) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * rs   = R->src[0];
+    const int32_t     * idx  = (const int32_t *) R->src[1]->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne03 == 1 && ne3 == 1);
+    GGML_ASSERT(nb00 == sizeof(float) && nb0 == sizeof(float)); // src1 may be transposed (strided nb10)
+
+    const int64_t n_rows = ne1 * ne2;
+    const int64_t dr     = (n_rows + nth - 1) / nth;
+    const int64_t r0     = dr * ith;
+    const int64_t r1     = std::min(r0 + dr, n_rows);
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i1 = r % ne1;
+        const int64_t i2 = r / ne1;
+        char * y = (char *) dst->data + i1*nb1 + i2*nb2;
+        const char * x0 = (const char *) rs->data + (size_t) idx[i2] * rs->nb[1] + i1*nb01;
+        memcpy(y, x0, ne00 * sizeof(float));
+        const char * x1 = (const char *) src1->data + i1*nb11 + i2*nb12;
+        for (int64_t i0 = 0; i0 < ne10; ++i0) {
+            memcpy(y + (ne00 + i0)*nb0, x1 + i0*nb10, sizeof(float));
+        }
+    }
+}
+
 void ggml_compute_forward_concat(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    {
+        const ggml_tensor * fwd_R = nullptr;
+        if ((dst->flags & GGML_CPU_TFLAG_CONV_FWD) && ggml_cpu_conv_fwd_lookup(params, dst, &fwd_R)) {
+            ggml_compute_forward_concat_conv_fwd(params, dst, fwd_R);
+            return;
+        }
+    }
 
     if (ggml_is_quantized(src0->type)) {
         GGML_ASSERT(ggml_is_contiguous_rows(src0));
