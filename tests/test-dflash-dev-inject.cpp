@@ -238,14 +238,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // LLAMA_TEST_INJECT_AA=1: A/A control - the second arm also runs with dev inject OFF, so any divergence is
+    // drafter/target nondeterminism, not the inject path (diagnostic for the 20261125 devhandoff r3/r4 smokes)
+    const char * aa_env = getenv("LLAMA_TEST_INJECT_AA");
+    const bool aa = aa_env != nullptr && atoi(aa_env) != 0;
+    fprintf(stderr, "mode: %s\n", aa ? "AA (OFF vs OFF)" : "AB (OFF vs ON)");
     int n_fail = 0;
     bool engaged_all = true;
     double ms_off = 0, ms_on = 0;
     size_t rounds_total = 0;
     for (size_t k = 0; k < prompts.size(); ++k) {
         const run_trace off = run_once(params, model_tgt, prompts[k], false);
-        const run_trace on  = run_once(params, model_tgt, prompts[k], true);
-        engaged_all = engaged_all && on.engaged && !off.engaged;
+        const run_trace on  = run_once(params, model_tgt, prompts[k], !aa);
+        engaged_all = engaged_all && (aa ? !on.engaged : on.engaged) && !off.engaged;
         size_t n_acc_off = 0;
         for (int a : off.accepted) n_acc_off += a > 0 ? a : 0;
         const bool same = off.ok && on.ok && off.drafts == on.drafts && off.accepted == on.accepted && off.output == on.output;
