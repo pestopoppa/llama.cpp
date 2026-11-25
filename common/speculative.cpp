@@ -1847,6 +1847,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     dp.tree_alts->clear();
                 }
                 dflash2_draft_log(result, n_block_tokens - 1, "dev");
+                // same tail as the host DFlash2 branch: n_min trim, then next sequence. Without the continue the
+                // block fell through to the plain-DFlash sampler loop, which samples ctx_dft logits a DFlash2
+                // drafter never produces (GGML_ASSERT(logits != nullptr), 20261125 devhandoff smoke)
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
             } else if (is_dflash2) {
                 GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
