@@ -124,7 +124,15 @@ static int gv_group_rows(const int n_q, const int gqa, const int n_su) {
 // what the nq 8 shapes pay for a wide split) and so every split streams >= 8 chunks (128 keys). The merge is unchanged
 // and sums splits in index order, so the result is deterministic run to run.
 static bool gv_vattn_rf() {
-    static const bool v = gv_env_int("GGML_HIP_VATTN_RF", 0) != 0;
+    static const int v = gv_env_int("GGML_HIP_VATTN_RF", 0);
+    return v != 0 && v != 7;
+}
+
+// GGML_HIP_VATTN_RF=7 (C22 VATTN-ROOFLINE-5, default OFF): wave-independent split-K streaming kernel (gv7_kernel below).
+// Selected only for the single-sequence q8_0 shapes (n_vseq 1, no row list, R = gqa*n_q <= 64, aligned views); every
+// other call keeps the C21 path. RF=7 does not enable RF1.
+static bool gv_vattn_rf7() {
+    static const bool v = gv_env_int("GGML_HIP_VATTN_RF", 0) == 7;
     return v;
 }
 
@@ -667,6 +675,415 @@ static __global__ void gv_merge_kernel(
     dst[(((int64_t) seq * n_q_tot + q) * n_head + hkv * gqa + h) * GV_D + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// GGML_HIP_VATTN_RF=7: wave-independent split-K streaming verify attention for q8_0 K/V (design:
+// /mnt/raid0/llm/tmp/vattn-rf7-design-20261125.md). No LDS and no barrier inside the key loop: each wave streams its own
+// 16-key chunks global -> VGPR straight into the MFMA operands, with the next chunk's loads in flight while it computes.
+//   S^T[key][row] = K Q^T : A = K  (lane l%16 = key, kq = l/16 owns d in [64kq, 64kq+64) = two whole q8_0 blocks, 68 B,
+//                                   4-byte aligned -> 4 dwordx4 + 1 dword), B = Q^T (Q fragments resident).
+//   The S^T D layout (lane l%16 = row, 4 consecutive keys per lane) is exactly the B operand of
+//   O^T[d][row] = V^T P^T, so P never leaves the registers. A = V^T with the d permutation d = 16*(l%16) + n for output
+//   tile n: lane l%16 = i reads 16 contiguous bytes (one half of q8_0 block i/2) of each of its 4 keys.
+//   Every O^T value a lane holds belongs to its row l%16, so the online-softmax rescale is a per-lane scalar.
+// A workgroup is 4 waves on one (row tile, split, KV head) sharing the Q tile in LDS (read-only after one barrier); wave
+// w takes chunks cb + w, cb + w + 4, ...; per wave one K set (issued right after the previous QK^T) and one V set
+// (issued right after the previous PV) are in flight. The 4 wave partials are combined once per split in LDS in a fixed
+// order, then a parallel merge combines the splits in index order: deterministic run to run.
+#define GV7_WAVES 4
+#define GV7_KC    16
+
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+typedef uint32_t gv7_u32x4 __attribute__((ext_vector_type(4)));
+typedef gv7_u32x4 gv7_u32x4_a4 __attribute__((aligned(4)));
+typedef uint32_t gv7_u32x2 __attribute__((ext_vector_type(2)));
+typedef _Float16 gv7_halfx2 __attribute__((ext_vector_type(2)));
+
+// K group of one chunk (issued right after the previous chunk's QK^T) and V group (issued right after its PV): one
+// register set each, so a wave holds 17 + 2 + 24 raw dwords instead of two full chunks.
+struct gv7_kraw {
+    gv7_u32x4 k[4];   // K bytes [68kq, 68kq+64) of key c0 + l%16
+    uint32_t  k16;    // K bytes [68kq+64, 68kq+68)
+    gv7_u32x2 m;      // 4 f16 mask values (keys c0 + 4kq .. +3, query row of lane l%16)
+};
+struct gv7_vraw {
+    uint32_t  vs[4];  // dword holding the V block scale, keys c0 + 4kq + t
+    gv7_u32x4 v[4];   // V 16-byte window (dword aligned) of the lane's half block
+    uint32_t  v4[4];  // 5th window dword (alignment spill)
+};
+
+// uniform (SGPR) chunk bases + 32-bit lane offsets, so the loads use the saddr form and hold no 64-bit VGPR pointers
+static __device__ __forceinline__ void gv7_load_k(gv7_kraw & r, const char * __restrict__ kc, const uint32_t koff,
+        const char * __restrict__ mc, const uint32_t moff) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        r.k[i] = *(const gv7_u32x4_a4 *) (kc + koff + 16 * i);
+    }
+    r.k16 = *(const uint32_t *) (kc + koff + 64);
+    r.m   = *(const gv7_u32x2 *) (mc + moff);
+}
+
+static __device__ __forceinline__ void gv7_load_v(gv7_vraw & r, const char * __restrict__ vc, const int64_t nb21,
+        const uint32_t vsoff, const uint32_t vwoff, const uint32_t v4off) {
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const char * p = vc + t * nb21;
+        r.vs[t] = *(const uint32_t *) (p + vsoff);
+        r.v[t]  = *(const gv7_u32x4_a4 *) (p + vwoff);
+        r.v4[t] = *(const uint32_t *) (p + v4off);
+    }
+}
+
+// 4 signed bytes of x -> 4 halves * s2 (exact integer via the 0x6400 magic, one f16 rounding in the scale product)
+static __device__ __forceinline__ gv_halfx4 gv7_deq4(uint32_t x, const gv7_halfx2 s2) {
+    x ^= 0x80808080u;
+    const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, x, 0x04010400u);
+    const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, x, 0x04030402u);
+    const gv7_halfx2 off = {(_Float16) 1152.0f, (_Float16) 1152.0f};
+    const gv7_halfx2 a = (__builtin_bit_cast(gv7_halfx2, lo) - off) * s2;
+    const gv7_halfx2 b = (__builtin_bit_cast(gv7_halfx2, hi) - off) * s2;
+    return (gv_halfx4) {a.x, a.y, b.x, b.y};
+}
+
+// S^T = K Q^T over d (16 MFMA steps, d = 64kq + 4s + t); Q^T fragments read from LDS (row stride GV7_QSTR halves)
+static __device__ __forceinline__ gv_floatx4 gv7_qk(const gv7_kraw & r, const _Float16 * __restrict__ sq) {
+    uint32_t kd[17];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        kd[i] = r.k[i / 4][i % 4];
+    }
+    kd[16] = r.k16;
+    const _Float16 ks0 = __builtin_bit_cast(_Float16, (uint16_t) (kd[0] & 0xffffu));
+    const _Float16 ks1 = __builtin_bit_cast(_Float16, (uint16_t) (kd[8] >> 16));
+    const gv7_halfx2 ks0x2 = {ks0, ks0};
+    const gv7_halfx2 ks1x2 = {ks1, ks1};
+    gv_floatx4 S = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+        const gv_halfx4 qb = *(const gv_halfx4 *) (sq + 4 * s);
+        const uint32_t x = s < 8 ? __builtin_amdgcn_alignbyte(kd[s + 1], kd[s], 2) : kd[s + 1];
+        const gv_halfx4 ka = gv7_deq4(x, s < 8 ? ks0x2 : ks1x2);
+        S = __builtin_amdgcn_mfma_f32_16x16x16f16(ka, qb, S, 0, 0, 0);
+    }
+    return S;
+}
+
+// online softmax over the lane's 4 keys of row l%16; returns P^T (the PV B operand) and the O rescale factor
+static __device__ __forceinline__ gv_halfx4 gv7_softmax(const gv_floatx4 S, const gv7_u32x2 mraw, float & m_run,
+        float & l_run, const float scale, float & alpha) {
+    const gv7_halfx2 mk01 = __builtin_bit_cast(gv7_halfx2, mraw.x);
+    const gv7_halfx2 mk23 = __builtin_bit_cast(gv7_halfx2, mraw.y);
+    float sv[4];
+    sv[0] = S[0] * scale + (float) mk01.x;
+    sv[1] = S[1] * scale + (float) mk01.y;
+    sv[2] = S[2] * scale + (float) mk23.x;
+    sv[3] = S[3] * scale + (float) mk23.y;
+    float mx = fmaxf(fmaxf(sv[0], sv[1]), fmaxf(sv[2], sv[3]));
+    mx = fmaxf(mx, __shfl_xor(mx, 16));
+    mx = fmaxf(mx, __shfl_xor(mx, 32));
+    const float m_new = fmaxf(m_run, mx);          // m_run starts at -FLT_MAX: finite even for an all -inf chunk
+    alpha = __expf(m_run - m_new);
+    m_run = m_new;
+    float p[4];
+    float psum = 0.0f;
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        p[v] = __expf(sv[v] - m_new);
+        psum += p[v];
+    }
+    l_run = l_run * alpha + psum;
+    return (gv_halfx4) {(_Float16) p[0], (_Float16) p[1], (_Float16) p[2], (_Float16) p[3]};
+}
+
+// O^T = V^T P^T, d = 16*(l%16) + n
+static __device__ __forceinline__ void gv7_pv(const gv7_vraw & r, const gv_halfx4 pb, const float alpha,
+        gv_floatx4 (&o)[GV_D / 16], const int vshift, const int sshift) {
+    uint32_t vq[4][4];
+    uint16_t sc[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        vq[t][0] = __builtin_amdgcn_alignbyte(r.v[t][1], r.v[t][0], vshift) ^ 0x80808080u;
+        vq[t][1] = __builtin_amdgcn_alignbyte(r.v[t][2], r.v[t][1], vshift) ^ 0x80808080u;
+        vq[t][2] = __builtin_amdgcn_alignbyte(r.v[t][3], r.v[t][2], vshift) ^ 0x80808080u;
+        vq[t][3] = __builtin_amdgcn_alignbyte(r.v4[t],   r.v[t][3], vshift) ^ 0x80808080u;
+        sc[t] = (uint16_t) ((r.vs[t] >> sshift) & 0xffffu);
+    }
+    const gv7_halfx2 vs01 = __builtin_bit_cast(gv7_halfx2, (uint32_t) sc[0] | ((uint32_t) sc[1] << 16));
+    const gv7_halfx2 vs23 = __builtin_bit_cast(gv7_halfx2, (uint32_t) sc[2] | ((uint32_t) sc[3] << 16));
+    const gv7_halfx2 off = {(_Float16) 1152.0f, (_Float16) 1152.0f};
+#pragma unroll
+    for (int n = 0; n < GV_D / 16; ++n) {
+        const int w = n / 4;
+        const int b = n % 4;
+        const uint32_t sel = (uint32_t) b | 0x0c00u | ((uint32_t) (4 + b) << 16) | 0x0c000000u;
+        const uint32_t x01 = __builtin_amdgcn_perm(vq[1][w], vq[0][w], sel) | 0x64006400u;
+        const uint32_t x23 = __builtin_amdgcn_perm(vq[3][w], vq[2][w], sel) | 0x64006400u;
+        const gv7_halfx2 a01 = (__builtin_bit_cast(gv7_halfx2, x01) - off) * vs01;
+        const gv7_halfx2 a23 = (__builtin_bit_cast(gv7_halfx2, x23) - off) * vs23;
+        const gv_halfx4 va = {a01.x, a01.y, a23.x, a23.y};
+        o[n] *= alpha;
+        o[n] = __builtin_amdgcn_mfma_f32_16x16x16f16(va, pb, o[n], 0, 0, 0);
+    }
+}
+#endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+
+#define GV7_QSTR  (GV_D + 8)     // sQ row stride (halves): 528 B, 16-byte aligned rows, 2-way banked fragment reads
+#define GV7_SLOT  ((GV_D / 16) * 4 * 64)   // floats: one wave's O^T partial (16 KB)
+
+// grid (row tile, split, KV head), 4 waves, 2 WG per CU (8 independent waves per CU; at the 3 WG/CU budget of 168
+// VGPRs the compiler spilled 44). Opart rows: ((split * n_head_kv + hkv) * R + r), MLpart = (max, sum).
+static __global__ void __launch_bounds__(64 * GV7_WAVES, 2) gv7_kernel(
+        const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
+        const char * __restrict__ mask, float * __restrict__ Opart, float2 * __restrict__ MLpart,
+        const float scale, const int n_q, const int gqa, const int n_head_kv, const int chunks_per_split, const int n_chunks,
+        const int64_t nb01, const int64_t nb02, const int64_t nb11, const int64_t nb12,
+        const int64_t nb21, const int64_t nb22, const int64_t nb31) {
+#if defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+    // sQ (16 x GV7_QSTR f16, 8.4 KB) during the key loop; one O slot (16 KB) for the end-of-split combine; sml apart
+    __shared__ float sbuf[GV7_SLOT];
+    __shared__ float sml[GV7_WAVES * 32];
+    _Float16 * sQ = (_Float16 *) sbuf;
+
+    const int tile  = blockIdx.x;
+    const int split = blockIdx.y;
+    const int hkv   = blockIdx.z;
+    const int tid   = threadIdx.x;
+    const int w     = __builtin_amdgcn_readfirstlane(tid / 64);
+    const int l     = tid % 64;
+    const int li    = l % 16;
+    const int kq    = l / 16;
+    const int R     = gqa * n_q;
+
+    // Q tile -> LDS as f16 [row][d]: thread -> row tid/16, 16 d at 16*(tid%16)
+    {
+        const int rr = tid / 16;
+        const int r  = 16 * tile + rr;
+        const bool ok = r < R;
+        const int h = ok ? r / n_q : 0;
+        const int q = ok ? r % n_q : 0;
+        const float4 * Qr = (const float4 *) (Q + (int64_t) (hkv * gqa + h) * nb02 + (int64_t) q * nb01) + 4 * (tid % 16);
+        float4 f[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            f[i] = ok ? Qr[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        gv_halfx4 hq[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            hq[i] = (gv_halfx4) {(_Float16) f[i].x, (_Float16) f[i].y, (_Float16) f[i].z, (_Float16) f[i].w};
+        }
+        gv_halfx4 * dq = (gv_halfx4 *) (sQ + rr * GV7_QSTR + 16 * (tid % 16));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            dq[i] = hq[i];
+        }
+    }
+    __syncthreads();
+    const _Float16 * sq = sQ + li * GV7_QSTR + 64 * kq;   // B operand of lane (row li, kq): + 4s per MFMA step
+
+    gv_floatx4 o[GV_D / 16];
+#pragma unroll
+    for (int n = 0; n < GV_D / 16; ++n) {
+        o[n] = (gv_floatx4) {0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    float m_run = -FLT_MAX;
+    float l_run = 0.0f;
+
+    const int  r     = 16 * tile + li;
+    const bool valid = r < R;
+    const int  qm    = valid ? r % n_q : 0;
+    // per-lane 32-bit byte offsets (the chunk / head part of every address is uniform)
+    const int vb     = li / 2;                       // q8_0 block of this lane's 16 d values
+    const int vh     = li % 2;
+    const int va     = 34 * vb + 2 + 16 * vh;        // first qs byte
+    const int vshift = va & 3;                       // 0 or 2
+    const int sshift = 8 * ((34 * vb) & 3);          // 0 or 16
+    const uint32_t vrow  = (uint32_t) (4 * kq) * (uint32_t) nb21;
+    const uint32_t vsoff = vrow + (uint32_t) ((34 * vb) & ~3);
+    const uint32_t vwoff = vrow + (uint32_t) (va & ~3);
+    const uint32_t v4off = vwoff + (vshift ? 16u : 12u); // never past the 272 B row
+    const uint32_t koff  = (uint32_t) li * (uint32_t) nb11 + 68u * (uint32_t) kq;
+    const uint32_t moff  = (uint32_t) qm * (uint32_t) nb31 + 8u * (uint32_t) kq;
+
+    const char * Kh = K + (int64_t) hkv * nb12;
+    const char * Vh = V + (int64_t) hkv * nb22;
+    const int cb = split * chunks_per_split;
+    const int ce = min(cb + chunks_per_split, n_chunks);
+
+#define GV7_KC_PTR(C_) (Kh + (int64_t) (C_) * GV7_KC * nb11)
+#define GV7_VC_PTR(C_) (Vh + (int64_t) (C_) * GV7_KC * nb21)
+#define GV7_MC_PTR(C_) (mask + (int64_t) (C_) * GV7_KC * 2)
+    gv7_kraw rk;
+    gv7_vraw rv;
+    int c = cb + w;
+    if (c < ce) {
+        gv7_load_k(rk, GV7_KC_PTR(c), koff, GV7_MC_PTR(c), moff);
+        gv7_load_v(rv, GV7_VC_PTR(c), nb21, vsoff, vwoff, v4off);
+    }
+    for (; c < ce; c += GV7_WAVES) {
+        const int cn = c + GV7_WAVES;
+        const gv_floatx4 S = gv7_qk(rk, sq);
+        const gv7_u32x2 mraw = rk.m;
+        if (cn < ce) {
+            gv7_load_k(rk, GV7_KC_PTR(cn), koff, GV7_MC_PTR(cn), moff);
+        }
+        float alpha;
+        const gv_halfx4 pb = gv7_softmax(S, mraw, m_run, l_run, scale, alpha);
+        gv7_pv(rv, pb, alpha, o, vshift, sshift);
+        if (cn < ce) {
+            gv7_load_v(rv, GV7_VC_PTR(cn), nb21, vsoff, vwoff, v4off);
+        }
+    }
+#undef GV7_KC_PTR
+#undef GV7_VC_PTR
+#undef GV7_MC_PTR
+
+    // row sum over the 4 kq lane groups (m_run is already uniform across them)
+    l_run += __shfl_xor(l_run, 16);
+    l_run += __shfl_xor(l_run, 32);
+
+    // ---- combine the 4 wave partials of this workgroup in a fixed order ((O3 + O2) + O1) + O0 -> deterministic
+    if (kq == 0) {
+        sml[w * 32 + li]      = m_run;
+        sml[w * 32 + 16 + li] = l_run;
+    }
+    __syncthreads();   // also: every wave is past its last sQ read, so sbuf may now hold O
+    float M = -FLT_MAX;
+#pragma unroll
+    for (int u = 0; u < GV7_WAVES; ++u) {
+        if (sml[u * 32 + 16 + li] > 0.0f) {
+            M = fmaxf(M, sml[u * 32 + li]);
+        }
+    }
+    float Lt = 0.0f;
+#pragma unroll
+    for (int u = GV7_WAVES - 1; u >= 0; --u) {
+        const float lu = sml[u * 32 + 16 + li];
+        Lt += lu > 0.0f ? __expf(sml[u * 32 + li] - M) * lu : 0.0f;
+    }
+    const float f_self = l_run > 0.0f ? __expf(m_run - M) : 0.0f;
+#pragma unroll
+    for (int n = 0; n < GV_D / 16; ++n) {
+        o[n] *= f_self;
+    }
+#pragma unroll
+    for (int u = GV7_WAVES - 1; u >= 0; --u) {
+        if (w == u) {
+            if (u < GV7_WAVES - 1) {
+#pragma unroll
+                for (int n = 0; n < GV_D / 16; ++n) {
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        o[n][v] += sbuf[(n * 4 + v) * 64 + l];
+                    }
+                }
+            }
+            if (u > 0) {
+#pragma unroll
+                for (int n = 0; n < GV_D / 16; ++n) {
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        sbuf[(n * 4 + v) * 64 + l] = o[n][v];
+                    }
+                }
+            }
+        }
+        if (u > 0) {
+            __syncthreads();
+        }
+    }
+    if (w == 0 && valid) {
+        const int64_t row = ((int64_t) split * n_head_kv + hkv) * R + r;
+        float * op = Opart + row * GV_D;
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+#pragma unroll
+            for (int n4 = 0; n4 < 4; ++n4) {
+                float4 f;
+                f.x = o[4 * n4 + 0][v];
+                f.y = o[4 * n4 + 1][v];
+                f.z = o[4 * n4 + 2][v];
+                f.w = o[4 * n4 + 3][v];
+                *(float4 *) (op + 16 * (4 * kq + v) + 4 * n4) = f;
+            }
+        }
+        if (kq == 0) {
+            MLpart[row] = make_float2(M, Lt);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, Opart, MLpart, scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
+                     nb01, nb02, nb11, nb12, nb21, nb22, nb31);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(AMD_MFMA_AVAILABLE)
+}
+
+// parallel deterministic split merge: one block per (row r, KV head), one thread per d; splits <= 256
+static __global__ void __launch_bounds__(GV_D) gv7_merge_kernel(
+        const float * __restrict__ Opart, const float2 * __restrict__ MLpart, float * __restrict__ dst,
+        const int n_splits, const int n_q, const int gqa, const int n_head_kv) {
+    __shared__ float sf[GV_D];
+    __shared__ float sl[GV_D];
+    __shared__ float swm[GV_D / 64];
+    const int r   = blockIdx.x;
+    const int hkv = blockIdx.y;
+    const int t   = threadIdx.x;
+    const int R   = gqa * n_q;
+
+    float m = -FLT_MAX;
+    float lv = 0.0f;
+    if (t < n_splits) {
+        const float2 ml = MLpart[((int64_t) t * n_head_kv + hkv) * R + r];
+        lv = ml.y;
+        m  = lv > 0.0f ? ml.x : -FLT_MAX;
+    }
+    float mx = m;
+#pragma unroll
+    for (int off = 32; off >= 1; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor(mx, off));
+    }
+    if (t % 64 == 0) {
+        swm[t / 64] = mx;
+    }
+    __syncthreads();
+    float M = swm[0];
+#pragma unroll
+    for (int u = 1; u < GV_D / 64; ++u) {
+        M = fmaxf(M, swm[u]);
+    }
+    const float f = (t < n_splits && lv > 0.0f) ? __expf(m - M) : 0.0f;
+    sf[t] = f;
+    sl[t] = f * lv;
+    __syncthreads();
+
+    float L = 0.0f;
+    float acc = 0.0f;
+    const float * op = Opart + ((int64_t) hkv * R + r) * GV_D + t;
+    const int64_t sstride = (int64_t) n_head_kv * R * GV_D;
+    int s = 0;
+    for (; s + 4 <= n_splits; s += 4) {
+        const float o0 = op[(s + 0) * sstride];
+        const float o1 = op[(s + 1) * sstride];
+        const float o2 = op[(s + 2) * sstride];
+        const float o3 = op[(s + 3) * sstride];
+        acc += sf[s + 0] * o0;
+        acc += sf[s + 1] * o1;
+        acc += sf[s + 2] * o2;
+        acc += sf[s + 3] * o3;
+        L += sl[s + 0];
+        L += sl[s + 1];
+        L += sl[s + 2];
+        L += sl[s + 3];
+    }
+    for (; s < n_splits; ++s) {
+        acc += sf[s] * op[s * sstride];
+        L   += sl[s];
+    }
+    const int h = r / n_q;
+    const int q = r % n_q;
+    const int n_head = n_head_kv * gqa;
+    dst[((int64_t) q * n_head + hkv * gqa + h) * GV_D + t] = L > 0.0f ? acc / L : 0.0f;
+}
+
 // GGML_CUDA_FA_GQA_VERIFY_DEBUG=1: the first 32 rejections of hd256 FA nodes are logged with their reason (WARN level, so that
 // llama-server's default verbosity shows them; ggml INFO lines are filtered there).
 static bool gv_reject(const ggml_tensor * dst, const char * why) {
@@ -801,6 +1218,43 @@ static void gv_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const bool rf7 = gv_vattn_rf7() && n_vseq == 1 && rows == nullptr && R <= 64 &&
+                     K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                     K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 &&
+                     (uintptr_t) K->data % 4 == 0 && (uintptr_t) V->data % 4 == 0 &&
+                     mask->nb[1] % 8 == 0 && (uintptr_t) mask->data % 8 == 0 &&
+                     Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && (uintptr_t) Q->data % 16 == 0;
+    if (rf7) {
+        const int nrt      = (R + 15) / 16;
+        const int n_chunks = n_kv / GV7_KC;
+        const int nsm      = ggml_cuda_info().devices[ctx.device].nsm;
+        // one resident round at 2 WG/CU (8 waves per CU), >= 4 chunks per wave
+        int n_splits = gv_splits_env() > 0 ? gv_splits_env() :
+            std::min(std::max(1, (2 * nsm) / (n_head_kv * nrt)), std::max(1, n_chunks / (4 * GV7_WAVES)));
+        n_splits = std::max(1, std::min(n_splits, std::min(n_chunks, GV_D)));
+        const int chunks_per_split = (n_chunks + n_splits - 1) / n_splits;
+        n_splits = (n_chunks + chunks_per_split - 1) / chunks_per_split;
+
+        const size_t n_rows_part = (size_t) n_splits * n_head_kv * R;
+        ggml_cuda_pool_alloc<float>  Opart(ctx.pool(), n_rows_part * GV_D);
+        ggml_cuda_pool_alloc<float2> MLpart(ctx.pool(), n_rows_part);
+        cudaStream_t stream = ctx.stream();
+        gv7_kernel<<<dim3(nrt, n_splits, n_head_kv), dim3(64 * GV7_WAVES), 0, stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            Opart.get(), MLpart.get(), scale, n_q, gqa, n_head_kv, chunks_per_split, n_chunks,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
+        CUDA_CHECK(cudaGetLastError());
+        gv7_merge_kernel<<<dim3(R, n_head_kv), dim3(GV_D), 0, stream>>>(
+            Opart.get(), MLpart.get(), (float *) dst->data, n_splits, n_q, gqa, n_head_kv);
+        CUDA_CHECK(cudaGetLastError());
+        static int n_rf7_calls = 0;
+        if (n_rf7_calls++ == 0) {
+            GGML_LOG_INFO("ggml_cuda_fattn_gqa_verify: GGML_HIP_VATTN_RF=7 wave-stream launch ran (splits=%d tiles=%d R=%d chunks/split=%d)\n",
+                n_splits, nrt, R, chunks_per_split);
+        }
+        return;
+    }
 
     const int kc       = cut ? GV_KC_CUT : GV_KC;
     const int n_chunks = n_kv / kc;

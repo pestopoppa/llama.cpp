@@ -14248,6 +14248,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, kv, 8, 1, GGML_TYPE_Q8_0, 1001));
     }
+    // C22 VATTN-ROOFLINE-5 (GGML_HIP_VATTN_RF=7, default off): uneven split/wave tails, 2- and 3-row-tile R (nq 3, 6),
+    // a split range shorter than 4 waves, a 2-stream call (falls back to C21) and the 16/2 A3B GQA.
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 3, 1, GGML_TYPE_Q8_0, 9));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 8192, 6, 1, GGML_TYPE_Q8_0, 77));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 768, 1, 1, GGML_TYPE_Q8_0, 17));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 24, 4, 4352, 8, 2, GGML_TYPE_Q8_0, 9));
+    test_cases.emplace_back(new test_fa_gqa_verify(256, 16, 2, 16384, 4, 1, GGML_TYPE_Q8_0, 41));
     // AK-GAP2 (gap census 2, sh)
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_shared_q81(GGML_TYPE_Q8_0, 2048, n, 2048));
