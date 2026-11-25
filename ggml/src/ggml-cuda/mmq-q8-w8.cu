@@ -23,7 +23,7 @@
 //     paged in LDS as [8][P][32 B] + [8][P] f32 (one page for K <= 6144 at P = 192), each lane reads its column's
 //     32 B + scale once per step and applies it to all 4 rows.
 // Deterministic (no atomics; lane 63 stores after the DPP reduce). Not bit-exact vs q8wv (different summation order).
-// Env: GGML_HIP_Q8W8=1 enables; GGML_HIP_Q8W8_DEPTH 2|3 (default 3); GGML_HIP_Q8W8_WAVES (max waves per WG, <= 8,
+// Env: GGML_HIP_Q8W8=1 enables design 1, =2 design 3 (q8wo, below; GGML_HIP_Q8W8_YT 2|4, default 2); GGML_HIP_Q8W8_DEPTH 2|3 (default 3); GGML_HIP_Q8W8_WAVES (max waves per WG, <= 8,
 //      default 8); GGML_HIP_Q8W8_MIN_BYTES (default 8 MiB, weight strictly larger; 27B attn_k/v stays stock).
 #include "mmq-q8-w8.cuh"
 
@@ -36,6 +36,7 @@
 #define Q8W8_STEP    64      // blocks per step = lanes per wave
 #define Q8W8_LDS_B   65536
 #define Q8W8_MAXWAVE 8
+#define Q8WO_MAXWAVE 16     // design 3: 1024-thread WG, 4 waves/SIMD at <= 128 VGPR
 
 static int q8w8_env_int(const char * name, int def) {
     const char * v = getenv(name);
@@ -43,18 +44,24 @@ static int q8w8_env_int(const char * name, int def) {
 }
 
 struct q8w8_cfg {
-    bool enabled; int depth; int waves; int64_t min_bytes;
+    bool enabled; int mode; int depth; int waves; int yt; int64_t min_bytes;
 };
 
 static const q8w8_cfg & q8w8_get_cfg() {
     static const q8w8_cfg cfg = [] {
         q8w8_cfg c;
-        c.enabled = q8w8_env_int("GGML_HIP_Q8W8", 0) == 1;
+        c.mode    = q8w8_env_int("GGML_HIP_Q8W8", 0);
+        c.enabled = c.mode == 1 || c.mode == 2;
         c.depth   = q8w8_env_int("GGML_HIP_Q8W8_DEPTH", 3) == 2 ? 2 : 3;
-        c.waves   = std::min(Q8W8_MAXWAVE, std::max(1, q8w8_env_int("GGML_HIP_Q8W8_WAVES", Q8W8_MAXWAVE)));
+        c.yt      = q8w8_env_int("GGML_HIP_Q8W8_YT", 2) == 4 ? 4 : 2;   // design 3 only
+        c.waves   = std::min(c.mode == 2 ? Q8WO_MAXWAVE : Q8W8_MAXWAVE,
+                             std::max(1, q8w8_env_int("GGML_HIP_Q8W8_WAVES", c.mode == 2 ? Q8WO_MAXWAVE : Q8W8_MAXWAVE)));
         const char * mb = getenv("GGML_HIP_Q8W8_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (8ll << 20);
-        if (c.enabled) {
+        if (c.enabled && c.mode == 2) {
+            GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8=2 w8 Q8_0 GEMV armed (design 3 occupancy-first q8wo: half-block lanes, "
+                          "YT %d, 2-deep flattened prefetch, %d waves, > %lld B)\n", c.yt, c.waves, (long long) c.min_bytes);
+        } else if (c.enabled) {
             GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8=1 w8 Q8_0 GEMV armed (ne11 == 8, full-block lanes, YT 4, depth %d, "
                           "%d waves, > %lld B)\n", c.depth, c.waves, (long long) c.min_bytes);
         }
@@ -119,6 +126,7 @@ static __device__ __forceinline__ q8w8_int4 q8w8_make_rsrc(const void * base, ui
 
 __device__ q8w8_int4 q8w8_buf_x4(q8w8_int4 rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 __device__ int       q8w8_buf_x1(q8w8_int4 rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.i32");
+__device__ short     q8w8_buf_s16(q8w8_int4 rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.i16");
 
 // LDS-only WG barrier: must NOT drain vmcnt (the next steps' weight windows are in flight across it)
 #define Q8W8_LDS_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
@@ -313,6 +321,203 @@ q8w8_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Design 3 (GGML_HIP_Q8W8=2, "q8wo", occupancy-first). Limiter of stock q8wv at w8 (census r2: VALU 0.38-0.43, 13-15
+// waves/CU, 49-57% of peak; attn_q = 2 rounds x 5 steps, 7.5 us per step, ~6.8 MB in flight): q8wv at M 6..8 runs UNRL 1
+// with NO prefetch (UN 2 spills at 128 VGPR), so every wave does load -> wait -> ~360 VALU of math -> load. All 16 waves
+// of a CU issue together and compute together (one WG, uniform k1 sequence), so HBM idles while the SIMDs run the
+// ~3.4 us math phase of a step and the SIMDs idle while HBM drains it: VALU 0.41 and BW 55% are the two halves of one
+// serialized loop. Design 1 (2 waves/SIMD x 2..3 deep) only traded waves for depth -> same overlap -> 0.94-0.98x.
+// This kernel keeps everything q8wv does (1024-thread WG, 4 waves/SIMD, one 64 KB LDS activation page staged once per
+// kernel when K fits, half-block lanes, 1088 B per wave instruction, DPP reduce, deterministic) and adds a 2-deep
+// register ring over the FLATTENED (row tile, K step) sequence of the wave: the loads of step i+1 are in flight while
+// step i computes, also across tile boundaries. To fit the ring under 128 VGPR the tile is YT = 2 rows (16 f32 acc +
+// 2 x 2 x 6 window regs) by default; YT = 4 (GGML_HIP_Q8W8_YT=4) is the register-tight variant (32 acc + 48 ring).
+template <int YT>
+struct q8wo_win {
+    q8w8_int4 a[YT];
+    int       b[YT];
+    short     s[YT];
+};
+
+template <int YT>
+static __device__ __forceinline__ void q8wo_issue(q8wo_win<YT> & w, const q8w8_int4 rsrc, const int t, const bool active,
+                                                  const int k1, const int hb, const int h, const int N, const int nb01,
+                                                  const int nblk) {
+    const int bb = k1 + hb;
+    const int tb = bb * 34 + 2 + 16 * h;
+#pragma unroll
+    for (int y = 0; y < YT; ++y) {
+        const int  row = t * YT + y;
+        const bool ok  = active && row < N && bb < nblk;
+        const int  rb  = row * nb01;
+        const int  vo  = ok ? rb + (tb & ~3) : 0x7ffffff0;
+        const int  vs  = ok ? rb + bb * 34   : 0x7ffffff0;
+        w.a[y] = q8w8_buf_x4(rsrc, vo,      0, 2);
+        w.b[y] = q8w8_buf_x1(rsrc, vo + 16, 0, 2);
+        w.s[y] = q8w8_buf_s16(rsrc, vs,     0, 0);
+    }
+}
+
+template <int YT>
+static __global__ void __launch_bounds__(64 * Q8WO_MAXWAVE)
+q8wo_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const int N, const uint32_t wbytes,
+             const int8_t * __restrict__ yq, const float * __restrict__ yd, const int P, const int n_tiles, const int n_rnd,
+             float * __restrict__ dst, const int64_t dst_s1) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    constexpr int M = Q8W8_M;
+    __shared__ q8w8_int4 lds[Q8W8_LDS_B / 16];
+    float * lds_d = (float *) &lds[M * P * 2];
+
+    const int lane = threadIdx.x;
+    const int wv   = blockDim.y;
+    const int tid  = threadIdx.y * 64 + lane;
+    const int nthr = 64 * wv;
+    const int h    = lane & 1;
+    const int hb   = lane >> 1;
+    const q8w8_int4 rsrc = q8w8_make_rsrc(W, wbytes);
+    const q8w8_int4 * yq4 = (const q8w8_int4 *) yq;
+
+    const int S = (nblk + 31) / 32;
+    const int I = n_rnd * S;
+    auto tile_of = [&](int r) { return (r * (int) gridDim.x + (int) blockIdx.x) * wv + (int) threadIdx.y; };
+
+    float acc[YT][M];
+#pragma unroll
+    for (int y = 0; y < YT; ++y) {
+#pragma unroll
+        for (int n = 0; n < M; ++n) {
+            acc[y][n] = 0.0f;
+        }
+    }
+
+    q8wo_win<YT> cur, nxt;
+    {
+        const int t = tile_of(0);
+        q8wo_issue<YT>(cur, rsrc, t, t < n_tiles, 0, hb, h, N, nb01, nblk);
+    }
+    int page = INT_MIN / 2;
+    int r = 0, s = 0;
+    for (int i = 0; i < I; ++i) {
+        // 1) prefetch step i+1 (possibly the next tile's first step) before anything waits
+        int r1 = r, s1 = s + 1;
+        if (s1 == S) { s1 = 0; ++r1; }
+        if (i + 1 < I) {
+            const int t1 = tile_of(r1);
+            q8wo_issue<YT>(nxt, rsrc, t1, t1 < n_tiles, 32 * s1, hb, h, N, nb01, nblk);
+        }
+        const int k1 = 32 * s;
+        // 2) activation page restage (uniform over the WG; LDS-only barrier keeps both ring slots in flight)
+        if (k1 < page || k1 >= page + P) {
+            Q8W8_LDS_BARRIER();
+            for (int j = tid; j < M * P * 2; j += nthr) {
+                const int n  = j / (2 * P);
+                const int rr = j - n * 2 * P;
+                const int b  = k1 + rr / 2;
+                q8w8_int4 v = {0, 0, 0, 0};
+                if (b < nblk) {
+                    v = yq4[((int64_t) n * nblk + b) * 2 + (rr & 1)];
+                }
+                lds[j] = v;
+            }
+            for (int j = tid; j < M * P; j += nthr) {
+                const int n = j / P;
+                const int b = k1 + (j - n * P);
+                lds_d[j] = b < nblk ? yd[(int64_t) n * nblk + b] : 0.0f;
+            }
+            Q8W8_LDS_BARRIER();
+            page = k1;
+        }
+        // 3) math on the current slot
+        {
+            const int bb = k1 + hb;
+            const uint32_t al = (uint32_t) ((bb * 34 + 2 + 16 * h) & 3);
+            const int bl = k1 - page + hb;
+            int   qw[YT][4];
+            float dw[YT];
+#pragma unroll
+            for (int y = 0; y < YT; ++y) {
+                const int d5[5] = {cur.a[y][0], cur.a[y][1], cur.a[y][2], cur.a[y][3], cur.b[y]};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    qw[y][j] = (int) __builtin_amdgcn_alignbyte((uint32_t) d5[j + 1], (uint32_t) d5[j], al);
+                }
+                dw[y] = __half2float(__ushort_as_half((unsigned short) cur.s[y]));
+            }
+#pragma unroll
+            for (int n = 0; n < M; ++n) {
+                const q8w8_int4 a  = lds[(n * P + bl) * 2 + h];
+                const float     da = lds_d[n * P + bl];
+#pragma unroll
+                for (int y = 0; y < YT; ++y) {
+                    int q = ggml_cuda_dp4a(qw[y][0], a[0], 0);
+                    q     = ggml_cuda_dp4a(qw[y][1], a[1], q);
+                    q     = ggml_cuda_dp4a(qw[y][2], a[2], q);
+                    q     = ggml_cuda_dp4a(qw[y][3], a[3], q);
+                    acc[y][n] += (float) q * (dw[y] * da);
+                }
+            }
+        }
+        // 4) tile done: DPP reduce, lane 63 stores, reset
+        if (s == S - 1) {
+#pragma unroll
+            for (int y = 0; y < YT; ++y) {
+#pragma unroll
+                for (int n = 0; n < M; ++n) {
+                    Q8W8_DPP_ADD(acc[y][n], "row_shr:8");
+                    Q8W8_DPP_ADD(acc[y][n], "row_shr:4");
+                    Q8W8_DPP_ADD(acc[y][n], "row_shr:2");
+                    Q8W8_DPP_ADD(acc[y][n], "wave_shr:1");
+                    Q8W8_DPP_ADD(acc[y][n], "row_bcast:15");
+                    Q8W8_DPP_ADD(acc[y][n], "row_bcast:31");
+                }
+            }
+            const int t = tile_of(r);
+            if (t < n_tiles && lane == 63) {
+#pragma unroll
+                for (int y = 0; y < YT; ++y) {
+                    const int row = t * YT + y;
+                    if (row < N) {
+#pragma unroll
+                        for (int n = 0; n < M; ++n) {
+                            dst[(int64_t) n * dst_s1 + row] = acc[y][n];
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int y = 0; y < YT; ++y) {
+#pragma unroll
+                for (int n = 0; n < M; ++n) {
+                    acc[y][n] = 0.0f;
+                }
+            }
+        }
+        cur = nxt;
+        r = r1; s = s1;
+    }
+#else
+    GGML_UNUSED(W); GGML_UNUSED(nb01); GGML_UNUSED(nblk); GGML_UNUSED(N); GGML_UNUSED(wbytes); GGML_UNUSED(yq);
+    GGML_UNUSED(yd); GGML_UNUSED(P); GGML_UNUSED(n_tiles); GGML_UNUSED(n_rnd); GGML_UNUSED(dst); GGML_UNUSED(dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
+template <int YT>
+static void q8wo_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int8_t * yq, const float * yd,
+                        int ncu, int max_waves, float * dst, int64_t dst_s1, cudaStream_t stream) {
+    constexpr int M = Q8W8_M;
+    int P = (Q8W8_LDS_B / (36 * M)) / 32 * 32;   // 224 blocks at M 8 (as q8wv)
+    P = std::min(P, (nblk + 31) / 32 * 32);
+    GGML_ASSERT(P >= 32 && M * P * 36 <= Q8W8_LDS_B);
+    const int n_tiles = (N + YT - 1) / YT;
+    const int n_rnd   = (n_tiles + ncu * max_waves - 1) / (ncu * max_waves);
+    const int wv      = (n_tiles + ncu * n_rnd - 1) / (ncu * n_rnd);
+    const dim3 block(64, wv, 1);
+    q8wo_mul_mat<YT><<<ncu, block, 0, stream>>>(W, nb01, nblk, N, wbytes, yq, yd, P, n_tiles, n_rnd, dst, dst_s1);
+}
+
 template <int DP>
 static void q8w8_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int8_t * yq, const float * yd,
                         int ncu, int max_waves, float * dst, int64_t dst_s1, cudaStream_t stream) {
@@ -335,7 +540,11 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
         // Path witness (rows grep it; also the build's strings content marker).
         static std::atomic<int64_t> n_calls{0};
         if (n_calls.fetch_add(1) == 0) {
-            GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 w8 Q8_0 GEMV ran (call 1, full-block lanes, depth %d)\n", cfg.depth);
+            if (cfg.mode == 2) {
+                GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 design 3 q8wo w8 Q8_0 GEMV ran (call 1, YT %d, 2-deep)\n", cfg.yt);
+            } else {
+                GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 w8 Q8_0 GEMV ran (call 1, full-block lanes, depth %d)\n", cfg.depth);
+            }
         }
     }
     cudaStream_t stream = ctx.stream();
@@ -357,7 +566,13 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
     const int      ncu    = ggml_cuda_info().devices[ctx.device].nsm;
     float *        d      = (float *) dst->data;
-    if (cfg.depth == 2) {
+    if (cfg.mode == 2) {
+        if (cfg.yt == 4) {
+            q8wo_launch<4>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, d, dst_s1, stream);
+        } else {
+            q8wo_launch<2>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, d, dst_s1, stream);
+        }
+    } else if (cfg.depth == 2) {
         q8w8_launch<2>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, d, dst_s1, stream);
     } else {
         q8w8_launch<3>(W, nb01, nblk, N, wbytes, yq.get(), yd.get(), ncu, cfg.waves, d, dst_s1, stream);
