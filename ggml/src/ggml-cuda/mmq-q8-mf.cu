@@ -1340,12 +1340,36 @@ static const char q8mf6_build_marker[] __attribute__((used)) =
 #define Q8MF6_HB    (32 * Q8MF_ROWB)   // 8704 B: half a packed stage
 #define Q8MF6_RED   2048
 
+// Q8IP-DET (GGML_HIP_Q8_MF6_DET=1, default off): the atomic split-half-tile tail above sums >= 3 float partials in
+// whatever order the WGs finish (fl(fl(0+a)+b)+c != fl(fl(0+c)+a)+b), so V5 output is not bitwise reproducible run to
+// run whenever a half-tile (S units) spans >= 3 WGs, i.e. floor(U/G) < S - 1 (every N = 5120 weight on 104 CUs:
+// U = 160 x 2 x S... -> ~7.7 units per WG vs S = 20). DET writes each contributor's partial to its own slot
+// (slot = g - owner(first unit of the half-tile)); the LAST contributor to arrive (per-half-tile counter, zeroed by the
+// pre-pass, V3 stream-K pattern) sums the slots in fixed WG order 0..g1-g0 and stores the half-tile. One launch.
+// owner(u) = the WG whose balanced range [g U / G, (g + 1) U / G) holds unit u.
+static __device__ __forceinline__ int q8mf6_owner(const int u, const int U, const int G) {
+    return (int) ((((int64_t) u + 1) * G - 1) / U);
+}
+
+static bool q8mf6_det() {
+    static const bool on = [] {
+        const bool v = q8mf_env_int("GGML_HIP_Q8_MF6_DET", 0) != 0;
+        if (v) {
+            GGML_LOG_INFO("ggml_cuda_q8_mf: V5 deterministic split-tile reduction enabled (GGML_HIP_Q8_MF6_DET=1)\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
 template <int P, int AUX>
 static __global__ void __launch_bounds__(Q8MF_NT, 4)
 q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * __restrict__ act, const uint32_t abytes,
-              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1) {
+              const int S, const int U, const int G, const int M, float * __restrict__ out, const int64_t out_s1,
+              float * __restrict__ part, int * __restrict__ cnt) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
     __shared__ __attribute__((aligned(16))) char lds[Q8MF6_HB + Q8MF_A1 + Q8MF6_RED];
+    __shared__ int s_last;
     const int tid  = threadIdx.x;
     const int lane = tid & 63;
     const int w    = __builtin_amdgcn_readfirstlane(tid >> 6);
@@ -1450,8 +1474,37 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
                         float * o = out + (int64_t) (c0 + r) * out_s1 + row;
                         if (full) {
                             *o = v;
+                        } else if (part != nullptr) {   // Q8IP-DET: own slot, summed in WG order by the last arriver
+                            const int slot = g - q8mf6_owner(ts, U, G);
+                            part[((int64_t) slot * M + (c0 + r)) * ((int64_t) (U / S) * 32) + row] = v;
                         } else {
                             unsafeAtomicAdd(o, v);
+                        }
+                    }
+                }
+            }
+            if (part != nullptr) {
+                const int ts = cht * S;
+                if (!(ts >= u0 && ts + S <= u1)) {   // uniform: split half-tile
+                    const int     g0 = q8mf6_owner(ts, U, G);
+                    const int     g1 = q8mf6_owner(ts + S - 1, U, G);
+                    const int64_t NN = (int64_t) (U / S) * 32;
+                    __threadfence();
+                    __syncthreads();
+                    if (tid == 0) {
+                        s_last = atomicAdd(cnt + cht, 1) == g1 - g0;
+                    }
+                    __syncthreads();
+                    if (s_last) {
+                        __threadfence();
+                        for (int e = tid; e < 32 * M; e += Q8MF_NT) {
+                            const int     c   = e / 32;
+                            const int64_t rw  = (int64_t) cht * 32 + e % 32;
+                            float         sum = 0.0f;
+                            for (int k = 0; k <= g1 - g0; ++k) {   // WG order: deterministic
+                                sum += __builtin_nontemporal_load(part + ((int64_t) k * M + c) * NN + rw);
+                            }
+                            out[(int64_t) c * out_s1 + rw] = sum;
                         }
                     }
                 }
@@ -1490,7 +1543,7 @@ q8mf6_mul_mat(const char * __restrict__ W, const uint32_t wbytes, const char * _
     } while (u < u1);
 #else
     GGML_UNUSED(W); GGML_UNUSED(wbytes); GGML_UNUSED(act); GGML_UNUSED(abytes); GGML_UNUSED(S); GGML_UNUSED(U);
-    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1);
+    GGML_UNUSED(G); GGML_UNUSED(M); GGML_UNUSED(out); GGML_UNUSED(out_s1); GGML_UNUSED(part); GGML_UNUSED(cnt);
     NO_DEVICE_CODE;
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
@@ -1519,13 +1572,25 @@ static void ggml_cuda_mul_mat_q8_mf6(ggml_backend_cuda_context & ctx, const ggml
     const size_t abytes = (size_t) S * Q8MF_A1;
     ggml_cuda_pool_alloc<char> act(ctx.pool(), abytes);
     float * d = (float *) dst->data;
+    // Q8IP-DET: per-contributor slots; a half-tile of S units spans at most ceil((S - 1) / floor(U / G)) + 1 WGs
+    const bool det = q8mf6_det();
+    ggml_cuda_pool_alloc<float> part(ctx.pool());
+    ggml_cuda_pool_alloc<int>   hcnt(ctx.pool());
+    if (det) {
+        const int64_t lmin  = std::max(1, U / G);
+        const int64_t nslot = (S - 1 + lmin - 1) / lmin + 1;
+        part.alloc((size_t) (nslot * M * (int64_t) N));
+        hcnt.alloc((size_t) (U / S));
+    }
+    float * pp = det ? part.get() : nullptr;
+    int *   pc = det ? hcnt.get() : nullptr;
     {
         const dim3 grid((nblk + 7) / 8, Q8MF_MAXM, 1);
-        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), nullptr, 0, d, dst_s1, N);
+        q8mf_pre_i8<<<grid, 256, 0, stream>>>((const float *) src1->data, s1, nblk, M, act.get(), pc, det ? U / S : 0, d, dst_s1, N);
     }
     const char *   W      = (const char *) src0->data;
     const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
-#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1)
+#define Q8MF6_L(PP, AA) q8mf6_mul_mat<PP, AA><<<G, Q8MF_NT, 0, stream>>>(W, wbytes, act.get(), (uint32_t) abytes, S, U, G, M, d, dst_s1, pp, pc)
     if (cfg.slc) {
         Q8MF6_L(2, 2);
     } else {
