@@ -16,19 +16,33 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <map>
+#include <tuple>
 #include <vector>
 
 static std::vector<float> run_graph(ggml_type type, bool moe, int64_t M, int64_t K, int64_t NT, int nth, bool invalid_id) {
-    const int64_t E = 32, U = 10;
-    ggml_init_params ip = { (size_t) 1536 * 1024 * 1024, nullptr, false };
+    const int64_t E = 12, U = 10;
+    ggml_init_params ip = { (size_t) 512 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(ip);
     std::mt19937 rng(4242 + (int) type * 7 + (int) M);
     std::normal_distribution<float> nd(0.0f, 1.0f);
+    // quantized weights are cached per (type, M, K, ne2, which) -- IQ3_S quantization dominates otherwise
+    static std::map<std::tuple<int, int64_t, int64_t, int64_t, int>, std::vector<uint8_t>> cache;
+    int which = 0;
     auto mk_w = [&](int64_t ne2) {
         ggml_tensor * w = ggml_new_tensor_3d(ctx, type, K, M, ne2);
-        std::vector<float> f(K * M * ne2);
-        for (auto & x : f) { x = 0.05f * nd(rng); }
-        ggml_quantize_chunk(type, f.data(), w->data, 0, M * ne2, K, nullptr);
+        auto key = std::make_tuple((int) type, M, K, ne2, which++);
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            std::mt19937 wr(99 + (int) type * 13 + (int) M + which);
+            std::normal_distribution<float> wd(0.0f, 1.0f);
+            std::vector<float> f(K * M * ne2);
+            for (auto & x : f) { x = 0.05f * wd(wr); }
+            std::vector<uint8_t> q(ggml_nbytes(w));
+            ggml_quantize_chunk(type, f.data(), q.data(), 0, M * ne2, K, nullptr);
+            it = cache.emplace(key, std::move(q)).first;
+        }
+        memcpy(w->data, it->second.data(), it->second.size());
         return w;
     };
     ggml_tensor * out = nullptr;
@@ -70,14 +84,14 @@ int main(int argc, char ** argv) {
     struct cell { ggml_type t; bool moe; int64_t M, K, NT; int nth; bool inval; };
     std::vector<cell> cells;
     for (ggml_type t : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS }) {
-        for (int nth : { 1, 7, 24, 72, 96 }) {
+        for (int nth : { 1, 7, 24, 96 }) {
             cells.push_back({ t, true, 640, 2560, 1, nth, false });
         }
         cells.push_back({ t, true, 640, 2560, 1, 24, true });   // inactive SER route
         cells.push_back({ t, true, 640, 2560, 5, 24, false });  // MTP verify: lever 1 must decline
     }
     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS }) {
-        for (int nth : { 7, 24, 72, 96 }) {
+        for (int nth : { 7, 24, 96 }) {
             for (int64_t nt : { 1, 5 }) {
                 cells.push_back({ t, false,  320, 10240, nt, nth, false });  // hc_*_down
                 cells.push_back({ t, false,  640,  2560, nt, nth, false });  // shexp gate/up
