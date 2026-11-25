@@ -129,6 +129,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_rowexact   (bool enabled);
     void set_embeddings_nextn(bool value, bool masked);
+    bool set_dflash_dev_inject(bool enable);
+    bool get_dflash_dev_inject() const { return cparams.dflash_dev_inject != nullptr; }
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -412,6 +414,10 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // Q8-SERVED-DEV-INJECT-1 persistent encoder-output buffer (see cparams.dflash_dev_inject)
+    ggml_context_ptr        dev_inject_ctx;
+    ggml_backend_buffer_ptr dev_inject_buf;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

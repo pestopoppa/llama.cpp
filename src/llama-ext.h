@@ -162,6 +162,13 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Q8-SERVED-DEV-INJECT-1: DFlash draft context only. When enabled, llama_encode() writes the encoder output into
+// a persistent device buffer (no D2H; llama_get_embeddings_nextn() is NOT updated by encode), and an embd-only
+// llama_decode() (KV injection) reads its rows from that buffer -- batch.embd must be non-null to select the
+// inject graph but its contents are ignored. Must be set before the first encode/decode; returns false if unsupported.
+LLAMA_API bool llama_set_dflash_dev_inject(struct llama_context * ctx, bool enable);
+LLAMA_API bool llama_get_dflash_dev_inject(const struct llama_context * ctx);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

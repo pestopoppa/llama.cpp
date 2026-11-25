@@ -184,6 +184,7 @@ llama_build(test-rowexact-backend-toggle.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build(test-device-accept.cpp)
 llama_build(test-device-accept-multiseq.cpp)
+llama_build(test-dflash-dev-inject.cpp) # Q8-SERVED-DEV-INJECT-1 ON vs OFF draft/accept identity (needs target + DFlash2 drafter)
 llama_build_and_test(test-mmap-evict.cpp LABEL "main")
 target_include_directories(test-mmap-evict PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

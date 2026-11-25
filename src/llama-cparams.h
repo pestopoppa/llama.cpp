@@ -74,4 +74,9 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // Q8-SERVED-DEV-INJECT-1 (LLAMA_DFLASH_DEV_INJECT): persistent device tensor [n_embd, n_ubatch] that the
+    // DFlash encoder graph writes its output into and the KV-inject decode graph reads from, so the encoder
+    // output never round-trips through the host. nullptr = off (default).
+    struct ggml_tensor * dflash_dev_inject = nullptr;
 };
