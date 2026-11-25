@@ -505,6 +505,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-gather-rows-e4m3-e8m0.cpp)
     # [AK-DTREE-2] tree-verification ops: chain-tree == chain and every tree path == chain, bitwise (CPU)
     llama_build_and_test(test-dtree-ops.cpp)
+    # [Q38FN-GDN-SNAP] GDN snapshots written into the cache view == result + ggml_cpy (CPU, bitwise)
+    llama_build_and_test(test-q38fn-gdn-snap.cpp)
 
     # [AKX-ALL-LB4] CPU FLASH_ATTN_EXT N=1 vs N=5 row-exactness on the long-context CPU shape. A
     # measurement of the build under test (not every kernel path is row-exact), so it is built but

@@ -13,6 +13,20 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
+// [Q38FN-GDN-SNAP] LLAMA_GDN_SNAP_INPLACE=1: in rollback-snapshot mode (n_rs_seq > 0, chain verify) the gated
+// delta net writes its K snapshot slots straight into the recurrent cache rows, so the per-layer ggml_cpy of
+// K * S_v*S_v*H floats (5 x 3 MiB per GDN layer at MTP n-max 4) disappears. Default off; values are bit-identical.
+static bool gdn_snap_inplace_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_GDN_SNAP_INPLACE");
+        const bool v = e != nullptr && atoi(e) > 0;
+        LLAMA_LOG_INFO("%s: LLAMA_GDN_SNAP_INPLACE = %d (%s)\n", __func__, v ? 1 : 0,
+                v ? "GDN rollback snapshots written in place, no state CPY" : "reference: snapshots copied by ggml_cpy");
+        return v;
+    }();
+    return on;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -842,7 +856,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) mem_size * row_size,
         (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    if (!ubatch.parent && gdn_out->type == GGML_TYPE_F32 && ssm_states_all->type == GGML_TYPE_F32 && gdn_snap_inplace_enabled()) {
+        // [Q38FN-GDN-SNAP] the op itself fills dst; expanding gdn_out keeps it in the graph like the cpy did
+        ggml_gated_delta_net_set_snap_dst(gdn_out, dst);
+        ggml_build_forward_expand(gf, gdn_out);
+    } else {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
 
     // [TAG_GDN_STATE_BF16] see above: narrow-cast the attn output back to F32 for the gated norm.
     if (output->type != GGML_TYPE_F32) {

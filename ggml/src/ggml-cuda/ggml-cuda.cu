@@ -5609,6 +5609,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+            // [Q38FN-GDN-SNAP] snapshots written into an external view: CPU kernel only
+            if (ggml_get_op_params_i32(op, 3) != 0) {
+                return false;
+            }
             // [RS-REPLAY] replay (op param 1 = n_pend > 0): recurrent-kernel replay loop, K == 1, F32 logs
             if (ggml_get_op_params_i32(op, 1) > 0) {
                 return ggml_get_op_params_i32(op, 0) == 1 && op->src[6]->type == GGML_TYPE_F32 &&
