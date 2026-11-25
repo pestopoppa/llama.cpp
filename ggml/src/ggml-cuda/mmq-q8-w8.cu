@@ -1266,8 +1266,7 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
             static std::atomic<int64_t> n_ip{0};
             const int64_t c = n_ip.fetch_add(1) + 1;
             if (c == 1 || (M != Q8W8_M && c < 4096 && (c & (c - 1)) == 0)) {
-                GGML_LOG_INFO("ggml_cuda_q8_w8: design 5 q8wp ran on IN-PLACE packed weight (call %lld, n=%d, %s)
-",
+                GGML_LOG_INFO("ggml_cuda_q8_w8: design 5 q8wp ran on IN-PLACE packed weight (call %lld, n=%d, %s)\n",
                               (long long) c, M, src0->name);
             }
         }
