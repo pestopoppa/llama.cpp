@@ -1096,9 +1096,8 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const uint32_t pbytes = (uint32_t) ggml_nbytes(src0);
         const int      ncu    = ggml_cuda_info().devices[ctx.device].nsm;
         float *        d      = (float *) dst->data;
-        if (false) {   // YT 4 spills (128 VGPR + 48 B scratch per lane, static gate): MYT=4 runs YT 2
-            q8wp_launch<4>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
-        } else if (cfg.myt == 1) {
+        // YT 4 is not instantiated: it spills (128 VGPR + 48 B scratch per lane, static gate). MYT=4 runs YT 2.
+        if (cfg.myt == 1) {
             q8wp_launch<1>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
         } else {
             q8wp_launch<2>(P, nblk, N, pbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
