@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -791,6 +793,54 @@ static ggml_tensor * build_dflash2_conv(
 
     const int64_t block_size = n_tokens / n_blocks;
     ggml_context * ctx0 = g.ctx0;
+
+    // AK-C22-SMALLOP-FUSE-2 C2B (LLAMA_AK_DF2_CONV=1, default off): the same arithmetic in ~2K + 3 launches instead of
+    // ~8K - 1. All K tap weights in one cont + repeat + add ([hidden, K, n_tokens]), the causal shift as views of ONE
+    // front-padded copy of the blocks (no per-tap fill + concat), no cont of an already-contiguous input, and no
+    // repeat of the base row (broadcast add). Per tap the order of operations is unchanged -- weight = coeff + base,
+    // term = weight * values, result = result + term -- so the output is bit-identical to the path below.
+    static const bool ak_fast = [] {
+        const char * e = getenv("LLAMA_AK_DF2_CONV");
+        return e != nullptr && atoi(e) == 1;
+    }();
+    if (ak_fast) {
+        static std::atomic<int> n_built{0};
+        if (n_built.fetch_add(1) == 0) {
+            LLAMA_LOG_INFO("%s: AK-C22-SMALLOP-FUSE-2 C2B dflash2 conv fast graph built (hidden %lld, K %lld, group %lld, "
+                    "n_tokens %lld, n_blocks %lld)\n", __func__, (long long) hidden_size, (long long) kernel_size,
+                    (long long) group_size, (long long) n_tokens, (long long) n_blocks);
+        }
+        if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
+            hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+        }
+        if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
+            dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+        }
+        ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+        ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
+        ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
+                coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+        // w[gs, ng, K, nt] = repeat(coeff) + base[:, :, side]
+        ggml_tensor * c4 = ggml_reshape_4d(ctx0, ggml_cont(ctx0, coeffs_side), 1, n_groups, kernel_size, n_tokens);
+        ggml_tensor * w  = ggml_repeat_4d(ctx0, c4, group_size, n_groups, kernel_size, n_tokens);
+        ggml_tensor * base_side = ggml_view_4d(ctx0, base, group_size, n_groups, kernel_size, 1,
+                ggml_row_size(base->type, group_size), base->nb[1], base->nb[2], side * base->nb[2]);
+        w = ggml_add(ctx0, w, base_side);
+        // padded[hidden, block + K - 1, n_blocks]: K - 1 zero rows in front of every block
+        ggml_tensor * padded = kernel_size > 1 ?
+            ggml_pad_ext(ctx0, blocks, 0, 0, (int) kernel_size - 1, 0, 0, 0, 0, 0) : blocks;
+        ggml_tensor * result = nullptr;
+        for (int64_t tap = 0; tap < kernel_size; ++tap) {
+            ggml_tensor * w_tap = ggml_view_3d(ctx0, w, hidden_size, block_size, n_blocks,
+                    w->nb[3], w->nb[3] * block_size, tap * w->nb[2]);
+            ggml_tensor * values = ggml_view_3d(ctx0, padded, hidden_size, block_size, n_blocks,
+                    padded->nb[1], padded->nb[2], (kernel_size - 1 - tap) * padded->nb[1]);
+            ggml_tensor * term = ggml_mul(ctx0, w_tap, values);
+            result = result ? ggml_add(ctx0, result, term) : term;
+        }
+        return ggml_reshape_2d(ctx0, result, hidden_size, n_tokens);
+    }
+
     hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
     dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);

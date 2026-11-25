@@ -4609,6 +4609,91 @@ struct test_ak_concat_flat : public test_case {
     }
 };
 
+// AK-C22-SMALLOP-FUSE-2 C2B (LLAMA_AK_DF2_CONV=1, src/models/dflash.cpp build_dflash2_conv): the DFlash2 dynamic
+// grouped causal conv as built under the knob (fast = 1: one cont + repeat_4d + broadcast add for all K tap weights,
+// the causal shift as overlapping views of ONE front-padded copy, per tap mul + accumulate add) and as built without
+// it (fast = 0: per tap fill + concat + cont + 2 x repeat + add + mul + add), both vs CPU. The served drafter has
+// K = 2, group 16, hidden 5120, 8-token blocks; K = 3 / 1, block < K and 2 blocks are covered.
+struct test_ak_df2_conv : public test_case {
+    const int64_t hidden_size, kernel_size, group_size, block_size, n_blocks;
+    const int side;
+    const bool fast;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_DF2_CONV"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-12; }
+    std::string vars() override {
+        return VARS_TO_STR7(hidden_size, kernel_size, group_size, block_size, n_blocks, side, fast);
+    }
+
+    test_ak_df2_conv(int64_t hidden_size, int64_t kernel_size, int64_t group_size, int64_t block_size, int64_t n_blocks,
+                     int side, bool fast)
+        : hidden_size(hidden_size), kernel_size(kernel_size), group_size(group_size), block_size(block_size),
+          n_blocks(n_blocks), side(side), fast(fast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = block_size * n_blocks;
+        const int64_t n_groups = hidden_size / group_size;
+        ggml_tensor * hidden  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
+        ggml_set_name(hidden, "hidden");
+        ggml_tensor * dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_groups * kernel_size * 2, n_tokens);
+        ggml_set_name(dynamic, "dynamic");
+        ggml_tensor * base    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, kernel_size, 2);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * coeffs = ggml_reshape_4d(ctx, dynamic, n_groups, kernel_size, 2, n_tokens);
+        ggml_tensor * coeffs_side = ggml_view_3d(ctx, coeffs, n_groups, kernel_size, n_tokens,
+                coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+        ggml_tensor * blocks = ggml_reshape_3d(ctx, hidden, hidden_size, block_size, n_blocks);
+        ggml_tensor * result = nullptr;
+        if (fast) {
+            ggml_tensor * c4 = ggml_reshape_4d(ctx, ggml_cont(ctx, coeffs_side), 1, n_groups, kernel_size, n_tokens);
+            ggml_tensor * w  = ggml_repeat_4d(ctx, c4, group_size, n_groups, kernel_size, n_tokens);
+            ggml_tensor * base_side = ggml_view_4d(ctx, base, group_size, n_groups, kernel_size, 1,
+                    ggml_row_size(base->type, group_size), base->nb[1], base->nb[2], side * base->nb[2]);
+            w = ggml_add(ctx, w, base_side);
+            ggml_tensor * padded = kernel_size > 1 ?
+                ggml_pad_ext(ctx, blocks, 0, 0, (int) kernel_size - 1, 0, 0, 0, 0, 0) : blocks;
+            for (int64_t tap = 0; tap < kernel_size; ++tap) {
+                ggml_tensor * w_tap = ggml_view_3d(ctx, w, hidden_size, block_size, n_blocks,
+                        w->nb[3], w->nb[3] * block_size, tap * w->nb[2]);
+                ggml_tensor * values = ggml_view_3d(ctx, padded, hidden_size, block_size, n_blocks,
+                        padded->nb[1], padded->nb[2], (kernel_size - 1 - tap) * padded->nb[1]);
+                ggml_tensor * term = ggml_mul(ctx, w_tap, values);
+                result = result ? ggml_add(ctx, result, term) : term;
+            }
+            result = ggml_reshape_2d(ctx, result, hidden_size, n_tokens);
+        } else {
+            ggml_tensor * grouped = ggml_reshape_3d(ctx, hidden, group_size, n_groups, n_tokens);
+            for (int64_t tap = 0; tap < kernel_size; ++tap) {
+                ggml_tensor * values = blocks;
+                if (tap > 0) {
+                    ggml_tensor * zeros = ggml_fill(ctx,
+                            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, std::min(tap, block_size), n_blocks), 0.0f);
+                    if (tap < block_size) {
+                        ggml_tensor * previous = ggml_view_3d(ctx, blocks, hidden_size, block_size - tap, n_blocks,
+                                blocks->nb[1], blocks->nb[2], 0);
+                        values = ggml_concat(ctx, zeros, previous, 1);
+                    } else {
+                        values = zeros;
+                    }
+                }
+                values = ggml_reshape_2d(ctx, values, hidden_size, n_tokens);
+                ggml_tensor * coeff = ggml_view_2d(ctx, coeffs_side, n_groups, n_tokens, coeffs_side->nb[2],
+                        tap * coeffs_side->nb[1]);
+                coeff = ggml_reshape_3d(ctx, ggml_cont(ctx, coeff), 1, n_groups, n_tokens);
+                coeff = ggml_reshape_2d(ctx, ggml_repeat(ctx, coeff, grouped), hidden_size, n_tokens);
+                ggml_tensor * base_tap = ggml_view_1d(ctx, base, hidden_size, tap * base->nb[1] + side * base->nb[2]);
+                ggml_tensor * weight = ggml_add(ctx, coeff, ggml_repeat(ctx, base_tap, hidden));
+                ggml_tensor * term = ggml_mul(ctx, weight, values);
+                result = result ? ggml_add(ctx, result, term) : term;
+            }
+        }
+        ggml_set_name(result, "out");
+        return result;
+    }
+};
+
 struct test_ak_add_rms_norm : public test_case {
     const int64_t ncols, nrows, nchan;
     const int64_t w_rows; // 1 = eligible weight row; 2 = broadcast weight, must not fuse
@@ -13918,6 +14003,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ak_concat_flat(1024, 8, 2, 4, 1));
     test_cases.emplace_back(new test_ak_concat_flat(1024, 8, 2, 4, 2));
     test_cases.emplace_back(new test_ak_concat_flat(10240, 200));
+    // AK-C22-SMALLOP-FUSE-2 C2B (LLAMA_AK_DF2_CONV=1): served drafter K 2 / group 16 / hidden 5120 / block 8, both sides,
+    // fast and legacy graphs; K 3 with 2 blocks, block 2 < K 3, K 1
+    for (bool fast : { true, false }) {
+        for (int side : { 0, 1 }) {
+            test_cases.emplace_back(new test_ak_df2_conv(5120, 2, 16, 8, 1, side, fast));
+        }
+        test_cases.emplace_back(new test_ak_df2_conv(5120, 2, 16, 8, 2, 1, fast));
+        test_cases.emplace_back(new test_ak_df2_conv(1024, 3, 16, 8, 2, 0, fast));
+        test_cases.emplace_back(new test_ak_df2_conv(1024, 3, 16, 2, 3, 1, fast));
+        test_cases.emplace_back(new test_ak_df2_conv(512, 1, 16, 8, 1, 0, fast));
+    }
     test_cases.emplace_back(new test_ak_cpy_batch(10240, 1, 1, 4, 1));
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,
