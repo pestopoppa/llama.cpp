@@ -4,6 +4,8 @@
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-svd.h"
 #include "llama-mtp-svd-ops.h"
+#include "llama-mtp-vocab.h"
+#include "llama-mtp-vocab-ops.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -588,8 +590,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // DRAFT-HEAD-SVD-CPU: LLAMA_MTP_DRAFT_HEAD_SVD=<factors> swaps the full draft head for a rank-r pre-score plus exact
     // logits on the top-C rows (-inf elsewhere). Draft graph only; the trunk head (graph above) is untouched.
     const llama_mtp_svd * svd = (head_s == nullptr && cur->ne[1] >= 1 && cur->ne[1] <= 4) ? llama_mtp_svd_get(head_w) : nullptr;
+    // Q38FN-GEMV2 DRAFTVOCAB: LLAMA_MTP_DRAFT_VOCAB=<id list> scores only a fixed top-K token subset (exact logits on
+    // those rows, -inf elsewhere). Draft graph only; verify keeps the full head, so the greedy stream is unchanged.
+    const llama_mtp_vocab * dvoc = (!svd && head_s == nullptr) ? llama_mtp_vocab_get(head_w) : nullptr;
     if (svd) {
         cur = mtp_svd::build_head(ctx0, head_w, cur, svd->v, svd->a, svd->C);
+    } else if (dvoc) {
+        cur = mtp_vocab::build_head(ctx0, dvoc->w_sub, dvoc->idx, cur, head_w->ne[1]);
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }

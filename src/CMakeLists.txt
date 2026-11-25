@@ -38,6 +38,7 @@ add_library(llama
             llama-mmap.cpp
             llama-mmap-evict.cpp
             llama-mtp-svd.cpp
+            llama-mtp-vocab.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
