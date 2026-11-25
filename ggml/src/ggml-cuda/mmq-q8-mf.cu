@@ -87,6 +87,7 @@
 //  MFMA load per CU per 2 stages (one per WG): 2 x 4 waves x 16 MFMA x 32 clk on 4 SIMDs = 1024 clk per 34.8 KB -> cap
 //  ~58 GB/s/CU (5x the HBM share); LDS ~3 B per weight byte (cap ~40 GB/s/CU at 128 B/clk).
 #include "mmq-q8-mf.cuh"
+#include "knee.cuh"
 
 #include "quantize.cuh"
 #include "mmq.cuh"
@@ -1144,6 +1145,49 @@ static __global__ void q8ip_permute(const char * __restrict__ src, char * __rest
     }
 }
 
+// GGML_HIP_KNEE_Q8IP=1 (HBM-knee batch, default off): the same chunk permutation from a persistent knee-sized grid, each
+// WG one contiguous range of chunk indices (so it reads one 16 B-chunk front, and its scattered stores stay inside one
+// stage window), 4 dwordx4 loads per lane issued before the stores. Stock: up to 65535 x 256 grid-stride threads,
+// ~32 resident waves x 1 KB = 32 KB/CU of loads in flight (past the 16 KB/CU knee).
+#define Q8IP_KNEE_U 4
+template <bool TO_PACKED>
+static __global__ void q8ip_permute_knee(const char * __restrict__ src, char * __restrict__ dst, const int64_t nb01, const int S,
+                                         const int64_t nchunk) {
+    int64_t r0, r1;
+    ggml_cuda_knee_range(nchunk, blockIdx.x, gridDim.x, r0, r1);
+    for (int64_t base = r0 + threadIdx.x; base < r1; base += (int64_t) blockDim.x * Q8IP_KNEE_U) {
+        int4    v[Q8IP_KNEE_U];
+        int64_t o[Q8IP_KNEE_U];
+#pragma unroll
+        for (int u = 0; u < Q8IP_KNEE_U; ++u) {
+            const int64_t q = base + (int64_t) u * blockDim.x;
+            o[u] = -1;
+            if (q >= r1) {
+                continue;
+            }
+            const int64_t st  = q / Q8MF_NCHUNK;
+            const int     c   = (int) (q % Q8MF_NCHUNK);
+            const int64_t t   = st / S;
+            const int     ks  = (int) (st % S);
+            const int64_t row = t * Q8MF_RT + c / 17;
+            const int64_t nat = row * nb01 + (int64_t) ks * Q8MF_ROWB + (c % 17) * 16;
+            if (TO_PACKED) {
+                v[u] = *(const int4 *) (src + nat);
+                o[u] = q * 16;
+            } else {
+                v[u] = *(const int4 *) (src + q * 16);
+                o[u] = nat;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < Q8IP_KNEE_U; ++u) {
+            if (o[u] >= 0) {
+                *(int4 *) (dst + o[u]) = v[u];
+            }
+        }
+    }
+}
+
 // in place, through a transient scratch (<= 16 MiB, whole tiles), synchronous on `stream`
 static void q8ip_permute_inplace(char * data, const int64_t N, const int64_t K, bool to_packed, cudaStream_t stream) {
     const int64_t nb01  = K / 32 * 34;
@@ -1159,6 +1203,24 @@ static void q8ip_permute_inplace(char * data, const int64_t N, const int64_t K, 
         char *        dst = data + t0 * tileb;
         CUDA_CHECK(cudaMemcpyAsync(scratch, dst, (size_t) (nt * tileb), cudaMemcpyDeviceToDevice, stream));
         const int64_t nchunk = nt * tileb / 16;
+        static const bool knee = ggml_cuda_knee_env("GGML_HIP_KNEE_Q8IP");
+        if (knee) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                GGML_LOG_INFO("ggml_cuda_q8ip: GGML_HIP_KNEE_Q8IP knee range permute ran (knee %d KB/CU)\n", ggml_cuda_knee_kb());
+            }
+            int dev = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            const int64_t wave_b = (int64_t) ggml_cuda_info().devices[dev].warp_size * 16 * Q8IP_KNEE_U;
+            const int64_t nwg    = ggml_cuda_knee_grid(dev, 256, wave_b, (nchunk + 256 * Q8IP_KNEE_U - 1) / (256 * Q8IP_KNEE_U));
+            if (to_packed) {
+                q8ip_permute_knee<true><<<(unsigned) nwg, 256, 0, stream>>>(scratch, dst, nb01, S, nchunk);
+            } else {
+                q8ip_permute_knee<false><<<(unsigned) nwg, 256, 0, stream>>>(scratch, dst, nb01, S, nchunk);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            continue;
+        }
         const int     grid   = (int) std::min<int64_t>((nchunk + 255) / 256, 65535);
         if (to_packed) {
             q8ip_permute<true><<<grid, 256, 0, stream>>>(scratch, dst, nb01, S, nchunk);
