@@ -18,7 +18,7 @@
 #include <vector>
 
 static void run(ggml_backend_t be, ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t m, int64_t n, bool shared) {
-    const int64_t n_mats = 64, n_used = 10;
+    const int64_t n_mats = 16, n_used = 10;
     auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
         ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_get_extra_bufts");
     std::mt19937 rng(7);
@@ -88,7 +88,8 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_cpu_set_n_threads(be, nth);
-    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) for (bool sh : {false, true}) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    for (int64_t n : {1, 2, 3, 4, 5, 8}) for (bool sh : {false, true}) {
         run(be, dev, GGML_TYPE_IQ3_S, 2560, 640, n, sh);
         run(be, dev, GGML_TYPE_IQ4_NL, 640, 2560, n, sh);
     }

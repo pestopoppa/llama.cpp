@@ -2143,6 +2143,10 @@ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mu
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_0_r8_q8_2H, kernels)
             return true;
         }
+        if (typeA == GGML_TYPE_IQ4_NL) {   // Q38FN-GEMV2: fp16-scale activations for GGML_IQK_IQ4_NL
+            IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_1_q8_2H_T, IQ4_NL_UnpackerU, kernels)
+            return true;
+        }
         return false;
     }
 #endif

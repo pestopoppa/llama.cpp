@@ -303,6 +303,9 @@ static_assert(iqk_mmid_shape_supported(GGML_TYPE_IQ3_S, 16));
 inline int iqk_activation_type(int weight_type) {
 #ifdef HAVE_FANCY_SIMD
     if (weight_type == GGML_TYPE_Q8_0) return GGML_TYPE_Q8_2_X4_H;
+    // Q38FN-GEMV2: IQ4_NL (GGML_IQK_IQ4_NL) takes the same fp16-scale Q8_0-rounded activations as the CPU_REPACK
+    // iq4_nl_8x8_q8_0 path it replaces (Q8_2_X4 stores a bf16 scale: the r3 KLD gate failed on that).
+    if (weight_type == GGML_TYPE_IQ4_NL) return GGML_TYPE_Q8_2_X4_H;
 #endif
     return iqk_weight_uses_q8_k(weight_type) ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_2_X4;
 }
