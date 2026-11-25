@@ -13811,7 +13811,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nh : { 48, 32, 24 }) {
             test_cases.emplace_back(new test_ak_tf2_g3(nh, nt));
         }
-        test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 1, true));
+        if (nt == 1) {
+            // swapped operands only where both ADD(dt, alpha) and MUL(a, sp) are same-shape: ggml_add / ggml_mul
+            // GGML_ASSERT that src1 repeats into src0, so nt > 1 aborted test-backend-ops (rc -6 after 8 G3 cases in
+            // ak-27b-tail-fuse2-gate-gpu-20261124-r3, which DQ'd G2 / G6 as "never fired")
+            test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 1, true));
+        }
         test_cases.emplace_back(new test_ak_tf2_g3(48, nt, 1, 2));
     }
     test_cases.emplace_back(new test_ak_tf2_g3(48, 4, 3));
