@@ -23,7 +23,8 @@
 //     paged in LDS as [8][P][32 B] + [8][P] f32 (one page for K <= 6144 at P = 192), each lane reads its column's
 //     32 B + scale once per step and applies it to all 4 rows.
 // Deterministic (no atomics; lane 63 stores after the DPP reduce). Not bit-exact vs q8wv (different summation order).
-// Env: GGML_HIP_Q8W8=1 enables design 1, =2 design 3 (q8wo, below; GGML_HIP_Q8W8_YT 2|4, default 2); GGML_HIP_Q8W8_DEPTH 2|3 (default 3); GGML_HIP_Q8W8_WAVES (max waves per WG, <= 8,
+// Env: GGML_HIP_Q8W8=3 design 4 (q8wm int8 MFMA; GGML_HIP_Q8W8_MYT 1|2|4 default 2, GGML_HIP_Q8W8_KS 0=auto),
+//      GGML_HIP_Q8W8=1 enables design 1, =2 design 3 (q8wo, below; GGML_HIP_Q8W8_YT 2|4, default 2); GGML_HIP_Q8W8_DEPTH 2|3 (default 3); GGML_HIP_Q8W8_WAVES (max waves per WG, <= 8,
 //      default 8); GGML_HIP_Q8W8_MIN_BYTES (default 8 MiB, weight strictly larger; 27B attn_k/v stays stock).
 #include "mmq-q8-w8.cuh"
 
@@ -44,21 +45,27 @@ static int q8w8_env_int(const char * name, int def) {
 }
 
 struct q8w8_cfg {
-    bool enabled; int mode; int depth; int waves; int yt; int64_t min_bytes;
+    bool enabled; int mode; int depth; int waves; int yt; int myt; int ks; int64_t min_bytes;
 };
 
 static const q8w8_cfg & q8w8_get_cfg() {
     static const q8w8_cfg cfg = [] {
         q8w8_cfg c;
         c.mode    = q8w8_env_int("GGML_HIP_Q8W8", 0);
-        c.enabled = c.mode == 1 || c.mode == 2;
+        c.enabled = c.mode == 1 || c.mode == 2 || c.mode == 3;
+        c.myt     = q8w8_env_int("GGML_HIP_Q8W8_MYT", 2);   // design 4: 16-row tiles per wave, 1|2|4
+        c.myt     = c.myt == 4 ? 4 : (c.myt == 1 ? 1 : 2);
+        c.ks      = q8w8_env_int("GGML_HIP_Q8W8_KS", 0);    // design 4: waves per WG splitting K (0 = auto)
         c.depth   = q8w8_env_int("GGML_HIP_Q8W8_DEPTH", 3) == 2 ? 2 : 3;
         c.yt      = q8w8_env_int("GGML_HIP_Q8W8_YT", 2) == 4 ? 4 : 2;   // design 3 only
         c.waves   = std::min(c.mode == 2 ? Q8WO_MAXWAVE : Q8W8_MAXWAVE,
                              std::max(1, q8w8_env_int("GGML_HIP_Q8W8_WAVES", c.mode == 2 ? Q8WO_MAXWAVE : Q8W8_MAXWAVE)));
         const char * mb = getenv("GGML_HIP_Q8W8_MIN_BYTES");
         c.min_bytes = (mb && *mb) ? std::max(0ll, atoll(mb)) : (8ll << 20);
-        if (c.enabled && c.mode == 2) {
+        if (c.enabled && c.mode == 3) {
+            GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8=3 w8 Q8_0 GEMV armed (design 4 q8wm: int8 MFMA 16x16x16, raw-pair "
+                          "register operands, YT %d x 16 rows, KS %d, > %lld B)\n", c.myt, c.ks, (long long) c.min_bytes);
+        } else if (c.enabled && c.mode == 2) {
             GGML_LOG_INFO("ggml_cuda_q8_w8: GGML_HIP_Q8W8=2 w8 Q8_0 GEMV armed (design 3 occupancy-first q8wo: half-block lanes, "
                           "YT %d, 2-deep flattened prefetch, %d waves, > %lld B)\n", c.yt, c.waves, (long long) c.min_bytes);
         } else if (c.enabled) {
@@ -504,6 +511,224 @@ q8wo_mul_mat(const char * __restrict__ W, const int nb01, const int nblk, const 
 #endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Design 4 (GGML_HIP_Q8W8=3, "q8wm"): purpose-built M = 8 int8 MFMA GEMV, weights straight from registers (no LDS, no
+// repack). Counter row ak-27b-q8wv-w8-counters r2: stock q8wv at w8 issues 0.101 wave instructions per weight byte
+// (w1: 0.041); the 8-column dp4a + per-half-block scale epilogue is 7 VALU per (row, column, 16 B). Here:
+//  * v_mfma_i32_16x16x16i8, srcB = 16 weight rows (lane l: row l%16, k group g = l/16), srcA = 16 activation "columns"
+//    c' = 8 * parity + column. The unit of K is a block PAIR (2 Q8_0 blocks = 68 B = 17 dwords of a row, dword aligned
+//    because nblk is even). Each lane loads 5 raw dwords of its row, starting at pair dword s_g = {0, 5, 10, 12}[g]
+//    (buffer_load_dwordx4 + dword): one wave instruction pair covers 16 rows x 68 contiguous B.
+//  * The scale bytes and the block boundary are handled in the ACTIVATION, not the weights: activation column (p, col)
+//    is laid out in raw pair byte coordinates, = q8 activation of block 2*pair+p at that block's qs bytes and 0 at the
+//    two f16 scale positions, at the other block's bytes and at the 3 duplicated dwords of group 3. So 5 MFMAs per pair
+//    give the exact per-(row, column, block) i32 dot products with no v_alignbyte, no masking and no padding columns.
+//  * Epilogue per pair: lane holds D[c' = 4g + v][row l%16] (one parity g/2, 4 columns): 4 x (cvt, mul, fma) with the
+//    lane's own block scale (one ushort load of the row's d, same lines) and 4 activation scales (one dwordx4).
+//  * Activation operands (5 dwords per lane per pair, + 4 scales) are shared by YT 16-row tiles per wave.
+//  * KS waves per WG split K of the same tile (deterministic LDS reduce at the end); grid = ceil(N / 16 YT) WGs.
+//  Static estimate per (pair, tile): 2 + 1 VMEM, 5 MFMA, 1 + 12 VALU, + 3 / YT shared loads -> ~0.02 inst / weight B.
+// ---------------------------------------------------------------------------------------------------------------------
+static const char q8wm_build_marker[] __attribute__((used)) =
+    "ggml-cuda: Q8W8 design 4 q8wm M8 int8 MFMA GEMV (GGML_HIP_Q8W8=3)";
+
+// y: [8][K] f32 -> actA [npairs][16 c'][4 g][5 dwords] int8 (raw pair byte coordinates), actD [npairs][16 c'] f32.
+// One WG (256 threads) per pair.
+static __global__ void __launch_bounds__(256) q8wm_prep(const float * __restrict__ y, const int64_t s1,
+                                                        int * __restrict__ actA, float * __restrict__ actD) {
+    __shared__ int8_t sq[16][32];   // [c' = 8 p + col][i]
+    const int pr  = blockIdx.x;
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int t   = tid + 256 * r;
+        const int e   = t >> 5;       // c'
+        const int i   = t & 31;
+        const int p   = e >> 3;
+        const int col = e & 7;
+        const float x = y[col * s1 + (int64_t) pr * 64 + 32 * p + i];
+        float amax = fabsf(x);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+        }
+        const float d = amax / 127.0f;
+        sq[e][i] = (int8_t) (amax == 0.0f ? 0 : (int) roundf(x / d));
+        if (i == 0) {
+            actD[(int64_t) pr * 16 + e] = d;
+        }
+    }
+    __syncthreads();
+    for (int q = tid; q < 320; q += 256) {
+        const int e  = q / 20;
+        const int g  = (q / 5) & 3;
+        const int ii = q % 5;
+        const int p  = e >> 3;
+        const int sg = g == 3 ? 12 : 5 * g;
+        uint32_t v = 0;
+        if (g != 3 || ii >= 3) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int b  = 4 * (sg + ii) + j;       // byte in the 68 B pair
+                const int k  = p == 0 ? b - 2 : b - 36; // qs index of block 2 pr + p
+                if (k >= 0 && k < 32) {
+                    v |= (uint32_t) (uint8_t) sq[e][k] << (8 * j);
+                }
+            }
+        }
+        actA[(int64_t) pr * 320 + q] = (int) v;
+    }
+}
+
+#if defined(GGML_USE_HIP)
+typedef int q8wm_v4i __attribute__((ext_vector_type(4)));
+#endif
+
+template <int YT>
+static __global__ void __launch_bounds__(1024)
+q8wm_mul_mat(const char * __restrict__ W, const int nb01, const int npairs, const int N, const uint32_t wbytes,
+             const int * __restrict__ actA, const uint32_t abytes, const float * __restrict__ actD, const uint32_t dbytes,
+             float * __restrict__ dst, const int64_t dst_s1) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+    extern __shared__ float q8wm_red[];   // [KS][YT][4][64]
+    constexpr uint32_t OOB = 0x7ffffff0u;
+    const int lane = threadIdx.x;
+    const int kw   = threadIdx.y;
+    const int KS   = blockDim.y;
+    const int g    = lane >> 4;
+    const int r16  = lane & 15;
+    const int sg4  = 4 * (g == 3 ? 12 : 5 * g);   // byte offset of this lane's window in a pair
+    const int pout = g >> 1;                      // parity of this lane's D rows (c' = 4 g + v)
+    const q8w8_int4 wrsrc = q8w8_make_rsrc(W, wbytes);
+    const q8w8_int4 arsrc = q8w8_make_rsrc(actA, abytes);
+    const q8w8_int4 drsrc = q8w8_make_rsrc(actD, dbytes);
+
+    const int row0 = blockIdx.x * 16 * YT;
+    int vrow[YT];
+#pragma unroll
+    for (int y = 0; y < YT; ++y) {
+        const int row = row0 + 16 * y + r16;
+        vrow[y] = row < N ? row * nb01 : (int) OOB;
+    }
+    const int p0 = (int) (((int64_t) kw * npairs) / KS);
+    const int p1 = (int) (((int64_t) (kw + 1) * npairs) / KS);
+
+    float acc[YT][4];
+#pragma unroll
+    for (int y = 0; y < YT; ++y) {
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            acc[y][v] = 0.0f;
+        }
+    }
+    const int aoff = (r16 * 4 + g) * 20;   // this lane's activation operand (c' = r16, group g) within a pair
+    for (int pr = p0; pr < p1; ++pr) {
+        const int wo = pr * 68;
+        q8w8_int4 wa[YT];
+        int       wb[YT];
+        short     ws[YT];
+#pragma unroll
+        for (int y = 0; y < YT; ++y) {
+            const int vo = vrow[y] == (int) OOB ? (int) OOB : vrow[y] + wo;
+            wa[y] = q8w8_buf_x4(wrsrc, vo == (int) OOB ? vo : vo + sg4,      0, 2);
+            wb[y] = q8w8_buf_x1(wrsrc, vo == (int) OOB ? vo : vo + sg4 + 16, 0, 2);
+            ws[y] = q8w8_buf_s16(wrsrc, vo == (int) OOB ? vo : vo + 34 * pout, 0, 0);
+        }
+        const q8w8_int4 aa = q8w8_buf_x4(arsrc, pr * 1280 + aoff,      0, 0);
+        const int       ab = q8w8_buf_x1(arsrc, pr * 1280 + aoff + 16, 0, 0);
+        const q8w8_int4 dd = q8w8_buf_x4(drsrc, pr * 64 + 16 * g,      0, 0);
+        const float da[4] = {__int_as_float(dd[0]), __int_as_float(dd[1]), __int_as_float(dd[2]), __int_as_float(dd[3])};
+#pragma unroll
+        for (int y = 0; y < YT; ++y) {
+            const q8wm_v4i z = {0, 0, 0, 0};
+            q8wm_v4i s = __builtin_amdgcn_mfma_i32_16x16x16i8(aa[0], wa[y][0], z, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(aa[1], wa[y][1], s, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(aa[2], wa[y][2], s, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(aa[3], wa[y][3], s, 0, 0, 0);
+            s          = __builtin_amdgcn_mfma_i32_16x16x16i8(ab,    wb[y],    s, 0, 0, 0);
+            const float dw = __half2float(__ushort_as_half((unsigned short) ws[y]));
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                acc[y][v] += (float) s[v] * (dw * da[v]);
+            }
+        }
+    }
+    // parity 0 (g 0,1) + parity 1 (g 2,3): lanes l and l ^ 32 hold the same row and columns
+#pragma unroll
+    for (int y = 0; y < YT; ++y) {
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            acc[y][v] += __shfl_xor(acc[y][v], 32, 64);
+        }
+    }
+    if (KS > 1) {
+#pragma unroll
+        for (int y = 0; y < YT; ++y) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                q8wm_red[((kw * YT + y) * 4 + v) * 64 + lane] = acc[y][v];
+            }
+        }
+        __syncthreads();
+        if (kw != 0) {
+            return;
+        }
+        for (int k = 1; k < KS; ++k) {
+#pragma unroll
+            for (int y = 0; y < YT; ++y) {
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    acc[y][v] += q8wm_red[((k * YT + y) * 4 + v) * 64 + lane];
+                }
+            }
+        }
+    }
+    if (g < 2) {
+#pragma unroll
+        for (int y = 0; y < YT; ++y) {
+            const int row = row0 + 16 * y + r16;
+            if (row < N) {
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    dst[(int64_t) (4 * g + v) * dst_s1 + row] = acc[y][v];
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED(W); GGML_UNUSED(nb01); GGML_UNUSED(npairs); GGML_UNUSED(N); GGML_UNUSED(wbytes); GGML_UNUSED(actA);
+    GGML_UNUSED(abytes); GGML_UNUSED(actD); GGML_UNUSED(dbytes); GGML_UNUSED(dst); GGML_UNUSED(dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(__HIP_DEVICE_COMPILE__) && defined(CDNA2)
+}
+
+// KS (waves per WG splitting K): best wave-slot fill over ncu x 16 resident waves, at least 8 pairs per wave.
+template <int YT>
+static void q8wm_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int * actA, const float * actD,
+                        int ncu, int ks_env, float * dst, int64_t dst_s1, cudaStream_t stream) {
+    const int npairs = nblk / 2;
+    const int tiles  = (N + 16 * YT - 1) / (16 * YT);
+    const int slots  = ncu * 16;
+    int ks = ks_env;
+    if (ks <= 0) {
+        double best = -1.0;
+        ks = 1;
+        for (int k = 1; k <= 16 && npairs / k >= 8; ++k) {
+            const int64_t w   = (int64_t) tiles * k;
+            const double  eff = (double) w / (double) (((w + slots - 1) / slots) * slots);
+            if (eff > best + 0.01) {
+                best = eff;
+                ks   = k;
+            }
+        }
+    }
+    ks = std::max(1, std::min(16, ks));
+    const dim3   block(64, ks, 1);
+    const size_t shm = ks > 1 ? (size_t) ks * YT * 4 * 64 * sizeof(float) : 0;
+    q8wm_mul_mat<YT><<<tiles, block, shm, stream>>>(W, nb01, npairs, N, wbytes, actA, (uint32_t) (npairs * 1280), actD,
+                                                    (uint32_t) (npairs * 64), dst, dst_s1);
+}
+
 template <int YT>
 static void q8wo_launch(const char * W, int nb01, int nblk, int N, uint32_t wbytes, const int8_t * yq, const float * yd,
                         int ncu, int max_waves, float * dst, int64_t dst_s1, cudaStream_t stream) {
@@ -540,7 +765,9 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
         // Path witness (rows grep it; also the build's strings content marker).
         static std::atomic<int64_t> n_calls{0};
         if (n_calls.fetch_add(1) == 0) {
-            if (cfg.mode == 2) {
+            if (cfg.mode == 3) {
+                GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 design 4 q8wm w8 Q8_0 int8 MFMA GEMV ran (call 1, YT %d)\n", cfg.myt);
+            } else if (cfg.mode == 2) {
                 GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 design 3 q8wo w8 Q8_0 GEMV ran (call 1, YT %d, 2-deep)\n", cfg.yt);
             } else {
                 GGML_LOG_INFO("ggml_cuda_q8_w8: gfx90a Q8W8 w8 Q8_0 GEMV ran (call 1, full-block lanes, depth %d)\n", cfg.depth);
@@ -555,6 +782,26 @@ void ggml_cuda_mul_mat_q8_w8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t dst_s1 = dst->nb[1]  / sizeof(float);
     GGML_ASSERT(src1->ne[1] == Q8W8_M);
 
+    if (cfg.mode == 3) {
+        const int npairs = nblk / 2;
+        ggml_cuda_pool_alloc<int>   actA(ctx.pool(), (size_t) npairs * 320);
+        ggml_cuda_pool_alloc<float> actD(ctx.pool(), (size_t) npairs * 16);
+        q8wm_prep<<<npairs, 256, 0, stream>>>((const float *) src1->data, s1, actA.get(), actD.get());
+        const char *   W      = (const char *) src0->data;
+        const int      nb01   = (int) src0->nb[1];
+        const uint32_t wbytes = (uint32_t) ggml_nbytes(src0);
+        const int      ncu    = ggml_cuda_info().devices[ctx.device].nsm;
+        float *        d      = (float *) dst->data;
+        if (cfg.myt == 4) {
+            q8wm_launch<4>(W, nb01, nblk, N, wbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
+        } else if (cfg.myt == 1) {
+            q8wm_launch<1>(W, nb01, nblk, N, wbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
+        } else {
+            q8wm_launch<2>(W, nb01, nblk, N, wbytes, actA.get(), actD.get(), ncu, cfg.ks, d, dst_s1, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) Q8W8_M * nblk * 32);
     ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) Q8W8_M * nblk);
     {
