@@ -44,7 +44,13 @@ static int run_case(ggml_backend_t be, int n_embd, int top_k, int bs, int nb, in
     ggml_build_forward_expand(gf, out);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     ggml_backend_tensor_set(t, lat.data(), 0, ggml_nbytes(t));
-    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); return 1; }
+    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+        printf("  %-8s top_k=%d bs=%d nb=%d levels=%d seed=%u : SKIP (compute failed)\n", ggml_backend_name(be), top_k, bs, nb, levels, seed);
+        fflush(stdout);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 2;
+    }
     std::vector<float> got(ggml_nelements(out));
     ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
 
@@ -57,6 +63,7 @@ static int run_case(ggml_backend_t be, int n_embd, int top_k, int bs, int nb, in
     }
     printf("  %-8s top_k=%d bs=%d nb=%d levels=%d seed=%u : %s (%d mismatches)\n", ggml_backend_name(be), top_k, bs,
            nb, levels, seed, bad ? "FAIL" : "ok", bad);
+    fflush(stdout);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return bad ? 1 : 0;
@@ -74,7 +81,17 @@ int main() {
         // served shape (n_embd 5120 >= 8*9, block 8 -> 7 drafts), plus wide top_k, multi-block, and tie lattices
         const int cfg[][5] = { {5120, 8, 8, 1, 0}, {5120, 8, 8, 1, 3}, {5120, 8, 8, 1, 1}, {5120, 8, 8, 4, 2},
                                {1024, 16, 16, 3, 0}, {1024, 16, 16, 3, 2}, {5120, 32, 8, 2, 0}, {5120, 32, 8, 2, 4} };
-        for (auto & c : cfg) for (uint32_t s = 1; s <= 25; ++s) fails += run_case(be, c[0], c[1], c[2], c[3], c[4], s) ? 1 : 0;
+        int n = 0, ok = 0, bad = 0, skip = 0;
+        for (auto & c : cfg) for (uint32_t s = 1; s <= 25; ++s) {
+            const int r = run_case(be, c[0], c[1], c[2], c[3], c[4], s);
+            ++n; ok += r == 0; bad += r == 1; skip += r == 2;
+        }
+        fails += bad + skip;
+        // machine-readable per-backend tally: gates read THIS line, never count case lines (backend stderr can
+        // interleave with stdout and split a case line)
+        fflush(stderr);
+        printf("TALLY backend=%s cases=%d ok=%d fail=%d skip=%d\n", ggml_backend_name(be), n, ok, bad, skip);
+        fflush(stdout);
         ggml_backend_free(be);
     }
     printf("backends=%d failing_cases=%d -> %s\n", n_be, fails, (fails == 0 && n_be > 0) ? "PASS" : "FAIL");
