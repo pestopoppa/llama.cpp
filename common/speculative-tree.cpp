@@ -242,6 +242,126 @@ std::vector<std::vector<int32_t>> common_dtree_build_greedy(
     return paths;
 }
 
+std::vector<std::vector<int32_t>> common_dtree_build_pando(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, const std::vector<int32_t> & main_in,
+        float temp, int32_t n_nodes, int32_t k_children) {
+    std::vector<std::vector<int32_t>> out;
+    if (D <= 0 || K < 2 || k_children < 1 || n_nodes - 1 - D <= 0) {
+        return out;
+    }
+    const double tau = temp > 0.0f ? (double) temp : 1.0;
+    std::vector<float>  sbuf(K);
+    std::vector<double> pr;
+    auto dist = [&](int32_t j, int32_t pred) {
+        const float * s = scores(j, pred);
+        for (int32_t k = 0; k < K; ++k) {
+            sbuf[k] = (float) ((double) s[k] / tau);
+        }
+        softmax_d(sbuf.data(), K, pr);
+    };
+
+    // main chain: the caller's (sampled) indices, or the greedy argmax chain (std::max_element tie rule)
+    std::vector<int32_t> main = main_in;
+    if ((int32_t) main.size() < D) {
+        main.clear();
+        int32_t pred = 0;
+        for (int32_t j = 0; j < D; ++j) {
+            const float * s = scores(j, pred);
+            pred = (int32_t) std::distance(s, std::max_element(s, s + K));
+            main.push_back(pred);
+        }
+    }
+    main.resize(D);
+
+    std::priority_queue<greedy_node, std::vector<greedy_node>, greedy_worse> heap;
+    // children of `path` (cumulative probability v) except `skip` (the main child, already in the tree): the top
+    // k_children candidates by the drafter's distribution at that depth (stable: lowest index first on ties)
+    std::vector<int32_t> order(K);
+    auto push_children = [&](const std::vector<int32_t> & path, double v, int32_t skip) {
+        const int32_t j = (int32_t) path.size();
+        if (j >= D || !(v > 0.0)) {
+            return;
+        }
+        dist(j, path.empty() ? 0 : path.back());
+        for (int32_t k = 0; k < K; ++k) {
+            order[k] = k;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return pr[a] > pr[b]; });
+        for (int32_t r = 0; r < k_children && r < K; ++r) {
+            const int32_t k = order[r];
+            if (k == skip || !(pr[k] > 0.0)) {
+                continue;
+            }
+            greedy_node n { v * pr[k], path };
+            n.path.push_back(k);
+            heap.push(std::move(n));
+        }
+    };
+
+    // the whole main chain is in the tree (the served rejection step needs it); its nodes seed the frontier
+    {
+        std::vector<int32_t> p;
+        double v = 1.0;
+        for (int32_t j = 0; j < D; ++j) {
+            push_children(p, v, main[j]);
+            dist(j, j == 0 ? 0 : main[j - 1]);
+            v *= pr[main[j]];
+            p.push_back(main[j]);
+        }
+    }
+
+    std::vector<std::vector<int32_t>> tree; // off-main nodes, insertion order
+    const int32_t extra = n_nodes - 1 - D;
+    while ((int32_t) tree.size() < extra && !heap.empty()) {
+        greedy_node n = heap.top();
+        heap.pop();
+        tree.push_back(n.path);
+        push_children(n.path, n.v, -1);
+    }
+
+    std::vector<bool> leaf(tree.size(), true);
+    for (const auto & p : tree) {
+        const std::vector<int32_t> par(p.begin(), p.end() - 1);
+        for (size_t i = 0; i < tree.size(); ++i) {
+            if (tree[i] == par) {
+                leaf[i] = false;
+                break;
+            }
+        }
+    }
+    for (size_t i = 0; i < tree.size(); ++i) {
+        if (leaf[i]) {
+            out.push_back(tree[i]);
+        }
+    }
+    return out;
+}
+
+int32_t common_dtree_pando_k() {
+    static const int32_t k = [] {
+        const char * e = std::getenv("LLAMA_DTREE_PANDO_K");
+        const int32_t v = e ? std::atoi(e) : 0;
+        return v >= 1 ? v : 3;
+    }();
+    return k;
+}
+
+int32_t common_dtree_builder() {
+    static const int32_t b = [] {
+        const char * e = std::getenv("LLAMA_DTREE_BUILDER");
+        const int32_t v = e != nullptr && std::strcmp(e, "pando") == 0 ? 1 : 0;
+        if (v == 1) {
+            fprintf(stderr, COMMON_DTREE_PANDO_ENABLED_MSG "\n", common_dtree_pando_k());
+        }
+        return v;
+    }();
+    return b;
+}
+
+bool common_dtree_varlen() {
+    return common_dtree_policy() == 1 || common_dtree_builder() == 1;
+}
+
 int32_t common_dtree_policy() {
     static const int32_t policy = [] {
         const char * e = std::getenv("LLAMA_DTREE_POLICY");

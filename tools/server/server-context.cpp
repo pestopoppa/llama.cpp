@@ -912,7 +912,7 @@ struct server_slot {
                 const llama_pos pa = prompt.tokens.pos_next(); // anchor position
                 // DTREE-TREE-QUALITY greedy tree: an alternative also shares its longest prefix with any EARLIER
                 // alternative (a best-first tree branches off branches), and never exceeds the round's column budget
-                const bool greedy = common_dtree_policy() == 1;
+                const bool greedy = common_dtree_varlen(); // greedy policy or C22 pando builder
                 int32_t n_cols = (int32_t) (spec_draft.size() + 1);
                 std::vector<llama_tokens>         alts_kept;
                 std::vector<std::vector<int32_t>> rows_kept;
@@ -1593,6 +1593,7 @@ private:
                     params_base.speculative.tree_seqs_per_slot(),
                     params_base.n_parallel * params_base.speculative.tree_seqs_per_slot());
             SRV_INF("draft tree policy: %s (LLAMA_DTREE_POLICY)\n", common_dtree_policy() == 1 ? "greedy" : "static");
+            SRV_INF("draft tree builder: %s (LLAMA_DTREE_BUILDER), pando k = %d\n", common_dtree_builder() == 1 ? "pando" : "default", common_dtree_pando_k());
         }
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -4774,7 +4775,7 @@ private:
             {
                 common_speculative_get_draft_params(spec.get(), slot.id).tree_alts = nullptr;
                 std::vector<llama_tokens> keep;
-                if (!draft.empty() && !use_serial_speculative_verify(slot) && common_dtree_policy() == 1) {
+                if (!draft.empty() && !use_serial_speculative_verify(slot) && common_dtree_varlen()) {
                     // DTREE-TREE-QUALITY greedy tree: alternatives keep their own length (a leaf may be deeper or
                     // shallower than the main chain); drop empties, prefixes of the main draft and duplicates.
                     // The paths mode verifies one sequence per path, so it keeps only as many as it has sequences.

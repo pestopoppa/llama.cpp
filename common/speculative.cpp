@@ -1853,8 +1853,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t j = 0; j < D; ++j) {
                         q[j] = (*dp.dists)[q0 + j].probs;
                     }
-                    const auto paths = common_dtree_build_sampled(D, selector_top_k, scores, main_idx, q, dp.tree_nodes,
-                                                                  common_dtree_sampled_max_paths());
+                    // C22 DTREE-PANDO: LLAMA_DTREE_BUILDER=pando spends the extra nodes best-first around the sampled
+                    // main chain (same verify; the alternatives vary in length)
+                    const auto paths = common_dtree_builder() == 1
+                            ? common_dtree_build_pando(D, selector_top_k, scores, main_idx, dp.temperature, dp.tree_nodes,
+                                                       common_dtree_pando_k())
+                            : common_dtree_build_sampled(D, selector_top_k, scores, main_idx, q, dp.tree_nodes,
+                                                         common_dtree_sampled_max_paths());
                     for (const auto & path : paths) {
                         llama_tokens alt;
                         alt.reserve(path.size());
@@ -1872,10 +1877,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     };
                     // DTREE-TREE-QUALITY: LLAMA_DTREE_POLICY=greedy grows a best-first tree; the main draft is then the
                     // greedy chain's prefix inside the tree (it may be shorter than D) and alternatives vary in length
-                    const bool greedy = common_dtree_policy() == 1;
-                    const auto paths = greedy
+                    const bool greedy = common_dtree_policy() == 1 && common_dtree_builder() != 1;
+                    std::vector<std::vector<int32_t>> paths;
+                    if (common_dtree_builder() == 1) {
+                        // C22 DTREE-PANDO at T = 0: the greedy chain stays whole (path 0), the rest best-first
+                        paths.push_back({});
+                        for (auto & a : common_dtree_build_pando(D, selector_top_k, scores, {}, 0.0f, dp.tree_nodes,
+                                                                 common_dtree_pando_k())) {
+                            paths.push_back(std::move(a));
+                        }
+                    } else {
+                        paths = greedy
                             ? common_dtree_build_greedy(D, selector_top_k, scores, dp.tree_nodes, false)
                             : common_dtree_build_paths(D, selector_top_k, scores, dp.tree_nodes, COMMON_DTREE_MAX_PATHS);
+                    }
                     if (greedy && !paths.empty() && paths[0].size() < result.size()) {
                         result.resize(paths[0].size());
                     }

@@ -46,6 +46,28 @@ std::vector<std::vector<int32_t>> common_dtree_build_paths(
 std::vector<std::vector<int32_t>> common_dtree_build_greedy(
         int32_t D, int32_t K, const common_dtree_scores_fn & scores, int32_t n_nodes, bool branch_follows_main);
 
+// C22 DTREE-PANDO (LLAMA_DTREE_BUILDER=pando, default off): Pando-style best-first tree around the drafted MAIN chain.
+// The whole main chain (main[0..D), the sampled chain at T > 0 or the greedy argmax chain when main is shorter than D)
+// is in the tree, so the served verify (recursive rejection on the main chain, sample-and-compare on siblings; greedy
+// match at T = 0) is unchanged and lossless. The remaining n_nodes - 1 - D draft nodes are taken best-first by
+// cumulative draft probability (product along the path of softmax(scores / temp), temp <= 0 -> 1) from a frontier
+// holding the top k_children candidates of every tree node (main nodes exclude their main child); any node may branch,
+// ties go to the lexicographically smaller index path. Returns the off-main leaves' root paths (variable length,
+// insertion order); path 0 = main is implied. Reference: headroom_replay.py build_pando (DTREE-HEADROOM-REPLAY).
+std::vector<std::vector<int32_t>> common_dtree_build_pando(
+        int32_t D, int32_t K, const common_dtree_scores_fn & scores, const std::vector<int32_t> & main,
+        float temp, int32_t n_nodes, int32_t k_children);
+
+// LLAMA_DTREE_BUILDER: 0 = default builders, 1 = pando (common_dtree_build_pando, DFlash2 reader). Read once; the
+// witness line below is printed to stderr when pando is on.
+int32_t common_dtree_builder();
+// LLAMA_DTREE_PANDO_K children per node (default 3, the replay's frozen k at N = 16)
+int32_t common_dtree_pando_k();
+// alternatives keep their own length (greedy policy or pando builder) instead of being cut to the main draft's
+bool common_dtree_varlen();
+#define COMMON_DTREE_PANDO_ENABLED_MSG \
+    "llama_dtree_builder: PANDO (LLAMA_DTREE_BUILDER=pando; best-first by cumulative draft probability, k=%d children/node, main chain kept, verify unchanged)"
+
 // LLAMA_DTREE_POLICY: 0 = static paths (default, common_dtree_build_paths), 1 = greedy (common_dtree_build_greedy)
 int32_t common_dtree_policy();
 
