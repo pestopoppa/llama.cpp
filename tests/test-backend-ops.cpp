@@ -14169,6 +14169,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // HBM-knee batch (GGML_HIP_KNEE_CONCAT): served short-row non-cont concats (GDN conv state 3 + n_tokens, 27B 10240 and
+    // A3B 8192 channels) and a long-row one that spans many knee ranges
+    for (int v : { 1, 2, 3 }) {
+        for (int64_t nt : { 1, 8 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, nt, 0, v));
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, nt, 0, v));
+        }
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4096, 33, 3, 1}, 5, 1, v));
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
