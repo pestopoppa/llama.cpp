@@ -1,6 +1,8 @@
 #include "concat.cuh"
 
 #include <stdint.h>
+#include <atomic>
+#include <cstdlib>
 
 // contiguous kernels
 template <typename T, int dim>
@@ -139,6 +141,56 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// AK-C22-SMALLOP-FUSE-2 C2A (GGML_CUDA_AK_CONCAT_FLAT=1, default off): the non-contiguous kernel above runs one
+// block of CUDA_CONCAT_BLOCK_SIZE threads per dst row, so a short row (the GDN conv input concat(conv_states, qkv^T),
+// ne0 = d_conv - 1 + n_tokens = 11 at verify width 8, 10240 rows) idles ~95 % of every block. This variant maps one
+// thread to one dst element over the flattened dst and copies the same bytes (bit-identical by construction).
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    const int64_t n = ne0*ne1*ne2*ne3;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+        int64_t r = i;
+        const int64_t i0 = r % ne0; r /= ne0;
+        const int64_t i1 = r % ne1; r /= ne1;
+        const int64_t i2 = r % ne2;
+        const int64_t i3 = r / ne2;
+        const T * x;
+        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+            x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+        } else if constexpr (dim == 0) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        } else if constexpr (dim == 1) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        } else if constexpr (dim == 2) {
+            x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+        } else {
+            x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+        }
+        *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+    }
+}
+
+static std::atomic<uint64_t> g_ak_concat_flat_n_calls{0};
+
+uint64_t ggml_cuda_ak_concat_flat_n_calls() {
+    return g_ak_concat_flat_n_calls.load();
+}
+
+static bool ak_concat_flat_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_AK_CONCAT_FLAT");
+        return e != nullptr && atoi(e) == 1;
+    }();
+    return on;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +214,34 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (ak_concat_flat_enabled() && dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE/2) {
+            const int64_t n    = ggml_nelements(dst);
+            const int     grid = (int) std::min<int64_t>((n + CUDA_CONCAT_BLOCK_SIZE - 1)/CUDA_CONCAT_BLOCK_SIZE, 65535);
+            auto launch_flat = [&](auto dim) {
+                concat_non_cont_flat<T, dim><<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                    (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            };
+            switch (dim) {
+                case 0: launch_flat(std::integral_constant<int, 0>{}); break;
+                case 1: launch_flat(std::integral_constant<int, 1>{}); break;
+                case 2: launch_flat(std::integral_constant<int, 2>{}); break;
+                case 3: launch_flat(std::integral_constant<int, 3>{}); break;
+                default: GGML_ABORT("Invalid dim: %d", dim);
+            }
+            const uint64_t c = g_ak_concat_flat_n_calls.fetch_add(1);
+            if (c == 0) {
+                GGML_LOG_INFO("ggml_cuda_ak_concat_flat: AK-C22-SMALLOP-FUSE-2 C2A flat non-contiguous concat path ran "
+                              "(dim %d, dst %lld x %lld x %lld x %lld)\n", dim, (long long) dst->ne[0], (long long) dst->ne[1],
+                              (long long) dst->ne[2], (long long) dst->ne[3]);
+            }
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

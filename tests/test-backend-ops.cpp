@@ -4531,6 +4531,84 @@ struct test_ak_cpy_batch : public test_case {
     }
 };
 
+// AK-C22-SMALLOP-FUSE-2 C2A (GGML_CUDA_AK_CONCAT_FLAT=1): non-contiguous CONCAT with a short dst row (ne0 < 128) runs
+// one thread per dst element. The served shape is the GDN conv input concat(conv_states, qkv^T, 0), ne0 = d_conv - 1 +
+// n_tokens; dim 1 / dim 2 non-contiguous and a 2-byte type are covered. Witness: >= 1 flat launch iff knob on and ne0 < 128.
+struct test_ak_concat_flat : public test_case {
+    const int64_t channels, n_tokens, n_seqs, d_conv;
+    const int dim;
+    const ggml_type type;
+
+    using n_calls_t = uint64_t (*)();
+    n_calls_t n_calls = nullptr;
+    bool      armed   = false;
+    bool      expect  = false;
+    uint64_t  before  = 0;
+    int64_t   dst_ne0 = 0;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "AK_CONCAT_FLAT"; }
+    double max_nmse_err() override { return 0.0; }
+    std::string vars() override { return VARS_TO_STR6(channels, n_tokens, n_seqs, d_conv, dim, type); }
+
+    test_ak_concat_flat(int64_t channels, int64_t n_tokens, int64_t n_seqs = 1, int64_t d_conv = 4, int dim = 0,
+                        ggml_type type = GGML_TYPE_F32)
+        : channels(channels), n_tokens(n_tokens), n_seqs(n_seqs), d_conv(d_conv), dim(dim), type(type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = nullptr;
+        if (dim == 0) {
+            ggml_tensor * conv_states = ggml_new_tensor_3d(ctx, type, d_conv - 1, channels, n_seqs);
+            ggml_set_name(conv_states, "conv_states");
+            ggml_tensor * qkv = ggml_new_tensor_3d(ctx, type, channels, n_tokens, n_seqs);
+            ggml_set_name(qkv, "qkv_mixed");
+            out = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
+        } else {
+            // a [d_conv, channels / 16, n_tokens, n_seqs] pair, src1 permuted so the concat is non-contiguous along `dim`
+            ggml_tensor * a = ggml_new_tensor_4d(ctx, type, d_conv, channels/16, n_tokens, n_seqs);
+            ggml_set_name(a, "a");
+            ggml_tensor * b = ggml_new_tensor_4d(ctx, type, channels/16, d_conv, n_tokens, n_seqs);
+            ggml_set_name(b, "b");
+            out = ggml_concat(ctx, a, ggml_permute(ctx, b, 1, 0, 2, 3), dim);
+        }
+        dst_ne0 = out->ne[0];
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void witness_begin(ggml_backend_t backend) override {
+        armed = false;
+        if (ggml_backend_is_cpu(backend)) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        n_calls = (n_calls_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ak_concat_flat_n_calls");
+        if (n_calls == nullptr) {
+            return;
+        }
+        const char * e = getenv("GGML_CUDA_AK_CONCAT_FLAT");
+        expect = e != nullptr && atoi(e) == 1 && dst_ne0 < 128;
+        before = n_calls();
+        armed  = true;
+    }
+
+    std::string witness_check(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (!armed) {
+            return "";
+        }
+        const uint64_t advanced = n_calls() - before;
+        std::string reason;
+        if (expect && advanced == 0) {
+            reason = "AK_CONCAT_FLAT_WITNESS: flat concat kernel did not run";
+        } else if (!expect && advanced != 0) {
+            reason = "AK_CONCAT_FLAT_WITNESS: flat concat kernel ran where it must not";
+        }
+        fprintf(stderr, "AK_CONCAT_FLAT_WITNESS %s expect=%s calls_advanced=%" PRIu64 " verdict=%s\n", vars().c_str(),
+                expect ? "flat" : "rowblock", advanced, reason.empty() ? "PASS" : "FAIL");
+        return reason;
+    }
+};
+
 struct test_ak_add_rms_norm : public test_case {
     const int64_t ncols, nrows, nchan;
     const int64_t w_rows; // 1 = eligible weight row; 2 = broadcast weight, must not fuse
@@ -13829,6 +13907,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ak_cpy_batch(1000, nt, 2, 4, 4));
     }
     test_cases.emplace_back(new test_ak_cpy_batch(10240, 8, 1, 4, 1));
+    // AK-C22-SMALLOP-FUSE-2 C2A (GGML_CUDA_AK_CONCAT_FLAT=1): 27B conv channels 10240 at verify widths 1 / 8 / 16,
+    // A3B 8192, a ragged 1000 x 2 seqs, a 2-byte type, dims 1 / 2, and a long row (ne0 = 203) that must stay row-blocked
+    for (int64_t nt : { 1, 8, 16 }) {
+        test_cases.emplace_back(new test_ak_concat_flat(10240, nt));
+    }
+    test_cases.emplace_back(new test_ak_concat_flat(8192, 8));
+    test_cases.emplace_back(new test_ak_concat_flat(1000, 7, 2));
+    test_cases.emplace_back(new test_ak_concat_flat(10240, 8, 1, 4, 0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_ak_concat_flat(1024, 8, 2, 4, 1));
+    test_cases.emplace_back(new test_ak_concat_flat(1024, 8, 2, 4, 2));
+    test_cases.emplace_back(new test_ak_concat_flat(10240, 200));
     test_cases.emplace_back(new test_ak_cpy_batch(10240, 1, 1, 4, 1));
 
     // AK-RF-27B-TAIL-FUSE G1 (GGML_CUDA_AK_ADD_RMS_NORM=1): 27B n_embd 5120, A3B 2048, a < 1024 (256-thread) width,

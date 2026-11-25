@@ -5898,6 +5898,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_ak_tf2_n_calls") == 0) {
         return (void *)ggml_cuda_ak_tf2_n_calls;
     }
+    // AK-C22-SMALLOP-FUSE-2 C2A test witness: flat non-contiguous concat launches since process start
+    if (strcmp(name, "ggml_backend_cuda_ak_concat_flat_n_calls") == 0) {
+        return (void *)ggml_cuda_ak_concat_flat_n_calls;
+    }
     // AK-C22-SMALLOP-FUSE F1 test witness: batched cpy launches since process start
     if (strcmp(name, "ggml_backend_cuda_ak_cpy_batch_n_calls") == 0) {
         return (void *)ggml_cuda_ak_cpy_batch_n_calls;
