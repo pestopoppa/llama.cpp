@@ -581,6 +581,14 @@ extern "C" IQK_API int iqk_dequant_type(int type, int Ny) {
     return MulMat::is_dequant_better(ggml_type(type), Ny);
 }
 
+static bool iqk_skinny_balance_enabled() {
+    static const bool e = []() {
+        const char * v = getenv("GGML_IQK_SKINNY_BALANCE");
+        return v && atoi(v) != 0;
+    }();
+    return e;
+}
+
 static bool iqk_mul_mat_impl(long Nx, long Ny, long ne00,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
@@ -597,6 +605,28 @@ static bool iqk_mul_mat_impl(long Nx, long Ny, long ne00,
     if (Nx/nth < k_min_step) {
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
             return false;
+        }
+        // AK Q38FN-CPU-MOE-GEMV-1 lever 2: GGML_IQK_SKINNY_BALANCE (default OFF). The stock skinny
+        // branch below deals 16-row tiles round-robin, so an Nx-row GEMV keeps only ceil(Nx/16)
+        // threads busy: Q38FN hc_{attn,ffn}_down (Nx=320) runs on 20 of 72/96 threads, shexp
+        // gate/up (Nx=640) on 40, shexp down (Nx=2560) at 96 threads is 160 tiles = 1.67 rounds.
+        // ON: for a single y-tile (Ny <= 16) give every thread one contiguous, balanced run of
+        // whole kernel-row units. Same kernel, same rows, rows accumulate independently ->
+        // bit-identical output; only the row->thread assignment changes.
+        if (Ny <= 16 && iqk_skinny_balance_enabled()) {
+            const int num_rows = MulMat::num_rows(ggml_type(typeA));
+            if (num_rows > 0 && Nx % num_rows == 0) {
+                const long units = Nx / num_rows;
+                const long u0 = units * ith / nth;
+                const long u1 = units * (ith + 1) / nth;
+                if (u1 > u0) {
+                    const long ix = u0 * num_rows;
+                    DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+                    info.allow_rowexact = rowexact;
+                    mm.mul_mat_NxM(ne00, (const char *)A + ix*row_size_qx, row_size_qx, info, (int) ((u1 - u0) * num_rows), Ny);
+                }
+                return true;
+            }
         }
         const int min_step = Ny <= 16 ? 16 : 32;
         int ntile_x = (Nx + min_step - 1)/min_step;
