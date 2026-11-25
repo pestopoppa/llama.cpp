@@ -3597,6 +3597,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // AK-C22-SMALLOP-FUSE F1: a run of same-layout CPY nodes in one launch (GGML_CUDA_AK_CPY_BATCH=1, default off)
+    if (node->op == GGML_OP_CPY && ggml_cuda_ak_cpy_batch_enabled()) {
+        const int n_skip = ggml_cuda_ak_cpy_batch_try(*cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
     // AK-ASM-H15: concat + conv-state cpy + ssm_conv + silu + q/k l2_norm (default off since C19; GGML_CUDA_AK_H15=1 enables)
     // (at SSM_CONV it only skips a tail the fused kernel already computed at the CONCAT position)
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
@@ -5916,6 +5924,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // AK-RF-27B-TAIL-FUSE-2 test witness: uint64_t (*)(int group), fused launches of that group since process start
     if (strcmp(name, "ggml_backend_cuda_ak_tf2_n_calls") == 0) {
         return (void *)ggml_cuda_ak_tf2_n_calls;
+    }
+    // AK-C22-SMALLOP-FUSE F1 test witness: batched cpy launches since process start
+    if (strcmp(name, "ggml_backend_cuda_ak_cpy_batch_n_calls") == 0) {
+        return (void *)ggml_cuda_ak_cpy_batch_n_calls;
     }
     // AK-RF-27B-TAIL-FUSE G1 test witness: fused add+rms_norm+mul launches since process start
     if (strcmp(name, "ggml_backend_cuda_ak_add_rms_norm_n_calls") == 0) {

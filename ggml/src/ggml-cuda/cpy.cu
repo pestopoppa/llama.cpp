@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include <atomic>
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -614,4 +615,126 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
+}
+
+// AK-C22-SMALLOP-FUSE F1 (GGML_CUDA_AK_CPY_BATCH=1, default off): a run of same-shape, same-stride, same-type CPY nodes
+// (F32 -> F32 only; the K = n_rs_seq + 1 per-token conv-state rollback snapshots of llm_build_delta_net_base::build_conv_state, 8 per GDN
+// layer x 48 layers = 384 cpy_scalar launches per 27B verify) runs as ONE launch: blockIdx.y selects the copy, each copy
+// does exactly cpy_scalar's index math and element store, so dst is bit-identical to the unfused run.
+#define AK_CPY_BATCH_MAX 16
+
+struct ak_cpy_batch_ptrs {
+    const char * src[AK_CPY_BATCH_MAX];
+    char       * dst[AK_CPY_BATCH_MAX];
+};
+
+template <typename T>
+static __global__ void ak_cpy_scalar_batched(const ak_cpy_batch_ptrs p, const int64_t ne,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+        const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+        const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+    const char * cx   = p.src[blockIdx.y];
+    char       * cdst = p.dst[blockIdx.y];
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    *(T *)(cdst + dst_offset) = *(const T *)(cx + x_offset);
+}
+
+static std::atomic<uint64_t> g_ak_cpy_batch_n_calls{0};
+
+uint64_t ggml_cuda_ak_cpy_batch_n_calls() {
+    return g_ak_cpy_batch_n_calls.load();
+}
+
+bool ggml_cuda_ak_cpy_batch_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_AK_CPY_BATCH");
+        return e != nullptr && atoi(e) == 1;
+    }();
+    return on;
+}
+
+static bool ak_cpy_batch_same(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->type != b->type) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const ggml_tensor * ak_cpy_batch_base(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+int ggml_cuda_ak_cpy_batch_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * n0 = cgraph->nodes[i];
+    if (n0->op != GGML_OP_CPY) {
+        return 0;
+    }
+    const ggml_tensor * s0 = n0->src[0];
+    const ggml_tensor * d0 = n0->src[1];
+    if (s0 == nullptr || d0 == nullptr || s0->type != d0->type || s0->type != GGML_TYPE_F32 ||
+        ggml_nelements(s0) != ggml_nelements(d0) || ak_cpy_batch_base(s0) == ak_cpy_batch_base(d0)) {
+        return 0;
+    }
+    int idx[AK_CPY_BATCH_MAX];
+    int n = 0;
+    int last = i;
+    for (int j = i; j < cgraph->n_nodes && n < AK_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op == GGML_OP_VIEW || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_PERMUTE ||
+            nj->op == GGML_OP_TRANSPOSE || nj->op == GGML_OP_NONE) {
+            continue;  // no-op nodes between the copies (their views) launch nothing
+        }
+        if (nj->op != GGML_OP_CPY || nj->src[0] == nullptr || nj->src[1] == nullptr || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !ak_cpy_batch_same(nj->src[0], s0) || !ak_cpy_batch_same(nj->src[1], d0) ||
+            ak_cpy_batch_base(nj->src[0]) != ak_cpy_batch_base(s0) || ak_cpy_batch_base(nj->src[1]) != ak_cpy_batch_base(d0)) {
+            break;
+        }
+        // same src base and same dst base, src base != dst base: no copy in the run reads another's output
+        idx[n++] = j;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ak_cpy_batch_ptrs p = {};
+    for (int k = 0; k < n; ++k) {
+        p.src[k] = (const char *) cgraph->nodes[idx[k]]->src[0]->data;
+        p.dst[k] = (char *) cgraph->nodes[idx[k]]->src[1]->data;
+    }
+    const int64_t ne = ggml_nelements(s0);
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const dim3 grid((unsigned) num_blocks, (unsigned) n, 1);
+    cudaStream_t stream = ctx.stream();
+    ak_cpy_scalar_batched<float><<<grid, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(p, ne,
+        s0->ne[0], s0->ne[1], s0->ne[2], s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3],
+        d0->ne[0], d0->ne[1], d0->ne[2], d0->nb[0], d0->nb[1], d0->nb[2], d0->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+    const uint64_t c = g_ak_cpy_batch_n_calls.fetch_add(1);
+    if (c == 0 || c == 1000) {
+        GGML_LOG_INFO("ggml_cuda_ak_cpy_batch: AK-C22-SMALLOP-FUSE F1 batched cpy fused path ran (call %llu, %d copies in one launch, "
+                      "ne=%lld, GGML_CUDA_AK_CPY_BATCH=1)\n", (unsigned long long) c + 1, n, (long long) ne);
+    }
+    return last - i;
 }
