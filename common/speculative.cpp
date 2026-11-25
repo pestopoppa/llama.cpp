@@ -1341,6 +1341,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // :1130) instead of fc / output_norm_enc. Used here only to make the target-width check real.
     bool    is_dspark41    = false;
     int32_t selector_top_k = 0;
+    // Q8-SERVED-DEV-SELECT-1: greedy selector chain runs on the device (read by the drafter graph too)
+    const bool dev_select = [] {
+        const char * e = getenv("LLAMA_DFLASH_DEV_SELECT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    // LLAMA_DFLASH_DRAFT_LOG=1: one line per draft with the drafted ids (the DEV-SELECT ON/OFF identity test)
+    const bool draft_log = [] {
+        const char * e = getenv("LLAMA_DFLASH_DRAFT_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    void dflash2_draft_log(const llama_tokens & result, int32_t n, const char * path) const {
+        if (!draft_log) {
+            return;
+        }
+        std::string s;
+        for (int32_t i = std::max<int32_t>(0, (int32_t) result.size() - n); i < (int32_t) result.size(); ++i) {
+            s += std::to_string(result[i]);
+            s += ' ';
+        }
+        LOG_INF("dflash2_draft_ids[%s]: %s\n", path, s.c_str());
+    }
     std::vector<std::mt19937> selector_rng;
     std::vector<bool> selector_reset;
 
@@ -1809,7 +1830,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 dp.dists->clear();
             }
 
-            if (is_dflash2) {
+            if (is_dflash2 && dev_select) {
+                // Q8-SERVED-DEV-SELECT-1: the drafter graph ran the greedy selector chain on the device; the nextn
+                // output holds (n_block_tokens-1) F32 ids per block, blocks in batch order (single ubatch)
+                if (dp.temperature > 0.0f) {
+                    GGML_ABORT("LLAMA_DFLASH_DEV_SELECT=1 supports greedy drafting only (temperature %.3f)", dp.temperature);
+                }
+                GGML_ASSERT(batch.n_tokens <= (int32_t) llama_n_ubatch(ctx_dft) && "DEV_SELECT needs one ubatch");
+                const float * ids = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(ids && "DFlash2 dev-select produced no ids");
+                const int32_t blk = beg / n_block_tokens;
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    result.push_back((llama_token) ids[(size_t) blk * (n_block_tokens - 1) + (i - 1)]);
+                }
+                if (dp.tree_alts) {
+                    dp.tree_alts->clear();
+                }
+                dflash2_draft_log(result, n_block_tokens - 1, "dev");
+                // same tail as the host DFlash2 branch: n_min trim, then next sequence. Without the continue the
+                // block fell through to the plain-DFlash sampler loop, which samples ctx_dft logits a DFlash2
+                // drafter never produces (GGML_ASSERT(logits != nullptr), 20261125 devhandoff smoke)
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            } else if (is_dflash2) {
                 GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");

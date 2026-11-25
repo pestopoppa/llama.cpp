@@ -1,9 +1,11 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "llama-dflash-select.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1389,6 +1391,28 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
 
     packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
     cb(packed, "dflash2_lattice", -1);
+
+    // Q8-SERVED-DEV-SELECT-1 (LLAMA_DFLASH_DEV_SELECT=1, default off): run the greedy selector argmax chain on the
+    // device as a graph tail and emit only the drafted ids, so the host reads (block_size-1) floats per block instead
+    // of the whole lattice. Same rule as the host chain in common/speculative.cpp: depth 1 reads predecessor 0, each
+    // depth takes argmax over scores[pred][*] with ties to the LOWEST index (ggml_argmax's DTREE-A rule, matching
+    // std::max_element), and the drafted id is candidate_ids[argmax]. Ids are exact in F32 (< 2^24).
+    static const bool dev_select = [] {
+        const char * e = getenv("LLAMA_DFLASH_DEV_SELECT");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            LLAMA_LOG_INFO("dflash2_dev_select: Q8-SERVED-DEV-SELECT-1 device selector chain enabled (LLAMA_DFLASH_DEV_SELECT=1)\n");
+        }
+        return on;
+    }();
+    if (dev_select && block_size > 1) {
+        ggml_tensor * chain = llama_dflash2_dev_select(ctx0, packed, top_k, block_size, n_blocks);
+        cb(chain, "dflash2_dev_select", -1);
+        res->t_h_nextn = chain;
+        ggml_build_forward_expand(gf, chain);
+        return;
+    }
+
     res->t_h_nextn = packed;
     ggml_build_forward_expand(gf, packed);
 }
