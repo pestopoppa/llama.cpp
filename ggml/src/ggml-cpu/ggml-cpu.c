@@ -2907,6 +2907,17 @@ static bool ggml_cpu_node_is_solo(const struct ggml_tensor * node) {
     }
 }
 
+// AK-CPU-C22 levers: one stderr witness line when an engagement counter reaches 1, 1e3, 1e6, ...
+// (non-PROF builds; the row harness greps it). <tag>_QUIET silences it.
+// C22 fold: carried from 2d9fe8740 (ROUTER_BF16, not folded), which defined it for every C22 CPU lever.
+static void ggml_cpu_lever_witness(const char * tag, const char * quiet_env, long long n) {
+    if (n == 1 || n == 1000 || n == 1000000 || n == 1000000000) {
+        if (getenv(quiet_env) == NULL) {
+            fprintf(stderr, "[%s] engaged: %lld\n", tag, n);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // AK-CPU-CONV-STATE-FWD (GGML_CONV_STATE_FWD, default OFF). The recurrent conv path is
 //   R = GET_ROWS(conv_states_all, s_copy) -> T = RESHAPE(R) [d_conv-1, ch, n_seqs] ->
