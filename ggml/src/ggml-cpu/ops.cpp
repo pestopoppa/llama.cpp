@@ -9302,9 +9302,146 @@ struct cmp_top_k {
     }
 };
 
+// [Q38FN-TOPK-SELECT] GGML_CPU_TOPK_SELECT replaces the reference indirect std::partial_sort:
+//   1 = EXACT: the libstdc++ __heap_select + __sort_heap steps replayed on contiguous (value, index) pairs,
+//       with a branch-free skip over runs that cannot enter the heap. Every comparison the reference makes
+//       is made here on the same values in the same order, so dst is bit-identical, ties included.
+//   C22 fold: the lossy mode 2 (packed-key nth_element select) failed quality and is NOT carried; any value
+//       other than 1 selects the reference path.
+extern "C" int ggml_cpu_topk_select_enabled(void) {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CPU_TOPK_SELECT");
+        int v = e != nullptr ? atoi(e) : 0;
+        if (v != 1) {
+            v = 0;
+        }
+        GGML_LOG_INFO("ggml_cpu: GGML_CPU_TOPK_SELECT = %d (%s)\n", v,
+                v == 1 ? "top_k exact heap replay on contiguous pairs" :
+                "reference std::partial_sort top_k");
+        return v;
+    }();
+    return mode;
+}
+
+// ---- mode 1: the libstdc++ heap algorithms (bits/stl_heap.h), comparator a.v > b.v ----
+struct ggml_topk_pair { float v; int32_t i; };
+
+static inline void ggml_topk_push_heap(ggml_topk_pair * first, int64_t hole, int64_t top, ggml_topk_pair value) {
+    int64_t parent = (hole - 1) / 2;
+    while (hole > top && first[parent].v > value.v) {
+        first[hole] = first[parent];
+        hole   = parent;
+        parent = (hole - 1) / 2;
+    }
+    first[hole] = value;
+}
+
+static inline void ggml_topk_adjust_heap(ggml_topk_pair * first, int64_t hole, int64_t len, ggml_topk_pair value) {
+    const int64_t top = hole;
+    int64_t second = hole;
+    while (second < (len - 1) / 2) {
+        second = 2 * (second + 1);
+        if (first[second].v > first[second - 1].v) {
+            second--;
+        }
+        first[hole] = first[second];
+        hole = second;
+    }
+    if ((len & 1) == 0 && second == (len - 2) / 2) {
+        second = 2 * (second + 1);
+        first[hole] = first[second - 1];
+        hole = second - 1;
+    }
+    ggml_topk_push_heap(first, hole, top, value);
+}
+
+static void ggml_topk_exact_row(const float * src, int64_t n, int64_t k, ggml_topk_pair * h, int32_t * dst) {
+    for (int64_t j = 0; j < k; ++j) {
+        h[j] = { src[j], (int32_t) j };
+    }
+    // __make_heap
+    if (k >= 2) {
+        for (int64_t parent = (k - 2) / 2; ; --parent) {
+            ggml_topk_adjust_heap(h, parent, k, h[parent]);
+            if (parent == 0) {
+                break;
+            }
+        }
+    }
+    // __heap_select: element j enters iff src[j] > top (the evicted top's store into the tail is never read)
+    int64_t j = k;
+    float top = h[0].v;
+    while (j < n) {
+        // skip 16 at a time while none can enter; the scalar test below is the reference's own test
+        while (j + 16 <= n) {
+            int any = 0;
+            for (int u = 0; u < 16; ++u) {
+                any |= src[j + u] > top;
+            }
+            if (any) {
+                break;
+            }
+            j += 16;
+        }
+        const int64_t end = std::min<int64_t>(n, j + 16);
+        for (; j < end; ++j) {
+            if (src[j] > top) {
+                ggml_topk_adjust_heap(h, 0, k, { src[j], (int32_t) j });
+                top = h[0].v;
+            }
+        }
+    }
+    // __sort_heap
+    for (int64_t last = k; last > 1; ) {
+        --last;
+        const ggml_topk_pair value = h[last];
+        h[last] = h[0];
+        ggml_topk_adjust_heap(h, 0, last, value);
+    }
+    for (int64_t t = 0; t < k; ++t) {
+        dst[t] = h[t].i;
+    }
+}
+
+static void ggml_compute_forward_top_k_f32_select(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(ne00 <= (int64_t) INT32_MAX);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr    = ggml_nrows(src0);
+    const int64_t top_k = ne0;
+
+    // the planner reserves 2 int32 per element per task (one (value, index) pair per cell)
+    uint64_t * keys = (uint64_t *) ((int32_t *) params->wdata + (2*ne00 + CACHE_LINE_SIZE_F32) * ith);
+
+    for (int64_t i = ith; i < nr; i += nth) {
+        const float * src_data = (const float *)((const char *) src0->data + i*nb01);
+        int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
+        ggml_topk_exact_row(src_data, ne00, top_k, (ggml_topk_pair *) keys, dst_data);
+        // same convention as the reference: the order is not important
+        if (top_k > 1) {
+            std::swap(dst_data[0], dst_data[1]);
+        }
+    }
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
+
+    if (ggml_cpu_topk_select_enabled()) {
+        ggml_compute_forward_top_k_f32_select(params, dst);
+        return;
+    }
 
     const ggml_tensor * src0 = dst->src[0];
 

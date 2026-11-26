@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
+
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "ggml-backend-impl.h"
@@ -17,6 +18,8 @@
 #include "ggml.h"
 #include "common.h"
 #include "exl3.h"
+
+int ggml_cpu_topk_select_enabled(void); // [Q38FN-TOPK-SELECT] defined in ops.cpp
 
 #if defined(GGML_USE_IQK_MULMAT)
 #include "iqk/iqk_config.h"
@@ -3867,7 +3870,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_TOP_K:
                     {
-                        cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                        // [Q38FN-TOPK-SELECT] select mode keeps one 64-bit key per element (+ the per-task pad)
+                        cur += ggml_cpu_topk_select_enabled()
+                            ? sizeof(int32_t)*(2*node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks
+                            : sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
