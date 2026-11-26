@@ -12453,6 +12453,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
 
+    // [Q38FN-GDN-SNAP] op param 3: the snapshot slots go straight to the cache view in src[7]
+    const ggml_tensor * src_snap = (!replay_op && ggml_get_op_params_i32(dst, 3) != 0) ? dst->src[7] : nullptr;
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
@@ -12462,6 +12465,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_tensor * src_parent = replay_op ? nullptr : dst->src[6];
     const int32_t * par_d = src_parent ? (const int32_t *) src_parent->data : nullptr;
     GGML_ASSERT(par_d == nullptr || K == n_tokens);
+    // a tree reads parent snapshots back, from wherever they were written
+    GGML_ASSERT(src_snap == nullptr || par_d == nullptr || src_snap->ne[2] == n_tokens);
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -12544,6 +12549,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 GGML_ASSERT(p >= -1 && p < t);
                 if (p != t - 1) {
                     const float * src_s = p < 0 ? s_in
+                        : src_snap ? (const float *) ((const char *) src_snap->data + (n_tokens - 1 - p) * src_snap->nb[2] + iv3 * src_snap->nb[1]) + iv1 * S_v * S_v
                         : state_out_base + (n_tokens - 1 - p) * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                     memcpy(s_out, src_s, S_v * S_v * sizeof(float));
                 }
@@ -12592,8 +12598,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                   (iv3 * H + iv1) * S_v * S_v;
+                    if (src_snap) {
+                        // ggml_cpy(src slot i -> snap_dst slot i) of the reference path, done at the source
+                        curr_state_o = target_slot < src_snap->ne[2]
+                            ? (float *) ((char *) src_snap->data + target_slot * src_snap->nb[2] + iv3 * src_snap->nb[1]) + iv1 * S_v * S_v
+                            : nullptr;
+                    } else {
+                        curr_state_o = state_out_base + target_slot * state_size_per_snap +
+                                       (iv3 * H + iv1) * S_v * S_v;
+                    }
                 }
             }
 

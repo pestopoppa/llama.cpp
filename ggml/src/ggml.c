@@ -6679,6 +6679,22 @@ struct ggml_tensor * ggml_gated_delta_net(
     return ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, NULL, NULL, NULL, NULL, K, false);
 }
 
+void ggml_gated_delta_net_set_snap_dst(
+        struct ggml_tensor  * gdn,
+        struct ggml_tensor  * snap_dst) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(gdn, 1) == 0 && "snap_dst: not with replay");
+    // tree parents (src[6], AK-DTREE-2) are fine: the kernel reads parent snapshots back from snap_dst
+    GGML_ASSERT(gdn->type == GGML_TYPE_F32 && snap_dst->type == GGML_TYPE_F32);
+    const int64_t S_v = gdn->src[2]->ne[0];
+    const int64_t H   = gdn->src[2]->ne[1];
+    GGML_ASSERT(snap_dst->ne[0] == S_v*S_v*H && snap_dst->nb[0] == sizeof(float));
+    GGML_ASSERT(snap_dst->ne[1] == gdn->src[2]->ne[3]);
+    GGML_ASSERT(snap_dst->ne[2] <= ggml_get_op_params_i32(gdn, 0));
+    ggml_set_op_params_i32(gdn, 3, 1);
+    gdn->src[7] = snap_dst;
+}
+
 struct ggml_tensor * ggml_gated_delta_net_tree(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

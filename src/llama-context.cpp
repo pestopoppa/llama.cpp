@@ -4,6 +4,8 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+bool llama_gdn_snap_inplace_enabled(); // [Q38FN-GDN-SNAP] src/models/delta-net-base.cpp
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-host-mirror-bind.h"
@@ -379,6 +381,12 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: rs_replay     = %s\n",   __func__, cparams.rs_replay ? "true" : "false");
+    // [Q38FN-GDN-SNAP] per-context witness (a log-once in the graph builder fell inside common/fit's muted context)
+    if (cparams.n_rs_seq > 0) {
+        const bool snap = llama_gdn_snap_inplace_enabled();
+        LLAMA_LOG_INFO("%s: LLAMA_GDN_SNAP_INPLACE = %d (%s)\n", __func__, snap ? 1 : 0,
+                snap ? "GDN rollback snapshots written in place, no state CPY" : "reference: snapshots copied by ggml_cpy");
+    }
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
