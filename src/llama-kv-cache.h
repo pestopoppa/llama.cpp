@@ -281,6 +281,12 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // [TAG_MTP_DRAFT_WINDOW] draft-only sink+window attention mask (0 = off, dense). Only the MTP draft
+    // context's cache sets it; cells are never evicted, only masked, so the trunk and rollback are unaffected.
+    void set_draft_window(uint32_t window, uint32_t sink, uint32_t min_pos = 0) {
+        draft_window = window; draft_sink = sink; draft_min_pos = min_pos;
+    }
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // UP-FAROWS-HIP: per-sequence K/V row lists for FLASH_ATTN_EXT (ggml_flash_attn_ext_set_rows_key) over the first
@@ -347,6 +353,10 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    uint32_t draft_window = 0; // [TAG_MTP_DRAFT_WINDOW]
+    uint32_t draft_sink   = 0;
+    uint32_t draft_min_pos = 0; // [TAG_MTP_DRAFT_WINDOW_ADAPT] window only for query positions >= this (0 = always)
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
